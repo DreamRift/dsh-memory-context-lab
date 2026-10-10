@@ -1,0 +1,4 @@
+- insert:
+    - id: memory-context-lab
+      name: dsh-memory-context-lab
+      config: {}
