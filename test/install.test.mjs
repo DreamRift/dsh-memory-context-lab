@@ -177,8 +177,8 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   const projection = ctx._projections[0]
   const view = projection.wire.view(projection.init())
   assert.deepEqual(Object.keys(view).sort(), [
-    'archiveBatchSize', 'archived', 'auto', 'autoRecall', 'autoRestore', 'enabled', 'releaseMarginRatio',
-    'restored', 'retainOperations', 'revision', 'targetOccupancy',
+    'archiveBatchSize', 'archived', 'auto', 'autoRecall', 'autoRestore', 'enabled',
+    'restored', 'retainOperations', 'revision',
   ].sort())
   for (const [key, value] of Object.entries(view)) {
     assert.notEqual(value, undefined, `${key} must not be undefined`)

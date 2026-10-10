@@ -110,21 +110,14 @@ export function archiveMac(text) {
 }
 
 /**
- * Resolve the input budget the target occupancy applies to.
- *
- * The target is measured against the **full context window**, not against the
- * window minus the output reservation, because that is the number the host's
- * own context meter shows (`projectedTokens / contextWindow`, and
- * `projectedTokens` is prompt-side only). If the plugin divided by
- * `contextWindow - maxTokens` instead, "40%" would mean a different, silently
- * stricter number than the one on screen, and the panel would report a target
- * the user never set.
- *
- * The window must be a positive integer supplied by the host and the output
- * reservation must be a non-negative integer; anything else fails closed so a
- * guessed window can never drive a destructive rewrite.
+ * Window bookkeeping for display: the context window and the completion
+ * reservation, both confirmed values. There is no occupancy budget anymore —
+ * the retention count alone decides when a batch is ready — so this exists
+ * only to render the report, never to gate a plan. Either number being
+ * unconfirmed fails closed, because a guessed window should never reach a
+ * destructive rewrite either.
  */
-export function resolveOccupancyBudget({ contextWindow, reservedCompletionTokens = 0, targetOccupancy }) {
+export function resolveWindow({ contextWindow, reservedCompletionTokens = 0 }) {
   if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
     throw new OccupancyUnavailableError(
       'window',
@@ -137,31 +130,13 @@ export function resolveOccupancyBudget({ contextWindow, reservedCompletionTokens
       `宿主返回的完成 token 预留不可信（maxTokens=${String(reservedCompletionTokens)}），已失败关闭。`,
     )
   }
-  if (typeof targetOccupancy !== 'number' || !(targetOccupancy > 0 && targetOccupancy < 1)) {
-    throw new OccupancyUnavailableError('target', '触发占用率未设置或不在 (0, 1) 区间，请在面板中设置。')
-  }
-  const usableWindowTokens = contextWindow - reservedCompletionTokens
-  if (usableWindowTokens <= 0) {
-    throw new OccupancyUnavailableError(
-      'window',
-      `模型上下文窗口 ${contextWindow} 减去预留完成 token ${reservedCompletionTokens} 后没有可用输入预算，已失败关闭。`,
-    )
-  }
-  return {
-    contextWindow,
-    reservedCompletionTokens,
-    usableWindowTokens,
-    // Same denominator as the host context meter, so the panel and the screen agree.
-    targetTokens: Math.floor(contextWindow * targetOccupancy),
-    /** True when the target leaves less room for output than the route reserves. */
-    reservationExceedsTarget: contextWindow - Math.floor(contextWindow * targetOccupancy) < reservedCompletionTokens,
-  }
+  return { contextWindow, reservedCompletionTokens }
 }
 
-/** Current occupancy as a fraction of the usable input window, or null when unmeasurable. */
-export function computeOccupancy(assembledTokens, usableWindowTokens) {
-  if (!Number.isFinite(assembledTokens) || !Number.isFinite(usableWindowTokens) || usableWindowTokens <= 0) return null
-  return assembledTokens / usableWindowTokens
+/** Current occupancy as a fraction of the context window, or null when unmeasurable. */
+export function computeOccupancy(assembledTokens, contextWindow) {
+  if (!Number.isFinite(assembledTokens) || !Number.isFinite(contextWindow) || contextWindow <= 0) return null
+  return assembledTokens / contextWindow
 }
 
 /**
@@ -430,47 +405,34 @@ export function collectOperationCandidates(view) {
 /**
  * Choose the operations to archive in one batch.
  *
- * Two passes, in this order, because they answer two different questions:
- *
- *  1. **Retention (always on).** Every candidate older than the newest
- *     `retainOperations` operations is archived, whether or not the occupancy
- *     target has been reached — that is what makes the plugin continuously
- *     useful rather than a last-resort valve. The batch waits until
- *     `batchSize` operations have piled up, because each submitted batch
- *     invalidates the prefix cache from its oldest touched node onward, so
- *     batch *count* is the cost driver. Measured on a real 1M-window session:
- *     batching 10 costs 0.16× the do-nothing baseline, batching 1 costs 0.57×.
- *
- *  2. **Occupancy target (safety net).** If the assembled input still exceeds
- *     the target, the planner keeps going — oldest-first, into the retention
- *     window if it must — until the target is met or nothing safe is left. This
- *     pass ignores the batch threshold: the target exists precisely for the case
- *     where the retention window alone is not enough to keep the session under
- *     control.
+ * Retention is the only trigger: every candidate older than the newest
+ * `retainOperations` operations is archived once the batch threshold is met.
+ * There is no occupancy safety net — the retention count is the entire budget.
+ * The batch waits until `batchSize` operations have piled up, because each
+ * submitted batch invalidates the prefix cache from its oldest touched node
+ * onward, so batch *count* is the cost driver. Measured on a real 1M-window
+ * session: batching 10 costs 0.16× the do-nothing baseline, batching 1 costs
+ * 0.57×.
  *
  * Ordering is by source event seq, never by size, tool name, or randomness, and
  * the receipt's own estimated cost is subtracted.
  *
  * @param batchSize - how many out-of-window candidates must accumulate before
- *   pass 1 submits. The target pass is not gated by it.
- * @returns the plan, including how far below the retention baseline it had to go.
+ *   a batch submits.
+ * @returns the plan.
  */
 export function planCooling({
   candidates = [],
-  excessTokens = 0,
   meter,
   nodeIdFor,
   retainOperations = 0,
   batchSize = 1,
   maxOperations = 64,
   minNetReleaseTokens = 128,
-  releaseMarginTokens = 0,
 }) {
   const units = []
   const rejected = []
-  const targetRelease = excessTokens > 0 ? excessTokens + Math.max(0, releaseMarginTokens) : 0
   let plannedReleaseTokens = 0
-  const admitted = new Set()
 
   function admit(candidate) {
     if (units.length >= maxOperations) return false
@@ -497,11 +459,11 @@ export function planCooling({
     }
     units.push({ ...candidate, nodeId, hash, receipt, receiptTokens, netReleaseTokens })
     plannedReleaseTokens += netReleaseTokens
-    admitted.add(candidate)
     return true
   }
 
-  // ── Pass 1: retention, always on ─────────────────────────────────────────
+  // Retention, always on: archive everything older than the newest N
+  // operations once `batchSize` of them have piled up.
   const outOfWindow = candidates.filter((candidate) => !candidate.withinRetention)
   const threshold = Math.max(1, batchSize)
   const baselineReady = outOfWindow.length >= threshold
@@ -518,40 +480,21 @@ export function planCooling({
     }
   }
 
-  // ── Pass 2: the occupancy target, a safety net that may enter the window ──
-  let safetyNetUnits = 0
-  if (targetRelease > 0) {
-    for (const candidate of candidates) {
-      if (units.length >= maxOperations) break
-      if (plannedReleaseTokens >= targetRelease) break
-      if (admitted.has(candidate)) continue
-      if (admit(candidate)) safetyNetUnits += 1
-    }
-  }
-
   const archivedFromRetained = units.filter((unit) => unit.withinRetention).length
-  const shortfall = Math.max(0, targetRelease - plannedReleaseTokens)
   return {
     units,
     rejected,
     plannedReleaseTokens,
-    targetRelease,
-    shortfall,
-    /** False when this batch could not free the target by itself. */
-    reachable: shortfall === 0,
-    /** True when the per-batch ceiling stopped it, so the next step continues. */
-    limitedByCap: units.length >= maxOperations && shortfall > 0,
     archivedFromRetained,
     archivedFromOpenTurn: units.filter((unit) => unit.inOpenTurn).length,
     baselineRetention: retainOperations,
-    /** Protected operations remaining after this batch; each consumed one lowers it by one. */
+    /** Protected operations remaining after this batch. */
     effectiveRetention: Math.max(0, retainOperations - archivedFromRetained),
-    /** Retention pass bookkeeping, so callers can say "waiting for the batch to fill". */
+    /** Retention bookkeeping, so callers can say "waiting for the batch to fill". */
     batchSize: threshold,
     outOfWindowCount: outOfWindow.length,
     baselineReady,
     baselineUnits,
-    safetyNetUnits,
   }
 }
 
@@ -891,22 +834,18 @@ export function summarizeOutcomes(outcomes) {
 export function occupancyLines(occupancy) {
   const {
     host,
-    budget,
     view,
-    excessTokens,
     plan,
-    targetOccupancy,
     archivedCount = 0,
     cacheStats = null,
   } = occupancy
   // Same denominator the host context meter uses, so this line and the meter agree.
-  const current = computeOccupancy(host.assembledTokens, budget.contextWindow)
+  const current = computeOccupancy(host.assembledTokens, host.contextWindow)
   const lines = [
     `当前模型：${host.provider}/${host.model}`,
     `上下文窗口：${host.contextWindow} token（占用率口径与界面一致：组装输入 ÷ 窗口）`,
     `组装输入估算：≈${host.assembledTokens} token（来源：${host.baselineKind === 'usage' ? '提供方 usage 锚点 + 增量估算' : '宿主 estimator 纯估算'}）`,
-    `当前占用率：${current === null ? '无法计算' : `${(current * 100).toFixed(1)}%`}（安全网触发线 ${(targetOccupancy * 100).toFixed(0)}%，仅在保留数不够用时才启用）`,
-    `目标预算：${budget.targetTokens} token；超出：${excessTokens} token`,
+    `当前占用率：${current === null ? '无法计算' : `${(current * 100).toFixed(1)}%`}`,
     formatCacheLine(cacheStats),
     `候选：${view.candidates.length} 个完整操作可归档（已保护／不合格 ${view.skipped.length} 条）；本批计划释放 ≈${plan.plannedReleaseTokens} token（含回执成本）`,
     `保留最近 ${plan.baselineRetention} 个操作（一直生效）：窗口外待归档 ${plan.outOfWindowCount} 个，`
@@ -914,29 +853,13 @@ export function occupancyLines(occupancy) {
       ? `已攒够 ${plan.batchSize} 个，本批提交`
       : `未攒够 ${plan.batchSize} 个，暂不提交（攒够即归档，与占用率无关）`),
   ]
-  if (budget.reservationExceedsTarget) {
-    lines.push(
-      `注意：目标 ${(targetOccupancy * 100).toFixed(0)}% 之后的剩余空间小于本路由预留的完成 token ${host.reservedCompletionTokens}，`
-      + '长回答仍可能触顶；要留出输出余量请下调目标。',
-    )
-  }
   if (plan.units.length) {
     lines.push(
-      `本批构成：保留窗口外 ${plan.baselineUnits} 个`
-      + (plan.safetyNetUnits > 0
-        ? ` + 为满足安全网额外动用保留窗口内 ${plan.safetyNetUnits} 个（保留基线 ${plan.baselineRetention} → ${plan.effectiveRetention}）`
-        : `（保留基线 ${plan.baselineRetention} 个未被动用）`),
+      `本批构成：保留窗口外 ${plan.baselineUnits} 个（保留基线 ${plan.baselineRetention} 个未被动用）`,
     )
     if (plan.archivedFromOpenTurn > 0) {
       lines.push(`其中 ${plan.archivedFromOpenTurn} 个属于当前尚未结束的回合。`)
     }
-    if (plan.shortfall > 0) {
-      lines.push(plan.limitedByCap
-        ? `本批受单批上限约束，仍差 ≈${plan.shortfall} token，下一步会继续。`
-        : `已无可归档操作，仍超出 ≈${plan.shortfall} token：剩余的是受保护的系统头／最新用户消息，或不合格（失败、含非文本块、过短、超出可回读上限）的操作。`)
-    }
-  } else if (excessTokens > 0) {
-    lines.push('安全网已触发，但已无可归档操作：剩余的是受保护的系统头／最新用户消息，或不合格的操作。')
   }
   lines.push(`已归档操作：${archivedCount} 个`)
   return lines

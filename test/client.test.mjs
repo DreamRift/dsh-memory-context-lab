@@ -390,7 +390,7 @@ test('clicking the chip opens the settings popover from the chip itself', async 
     assert.equal(typeof node.props['aria-checked'], 'boolean')
   }
   const inputs = collect(opened, (node) => node.type === 'input')
-  assert.ok(inputs.length >= 3, 'the numeric settings must have inputs')
+  assert.ok(inputs.length >= 2, 'the numeric settings must have inputs')
   for (const node of inputs) assert.ok(node.props['aria-label'], 'every input needs an accessible name')
 
   // Escape closes it again.

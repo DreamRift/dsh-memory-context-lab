@@ -60,11 +60,9 @@ const HELP = [
   '',
   '/memory-lab on                  在本会话启用降温（同时抑制真实灵枢对本会话的自动读写）。',
   '/memory-lab off                 停用降温并让本会话回到正常：恢复原文、清除隔离数据。',
-  '/memory-lab status              查看保留量、批量阈值、安全网触发线、归档数、占用率与前缀缓存命中。',
-  '/memory-lab set retain 10       保留最近 N 个操作原文；更旧的攒够批量阈值就归档（一直生效）。',
+  '/memory-lab status              查看保留量、批量阈值、归档数、占用率与前缀缓存命中。',
+  '/memory-lab set retain 10       保留最近 N 个操作原文；更旧的攒够批量阈值就归档（唯一触发线）。',
   '/memory-lab set batch 10        保留窗口外攒够 N 个操作提交一批（越大越省缓存重算，上下文留得越多）。',
-  '/memory-lab set target 0.60     安全网触发占用率（0-1 或 60%）；保留数不够用时才启用。',
-  '/memory-lab set margin 0.05     安全网触发时，在超出量之外再多减的比例。',
   '/memory-lab set auto on|off     自动降温开关（默认开）。',
   '/memory-lab set recall on|off   命中回注开关（默认开）。',
   '/memory-lab set autorestore on|off  停用时是否恢复原文并清数据（默认开）。',
@@ -74,11 +72,10 @@ const HELP = [
   '/memory-lab clean               删除本会话的隔离数据（有未恢复回执时会拒绝）。',
   '',
   '归档单位是「一次完整操作」：助手的工具调用（含参数）加对应的工具结果，整体换成一条回执。',
-  '**保留最近 N 个操作是一直生效的主行为**：不管占用率多少，更旧的操作攒够批量阈值就归档。',
-  '触发占用率是**安全网**：只有当保留数不足以把占用压下来时，才动用保留窗口内的操作。',
+  '**保留最近 N 个操作是唯一触发线**：不管占用率多少，更旧的操作攒够批量阈值就归档。',
+  '上下文上限由宿主的自动压缩兜底，插件不再自己看护占用率（历史上从未触发，宿主压缩也从未触发）。',
   '批量阈值是成本杠杆：每提交一批就会让替换点之后的上下文按未命中价重算一次，批次数越多代价越大，',
   '所以攒几个再提交比来一个归档一个便宜得多。',
-  '占用率口径与界面一致：组装输入 ÷ 上下文窗口。',
   '模型可见的工具集永不改变——工具定义在请求前缀里，增删工具会作废整段前缀缓存。',
   '自动回注只追加在进入步骤的消息批次尾部，每条用户消息最多一次，因此不影响前缀命中。',
 ].join('\n')
@@ -496,7 +493,7 @@ export async function apply(ctx) {
       const numeric = NUMERIC_SETTINGS[settingName]
       const boolean = BOOLEAN_SETTINGS[settingName]
       if (!numeric && !boolean) {
-        return { kind: 'error', text: '用法：/memory-lab set retain 10 | batch 10 | target 0.60 | margin 0.05 | auto on|off | recall on|off | autorestore on|off' }
+        return { kind: 'error', text: '用法：/memory-lab set retain 10 | batch 10 | auto on|off | recall on|off | autorestore on|off' }
       }
       const record = records.get(sessionId) ?? await adopt(invocation.agent)
       if (!record) {
@@ -756,7 +753,7 @@ export async function apply(ctx) {
       definitionId: 'dsh-memory-context-lab/control',
       name: COMMAND_NAME,
       description: 'Archive finished operations into an isolated cold store to reduce context',
-      input: { hint: 'on | off | status | set target|retain|margin|auto|recall <value> | now | dry-run | restore | clean | help' },
+      input: { hint: 'on | off | status | set retain|batch|auto|recall|autorestore <value> | now | dry-run | restore | clean | help' },
       handler: (invocation) => {
         const pending = commandHandler(invocation)
         activeOperations.add(pending)

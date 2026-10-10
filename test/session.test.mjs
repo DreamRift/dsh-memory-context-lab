@@ -192,14 +192,16 @@ test('on/status/off report through the command surface', async () => {
     assert.ok(settings.text.includes('保留最近操作数'))
     assert.ok(settings.text.includes('3'))
 
+    // The retired occupancy keys are gone from the settings registry, so the old
+    // spellings are rejected like any other unknown name.
     const bad = await run(ctx, agent, 'set target 5')
     assert.equal(bad.kind, 'error')
 
-    // Release the retained window and drop the trigger below the current
-    // occupancy so there is real work to attempt, then prove that a missing cold
-    // store fails closed instead of rewriting the surface.
+    // Release the retained window and drop the batch threshold to 1 so the two
+    // operations are a filled batch, then prove that a missing cold store fails
+    // closed instead of rewriting the surface.
     await run(ctx, agent, 'set retain 0')
-    await run(ctx, agent, 'set target 1%')
+    await run(ctx, agent, 'set batch 1')
     const now = await run(ctx, agent, 'now')
     assert.equal(now.kind, 'error', `archiving without a usable cold store must fail closed, got: ${now.text}`)
     assert.ok(now.text.includes('原文未作静默删除'), now.text)
@@ -251,10 +253,10 @@ test('a set issued before on governs the engine, not only the panel', async () =
 
     // The host records every command it runs, so the log is written first. A `set`
     // before `on` used to be refused and therefore never reached the durable state,
-    // while the projection still folded it from the log: the panel promised 40%
-    // and the engine kept cooling against the 60% default, so it never fired.
-    session.append('command/run', { commandId: 'c1', name: 'memory-lab', args: ' set target 0.4000' })
-    const preset = await run(ctx, agent, 'set target 0.4')
+    // while the projection still folded it from the log: the panel promised one
+    // value and the engine kept cooling against the default, so it never fired.
+    session.append('command/run', { commandId: 'c1', name: 'memory-lab', args: ' set batch 4' })
+    const preset = await run(ctx, agent, 'set batch 4')
     assert.equal(preset.kind, 'success', preset.text)
 
     session.append('command/run', { commandId: 'c2', name: 'memory-lab', args: ' on' })
@@ -264,13 +266,13 @@ test('a set issued before on governs the engine, not only the panel', async () =
     // The durable file the engine reads must agree with the panel's folded view.
     const stored = await readSessionState(labRoot, sessionId)
     assert.equal(
-      stored.state.settings.targetOccupancy,
-      0.4,
+      stored.state.settings.archiveBatchSize,
+      4,
       'enabling must adopt a setting recorded before it, not reset to the default',
     )
 
     const status = await run(ctx, agent, 'status')
-    assert.ok(status.text.includes('40%'), `status must report the folded target, got: ${status.text}`)
+    assert.ok(status.text.includes('攒够 4 个'), `status must report the folded batch size, got: ${status.text}`)
     await ctx._dispose()
   })
 })
@@ -278,7 +280,7 @@ test('a set issued before on governs the engine, not only the panel', async () =
 test('a durable configuration survives when the log has no memory-lab record', async () => {
   await withTempLab('nolog', async (labRoot) => {
     const sessionId = 'session-nolog-0001'
-    const seeded = await createSessionState(labRoot, sessionId, { targetOccupancy: 0.25, retainOperations: 3 })
+    const seeded = await createSessionState(labRoot, sessionId, { archiveBatchSize: 7, retainOperations: 3 })
     seeded.state.enabled = true
     await writeSessionState(seeded.directory, seeded.state)
 
@@ -289,7 +291,7 @@ test('a durable configuration survives when the log has no memory-lab record', a
     const { agent } = agentFor(session)
     const status = await run(ctx, agent, 'status')
     assert.equal(status.kind, 'success')
-    assert.ok(status.text.includes('25%'), `the stored target must survive, got: ${status.text}`)
+    assert.ok(status.text.includes('攒够 7 个'), `the stored batch size must survive, got: ${status.text}`)
     assert.ok(status.text.includes('保留最近操作：3'), `the stored retention must survive, got: ${status.text}`)
     await ctx._dispose()
   })
@@ -298,17 +300,15 @@ test('a durable configuration survives when the log has no memory-lab record', a
 test('the projection rebuilds settings from the session log, not from plugin memory', () => {
   // This is the mechanism that makes resume correct: the log alone is enough.
   let state = initProjectionState()
-  const lines = ['on', 'set target 0.55', 'set retain 4', 'set batch 6', 'set margin 0.1', 'set auto off', 'set recall off', 'set autorestore off']
+  const lines = ['on', 'set retain 4', 'set batch 6', 'set auto off', 'set recall off', 'set autorestore off']
   for (const [index, args] of lines.entries()) {
     state = applyEvent(state, { type: 'command/run', seq: index + 1, data: { name: 'memory-lab', args } })
   }
   const view = viewOf(state)
   assert.deepEqual(view, {
     enabled: true,
-    targetOccupancy: 0.55,
     retainOperations: 4,
     archiveBatchSize: 6,
-    releaseMarginRatio: 0.1,
     auto: false,
     autoRecall: false,
     autoRestore: false,
@@ -321,7 +321,7 @@ test('the projection rebuilds settings from the session log, not from plugin mem
 test('a cold session directory is written under the session key, not the raw id', async () => {
   await withTempLab('paths', async (labRoot) => {
     const sessionId = 'session-paths-0001'
-    const created = await createSessionState(labRoot, sessionId, { targetOccupancy: 0.6 })
+    const created = await createSessionState(labRoot, sessionId, { retainOperations: 10 })
     assert.equal(path.basename(created.directory), sessionKeyFor(sessionId))
     assert.ok(!created.directory.includes(sessionId), 'the raw session id must not appear in a path')
     const read = await readSessionState(labRoot, sessionId)
@@ -366,7 +366,7 @@ test('recall is a no-op with nothing archived and fails closed once something is
 
     // ── Phase 2: seed a pending receipt, then enable so the record holds it.
     const pendingId = 'session-recall-pending'
-    const seeded = await createSessionState(labRoot, pendingId, { targetOccupancy: 0.6 })
+    const seeded = await createSessionState(labRoot, pendingId, { retainOperations: 10, archiveBatchSize: 10 })
     seeded.state.enabled = true
     seeded.state.archive.push({
       rangeStart: 3,
@@ -448,9 +448,10 @@ test('a session whose batch has not filled still records what it measured', asyn
     const sessionId = 'session-measured-0001'
     const session = buildSession({ operations: 2, id: sessionId })
     const { agent } = agentFor(session)
-    // A target of 90% of a 1M window is far above this tiny fixture.
+    // The default retention keeps 10 operations verbatim, so with only two
+    // operations on the surface nothing is ever out of the window — the batch
+    // can never fill, which is exactly the steady state this test pins down.
     await run(ctx, agent, 'on')
-    await run(ctx, agent, 'set target 0.9')
 
     for (const listener of ctx._listeners.get('agent/pre-step')) {
       await listener({ agent, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [] }))
@@ -460,9 +461,8 @@ test('a session whose batch has not filled still records what it measured', asyn
     const stored = found?.state.lastMeasurement
     assert.ok(stored, 'an under-trigger step must persist its measurement')
     assert.equal(stored.kind, 'noop')
-    assert.equal(stored.reason, 'waiting-for-batch', 'under the target the only reason to hold is an unfilled batch')
+    assert.equal(stored.reason, 'waiting-for-batch', 'the only reason to hold is an unfilled batch')
     assert.ok(stored.assembledTokens > 0, 'the assembled estimate must be recorded')
-    assert.ok(stored.targetTokens > stored.assembledTokens, 'the fixture must sit below its trigger line')
     assert.equal(found.state.archive.length, 0, 'two operations are inside the retention window, so nothing is archived')
     await ctx._dispose()
 
@@ -472,7 +472,7 @@ test('a session whose batch has not filled still records what it measured', asyn
     const later = await harness({ labRoot })
     const status = await run(later, agent, 'status')
     assert.ok(status.text.includes('未触发归档'), `status must surface the stored measurement, got: ${status.text}`)
-    assert.ok(status.text.includes('距触发线还差'), `status must name the distance, got: ${status.text}`)
+    assert.ok(status.text.includes('等待批量攒满'), `status must name the reason, got: ${status.text}`)
     await later._dispose()
   })
 })
@@ -835,7 +835,7 @@ test('the archived cold node carries every byte needed to rebuild the operation'
     archivedRanges: [],
     minimumChars: 100,
   })
-  const plan = planCooling({ candidates: view.candidates, excessTokens: 1e9, meter: fakeMeter, nodeIdFor: () => 'n1', minNetReleaseTokens: 1 })
+  const plan = planCooling({ candidates: view.candidates, meter: fakeMeter, nodeIdFor: () => 'n1', minNetReleaseTokens: 1 })
   assert.equal(plan.units.length, 1)
   const store = new FakeColdStore()
   const outcome = await applyOneOperation({ session, client: store, unit: plan.units[0], meter: fakeMeter, hostVersion: 'test' })

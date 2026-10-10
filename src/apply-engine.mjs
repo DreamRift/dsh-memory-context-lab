@@ -11,7 +11,6 @@ import {
   applyOperations,
   cacheStatsOf,
   collectOperationCandidates,
-  computeOccupancy,
   formatBatchReport,
   formatCacheLine,
   formatRestoreReport,
@@ -21,12 +20,11 @@ import {
   openTurnOf,
   planCooling,
   recallDigest,
-  resolveOccupancyBudget,
+  resolveWindow,
   restoreReceipts,
   summarizeOutcomes,
 } from './apply.mjs'
 import {
-  formatRatio,
   MAX_OPERATIONS_PER_BATCH,
   MIN_NET_RELEASE_TOKENS,
   MIN_OPERATION_CHARS,
@@ -90,14 +88,11 @@ export function formatStoredMeasurement(stored) {
     return `最近一次测量：失败关闭${stamp}——${stored.reason || '原因未记录'}`
   }
   const assembled = Number.isFinite(stored?.assembledTokens) ? stored.assembledTokens : null
-  const target = Number.isFinite(stored?.targetTokens) ? stored.targetTokens : null
-  if (assembled === null || target === null) {
-    return `最近一次测量${stamp}：记录不完整（占用或目标缺失）。`
+  if (assembled === null) {
+    return `最近一次测量${stamp}：记录不完整（占用缺失）。`
   }
-  const gap = target - assembled
-  const shortfall = gap > 0 ? `，距触发线还差 ${gap} token` : `，已超出触发线 ${Math.abs(gap)} token`
-  const action = stored?.kind === 'applied' ? '已归档一批' : '未触发归档'
-  return `最近一次测量：${action}${stamp}——占用 ≈${assembled} token / 目标 ${target} token${shortfall}。`
+  const action = stored?.kind === 'applied' ? '已归档一批' : (stored?.reason === 'waiting-for-batch' ? '未触发归档（等待批量攒满）' : '未触发归档')
+  return `最近一次测量：${action}${stamp}——占用 ≈${assembled} token。`
 }
 
 /**
@@ -187,7 +182,7 @@ export function createEngine(dependencies) {
    * `applyOneOperation`, the same attempt then re-reads its own already-written
    * bytes and proceeds.
    */
-  function surfaceViewOf(record, measuredNodes, budget, settings) {
+  function surfaceViewOf(record, measuredNodes, settings) {
     const session = record.agent.session
     return collectOperationCandidates({
       surfaceNodes: [...session.surface.nodes],
@@ -204,24 +199,20 @@ export function createEngine(dependencies) {
   async function measureOccupancy(record, signal, { persistClaims = true } = {}) {
     const settings = settingsOf(record)
     const { meter, host } = await resolveHostOccupancy(record, signal, services)
-    const budget = resolveOccupancyBudget({
+    const window = resolveWindow({
       contextWindow: host.contextWindow,
       reservedCompletionTokens: host.reservedCompletionTokens,
-      targetOccupancy: settings.targetOccupancy,
     })
-    const view = surfaceViewOf(record, host.surfaceNodes, budget, settings)
-    const excessTokens = Math.max(0, host.assembledTokens - budget.targetTokens)
+    const view = surfaceViewOf(record, host.surfaceNodes, settings)
     const ordinalOf = new Map(view.candidates.map((candidate, index) => [candidate.rangeStart, index]))
-    // Two passes share one batch. The retention pass is always on and only waits
-    // for the batch to fill; the target pass is a safety net that is not gated by
-    // that threshold. Batch *count* is what costs money, because each submitted
-    // batch re-bills the prefix cache from its earliest touched node.
+    // Retention is the only trigger: the batch waits for the threshold to fill,
+    // and batch *count* is what costs money, because each submitted batch
+    // re-bills the prefix cache from its earliest touched node.
     const allocator = makeOrdinalAllocator(record)
     const claims = claimsOfRecord(record)
     const freshClaims = []
     const plan = planCooling({
       candidates: view.candidates,
-      excessTokens,
       meter,
       nodeIdFor: (candidate) => {
         const rangeStart = candidate.rangeStart
@@ -237,14 +228,10 @@ export function createEngine(dependencies) {
         }
         return nodeIdFor(record, fresh)
       },
-      // The baseline the planner may descend below when the target demands it.
       retainOperations: settings.retainOperations,
       batchSize: settings.archiveBatchSize,
       maxOperations: MAX_OPERATIONS_PER_BATCH,
       minNetReleaseTokens: MIN_NET_RELEASE_TOKENS,
-      // Same denominator as the target, so "release a bit extra" means the same
-      // fraction of the window the user set their target against.
-      releaseMarginTokens: Math.floor(budget.contextWindow * settings.releaseMarginRatio),
     })
     // A dry-run must leave no claims behind: it writes nothing and its idea of
     // "the plan" is disposable. A committed measure keeps them so the batch (and
@@ -255,13 +242,11 @@ export function createEngine(dependencies) {
     return {
       host,
       meter,
-      budget,
+      window,
       view,
-      excessTokens,
       plan,
       settings,
       cacheStats: cacheStatsOf(lastUsageOf(record.agent.session)),
-      targetOccupancy: settings.targetOccupancy,
       archivedCount: pendingReceipts(record).length,
     }
   }
@@ -411,8 +396,6 @@ export function createEngine(dependencies) {
       reason,
       assembledTokens: assembled,
       contextWindow: window,
-      targetTokens: occupancy?.budget?.targetTokens ?? null,
-      excessTokens: occupancy?.excessTokens ?? null,
     }
     try {
       await persist(record)
@@ -442,13 +425,11 @@ export function createEngine(dependencies) {
     record.occupancy = occupancy
     record.occupancyError = null
     if (!occupancy.plan.units.length) {
-      // Two very different no-ops. `waiting` is the normal steady state of the
-      // retention pass: fewer than `batchSize` operations have left the window
-      // yet, so the plugin is deliberately holding them verbatim. `exhausted`
-      // means the target is exceeded but nothing safe is left to archive.
-      const reason = occupancy.excessTokens > 0 ? 'exhausted' : 'waiting-for-batch'
-      await rememberMeasurement(record, occupancy, { action: 'noop', reason })
-      return { action: 'noop', reason }
+      // The normal steady state: fewer than `batchSize` operations have left
+      // the retention window yet, so the plugin is deliberately holding them
+      // verbatim until the batch fills.
+      await rememberMeasurement(record, occupancy, { action: 'noop', reason: 'waiting-for-batch' })
+      return { action: 'noop', reason: 'waiting-for-batch' }
     }
     const result = await runBatch(record, occupancy, signal)
     await rememberMeasurement(record, occupancy, { action: 'applied', reason: '' })
@@ -482,9 +463,7 @@ export function createEngine(dependencies) {
     if (dryRun) {
       const lines = ['预演（零副作用）：未写入冷库，未替换任何会话事件。', ...occupancyLines(occupancy)]
       if (!occupancy.plan.units.length) {
-        lines.push(occupancy.excessTokens > 0
-          ? '安全网已触发，但已无可归档操作（原因见上一行）。'
-          : `保留窗口外只有 ${occupancy.plan.outOfWindowCount} 个操作，未攒够 ${occupancy.plan.batchSize} 个；等它攒够就会自动归档，与占用率无关。`)
+        lines.push(`保留窗口外只有 ${occupancy.plan.outOfWindowCount} 个操作，未攒够 ${occupancy.plan.batchSize} 个；等它攒够就会自动归档，与占用率无关。`)
       } else {
         lines.push(`将在单批内按 seq 从旧到新处理：${occupancy.plan.units.map((unit) => `${unit.rangeStart}–${unit.rangeEnd}`).join(', ')}`)
         lines.push('单批提交：替换最旧节点会让其后整段上下文的前缀缓存失效一次，批次数越多代价越大，因此一批做够而不是分批。')
@@ -498,13 +477,10 @@ export function createEngine(dependencies) {
     if (!occupancy.plan.units.length) {
       // `/memory-lab now` is not the dry run: it may record what it measured, so
       // a session that is still filling its first batch leaves evidence behind.
-      const reason = occupancy.excessTokens > 0 ? 'exhausted' : 'waiting-for-batch'
-      await rememberMeasurement(record, occupancy, { action: 'noop', reason })
+      await rememberMeasurement(record, occupancy, { action: 'noop', reason: 'waiting-for-batch' })
       return {
         kind: 'success',
-        text: occupancy.excessTokens > 0
-          ? `已无可归档操作，仍超出目标 ≈${occupancy.excessTokens} token（当前 ≈${occupancy.host.assembledTokens}，目标 ${occupancy.budget.targetTokens}）。`
-          : `无需归档：保留窗口外只有 ${occupancy.plan.outOfWindowCount} 个操作，未攒够 ${occupancy.plan.batchSize} 个；当前 ≈${occupancy.host.assembledTokens} token。`,
+        text: `无需归档：保留窗口外只有 ${occupancy.plan.outOfWindowCount} 个操作，未攒够 ${occupancy.plan.batchSize} 个；当前 ≈${occupancy.host.assembledTokens} token。`,
       }
     }
     const result = await runBatch(record, occupancy, signal)
@@ -531,7 +507,7 @@ export function createEngine(dependencies) {
     const suppression = record.suppressionLease?.stats?.() ?? { write: 0, read: 0 }
     const lines = [
       `上下文降温：已启用（session=${record.sessionId}）`,
-      `触发占用率：${formatRatio(settings.targetOccupancy)}（仅作安全网）；保留最近操作：${settings.retainOperations} 个（一直生效）；超量减少：${formatRatio(settings.releaseMarginRatio)}`,
+      `保留最近操作：${settings.retainOperations} 个（唯一触发线，一直生效）`,
       `归档节奏：保留窗口外攒够 ${settings.archiveBatchSize} 个操作提交一批`,
       `自动降温：${settings.auto ? '开' : '关'}；自动回注：${settings.autoRecall ? '开' : '关'}`,
       `已归档操作：${pending} 个；已恢复：${restored} 个`,
@@ -568,6 +544,5 @@ export function createEngine(dependencies) {
     buildRecall,
     formatStatus,
     ensureClient,
-    computeOccupancy,
   }
 }

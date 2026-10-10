@@ -40,37 +40,39 @@ test('textFromContent keeps only text blocks', () => {
   assert.equal(textFromContent(null), '')
 })
 
-test('numeric settings accept fractions, percentages, and integers', () => {
-  assert.equal(parseNumericSetting('0.6', NUMERIC_SETTINGS.target), 0.6)
-  assert.equal(parseNumericSetting('60%', NUMERIC_SETTINGS.target), 0.6)
-  assert.equal(parseNumericSetting('5%', NUMERIC_SETTINGS.margin), 0.05)
-  assert.equal(parseNumericSetting('0', NUMERIC_SETTINGS.margin), 0)
+test('numeric settings accept integers', () => {
   assert.equal(parseNumericSetting('10', NUMERIC_SETTINGS.retain), 10)
   assert.equal(parseNumericSetting('0', NUMERIC_SETTINGS.retain), 0)
+  assert.equal(parseNumericSetting('5', NUMERIC_SETTINGS.batch), 5)
+  // The percent form still parses to a fraction; a non-integer then trips the
+  // integer check, so "10%" is rejected for batch rather than silently accepted.
+  assert.throws(() => parseNumericSetting('10%', NUMERIC_SETTINGS.batch), SettingsError)
 })
 
 test('numeric settings reject out-of-range and malformed values', () => {
-  assert.throws(() => parseNumericSetting('0', NUMERIC_SETTINGS.target), SettingsError)
-  assert.throws(() => parseNumericSetting('1', NUMERIC_SETTINGS.target), SettingsError)
-  assert.throws(() => parseNumericSetting('abc', NUMERIC_SETTINGS.target), SettingsError)
-  assert.throws(() => parseNumericSetting('', NUMERIC_SETTINGS.target), SettingsError)
+  assert.throws(() => parseNumericSetting('abc', NUMERIC_SETTINGS.retain), SettingsError)
+  assert.throws(() => parseNumericSetting('', NUMERIC_SETTINGS.retain), SettingsError)
   assert.throws(() => parseNumericSetting('1.5', NUMERIC_SETTINGS.retain), SettingsError)
   assert.throws(() => parseNumericSetting('-1', NUMERIC_SETTINGS.retain), SettingsError)
   assert.throws(() => parseNumericSetting('201', NUMERIC_SETTINGS.retain), SettingsError)
+  assert.throws(() => parseNumericSetting('0', NUMERIC_SETTINGS.batch), SettingsError)
+  assert.throws(() => parseNumericSetting('2.5', NUMERIC_SETTINGS.batch), SettingsError)
   // A bare out-of-range number is never silently rescaled into a percentage.
-  assert.throws(() => parseNumericSetting('60', NUMERIC_SETTINGS.target), SettingsError)
-  assert.throws(() => parseNumericSetting('2', NUMERIC_SETTINGS.margin), SettingsError)
+  assert.throws(() => parseNumericSetting('600', NUMERIC_SETTINGS.batch), SettingsError)
+  assert.throws(() => parseNumericSetting('2.5', NUMERIC_SETTINGS.retain), SettingsError)
 })
 
 test('normalizeSettings falls back to defaults for anything unusable', () => {
   assert.deepEqual(normalizeSettings(undefined), { ...DEFAULT_SETTINGS })
-  assert.deepEqual(normalizeSettings({ targetOccupancy: 5, retainOperations: -1, auto: 'yes' }), { ...DEFAULT_SETTINGS })
+  assert.deepEqual(normalizeSettings({ retainOperations: -1, auto: 'yes' }), { ...DEFAULT_SETTINGS })
   // A batch threshold below 1 would mean "never submit", which is not a state the
   // planner can express; anything unusable falls back to the default.
   assert.deepEqual(normalizeSettings({ archiveBatchSize: 0 }), { ...DEFAULT_SETTINGS })
   assert.deepEqual(normalizeSettings({ archiveBatchSize: 2.5 }), { ...DEFAULT_SETTINGS })
+  // Retired occupancy keys are no longer folded back in: they are gone from
+  // DEFAULT_SETTINGS, so normalizeSettings must not resurrect them either.
   const kept = normalizeSettings({ targetOccupancy: 0.5, retainOperations: 3, archiveBatchSize: 4, releaseMarginRatio: 0.1, auto: false, autoRecall: false, autoRestore: false })
-  assert.deepEqual(kept, { targetOccupancy: 0.5, retainOperations: 3, archiveBatchSize: 4, releaseMarginRatio: 0.1, auto: false, autoRecall: false, autoRestore: false })
+  assert.deepEqual(kept, { retainOperations: 3, archiveBatchSize: 4, auto: false, autoRecall: false, autoRestore: false })
 })
 
 test('the stop-time restore switch is user-settable and defaults on', () => {
@@ -98,13 +100,11 @@ test('foldCommandIntoState applies on/off and every set form', () => {
   assert.equal(state.enabled, true)
   assert.equal(foldCommandIntoState(state, 'on'), false, 'a repeated on is not a change')
 
-  assert.equal(foldCommandIntoState(state, 'set target 50%'), true)
-  assert.equal(state.targetOccupancy, 0.5)
-  assert.equal(foldCommandIntoState(state, 'set target 50%'), false, 'a repeated identical value is not a change')
   assert.equal(foldCommandIntoState(state, 'set retain 4'), true)
   assert.equal(state.retainOperations, 4)
-  assert.equal(foldCommandIntoState(state, 'set margin 0.1'), true)
-  assert.equal(state.releaseMarginRatio, 0.1)
+  assert.equal(foldCommandIntoState(state, 'set retain 4'), false, 'a repeated identical value is not a change')
+  assert.equal(foldCommandIntoState(state, 'set batch 6'), true)
+  assert.equal(state.archiveBatchSize, 6)
   assert.equal(foldCommandIntoState(state, 'set auto off'), true)
   assert.equal(state.auto, false)
   assert.equal(foldCommandIntoState(state, 'set recall off'), true)
@@ -117,7 +117,7 @@ test('foldCommandIntoState applies on/off and every set form', () => {
 test('foldCommandIntoState ignores malformed lines instead of corrupting state', () => {
   const state = { ...initialProjectionState() }
   const before = JSON.stringify(state)
-  for (const line of ['set', 'set target', 'set target nope', 'set target 5', 'set target 60', 'set retain -2', 'set auto maybe', 'set unknown 1', 'status', 'now', 'restore', 'dry-run', 'help', 'nonsense']) {
+  for (const line of ['set', 'set target', 'set target 5', 'set target 60', 'set margin 0.1', 'set retain', 'set retain nope', 'set retain -2', 'set auto maybe', 'set unknown 1', 'status', 'now', 'restore', 'dry-run', 'help', 'nonsense']) {
     assert.equal(foldCommandIntoState(state, line), false, `"${line}" must not change state`)
   }
   assert.equal(JSON.stringify(state), before)
@@ -254,12 +254,12 @@ test('the projection folds settings from command/run records', () => {
   let state = initProjectionState()
   const run = (args) => { state = applyEvent(state, { type: 'command/run', seq: state.revision + 100, data: { name: 'memory-lab', args } }) }
   run('on')
-  run('set target 0.5')
+  run('set batch 5')
   run('set retain 3')
   run('set auto off')
   const view = viewOf(state)
   assert.equal(view.enabled, true)
-  assert.equal(view.targetOccupancy, 0.5)
+  assert.equal(view.archiveBatchSize, 5)
   assert.equal(view.retainOperations, 3)
   assert.equal(view.auto, false)
   assert.equal(view.autoRecall, true)
@@ -329,6 +329,6 @@ test('the projection tolerates a corrupted state instead of throwing', () => {
   assert.doesNotThrow(() => applyEvent(broken, { type: 'command/run', data: { name: 'memory-lab', args: 'set retain 2' } }))
   const view = viewOf(broken)
   assert.equal(view.retainOperations, 0)
-  assert.equal(view.targetOccupancy, null)
+  assert.equal(view.targetOccupancy, undefined, 'retired occupancy keys must not appear in the view')
   assert.equal(view.archived, 0)
 })

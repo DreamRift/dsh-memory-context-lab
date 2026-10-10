@@ -28,16 +28,12 @@ export function initProjectionState() {
 
 /** The client-visible view. Plain JSON, no functions, no undefined. */
 export function viewOf(state) {
-  const target = state.targetOccupancy
-  const margin = state.releaseMarginRatio
   const retain = state.retainOperations
   const batch = state.archiveBatchSize
   return {
     enabled: state.enabled === true,
-    targetOccupancy: typeof target === 'number' && Number.isFinite(target) && target > 0 && target < 1 ? target : null,
     retainOperations: Number.isInteger(retain) && retain >= 0 && retain <= 200 ? retain : 0,
     archiveBatchSize: Number.isInteger(batch) && batch >= 1 && batch <= 200 ? batch : 10,
-    releaseMarginRatio: typeof margin === 'number' && Number.isFinite(margin) && margin >= 0 && margin <= 1 ? margin : 0,
     auto: state.auto === true,
     autoRecall: state.autoRecall === true,
     autoRestore: state.autoRestore !== false,

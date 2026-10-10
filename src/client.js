@@ -66,14 +66,11 @@ window.__ModuleLoader__.load({
       'panel.status.manual': '手动',
       'panel.status.archived': '归档 {count}',
 
-      'field.target': '安全网触发占用率',
       'field.retain': '保留最近操作',
       'field.batch': '攒够几个再归档',
-      'field.margin': '超量减少',
       'field.auto': '自动降温',
       'field.recall': '自动回注',
       'field.autorestore': '停用时恢复原文',
-      'unit.percent': '%',
 
       'action.now': '立即降温',
       'action.dryRun': '预演',
@@ -106,14 +103,11 @@ window.__ModuleLoader__.load({
       'panel.status.manual': 'Manual',
       'panel.status.archived': '{count} archived',
 
-      'field.target': 'Safety-net trigger occupancy',
       'field.retain': 'Keep recent operations',
       'field.batch': 'Archive after N pile up',
-      'field.margin': 'Overflow reduction',
       'field.auto': 'Auto cooling',
       'field.recall': 'Auto recall',
       'field.autorestore': 'Restore text when stopping',
-      'unit.percent': '%',
 
       'action.now': 'Cool now',
       'action.dryRun': 'Dry run',
@@ -265,35 +259,6 @@ window.__ModuleLoader__.load({
     function countOf(value) {
       var n = numOf(value, 0);
       return n > 0 ? Math.round(n) : 0;
-    }
-
-    /** 0-1 数值或 null（`null` = 未设置）。 */
-    function ratioOf(value) {
-      if (typeof value !== 'number' || !isFinite(value)) return null;
-      if (value < 0) return 0;
-      if (value > 1) return 1;
-      return value;
-    }
-
-    /** 0.6 → "60"（输入框按百分比显示）。 */
-    function percentText(ratio) {
-      return String(Math.round(ratio * 100));
-    }
-
-    /**
-     * 输入框文本 → 0-1；接受 `0.6`、`60`、`60%`。
-     * @returns {number|null} 非法输入返回 null（调用方回滚草稿，不发命令）。
-     */
-    function parsePercent(text) {
-      if (typeof text !== 'string') return null;
-      var raw = text.trim().replace(/%$/, '').trim();
-      if (raw.length === 0) return null;
-      var value = Number(raw);
-      if (!isFinite(value)) return null;
-      if (value > 1) value = value / 100;
-      if (value < 0) return 0;
-      if (value > 1) return 1;
-      return value;
     }
 
     /** 非负整数；非法输入返回 null。 */
@@ -588,24 +553,16 @@ window.__ModuleLoader__.load({
       var auto = boolOf(view != null ? view.auto : undefined, false);
       var autoRecall = boolOf(view != null ? view.autoRecall : undefined, false);
       var autoRestore = boolOf(view != null ? view.autoRestore : undefined, true);
-      var target = ratioOf(view != null ? view.targetOccupancy : undefined);
-      var margin = ratioOf(view != null ? view.releaseMarginRatio : undefined);
       var retain = countOf(view != null ? view.retainOperations : undefined);
       var batch = countOf(view != null ? view.archiveBatchSize : undefined);
       var archived = countOf(view != null ? view.archived : undefined);
 
-      var targetPair = React.useState(target == null ? '' : percentText(target));
-      var targetDraft = targetPair[0];
-      var setTargetDraft = targetPair[1];
       var retainPair = React.useState(String(retain));
       var retainDraft = retainPair[0];
       var setRetainDraft = retainPair[1];
       var batchPair = React.useState(String(batch));
       var batchDraft = batchPair[0];
       var setBatchDraft = batchPair[1];
-      var marginPair = React.useState(margin == null ? '' : percentText(margin));
-      var marginDraft = marginPair[0];
-      var setMarginDraft = marginPair[1];
       var cleanPair = React.useState(false);
       var cleanArmed = cleanPair[0];
       var setCleanArmed = cleanPair[1];
@@ -613,17 +570,11 @@ window.__ModuleLoader__.load({
       // 投影值真正变化时（一次成功提交之后）回灌草稿；依赖是原始值，
       // 因此宿主每帧推新对象也不会把用户正在输入的内容冲掉。
       React.useEffect(function () {
-        setTargetDraft(target == null ? '' : percentText(target));
-      }, [target]);
-      React.useEffect(function () {
         setRetainDraft(String(retain));
       }, [retain]);
       React.useEffect(function () {
         setBatchDraft(String(batch));
       }, [batch]);
-      React.useEffect(function () {
-        setMarginDraft(margin == null ? '' : percentText(margin));
-      }, [margin]);
 
       if (!store.open) return null;
 
@@ -631,16 +582,6 @@ window.__ModuleLoader__.load({
 
       function run(line) {
         callCommand(props, line, t);
-      }
-
-      function commitTarget() {
-        var parsed = parsePercent(targetDraft);
-        if (parsed == null) {
-          setTargetDraft(target == null ? '' : percentText(target));
-          return;
-        }
-        if (target != null && Math.abs(parsed - target) < 1e-9) return;
-        run('/memory-lab set target ' + parsed.toFixed(4));
       }
 
       function commitRetain() {
@@ -663,41 +604,11 @@ window.__ModuleLoader__.load({
         run('/memory-lab set batch ' + String(parsed));
       }
 
-      function commitMargin() {
-        var parsed = parsePercent(marginDraft);
-        if (parsed == null) {
-          setMarginDraft(margin == null ? '' : percentText(margin));
-          return;
-        }
-        if (margin != null && Math.abs(parsed - margin) < 1e-9) return;
-        run('/memory-lab set margin ' + parsed.toFixed(4));
-      }
-
       function onEnter(event) {
         if (event.key !== 'Enter') return;
         event.preventDefault();
         var el = event.target;
         if (el != null && typeof el.blur === 'function') el.blur();
-      }
-
-      // 行标签是兄弟节点而非 <label>，所以每个输入框必须自带可访问名称。
-      function numberInput(value, disabled, onDraft, onCommit, mode, ariaLabel) {
-        return h('span', { className: 'mcl-field' },
-          h('input', {
-            type: 'text',
-            inputMode: mode,
-            spellCheck: false,
-            autoComplete: 'off',
-            className: 'mcl-input',
-            value: value,
-            disabled: disabled,
-            'aria-label': ariaLabel,
-            title: ariaLabel,
-            onChange: function (event) { onDraft(event.target.value); },
-            onBlur: onCommit,
-            onKeyDown: onEnter
-          }),
-          h('span', { 'aria-hidden': 'true' }, t('unit.percent')));
       }
 
       var statusText = enabled
@@ -713,10 +624,6 @@ window.__ModuleLoader__.load({
           run(next ? '/memory-lab on' : '/memory-lab off');
         }),
         h('span', { className: 'mcl-status', title: statusText }, statusText)));
-
-      rows.push(h('div', { className: 'mcl-row', key: 'target' },
-        h('span', { className: 'mcl-label' }, t('field.target')),
-        numberInput(targetDraft, busy, setTargetDraft, commitTarget, 'decimal', t('field.target'))));
 
       rows.push(h('div', { className: 'mcl-row', key: 'retain' },
         h('span', { className: 'mcl-label' }, t('field.retain')),
@@ -753,10 +660,6 @@ window.__ModuleLoader__.load({
             onBlur: commitBatch,
             onKeyDown: onEnter
           }))));
-
-      rows.push(h('div', { className: 'mcl-row', key: 'margin' },
-        h('span', { className: 'mcl-label' }, t('field.margin')),
-        numberInput(marginDraft, busy, setMarginDraft, commitMargin, 'decimal', t('field.margin'))));
 
       rows.push(h('div', { className: 'mcl-row', key: 'auto' },
         h('span', { className: 'mcl-label' }, t('field.auto')),

@@ -12,7 +12,7 @@ import {
   recallQueryFrom,
   openTurnOf,
   planCooling,
-  resolveOccupancyBudget,
+  resolveWindow,
   restoreReceipts,
 } from '../src/apply.mjs'
 import {
@@ -36,7 +36,7 @@ function viewOf(session, { retainOperations = 0 } = {}) {
   })
 }
 
-function planFor(session, { excessTokens = 100000, retainOperations = 0, batchSize = 1, archivedRanges = [] } = {}) {
+function planFor(session, { retainOperations = 0, batchSize = 1, archivedRanges = [] } = {}) {
   const measured = fakeMeter.measure(session)
   const view = collectOperationCandidates({
     surfaceNodes: session.surface.nodes,
@@ -49,14 +49,12 @@ function planFor(session, { excessTokens = 100000, retainOperations = 0, batchSi
   })
   const plan = planCooling({
     candidates: view.candidates,
-    excessTokens,
     meter: fakeMeter,
     nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
     retainOperations,
     batchSize,
     maxOperations: 64,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
   return { view, plan }
 }
@@ -83,14 +81,12 @@ test('never archives the system head or the user message', () => {
 })
 
 test('retention is always on: out-of-window operations are archived in strict batchSize batches', () => {
-  // Strict batch cap (0.4.1): the retention pass submits the OLDEST `batchSize`
+  // Strict batch cap: the retention pass submits the OLDEST `batchSize`
   // out-of-window operations per batch and leaves the rest as candidates for
   // the next measure. The user-visible contract is "N per batch"; a backlog is
   // drained over successive batches, one full batch at a time.
   const session = buildSession({ operations: 5, resultChars: 4000 })
-  // excessTokens 0: the occupancy target is nowhere near being reached. The
-  // retention pass must still archive past the window, strictly capped.
-  const { view, plan } = planFor(session, { excessTokens: 0, retainOperations: 2, batchSize: 1 })
+  const { view, plan } = planFor(session, { retainOperations: 2, batchSize: 1 })
   assert.equal(view.candidates.length, 5, 'the retained window must not be excluded from candidacy')
   assert.equal(view.candidates.filter((candidate) => candidate.withinRetention).length, 2)
   assert.equal(view.candidates.filter((candidate) => candidate.withinRetention).map((candidate) => candidate.tools[0]).join(','), 'edit,read')
@@ -99,13 +95,12 @@ test('retention is always on: out-of-window operations are archived in strict ba
   assert.equal(plan.outOfWindowCount, 3, 'three operations wait outside the window')
   assert.equal(plan.units.length, 1, 'only the oldest operation is submitted in this batch')
   assert.equal(plan.baselineUnits, 1)
-  assert.equal(plan.safetyNetUnits, 0, 'the target is not what drove this batch')
   assert.equal(plan.archivedFromRetained, 0, 'the retained window must not be touched')
   assert.equal(plan.effectiveRetention, 2)
 
   // A whole batch (batchSize 3) submits all three at once — that is the
   // batching mode the cost model is written against.
-  const full = planFor(buildSession({ operations: 5, resultChars: 4000 }), { excessTokens: 0, retainOperations: 2, batchSize: 3 })
+  const full = planFor(buildSession({ operations: 5, resultChars: 4000 }), { retainOperations: 2, batchSize: 3 })
   assert.equal(full.plan.units.length, 3)
   assert.equal(full.plan.baselineUnits, 3)
   assert.equal(full.plan.archivedFromRetained, 0)
@@ -113,7 +108,7 @@ test('retention is always on: out-of-window operations are archived in strict ba
 
 test('the batch threshold holds the retention pass back until enough has piled up', () => {
   const session = buildSession({ operations: 5, resultChars: 4000 })
-  const { plan } = planFor(session, { excessTokens: 0, retainOperations: 2, batchSize: 5 })
+  const { plan } = planFor(session, { retainOperations: 2, batchSize: 5 })
   // Only 3 operations have left the window, which is below the threshold of 5.
   assert.equal(plan.outOfWindowCount, 3)
   assert.equal(plan.baselineReady, false)
@@ -121,100 +116,81 @@ test('the batch threshold holds the retention pass back until enough has piled u
   assert.equal(plan.batchSize, 5)
 })
 
-test('the occupancy target overrides the batch threshold, because it is a safety net', () => {
-  const session = buildSession({ operations: 5, resultChars: 4000 })
-  // Same fixture as above, but now the input is over the target: waiting for the
-  // batch to fill would defeat the whole point of the safety net.
-  const { plan } = planFor(session, { excessTokens: 100000, retainOperations: 2, batchSize: 5 })
-  assert.equal(plan.baselineReady, false, 'the retention pass alone would still be waiting')
-  assert.ok(plan.units.length > 0, 'the target pass must act anyway')
-  assert.equal(plan.baselineUnits, 0)
-  assert.equal(plan.safetyNetUnits, plan.units.length)
-})
-
-test('under sustained pressure the plan descends into the retained window, oldest-first', () => {
-  const session = buildSession({ operations: 6, resultChars: 4000 })
-  // Each operation is roughly 1k estimated tokens, so 5000 exceeds what the four
-  // operations outside a baseline of two can free. The default batchSize 1 caps
-  // the retention pass at ONE unit; the safety net consumes the rest, oldest-first.
-  const { view, plan } = planFor(session, { excessTokens: 5000, retainOperations: 2 })
-  const outside = view.candidates.filter((candidate) => !candidate.withinRetention)
-  const inside = view.candidates.filter((candidate) => candidate.withinRetention)
-  assert.equal(outside.length, 4)
-  assert.equal(inside.length, 2)
-
-  // The retention pass takes the oldest out-of-window operation only...
-  const chosen = plan.units.map((unit) => unit.rangeStart)
-  assert.equal(plan.baselineUnits, 1, 'the strict batch cap holds the retention pass to one unit')
-  assert.equal(chosen[0], outside[0].rangeStart)
-  // ...5k cannot be freed before the baseline is reached at all.
-  assert.ok(plan.units.length > outside.length, 'this target cannot be met outside the window')
-  const extra = chosen.slice(1)
-  // The safety net keeps the same oldest-first order: the remaining outside
-  // operations first, then the descent starts from the oldest retained one.
-  assert.deepEqual(extra.slice(0, outside.length - 1), outside.slice(1).map((candidate) => candidate.rangeStart))
-  const descent = extra.slice(outside.length - 1)
-  assert.deepEqual(descent, inside.slice(0, descent.length).map((candidate) => candidate.rangeStart))
-  assert.equal(plan.archivedFromRetained, descent.length)
-  assert.equal(plan.safetyNetUnits, extra.length, 'everything past the capped retention unit came from the safety net')
-  assert.ok(plan.effectiveRetention < 2, `the baseline must be lowered, got ${plan.effectiveRetention}`)
-  assert.equal(plan.effectiveRetention, 2 - plan.archivedFromRetained)
-  assert.equal(plan.reachable, true)
-})
-
-test('the safety-net pass stops as soon as the target is met', () => {
+test('the strict cap submits only the oldest batchSize operations and leaves the rest pending', () => {
+  // 8 operations, keep the newest 2: 6 are out of the window. batchSize 4 means
+  // exactly the four OLDEST out-of-window operations submit; the other two wait
+  // for the next measure, even though the whole backlog is archivable.
   const session = buildSession({ operations: 8, resultChars: 4000 })
-  // 8 operations, keep the newest 6: only 2 are out of the window. Each is about
-  // 1k tokens, so a 2.5k target needs exactly one operation from the window.
-  // With the default batchSize 1 the retention pass submits only the oldest
-  // out-of-window unit; the safety net provides the remainder.
-  const { view, plan } = planFor(session, { excessTokens: 2500, retainOperations: 6 })
+  const { view, plan } = planFor(session, { retainOperations: 2, batchSize: 4 })
   const outside = view.candidates.filter((candidate) => !candidate.withinRetention)
-  assert.equal(outside.length, 2)
-  assert.equal(plan.baselineUnits, 1, 'the strict batch cap holds the retention pass to one unit')
-  assert.equal(plan.units[0].rangeStart, outside[0].rangeStart, 'the capped unit is the oldest one')
-  assert.ok(plan.safetyNetUnits >= 1, 'the target needs more than the capped single unit gives')
-  // It stops there rather than consuming the whole retained window.
-  assert.ok(plan.safetyNetUnits < 6, `the descent must stop at the target, took ${plan.safetyNetUnits}`)
-  assert.ok(plan.reachable)
-  assert.equal(plan.shortfall, 0)
+  assert.equal(outside.length, 6)
+  assert.equal(plan.baselineReady, true)
+  assert.equal(plan.outOfWindowCount, 6)
+  assert.equal(plan.batchSize, 4)
+  assert.equal(plan.units.length, 4, 'the strict cap holds the batch to four units')
+  assert.equal(plan.baselineUnits, 4)
+  assert.deepEqual(
+    plan.units.map((unit) => unit.rangeStart),
+    outside.slice(0, 4).map((candidate) => candidate.rangeStart),
+    'only the oldest four are submitted; the rest stay candidates',
+  )
+  assert.equal(plan.archivedFromRetained, 0, 'the retention window is never descended into')
+  assert.equal(plan.effectiveRetention, 2)
+  assert.equal(plan.archivedFromOpenTurn, 0)
 })
 
-test('with nothing retained the strict batch cap still holds: submit one unit, not all', () => {
+test('an under-filled batch never archives, no matter how large the operations are', () => {
+  // Retention is the ONLY trigger: there is no occupancy escape hatch any more.
+  // A backlog below the threshold waits, full stop — nothing about token counts
+  // or window pressure can bring the batch forward.
+  const session = buildSession({ operations: 5, resultChars: 4000 })
+  const { plan } = planFor(session, { retainOperations: 2, batchSize: 5 })
+  assert.equal(plan.baselineReady, false)
+  assert.equal(plan.outOfWindowCount, 3)
+  assert.equal(plan.units.length, 0, 'below the threshold the plan is empty, end of story')
+  assert.equal(plan.plannedReleaseTokens, 0)
+  assert.equal(plan.baselineUnits, 0)
+})
+
+test('retained-window operations are candidates but never planned', () => {
+  // Candidates at or inside the retention boundary are labelled
+  // `withinRetention` so the report can account for them, but the planner only
+  // ever submits the out-of-window tail.
   const session = buildSession({ operations: 6, resultChars: 4000 })
-  const { plan } = planFor(session, { excessTokens: 100, retainOperations: 0 })
+  const { view, plan } = planFor(session, { retainOperations: 4, batchSize: 1 })
+  const inside = view.candidates.filter((candidate) => candidate.withinRetention)
+  assert.equal(inside.length, 4)
+  assert.equal(plan.outOfWindowCount, 2)
+  assert.equal(plan.baselineReady, true)
+  assert.equal(plan.units.length, 1, 'batchSize 1 submits exactly the oldest out-of-window unit')
+  assert.equal(plan.archivedFromRetained, 0)
+  assert.equal(plan.effectiveRetention, 4, 'the retention baseline is never lowered')
+})
+
+test('with nothing retained every candidate is out of window and the strict cap still holds', () => {
+  const session = buildSession({ operations: 6, resultChars: 4000 })
+  const { plan } = planFor(session, { retainOperations: 0 })
   // `retain 0` means "keep nothing verbatim". With the default batchSize 1 the
   // retention pass submits exactly one unit per batch; the backlog drains over
-  // successive measures. The 100-token target is already met by that unit, so
-  // the safety net never engages.
+  // successive measures.
   assert.equal(plan.batchSize, 1)
+  assert.equal(plan.baselineReady, true)
+  assert.equal(plan.outOfWindowCount, 6)
   assert.equal(plan.units.length, 1)
   assert.equal(plan.baselineUnits, 1)
-  assert.equal(plan.safetyNetUnits, 0)
-  assert.equal(plan.reachable, true)
-  assert.equal(plan.shortfall, 0)
+  assert.equal(plan.archivedFromRetained, 0)
 })
 
-test('a larger drain-cap batch submits every out-of-window operation at once', () => {
+test('a batch sized to the whole backlog submits every out-of-window operation at once', () => {
   const session = buildSession({ operations: 6, resultChars: 4000 })
-  const { plan } = planFor(session, { excessTokens: 100, retainOperations: 0, batchSize: 6 })
+  const { plan } = planFor(session, { retainOperations: 0, batchSize: 6 })
   assert.equal(plan.units.length, 6)
   assert.equal(plan.baselineUnits, 6)
-  assert.equal(plan.safetyNetUnits, 0)
-  assert.equal(plan.reachable, true)
-  assert.equal(plan.shortfall, 0)
+  assert.equal(plan.outOfWindowCount, 6)
+  assert.equal(plan.baselineReady, true)
 })
 
-test('the plan reports a shortfall when the surface has nothing left to give', () => {
-  const session = buildSession({ operations: 2, resultChars: 4000 })
-  const { plan } = planFor(session, { excessTokens: 1000000, retainOperations: 0 })
-  assert.equal(plan.units.length, 2, 'both operations are archivable')
-  assert.ok(plan.shortfall > 0, 'the target cannot be met')
-  assert.equal(plan.reachable, false)
-  assert.equal(plan.limitedByCap, false, 'the per-batch ceiling is not what stopped it')
-})
-
-test('the per-batch ceiling is reported separately from a genuine shortfall', () => {
+test('the per-batch ceiling caps a filled batch, oldest-first', () => {
   const session = buildSession({ operations: 6, resultChars: 4000 })
   const measured = fakeMeter.measure(session)
   const view = collectOperationCandidates({
@@ -228,17 +204,19 @@ test('the per-batch ceiling is reported separately from a genuine shortfall', ()
   })
   const plan = planCooling({
     candidates: view.candidates,
-    excessTokens: 1000000,
     meter: fakeMeter,
     nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
     retainOperations: 0,
+    batchSize: 6,
     maxOperations: 2,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
-  assert.equal(plan.units.length, 2)
-  assert.equal(plan.limitedByCap, true, 'the next step is expected to continue')
-  assert.equal(plan.reachable, false)
+  assert.equal(plan.units.length, 2, 'maxOperations caps the batch')
+  assert.deepEqual(
+    plan.units.map((unit) => unit.rangeStart),
+    view.candidates.slice(0, 2).map((candidate) => candidate.rangeStart),
+    'the cap keeps the oldest units, not a random subset',
+  )
 })
 
 test('open-turn operations stay candidates and are labelled as such', () => {
@@ -306,7 +284,7 @@ test('a failed tool result blocks archiving of its operation', () => {
 
 test('planCooling builds a receipt whose cost is subtracted from the release', () => {
   const session = buildSession({ operations: 3, resultChars: 4000 })
-  const { plan } = planFor(session)
+  const { plan } = planFor(session, { batchSize: 3 })
   assert.equal(plan.units.length, 3)
   for (const unit of plan.units) {
     assert.ok(unit.receipt.startsWith('[已归档操作]'))
@@ -316,36 +294,20 @@ test('planCooling builds a receipt whose cost is subtracted from the release', (
   assert.equal(plan.plannedReleaseTokens, plan.units.reduce((sum, unit) => sum + unit.netReleaseTokens, 0))
 })
 
-test('a full batch under the target is held, but the target pass is never gated by it', () => {
-  const session = buildSession({ operations: 3, resultChars: 4000 })
-  // Under the target and not enough has left the window: the retention pass waits.
-  const waiting = planFor(session, { excessTokens: 0, retainOperations: 1, batchSize: 10 })
-  assert.equal(waiting.plan.units.length, 0)
-  assert.equal(waiting.plan.baselineReady, false)
-  // Same fixture, but over the target: the safety net acts immediately.
-  const urgent = planFor(session, { excessTokens: 100000, retainOperations: 1, batchSize: 10 })
-  assert.ok(urgent.plan.units.length > 0)
-  assert.equal(urgent.plan.baselineReady, false)
-})
-
-test('repeated batches converge under the target instead of stalling above it', async () => {
-  // The reported bug: the retention window was a fence, so once everything
-  // outside it had been archived the plugin stalled above the target forever and
-  // the session kept running hot. With the baseline descended on demand, the
-  // loop must actually reach the target.
-  const session = buildSession({ operations: 20, resultChars: 12000 })
+test('a filled batch drains a large session one strict batch at a time, never touching the retention window', async () => {
+  // What replaced the occupancy convergence loop: retention is the only
+  // trigger, so a long session is drained in `batchSize` chunks per measure
+  // until the out-of-window backlog no longer fills a batch, at which point
+  // cooling waits — regardless of what the occupancy meter says.
+  const session = buildSession({ operations: 21, resultChars: 12000 })
   const store = new FakeColdStore()
-  const window = 60000
-  const budget = resolveOccupancyBudget({ contextWindow: window, reservedCompletionTokens: 0, targetOccupancy: 0.5 })
-  const measure = () => fakeMeter.measure(session).totalTokens
   const baseline = 15
-
-  assert.ok(measure() > budget.targetTokens, `the fixture must start over the target: ${measure()} vs ${budget.targetTokens}`)
+  const batchSize = 3
 
   let rounds = 0
   let applied = 0
-  let firstRoundRetained = 0
-  while (measure() > budget.targetTokens && rounds < 40) {
+  const outOfWindowCounts = []
+  while (rounds < 20) {
     rounds += 1
     const measured = fakeMeter.measure(session)
     const view = collectOperationCandidates({
@@ -359,51 +321,46 @@ test('repeated batches converge under the target instead of stalling above it', 
     })
     const plan = planCooling({
       candidates: view.candidates,
-      excessTokens: measure() - budget.targetTokens,
       meter: fakeMeter,
       nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
       retainOperations: baseline,
+      batchSize,
       maxOperations: 64,
       minNetReleaseTokens: 128,
-      releaseMarginTokens: 0,
     })
-    if (rounds === 1) firstRoundRetained = plan.archivedFromRetained
+    outOfWindowCounts.push(plan.outOfWindowCount)
+    assert.ok(plan.units.length <= batchSize, 'the strict cap binds every round')
+    assert.equal(plan.archivedFromRetained, 0, 'the retained window is never descended into')
+    assert.equal(plan.effectiveRetention, baseline)
     if (!plan.units.length) break
+    assert.equal(plan.baselineReady, true)
     for (const unit of plan.units) {
       const outcome = await applyOneOperation({ session, client: store, unit, meter: fakeMeter, hostVersion: 'test' })
       if (outcome.state === 'applied') applied += 1
     }
   }
 
-  assert.ok(applied > 0, 'the loop must archive something')
-  assert.ok(firstRoundRetained > 0, 'this fixture requires descending into the retained window')
-  assert.ok(
-    measure() <= budget.targetTokens,
-    `must converge under the target; ended at ${measure()} vs target ${budget.targetTokens} after ${rounds} round(s)`,
-  )
-  // Convergence must come from cooling, not from the fixture running out of work.
+  // 6 operations start outside the window; batchSize 3 drains them in 3+3,
+  // then the loop stops because nothing out-of-window is left to fill a batch.
+  assert.equal(applied, 6, 'the whole out-of-window backlog is archived')
+  assert.deepEqual(outOfWindowCounts, [6, 3, 0], 'the backlog drains strictly, then the loop stops')
   const operationsLeft = session.surface.nodes.filter((seq) => session.eventAt(seq)?.type === 'assistant/message').length
-  assert.ok(operationsLeft < baseline, `the baseline must have been lowered, ${operationsLeft} operations left`)
+  assert.equal(operationsLeft, baseline, 'exactly the retained window remains verbatim')
 })
 
-test('the reported scenario converges with large, split bodies and a 16-operation baseline', async () => {
-  // Exactly the reported shape: a long session of large operations, target 40%,
-  // a baseline of 16. Every operation exceeds one cold node, so this also proves
-  // that large bodies are no longer silently unarchivable.
+test('a backlog of large, split bodies drains under the same retention rule, chunks intact', async () => {
+  // The reported fixture shape: a long session of large operations, a baseline
+  // of 16, every operation bigger than one cold node. Nothing here consults
+  // occupancy: the batch threshold alone drives the drain, and every stored
+  // node must still fit the read-back limit.
   const session = buildSession({ operations: 40, resultChars: 30000 })
   const store = new FakeColdStore()
-  const window = 100000
-  const budget = resolveOccupancyBudget({ contextWindow: window, reservedCompletionTokens: 8000, targetOccupancy: 0.4 })
-  assert.equal(budget.targetTokens, 40000)
-  const measure = () => fakeMeter.measure(session).totalTokens
-  const start = measure()
-  assert.ok(start > budget.targetTokens)
+  const batchSize = 8
 
   let rounds = 0
   let applied = 0
   let chunksWritten = 0
-  let lowestRetention = 16
-  while (measure() > budget.targetTokens && rounds < 200) {
+  while (rounds < 20) {
     rounds += 1
     const measured = fakeMeter.measure(session)
     const view = collectOperationCandidates({
@@ -418,15 +375,16 @@ test('the reported scenario converges with large, split bodies and a 16-operatio
     assert.ok(view.skipped.every((row) => row.reason !== 'too-large'), 'large bodies must not be refused')
     const plan = planCooling({
       candidates: view.candidates,
-      excessTokens: measure() - budget.targetTokens,
       meter: fakeMeter,
       nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
       retainOperations: 16,
+      batchSize,
       maxOperations: 64,
       minNetReleaseTokens: 128,
-      releaseMarginTokens: Math.floor(window * 0.05),
     })
-    lowestRetention = Math.min(lowestRetention, plan.effectiveRetention)
+    assert.ok(plan.units.length <= batchSize, 'the strict cap binds every round')
+    assert.equal(plan.archivedFromRetained, 0)
+    assert.equal(plan.effectiveRetention, 16, 'the baseline never moves')
     if (!plan.units.length) break
     for (const unit of plan.units) {
       const outcome = await applyOneOperation({ session, client: store, unit, meter: fakeMeter, hostVersion: 'test' })
@@ -436,20 +394,19 @@ test('the reported scenario converges with large, split bodies and a 16-operatio
     }
   }
 
-  const end = measure()
-  assert.ok(end <= budget.targetTokens, `must converge: ended at ${end} (${((end / window) * 100).toFixed(1)}%) vs target ${budget.targetTokens}`)
-  assert.ok(applied > 0, 'something must be archived')
-  assert.ok(lowestRetention < 16, `the baseline must drop below 16, got ${lowestRetention}`)
+  assert.equal(applied, 24, '40 operations minus the retained 16')
   assert.ok(chunksWritten > applied, 'these bodies are large enough to need splitting')
   // Every stored node must be readable whole.
   for (const [, node] of store.nodes) {
     assert.ok(Buffer.byteLength(node.content, 'utf8') <= 50 * 1024, 'each stored node must fit the read-back limit')
   }
+  const operationsLeft = session.surface.nodes.filter((seq) => session.eventAt(seq)?.type === 'assistant/message').length
+  assert.equal(operationsLeft, 16, 'exactly the retained window remains verbatim')
 })
 
 test('committing a batch replaces each operation with one user receipt the surface accepts', async () => {
   const session = buildSession({ operations: 3, resultChars: 4000 })
-  const { plan } = planFor(session)
+  const { plan } = planFor(session, { batchSize: 3 })
   const store = new FakeColdStore()
   const before = session.surface.nodes.length
 
@@ -519,12 +476,10 @@ test('the archived body keeps the assistant reasoning, so restore is not lossy',
   const store = new FakeColdStore()
   const plan = planCooling({
     candidates: [candidate],
-    excessTokens: 1e9,
     meter: fakeMeter,
     nodeIdFor: () => 'think-node',
     retainOperations: 0,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
   const outcome = await applyOneOperation({ session, client: store, unit: plan.units[0], meter: fakeMeter, hostVersion: 'test' })
   assert.equal(outcome.state, 'applied')
@@ -577,13 +532,10 @@ test('a body far larger than one cold node is split, verified per chunk, and res
   const store = new FakeColdStore()
   const plan = planCooling({
     candidates: [big],
-    excessTokens: 1e9,
     meter: fakeMeter,
     nodeIdFor: () => 'big-node',
     retainOperations: 0,
-    maxNetReleaseTokens: undefined,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
   const outcome = await applyOneOperation({ session, client: store, unit: plan.units[0], meter: fakeMeter, hostVersion: 'test' })
   assert.equal(outcome.state, 'applied', outcome.reason)
@@ -646,7 +598,7 @@ test('a missing chunk refuses the restore instead of writing a partial body', as
   const big = view.candidates.find((candidate) => candidate.callIds.includes('call-big2'))
   const store = new FakeColdStore()
   const plan = planCooling({
-    candidates: [big], excessTokens: 1e9, meter: fakeMeter, nodeIdFor: () => 'big2', retainOperations: 0, minNetReleaseTokens: 128,
+    candidates: [big], meter: fakeMeter, nodeIdFor: () => 'big2', retainOperations: 0, minNetReleaseTokens: 128,
   })
   const outcome = await applyOneOperation({ session, client: store, unit: plan.units[0], meter: fakeMeter, hostVersion: 'test' })
   assert.equal(outcome.state, 'applied')
@@ -687,7 +639,7 @@ test('a cold write failing on a later chunk keeps the original messages', async 
   const big = view.candidates.find((candidate) => candidate.callIds.includes('call-big3'))
   const store = new FakeColdStore()
   const plan = planCooling({
-    candidates: [big], excessTokens: 1e9, meter: fakeMeter, nodeIdFor: () => 'big3', retainOperations: 0, minNetReleaseTokens: 128,
+    candidates: [big], meter: fakeMeter, nodeIdFor: () => 'big3', retainOperations: 0, minNetReleaseTokens: 128,
   })
   // Fail the second chunk write.
   let writes = 0
@@ -733,13 +685,11 @@ test('a body with CRLF round-trips the store byte-identically', async () => {
 
   const plan = planCooling({
     candidates: [candidate],
-    excessTokens: 1e9,
     meter: fakeMeter,
     nodeIdFor: () => 'crlf-node',
     retainOperations: 0,
     maxOperations: 64,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
   const store = new FakeColdStore()
   const outcome = await applyOneOperation({ session, client: store, unit: plan.units[0], meter: fakeMeter, hostVersion: 'test' })
@@ -790,13 +740,11 @@ test('a retried CRLF unit reuses a node written before the fix', async () => {
   const candidate = view.candidates.find((row) => row.callIds.includes('call-legacy'))
   const plan = planCooling({
     candidates: [candidate],
-    excessTokens: 1e9,
     meter: fakeMeter,
     nodeIdFor: () => 'legacy-node',
     retainOperations: 0,
     maxOperations: 64,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
   const unit = plan.units[0]
   assert.equal(unit.chunkCount, 1, 'single-chunk fixture keeps the assertion simple')
@@ -820,7 +768,7 @@ test('a retried CRLF unit reuses a node written before the fix', async () => {
 
 test('restore returns the archived body and the surface accepts the replacement', async () => {
   const session = buildSession({ operations: 2, resultChars: 4000 })
-  const { plan } = planFor(session)
+  const { plan } = planFor(session, { batchSize: 2 })
   const store = new FakeColdStore()
   const applied = []
   for (const unit of plan.units) {
@@ -914,28 +862,18 @@ test('a tool/result replacement may only rewrite exactly one node', () => {
   }), SurfaceError)
 })
 
-test('resolveOccupancyBudget fails closed on an unconfirmed window', () => {
-  assert.throws(() => resolveOccupancyBudget({ contextWindow: undefined, targetOccupancy: 0.6 }))
-  assert.throws(() => resolveOccupancyBudget({ contextWindow: 1000, reservedCompletionTokens: -1, targetOccupancy: 0.6 }))
-  assert.throws(() => resolveOccupancyBudget({ contextWindow: 1000, targetOccupancy: null }))
-  assert.throws(() => resolveOccupancyBudget({ contextWindow: 8000, reservedCompletionTokens: 8000, targetOccupancy: 0.6 }))
-  const budget = resolveOccupancyBudget({ contextWindow: 100000, reservedCompletionTokens: 8000, targetOccupancy: 0.6 })
-  assert.equal(budget.usableWindowTokens, 92000)
-  assert.equal(budget.targetTokens, 60000)
-})
-
-test('the target is a fraction of the full window, matching the host context meter', () => {
-  // The host meter reports `projectedTokens / contextWindow`, where
-  // `projectedTokens` is prompt-side only. The plugin must use the same
-  // denominator or "40%" would silently mean a stricter number than the screen.
-  const budget = resolveOccupancyBudget({ contextWindow: 100000, reservedCompletionTokens: 8000, targetOccupancy: 0.4 })
-  assert.equal(budget.targetTokens, 40000)
-  assert.equal(budget.usableWindowTokens, 92000, 'the output reservation is reported, not folded into the denominator')
-  assert.equal(budget.reservationExceedsTarget, false, '60k of headroom covers an 8k reservation')
-
-  const tight = resolveOccupancyBudget({ contextWindow: 100000, reservedCompletionTokens: 8000, targetOccupancy: 0.99 })
-  assert.equal(tight.targetTokens, 99000)
-  assert.equal(tight.reservationExceedsTarget, true, '1k of headroom cannot cover an 8k reservation')
+test('resolveWindow fails closed on an unconfirmed window', () => {
+  assert.throws(() => resolveWindow({ contextWindow: undefined }))
+  assert.throws(() => resolveWindow({ contextWindow: 1000, reservedCompletionTokens: -1 }))
+  assert.throws(() => resolveWindow({ contextWindow: null }))
+  assert.throws(() => resolveWindow({ contextWindow: 0 }))
+  assert.throws(() => resolveWindow({ contextWindow: 1000, reservedCompletionTokens: 1.5 }))
+  // resolveWindow only confirms the window bookkeeping; there is no budget or
+  // target to derive any more — the retention count alone gates a plan.
+  const window = resolveWindow({ contextWindow: 100000, reservedCompletionTokens: 8000 })
+  assert.deepEqual(window, { contextWindow: 100000, reservedCompletionTokens: 8000 })
+  const bare = resolveWindow({ contextWindow: 100000 })
+  assert.deepEqual(bare, { contextWindow: 100000, reservedCompletionTokens: 0 })
 })
 
 test('occupancy, cache stats, and the batch report render without throwing', () => {
@@ -1051,13 +989,11 @@ test('a retried unit reuses cold nodes that already hold its exact bytes', async
   assert.ok(candidate.chunkCount > 1, 'the fixture must need more than one cold node')
   const plan = planCooling({
     candidates: [candidate],
-    excessTokens: 1e9,
     meter: fakeMeter,
     nodeIdFor: () => 'retry-node',
     retainOperations: 0,
     maxOperations: 64,
     minNetReleaseTokens: 128,
-    releaseMarginTokens: 0,
   })
   const unit = plan.units[0]
   assert.equal(unit.chunkCount, candidate.chunkCount)
@@ -1082,7 +1018,7 @@ test('a node held by different content refuses the write with an explicit reason
   // id but SOMEONE ELSE'S body, the honest move is to refuse loudly and keep the
   // originals — not to proceed into a doomed read-back hash mismatch.
   const session = buildSession({ operations: 1, resultChars: 4000 })
-  const { plan } = planFor(session, { excessTokens: 100000, retainOperations: 0 })
+  const { plan } = planFor(session, { retainOperations: 0 })
   const unit = plan.units[0]
   assert.ok(unit, 'the fixture needs one unit')
   const store = new FakeColdStore()

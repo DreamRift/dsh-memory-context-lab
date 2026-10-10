@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 export const PACKAGE_NAME = 'dsh-memory-context-lab'
-export const PACKAGE_VERSION = '0.4.2'
+export const PACKAGE_VERSION = '0.5.0'
 export const COMMAND_NAME = 'memory-lab'
 
 export const LAB_ROOT_NAME = '.memory-context-lab'
@@ -57,16 +57,9 @@ export const MAX_PREVIEW_CHARS = 700
  * composer panel; nothing in the archive path is hard-coded to these.
  */
 export const DEFAULT_SETTINGS = Object.freeze({
-  /** Cooling starts once the assembled input exceeds this fraction of the context window. */
-  targetOccupancy: 0.6,
   /**
-   * Number of newest operations kept verbatim. This is the *primary* trigger:
-   * anything older is archived whether or not the occupancy target is reached.
-   *
-   * It is still a baseline rather than a fence — while the input stays over the
-   * target the planner consumes these from their oldest end (16 → 15 → 14 …)
-   * until the target is met, then the setting applies again on its own. The
-   * setting itself is never rewritten.
+   * Number of newest operations kept verbatim. Anything older is archived once
+   * the batch threshold is met, regardless of how much of the window is used.
    */
   retainOperations: 10,
   /**
@@ -79,13 +72,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
    * price of holding those operations verbatim a little longer. Measured on a
    * real 1M-window session: batching 10 costs 0.16× the unbatched baseline while
    * batching 1 costs 0.57×, and both stay far below doing nothing at all.
-   *
-   * The occupancy target overrides this: once the target is exceeded the planner
-   * acts immediately rather than waiting for the batch to fill.
    */
   archiveBatchSize: 10,
-  /** Extra fraction of the window freed per batch, so the next batch is deferred. */
-  releaseMarginRatio: 0.05,
   /** Cool automatically at the stable pre-step boundary. */
   auto: true,
   /** Inject matching cold-store excerpts at the tail of each new user turn. */
@@ -104,10 +92,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 /** Settings whose value is a plain number with an inclusive range. */
 export const NUMERIC_SETTINGS = Object.freeze({
-  target: { key: 'targetOccupancy', min: 0, max: 1, exclusive: true, label: '触发占用率' },
   retain: { key: 'retainOperations', min: 0, max: 200, integer: true, label: '保留最近操作数' },
   batch: { key: 'archiveBatchSize', min: 1, max: 200, integer: true, label: '批量阈值' },
-  margin: { key: 'releaseMarginRatio', min: 0, max: 1, exclusive: false, label: '超量减少' },
 })
 
 /** Settings whose value is a boolean switch. */
@@ -196,23 +182,15 @@ export function formatRatio(value) {
 /** Normalize any partial settings object onto the defaults. */
 export function normalizeSettings(raw) {
   const value = raw && typeof raw === 'object' ? raw : {}
-  const target = typeof value.targetOccupancy === 'number' && value.targetOccupancy > 0 && value.targetOccupancy < 1
-    ? value.targetOccupancy
-    : DEFAULT_SETTINGS.targetOccupancy
   const retain = Number.isInteger(value.retainOperations) && value.retainOperations >= 0
     ? value.retainOperations
     : DEFAULT_SETTINGS.retainOperations
   const batch = Number.isInteger(value.archiveBatchSize) && value.archiveBatchSize >= 1
     ? value.archiveBatchSize
     : DEFAULT_SETTINGS.archiveBatchSize
-  const margin = typeof value.releaseMarginRatio === 'number' && value.releaseMarginRatio >= 0 && value.releaseMarginRatio <= 1
-    ? value.releaseMarginRatio
-    : DEFAULT_SETTINGS.releaseMarginRatio
   return {
-    targetOccupancy: target,
     retainOperations: retain,
     archiveBatchSize: batch,
-    releaseMarginRatio: margin,
     auto: typeof value.auto === 'boolean' ? value.auto : DEFAULT_SETTINGS.auto,
     autoRecall: typeof value.autoRecall === 'boolean' ? value.autoRecall : DEFAULT_SETTINGS.autoRecall,
     autoRestore: typeof value.autoRestore === 'boolean' ? value.autoRestore : DEFAULT_SETTINGS.autoRestore,
