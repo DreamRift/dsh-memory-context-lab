@@ -181,6 +181,7 @@ function createClientContext(options) {
   const slots = []
   const locales = []
   const listeners = []
+  const configForms = options?.configForms ?? null
   // One shared face: the plugin prefers `ctx.get('remote')`, so a per-call object
   // would ignore anything a test installs on `ctx.remote`.
   const execute = options?.execute ?? (async () => ({ ok: true, value: { kind: 'success', text: 'ok' } }))
@@ -212,6 +213,7 @@ function createClientContext(options) {
     logger: { info() {}, warn() {}, error() {} },
     get(name) {
       if (name === 'remote') return remote
+      if (name === 'configForms') return configForms
       return undefined
     },
     remote,
@@ -224,7 +226,90 @@ test('the bundle registers under the package name and declares its dependencies'
   assert.equal(entry.id, 'dsh-memory-context-lab')
   assert.equal(typeof entry.factory, 'function')
   assert.equal(typeof entry.exports.apply, 'function')
-  assert.deepEqual(entry.exports.inject, ['slots', 'locale', 'remote', 'remote.commands'])
+  assert.deepEqual(entry.exports.inject, ['slots', 'locale', 'remote', 'remote.commands', 'configForms'])
+})
+
+test('applying registers the settings-page card only while the namespace is served', async () => {
+  const { entry } = await loadClient()
+  const served = []
+  let registered = null
+  const configForms = {
+    whileServed(namespaces, fn) {
+      served.push([...namespaces])
+      // Registration happens only when the host serves the namespace.
+      return fn()
+    },
+    get(id) {
+      return {
+        getSnapshot() {
+          return { value: { defaults: {}, presets: [] }, revision: 0 }
+        },
+      }
+    },
+  }
+  const first = createClientContext()
+  first.context.slots.register = (options, component) => {
+    if (options.name === 'plugins.row.config') registered = { options, component }
+    return () => {}
+  }
+  entry.exports.apply(first.context)
+  assert.equal(registered, null, 'no configForms -> no settings card')
+
+  const second = createClientContext({ configForms })
+  const rows = []
+  second.context.slots.register = (options, component) => {
+    rows.push({ options, component })
+    return () => {}
+  }
+  entry.exports.apply(second.context)
+  assert.deepEqual(served, [['memory-context-lab']])
+  const card = rows.find((row) => row.options.name === 'plugins.row.config')
+  assert.ok(card, 'served namespace -> plugins.row.config card registered')
+  // Keyed-seat contract (plugins.row.config spec): `key` is `<package>#<rowId>`;
+  // the plugin-list row is clickable only while this key exists, and the detail
+  // page renderer passes { view: 'page', form } as props.
+  assert.equal(card.options.key, 'dsh-memory-context-lab#memory-context-lab')
+  assert.equal(typeof card.component, 'function')
+  // The card component renders a summary line when no form prop is provided.
+  const summary = card.component({ view: 'summary' })
+  assert.ok(textOf(summary).length > 0)
+})
+
+test('the settings card renders fields from both raw controllers and the thin form face', async () => {
+  const { entry, shim } = await loadClient()
+  const value = {
+    defaults: { enabled: true, triggerLines: 10, batchThreshold: 3, autoRestore: true },
+    presets: [{ id: 'p', name: '省流', triggerLines: 6, batchThreshold: 4, autoRestore: true }],
+  }
+  let registered = null
+  const configForms = {
+    whileServed(namespaces, fn) { return fn() },
+    get(id) {
+      return {
+        getSnapshot() { return { value, revision: 3 } },
+      }
+    },
+  }
+  const ctxWrap = createClientContext({ configForms })
+  ctxWrap.context.slots.register = (options, component) => {
+    if (options.name === 'plugins.row.config') registered = { options, component }
+    return () => {}
+  }
+  entry.exports.apply(ctxWrap.context)
+  assert.ok(registered, 'card registered')
+
+  // v0.6.0 插件管理页薄面：{ state: { value, revision }, mutate }（无 getSnapshot/subscribe）。
+  let mutated = null
+  const thin = { state: { value, revision: 3 }, mutate: (ops, rev) => { mutated = { ops, rev }; return Promise.resolve() } }
+  const page = shim.mount(registered.component, { view: 'page', form: thin })
+  const text = textOf(page)
+  assert.ok(text.length > 0, 'thin face renders content')
+  assert.ok(text.includes('默认') || text.includes('预设'), 'thin face shows settings sections')
+
+  // 原始控制器形态（弹层/旧渲染器）同样能渲染：FakeForm 的 presets 为空数组，
+  // 这里只断言不崩且有渲染内容，预设行由薄面用例覆盖。
+  const rawPage = shim.mount(registered.component, { view: 'page', form: configForms.get('memory-context-lab') })
+  assert.ok(textOf(rawPage).length > 0, 'raw controller renders without crashing')
 })
 
 test('applying registers exactly one composer seat, plus both dictionaries', async () => {

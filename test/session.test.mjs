@@ -9,12 +9,13 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { apply as applyPlugin } from '../src/index.mjs'
 import { applyEvent, initProjectionState, viewOf } from '../src/projection.mjs'
+import { GLOBAL_PRESET_LABEL } from '../src/core.mjs'
 import { buildSession, FakeColdStore, fakeMeter, operation } from './helpers/fake-host.mjs'
 import { createSessionState, readSessionState, sessionKeyFor, writeSessionState } from '../src/storage.mjs'
 import { claimsOfRecord, makeOrdinalAllocator, nodeClaimOf } from '../src/apply-engine.mjs'
@@ -312,6 +313,7 @@ test('the projection rebuilds settings from the session log, not from plugin mem
     auto: false,
     autoRecall: false,
     autoRestore: false,
+    preset: { id: '', label: GLOBAL_PRESET_LABEL, modified: false },
     archived: 0,
     restored: 0,
     revision: lines.length,
@@ -930,4 +932,52 @@ test('a poisoned claim can be deleted so the next measure re-mints a clean ordin
   delete claims[22]
   const allocator = makeOrdinalAllocator(record)
   assert.notEqual(allocator.next(), 1, 'the orphaned id must not be re-issued for the same range')
+})
+
+// C-11: a corrupt state file used to read as "never enabled", so the very next
+// turn silently dropped every archive receipt out of the projection. The fix
+// distinguishes damage from absence and refuses every mutating entry point
+// except the explicitly confirmed full-session delete.
+test('a corrupt state file stops intervention instead of reading as never-enabled', async () => {
+  await withTempLab('damaged', async (labRoot) => {
+    const sessionId = 'session-damaged-0001'
+    const first = await harness({ labRoot })
+    const session = buildSession({ operations: 2, id: sessionId })
+    const { agent } = agentFor(session)
+    const enabled = await run(first, agent, 'on')
+    assert.equal(enabled.kind, 'success', enabled.text)
+    await first._dispose()
+
+    const stateFile = path.join(labRoot, 'sessions', sessionKeyFor(sessionId), 'state.json')
+    await writeFile(stateFile, '{broken', 'utf8')
+
+    // A fresh plugin instance re-adopts from disk and must see damage, not
+    // absence.
+    const second = await harness({ labRoot })
+    const status = await run(second, agent, 'status')
+    assert.equal(status.kind, 'error')
+    assert.ok(status.text.includes('损坏'), status.text)
+    assert.ok(status.text.includes('delete-session'), 'the escape hatch must be named')
+
+    // Every mutating entry point refuses; nothing may rewrite the surface.
+    const surfaceBefore = session.surface.nodes.length
+    const on = await run(second, agent, 'on')
+    assert.equal(on.kind, 'error')
+    assert.ok(on.text.includes('损坏'), on.text)
+    const now = await run(second, agent, 'now')
+    assert.equal(now.kind, 'error')
+    assert.ok(now.text.includes('损坏'), now.text)
+    const off = await run(second, agent, 'off')
+    assert.equal(off.kind, 'error')
+    const plainClean = await run(second, agent, 'clean')
+    assert.equal(plainClean.kind, 'error')
+    assert.ok(plainClean.text.includes('confirm delete-session'), plainClean.text)
+    assert.equal(session.surface.nodes.length, surfaceBefore, 'no turn may rewrite the surface')
+
+    // The confirmed escape hatch deletes the whole session directory.
+    const confirmed = await run(second, agent, 'clean confirm delete-session')
+    assert.equal(confirmed.kind, 'success', confirmed.text)
+    await rm(path.join(labRoot, 'sessions', sessionKeyFor(sessionId)), { recursive: true, force: true })
+    await second._dispose()
+  })
 })

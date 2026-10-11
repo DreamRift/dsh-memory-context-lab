@@ -12,6 +12,17 @@ const TOOL_TIMEOUT_MS = 60_000
 const STOP_GRACE_MS = 1_500
 const STOP_KILL_WAIT_MS = 3_000
 
+/**
+ * Role view that makes `role:'tool-output'` records visible to `cg(read)`.
+ *
+ * The fixed 0.8.x store's default candidate pool excludes tool-output records;
+ * archived cold nodes are written with exactly that role, so recall without
+ * this view searches a pool that can never contain them (C-01). One explicit
+ * view parameter is the whole fix — the records themselves keep their role,
+ * layer, and tags.
+ */
+export const RECEIPT_VIEW = 'receipt'
+
 function aborted(signal, label = '操作') {
   const reason = signal?.reason
   if (reason instanceof Error) return reason
@@ -294,6 +305,8 @@ export class TemporaryLingshuClient {
   constructor({ bridge, sessionId }) {
     this.bridge = bridge
     this.sessionId = sessionId
+    /** @type {{ supported: boolean|null, reason?: string }|null} receipt-view capability, filled by probeReceiptView */
+    this.receiptView = null
   }
 
   static async create({ python = process.platform === 'win32' ? 'python' : 'python3', storeRoot, lingshuPackageRoot, sessionId, signal }) {
@@ -312,6 +325,10 @@ export class TemporaryLingshuClient {
       await bridge.stop().catch(() => {})
       throw new Error('隔离冷库未暴露 mdcg_remember/cg/mdcg_get，已拒绝启用降温。')
     }
+    // Startup capability probe: one read-only call, recorded for diagnostics
+    // (C-08). Inconclusive results do not block enablement; every real recall
+    // still carries the receipt view and fails explicitly if rejected.
+    await client.probeReceiptView(signal)
     return client
   }
 
@@ -370,13 +387,52 @@ export class TemporaryLingshuClient {
     return normalizeNodeRead(await this.callTool('mdcg_get', { node_id: nodeId }, signal))
   }
 
+  /**
+   * Query the isolated store with the receipt view (C-01).
+   *
+   * `view: RECEIPT_VIEW` is always sent: without it the default candidate pool
+   * silently excludes `role:'tool-output'` records and every query answers
+   * "no hits" against a store that actually holds the archive. A store too old
+   * to accept the parameter fails the call; that failure surfaces upstream as
+   * an explicit `unsupported`/`unavailable` status — never a silent fallback
+   * to the official lingshu root.
+   */
   async recall(query, signal, limit = 5) {
     return this.callTool('cg', {
       op: 'read',
       query,
-      k: limit,
+      k: Number.isInteger(limit) && limit > 0 ? limit : 5,
       session: this.sessionId,
+      view: RECEIPT_VIEW,
     }, signal)
+  }
+
+  /**
+   * Read-only capability probe for the receipt view (C-01/C-08).
+   *
+   * Runs one cheap `cg(read)` with the view parameter at startup. It never
+   * writes a probe node; if the store rejects the parameter the result says so
+   * explicitly. An inconclusive probe (transient error) reports `null` and the
+   * next real recall still carries the view.
+   */
+  async probeReceiptView(signal) {
+    try {
+      await this.callTool('cg', {
+        op: 'read',
+        query: 'probe',
+        k: 1,
+        session: this.sessionId,
+        view: RECEIPT_VIEW,
+      }, signal)
+      this.receiptView = { supported: true }
+    } catch (error) {
+      const message = String(error?.message ?? error)
+      const unsupported = /view|参数|invalid|unexpected|unknown|not support/i.test(message)
+      this.receiptView = unsupported
+        ? { supported: false, reason: message.slice(0, 200) }
+        : { supported: null, reason: message.slice(0, 200) }
+    }
+    return this.receiptView
   }
 
   async serviceInfo(signal) {

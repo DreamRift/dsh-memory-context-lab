@@ -230,6 +230,91 @@ test('open-turn operations stay candidates and are labelled as such', () => {
   assert.equal(candidates.filter((candidate) => !candidate.inOpenTurn).length, 2)
 })
 
+function lastAssistantSeqOf(session) {
+  for (const seq of [...session.surface.nodes].reverse()) {
+    if (session.events[seq]?.type === 'assistant/message') return seq
+  }
+  return null
+}
+
+test('C-12: collection fences the newest assistant turn (sent evidence may still be coming)', () => {
+  const session = buildSession({ operations: 3, resultChars: 4000 })
+  const lastAssistantSeq = lastAssistantSeqOf(session)
+  const view = collectOperationCandidates({
+    surfaceNodes: session.surface.nodes,
+    eventAt: (seq) => session.events[seq],
+    measuredNodes: fakeMeter.measure(session).nodes,
+    retainOperations: 0,
+    openTurn: openTurnOf(session),
+    archivedRanges: [],
+    minimumChars: MIN_OPERATION_CHARS,
+    lastAssistantSeq,
+  })
+  assert.ok(
+    view.candidates.every((candidate) => candidate.rangeStart < lastAssistantSeq),
+    'no candidate may start at or after the newest assistant message',
+  )
+  assert.equal(view.lastAssistantSeq, lastAssistantSeq, 'the fence seq is echoed for callers')
+  assert.ok(
+    view.skipped.some((entry) => entry.reason === 'not-yet-exposed'),
+    'the fenced operation is reported with an explicit reason',
+  )
+  // Without the fence the same view yields one more candidate (the newest op).
+  const unfenced = collectOperationCandidates({
+    surfaceNodes: session.surface.nodes,
+    eventAt: (seq) => session.events[seq],
+    measuredNodes: fakeMeter.measure(session).nodes,
+    retainOperations: 0,
+    openTurn: openTurnOf(session),
+    archivedRanges: [],
+    minimumChars: MIN_OPERATION_CHARS,
+  })
+  assert.equal(unfenced.candidates.length, view.candidates.length + 1)
+})
+
+test('C-12: the plan re-fences stale candidates against the archive ceiling', () => {
+  const session = buildSession({ operations: 3, resultChars: 4000 })
+  const lastAssistantSeq = lastAssistantSeqOf(session)
+  const { candidates } = viewOf(session)
+  const plan = planCooling({
+    candidates,
+    meter: fakeMeter,
+    nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
+    retainOperations: 0,
+    batchSize: 3,
+    maxOperations: 64,
+    minNetReleaseTokens: 128,
+    archiveFromSeq: lastAssistantSeq,
+  })
+  assert.ok(
+    plan.units.every((unit) => unit.rangeStart < lastAssistantSeq),
+    'planned units must not cover the model-visible tail',
+  )
+  assert.ok(
+    plan.rejected.some((entry) => entry.reason === 'not-yet-exposed'),
+    'stale candidates inside the tail are rejected with an explicit reason',
+  )
+})
+
+test('C-12: the batch release ceiling stops early but never blocks the first operation', () => {
+  const session = buildSession({ operations: 6, resultChars: 12000 })
+  const { candidates } = viewOf(session)
+  const plan = planCooling({
+    candidates,
+    meter: fakeMeter,
+    nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
+    retainOperations: 0,
+    batchSize: 6,
+    maxOperations: 64,
+    minNetReleaseTokens: 128,
+    // One batch may free at most two of these operations' worth of tokens.
+    maxReleaseTokens: fakeMeter.measure(session).totalTokens / 3,
+  })
+  assert.ok(plan.units.length >= 1, 'the first candidate is always admitted')
+  assert.ok(plan.units.length < 6, 'the ceiling keeps the remainder for later batches')
+  assert.equal(plan.releaseCapped, true, 'the early stop is reported')
+})
+
 test('an operation whose result has not landed yet is never a candidate', () => {
   // This is what makes cooling the open turn safe: pair completeness, not a
   // turn-level fence, keeps in-flight work out of the candidate set.

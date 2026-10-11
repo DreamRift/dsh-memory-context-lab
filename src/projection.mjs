@@ -11,9 +11,15 @@
  * `apply` is pure and synchronous and returns the same reference for events it
  * ignores, so unchanged state costs nothing downstream. It never throws: a
  * malformed event must not be able to blank a client slot.
+ *
+ * The projection is built through {@link createMemoryContextLabProjection} with
+ * the plugin configuration as context, so `preset` commands fold against the
+ * same preset list the command handler resolved them against. The exported
+ * `memoryContextLabProjection` keeps the no-context shape for tests and for a
+ * host that registers the projection before configuration is available.
  */
 
-import { foldCommandIntoState, initialProjectionState, isReceiptMessage } from './core.mjs'
+import { foldCommandIntoState, GLOBAL_PRESET_LABEL, initialProjectionState, isReceiptMessage } from './core.mjs'
 
 /** Surface event types that can carry a `surfaceOp`. */
 const SURFACE_TYPES = new Set(['system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result'])
@@ -26,6 +32,27 @@ export function initProjectionState() {
   return { ...initialProjectionState(), receiptSeqs: [] }
 }
 
+/**
+ * The preset slice of the client view.
+ *
+ * `presetId` is empty for the global default; `modified` is true when a later
+ * `set` moved a value away from the preset's own baseline. Old fold states that
+ * predate presets read as the global default, which is exactly what they were.
+ */
+function presetViewOf(state) {
+  const label = typeof state.presetLabel === 'string' && state.presetLabel ? state.presetLabel : GLOBAL_PRESET_LABEL
+  const id = typeof state.presetId === 'string' ? state.presetId : ''
+  const baseline = state.presetBaseline && typeof state.presetBaseline === 'object' ? state.presetBaseline : null
+  const modified = baseline !== null && (
+    state.retainOperations !== baseline.retainOperations
+    || state.archiveBatchSize !== baseline.archiveBatchSize
+    || (state.auto === true) !== (baseline.auto === true)
+    || (state.autoRecall === true) !== (baseline.autoRecall === true)
+    || (state.autoRestore !== false) !== (baseline.autoRestore !== false)
+  )
+  return { id, label, modified }
+}
+
 /** The client-visible view. Plain JSON, no functions, no undefined. */
 export function viewOf(state) {
   const retain = state.retainOperations
@@ -33,10 +60,11 @@ export function viewOf(state) {
   return {
     enabled: state.enabled === true,
     retainOperations: Number.isInteger(retain) && retain >= 0 && retain <= 200 ? retain : 0,
-    archiveBatchSize: Number.isInteger(batch) && batch >= 1 && batch <= 200 ? batch : 10,
+    archiveBatchSize: Number.isInteger(batch) && batch >= 1 && batch <= 200 ? batch : 5,
     auto: state.auto === true,
     autoRecall: state.autoRecall === true,
     autoRestore: state.autoRestore !== false,
+    preset: presetViewOf(state),
     archived: Array.isArray(state.receiptSeqs) ? state.receiptSeqs.length : 0,
     restored: Number.isInteger(state.restored) && state.restored >= 0 ? state.restored : 0,
     revision: Number.isInteger(state.revision) && state.revision >= 0 ? state.revision : 0,
@@ -48,15 +76,18 @@ export function viewOf(state) {
  *
  * @param state - the previous state.
  * @param event - one committed session event.
+ * @param context - optional `{ presets, defaults }` for `preset` folding.
  * @returns the next state, or the same reference when nothing changed.
  */
-export function applyEvent(state, event) {
+export function applyEvent(state, event, context = null) {
   if (!event || typeof event !== 'object') return state
 
   if (event.type === 'command/run') {
     if (event.data?.name !== 'memory-lab') return state
     const next = { ...state }
-    if (!foldCommandIntoState(next, event.data?.args ?? '')) return state
+    if (next.presetId === undefined) next.presetId = ''
+    if (next.presetLabel === undefined) next.presetLabel = GLOBAL_PRESET_LABEL
+    if (!foldCommandIntoState(next, event.data?.args ?? '', context)) return state
     next.revision = (state.revision ?? 0) + 1
     return next
   }
@@ -98,12 +129,17 @@ export function applyEvent(state, event) {
   }
 }
 
-/** The registry definition, ready for `ctx.sessionProjections.register(...)`. */
-export const memoryContextLabProjection = {
-  key: 'memoryContextLab',
-  stateVersion: 1,
-  stateSchema: PASSTHROUGH_SCHEMA,
-  init: () => initProjectionState(),
-  apply: applyEvent,
-  wire: { viewSchema: PASSTHROUGH_SCHEMA, view: viewOf },
+/** Assemble the registry definition; `context` feeds `preset` folding. */
+export function createMemoryContextLabProjection(context = null) {
+  return {
+    key: 'memoryContextLab',
+    stateVersion: 1,
+    stateSchema: PASSTHROUGH_SCHEMA,
+    init: () => initProjectionState(),
+    apply: (state, event) => applyEvent(state, event, context),
+    wire: { viewSchema: PASSTHROUGH_SCHEMA, view: viewOf },
+  }
 }
+
+/** The registry definition, ready for `ctx.sessionProjections.register(...)`. */
+export const memoryContextLabProjection = createMemoryContextLabProjection(null)

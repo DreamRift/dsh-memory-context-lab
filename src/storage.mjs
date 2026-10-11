@@ -53,6 +53,41 @@ async function readJson(file) {
   }
 }
 
+/**
+ * Read a JSON file distinguishing "absent" from "present but unreadable"
+ * (C-11). Returns null only for a missing file; a parse failure or a read
+ * failure (permissions, IO) throws with `code: 'EDAMAGED'` so callers can fail
+ * closed instead of mistaking damage for "never enabled".
+ */
+async function readJsonStrict(file) {
+  let text
+  try {
+    text = await readFile(file, 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    const wrapped = new Error(`状态文件不可读：${error instanceof Error ? error.message : String(error)}`)
+    wrapped.code = 'EDAMAGED'
+    throw wrapped
+  }
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    const wrapped = new Error(`状态文件不是有效的 JSON：${error instanceof Error ? error.message : String(error)}`)
+    wrapped.code = 'EDAMAGED'
+    throw wrapped
+  }
+}
+
+/** Thrown when a session's state file exists but cannot be trusted (C-11). */
+export class SessionStateDamagedError extends Error {
+  constructor(message, { directory, reason }) {
+    super(message)
+    this.name = 'SessionStateDamagedError'
+    this.directory = directory
+    this.reason = reason
+  }
+}
+
 export async function writeJsonAtomic(file, value) {
   const parent = path.dirname(file)
   await mkdir(parent, { recursive: true })
@@ -105,14 +140,38 @@ export async function createSessionState(labRoot, sessionId, settings) {
   return { directory, state }
 }
 
-/** Read the durable state for one session, or null when it was never enabled. */
+/**
+ * Read the durable state for one session, or null when it was never enabled.
+ *
+ * A present-but-invalid state file (broken JSON, wrong kind/schema, foreign
+ * session id) throws {@link SessionStateDamagedError} instead of returning
+ * null: callers must not treat damage as "never enabled", or an `on` would
+ * silently overwrite the archive ledger that receipts still depend on (C-11).
+ */
 export async function readSessionState(labRoot, sessionId) {
   const root = path.resolve(labRoot)
   const marker = await readJson(path.join(root, LAB_ROOT_MARKER_FILE))
   if (marker === null || marker.kind !== LAB_ROOT_MARKER_KIND || marker.schemaVersion !== SCHEMA_VERSION) return null
   const directory = sessionDirectoryFor(root, sessionId)
-  const state = await readJson(path.join(directory, STATE_FILE))
-  if (!isSessionState(state) || state.sessionId !== sessionId) return null
+  let state
+  try {
+    state = await readJsonStrict(path.join(directory, STATE_FILE))
+  } catch (error) {
+    if (error?.code === 'EDAMAGED') {
+      throw new SessionStateDamagedError(
+        `本会话的降温状态文件已损坏，无法判断历史归档事实（${error.message}）。不会将其当作「从未启用」，也不会覆盖它。`,
+        { directory, reason: error.message },
+      )
+    }
+    throw error
+  }
+  if (state !== null && (!isSessionState(state) || state.sessionId !== sessionId)) {
+    throw new SessionStateDamagedError(
+      '本会话的降温状态文件内容无效（kind/schema/sessionId 不匹配），已拒绝读取。',
+      { directory, reason: 'invalid-state' },
+    )
+  }
+  if (state === null) return null
   return { directory, state }
 }
 

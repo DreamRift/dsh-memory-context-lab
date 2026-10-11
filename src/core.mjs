@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 export const PACKAGE_NAME = 'dsh-memory-context-lab'
-export const PACKAGE_VERSION = '0.5.0'
+export const PACKAGE_VERSION = '0.6.0'
 export const COMMAND_NAME = 'memory-lab'
 
 export const LAB_ROOT_NAME = '.memory-context-lab'
@@ -45,23 +45,42 @@ export const MAX_OPERATION_TOTAL_BYTES = 4 * 1024 * 1024
 export const MAX_OPERATIONS_PER_BATCH = 64
 /** An operation must free at least this many estimated tokens to be worth a rewrite. */
 export const MIN_NET_RELEASE_TOKENS = 128
+/**
+ * One batch may release at most this many estimated tokens (C-12 sizing, C-07
+ * bounded batches). A giant burst of old evidence is drained over several
+ * measured turns instead of vanishing from the projection in one rewrite.
+ */
+export const MAX_BATCH_RELEASE_TOKENS = 65_536
 
 /** Recall digest bounds. */
 export const MAX_RECALL_QUERY_CHARS = 800
 export const MAX_RECALL_HITS = 5
 export const MAX_RECALL_DIGEST_CHARS = 1200
 export const MAX_PREVIEW_CHARS = 700
+/**
+ * Minimum operations kept visible before the exposed-evidence guard (C-12) can
+ * even be discussed. The newest assistant message is the hard floor regardless
+ * of this number; this only keeps the setting meaningful when the user sets
+ * `retainOperations = 0`.
+ */
+export const MIN_EXPOSED_OPERATIONS = 1
 
 /**
  * Default per-session settings. Every value here is user-adjustable from the
  * composer panel; nothing in the archive path is hard-coded to these.
+ *
+ * The 5/5 pair is the all-round default from the cost grids simulated on the
+ * two bundled reference sessions (`docs/预设成本分析.md`): batch 5 sits within
+ * ~0.3% of the optimum for GLM-5.3-flash and well below the old 10/10 pair for
+ * DeepSeek V4.1-flash, while keeping the verbatim window small. The two model
+ * presets shipped in {@link BUILTIN_PRESETS} encode each model's optimum.
  */
 export const DEFAULT_SETTINGS = Object.freeze({
   /**
    * Number of newest operations kept verbatim. Anything older is archived once
    * the batch threshold is met, regardless of how much of the window is used.
    */
-  retainOperations: 10,
+  retainOperations: 5,
   /**
    * How many operations must have fallen out of the retention window before a
    * batch is submitted.
@@ -69,11 +88,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
    * Archiving is never free: replacing a range invalidates the prefix cache from
    * that point on, so the cost is driven by batch *count*. Waiting for a few
    * operations to pile up cuts the number of invalidations several-fold, at the
-   * price of holding those operations verbatim a little longer. Measured on a
-   * real 1M-window session: batching 10 costs 0.16× the unbatched baseline while
-   * batching 1 costs 0.57×, and both stay far below doing nothing at all.
+   * price of holding those operations verbatim a little longer.
    */
-  archiveBatchSize: 10,
+  archiveBatchSize: 5,
   /** Cool automatically at the stable pre-step boundary. */
   auto: true,
   /** Inject matching cold-store excerpts at the tail of each new user turn. */
@@ -89,6 +106,48 @@ export const DEFAULT_SETTINGS = Object.freeze({
    */
   autoRestore: true,
 })
+
+/** Label of the unnamed fallback preset: the global defaults. */
+export const GLOBAL_PRESET_LABEL = '全局预设'
+
+/**
+ * Presets bundled with the plugin, also the schema default for the `presets`
+ * config field, so a fresh install serves them in the settings page.
+ *
+ * Values come from the cost grids simulated on the two reference sessions in
+ * `docs/预设成本分析.md` (prices of 2026-02):
+ * - GLM-5.3-flash misses are cheap but cache hits are ~3.5× cheaper still, and
+ *   its operation sizes are small — batch 3 is the optimum, batch 5 costs
+ *   ~0.3% more, batch 8+ drifts into double digits.
+ * - DeepSeek V4.1-flash pays real money per cache miss, so the optimum is the
+ *   other end: batch 16 (with retain ≥ 5) cuts about a fifth off batch 5.
+ * The floor of 5 retained operations is the product requirement, not an
+ * accident; `retain` 5 + `batch` 16 keeps at most 21 operations live.
+ */
+export const BUILTIN_PRESETS = Object.freeze([
+  Object.freeze({
+    id: 'glm-5.3-flash-eco',
+    name: 'GLM 5.3 Flash 省流',
+    settings: Object.freeze({
+      retainOperations: 5,
+      archiveBatchSize: 3,
+      auto: true,
+      autoRecall: true,
+      autoRestore: true,
+    }),
+  }),
+  Object.freeze({
+    id: 'deepseek-v4.1-flash-eco',
+    name: 'DeepSeek V4.1 Flash 省流',
+    settings: Object.freeze({
+      retainOperations: 5,
+      archiveBatchSize: 16,
+      auto: true,
+      autoRecall: true,
+      autoRestore: true,
+    }),
+  }),
+])
 
 /** Settings whose value is a plain number with an inclusive range. */
 export const NUMERIC_SETTINGS = Object.freeze({
@@ -197,6 +256,66 @@ export function normalizeSettings(raw) {
   }
 }
 
+/** Normalize one user-defined preset; null when it has no usable id. */
+export function normalizePresetEntry(raw) {
+  const value = raw && typeof raw === 'object' ? raw : {}
+  const id = String(value.id ?? '').trim()
+  if (!id) return null
+  const name = String(value.name ?? '').trim() || id
+  // Config schema 与用户编辑都可能是「嵌套 settings」形态；平铺字段形态也兼容。
+  const source = value.settings && typeof value.settings === 'object' ? value.settings : value
+  return { id, name, settings: normalizeSettings(source) }
+}
+
+/** Normalize a preset list: drop unusable entries and duplicate ids, keep order. */
+export function normalizePresets(raw) {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set()
+  const list = []
+  for (const item of raw) {
+    const entry = normalizePresetEntry(item)
+    if (!entry || seen.has(entry.id)) continue
+    seen.add(entry.id)
+    list.push(entry)
+  }
+  return list
+}
+
+/** Words that switch a session back to the global-default preset when used as `/memory-lab preset <word>`. */
+export const PRESET_RESET_WORDS = ['reset', '默认', '全局', 'global']
+
+/** One-line human summary of a settings snapshot, for preset listings. */
+export function formatPresetValue(settings) {
+  const value = normalizeSettings(settings)
+  return `保留 ${value.retainOperations} / 批量 ${value.archiveBatchSize} / 自动 ${value.auto ? '开' : '关'} / 回注 ${value.autoRecall ? '开' : '关'} / 恢复 ${value.autoRestore ? '开' : '关'}`
+}
+
+/** Find a preset by id or name; unique prefixes and unique substrings also count.
+ * Order: exact id → exact name → unique prefix → unique substring. Null when ambiguous or absent. */
+export function resolvePreset(presets, query) {
+  const text = String(query ?? '').trim().toLowerCase()
+  if (!text) return null
+  const list = Array.isArray(presets) ? presets : []
+  const exact = list.find((entry) => entry.id.toLowerCase() === text)
+  if (exact) return exact
+  const byName = list.find((entry) => entry.name.toLowerCase() === text)
+  if (byName) return byName
+  const byPrefix = list.filter((entry) => entry.id.toLowerCase().startsWith(text) || entry.name.toLowerCase().startsWith(text))
+  if (byPrefix.length === 1) return byPrefix[0]
+  const bySubstring = list.filter((entry) => entry.id.toLowerCase().includes(text) || entry.name.toLowerCase().includes(text))
+  if (bySubstring.length === 1) return bySubstring[0]
+  return null
+}
+
+function applySettingsSnapshot(state, settings) {
+  const normalized = normalizeSettings(settings)
+  state.retainOperations = normalized.retainOperations
+  state.archiveBatchSize = normalized.archiveBatchSize
+  state.auto = normalized.auto
+  state.autoRecall = normalized.autoRecall
+  state.autoRestore = normalized.autoRestore
+}
+
 /**
  * Apply one `/memory-lab ...` input line to a settings-shaped state object.
  *
@@ -205,11 +324,17 @@ export function normalizeSettings(raw) {
  * publishes are reconstructed from the session log itself rather than from
  * plugin memory. That is what makes a resumed or forked session correct.
  *
+ * The optional `context` carries the plugin configuration (`presets` and
+ * `defaults`); when absent, the built-in presets and defaults are used. The
+ * projection and the command handler must always pass the same context, or a
+ * preset applied at runtime would fold differently on resume.
+ *
  * @param state - the folded state to update in place.
  * @param rawInput - the command's raw input, exactly as `command/run` recorded it.
+ * @param context - optional `{ presets, defaults }` from the plugin config.
  * @returns true when the line changed the state.
  */
-export function foldCommandIntoState(state, rawInput) {
+export function foldCommandIntoState(state, rawInput, context = null) {
   const { operation, remainder } = parseOperation(rawInput)
   if (operation === 'on') {
     if (state.enabled === true) return false
@@ -219,6 +344,21 @@ export function foldCommandIntoState(state, rawInput) {
   if (operation === 'off') {
     if (state.enabled === false) return false
     state.enabled = false
+    return true
+  }
+  if (operation === 'preset') {
+    const query = remainder.trim()
+    if (!query) return false
+    const isReset = PRESET_RESET_WORDS.includes(query.toLowerCase()) || query === '默认' || query === '全局'
+    const entry = isReset ? null : resolvePreset(normalizePresets(context?.presets ?? BUILTIN_PRESETS), query)
+    // A preset that no longer exists keeps the current settings: the command
+    // still reads as if it ran, and folding it must not silently reseed values.
+    if (!isReset && !entry) return false
+    const settings = normalizeSettings(entry ? entry.settings : context?.defaults)
+    applySettingsSnapshot(state, settings)
+    state.presetId = entry ? entry.id : ''
+    state.presetLabel = entry ? entry.name : GLOBAL_PRESET_LABEL
+    state.presetBaseline = settings
     return true
   }
   if (operation !== 'set') return false
@@ -250,6 +390,9 @@ export function initialProjectionState() {
   return {
     enabled: false,
     ...normalizeSettings({}),
+    presetId: '',
+    presetLabel: GLOBAL_PRESET_LABEL,
+    presetBaseline: null,
     archived: 0,
     restored: 0,
     revision: 0,
@@ -440,6 +583,57 @@ export function formatRecallDigest(summaries, limit = MAX_RECALL_DIGEST_CHARS) {
   })
   const text = lines.join('\n')
   return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`
+}
+
+/** How a cold-store call ended, as distinct statuses instead of one empty digest. */
+export const RECALL_STATUS = Object.freeze({
+  OK: 'ok',
+  UNSUPPORTED: 'unsupported',
+  UNAVAILABLE: 'unavailable',
+})
+
+/**
+ * Normalize one cold-store read response into `{ status, summaries }` (C-04).
+ *
+ * The recall digest is injected before the request is built, so "query failed"
+ * must never silently become "no archive" — the model could then conclude the
+ * work was lost and redo it. Separating the statuses is the whole point:
+ *
+ * - `ok`          — the store answered with a result envelope (rows may be
+ *   empty; zero rows really means "no matching archive").
+ * - `unsupported` — the store answered but refused the call (`ok:false`, no
+ *   recognizable envelope): the digest is not injectable and the failure must
+ *   be reported.
+ * - `unavailable` — the call itself threw (store down, timeout); the engine
+ *   assigns this before normalization ever runs.
+ */
+export function normalizeRecallPayload(payload, maxHits = MAX_RECALL_HITS) {
+  const outer = payload && typeof payload === 'object' ? payload : {}
+  if (outer.ok === false) {
+    const reason = String(outer.error?.message ?? outer.error ?? '').slice(0, 200)
+    return { status: RECALL_STATUS.UNSUPPORTED, summaries: [], reason: reason || 'store returned ok=false' }
+  }
+  const candidates = ['results', 'items', 'hits', 'nodes', 'data']
+  let rows = null
+  for (const key of candidates) {
+    if (Array.isArray(outer[key])) {
+      rows = outer[key]
+      break
+    }
+  }
+  if (!Array.isArray(rows)) {
+    return { status: RECALL_STATUS.UNSUPPORTED, summaries: [], reason: 'store returned no result envelope' }
+  }
+  const summaries = rows.slice(0, maxHits).map((raw, index) => {
+    const item = raw && typeof raw === 'object' ? raw : {}
+    const node = item.node && typeof item.node === 'object' ? item.node : item
+    const id = String(node.id ?? item.id ?? `hit-${index + 1}`)
+    const content = String(node.content ?? item.content ?? node.preview ?? item.preview ?? '')
+    const scoreRaw = item.score ?? node.score
+    const score = typeof scoreRaw === 'number' && Number.isFinite(scoreRaw) ? scoreRaw : undefined
+    return { id, preview: displayPreview(content), ...(score === undefined ? {} : { score }) }
+  })
+  return { status: RECALL_STATUS.OK, summaries }
 }
 
 export function displayPreview(value, limit = MAX_PREVIEW_CHARS) {

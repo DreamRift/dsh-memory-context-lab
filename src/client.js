@@ -85,7 +85,12 @@ window.__ModuleLoader__.load({
       'error.noRemote': '命令通道尚未就绪，请稍后重试',
       'error.empty': '命令没有返回结果',
       'error.unknownCommand': '命令没有返回结果（可能是未知命令）',
-      'error.transport': '执行失败：{message}'
+      'error.transport': '执行失败：{message}',
+
+      'preset.label': '预设',
+      'preset.global': '全局预设',
+      'preset.modified': '已调整',
+      'preset.unavailable': '预设列表加载失败，仅显示全局预设'
     };
 
     /** English dictionary, checked complete against the zh key set. */
@@ -122,8 +127,80 @@ window.__ModuleLoader__.load({
       'error.noRemote': 'The command channel is not ready yet, try again shortly',
       'error.empty': 'The command returned no result',
       'error.unknownCommand': 'The command returned no result (unknown command?)',
-      'error.transport': 'Command failed: {message}'
+      'error.transport': 'Command failed: {message}',
+
+      'preset.label': 'Preset',
+      'preset.global': 'Global preset',
+      'preset.modified': 'adjusted',
+      'preset.unavailable': 'Preset list unavailable, showing global preset only'
     };
+    //#endregion
+
+    //#region 全局配置（设置页）读取
+    /**
+     * 宿主设置域（settings）与配置表单（configForms）的只读辅助。
+     * 两者都按「可选能力」对待：拿不到时降温 chip 与命令照常工作，
+     * 仅弹层的预设列表退化为只有「全局预设」、设置页卡片不注册。
+     */
+    var CONFIG_NS = 'memory-context-lab';
+    var SETTINGS_CARD_KEY = 'dsh-memory-context-lab#' + CONFIG_NS;
+
+    function optionalService(ctx, id) {
+      if (ctx && typeof ctx[id] !== 'undefined') return ctx[id]
+      try {
+        return typeof ctx.get === 'function' ? ctx.get(id) : null
+      } catch (error) {
+        return null
+      }
+    }
+
+    function configFormsOf(ctx) {
+      var service = optionalService(ctx, 'configForms');
+      return service && typeof service.get === 'function' ? service : null;
+    }
+
+    /** 读取本插件 Config 命名空间当前生效值；未就绪/不可用时返回 null。 */
+    function readConfigValue(ctx) {
+      var forms = configFormsOf(ctx);
+      if (!forms) return null;
+      try {
+        var form = forms.get(CONFIG_NS);
+        var snapshot = form && typeof form.getSnapshot === 'function' ? form.getSnapshot() : null;
+        var value = snapshot && snapshot.value;
+        return value && typeof value === 'object' ? value : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    /** 归一化预设行列表：只要 id + name + 5 个数值/开关字段。 */
+    function presetRowsOf(configValue) {
+      var raw = configValue && Array.isArray(configValue.presets) ? configValue.presets : [];
+      var rows = [];
+      raw.forEach(function (entry, index) {
+        if (!entry || typeof entry !== 'object') return;
+        var settings = entry.settings && typeof entry.settings === 'object' ? entry.settings : entry;
+        rows.push({
+          id: typeof entry.id === 'string' && entry.id ? entry.id : 'preset-' + (index + 1),
+          name: typeof entry.name === 'string' && entry.name ? entry.name : '预设 ' + (index + 1),
+          settings: {
+            retainOperations: Number(settings.retainOperations),
+            archiveBatchSize: Number(settings.archiveBatchSize),
+            auto: settings.auto !== false,
+            autoRecall: settings.autoRecall !== false,
+            autoRestore: settings.autoRestore !== false
+          }
+        });
+      });
+      return rows;
+    }
+
+    function presetNameOf(rows, id) {
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].id === id) return rows[i].name;
+      }
+      return '';
+    }
     //#endregion
 
     //#region 样式
@@ -174,7 +251,24 @@ window.__ModuleLoader__.load({
       + '.mcl-button:disabled{cursor:not-allowed;opacity:.4}'
       + ".mcl-button[data-danger='true']{border-color:var(--dsw-alias-state-error-secondary);color:var(--dsw-alias-state-error-primary)}"
       + '.mcl-error{margin:0;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px;white-space:pre-line;word-break:break-word}'
-      + '.mcl-output{box-sizing:border-box;max-height:96px;overflow:auto;margin:0;padding:8px;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-tertiary);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}';
+      + '.mcl-output{box-sizing:border-box;max-height:96px;overflow:auto;margin:0;padding:8px;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-tertiary);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}'
+      + '.mcl-select{box-sizing:border-box;max-width:220px;height:28px;padding:0 4px 0 8px;border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;cursor:pointer}'
+      + '.mcl-select:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-1px}'
+      + '.mcl-select:disabled{cursor:not-allowed;opacity:.5}'
+      + '.mcl-input{box-sizing:border-box;max-width:72px;height:28px;padding:0 8px;border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px}'
+      + '.mcl-input:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-1px}'
+      + '.mcl-input:disabled{opacity:.5;cursor:not-allowed}'
+      + '.mcl-name{box-sizing:border-box;width:150px;height:28px;padding:0 8px;border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px}'
+      + '.mcl-name:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-1px}'
+      + '.mcl-card{display:flex;flex-direction:column;gap:10px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}'
+      + '.mcl-card-block{display:flex;flex-direction:column;gap:6px;padding:10px;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-module-platform)}'
+      + '.mcl-card-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-height:28px}'
+      + '.mcl-card-title{margin:0;font-size:13px;font-weight:500;color:var(--dsw-alias-label-primary)}'
+      + '.mcl-card-hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}'
+      + '.mcl-card-empty{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;font-style:italic}'
+      + '.mcl-check{display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-tertiary);font-size:12px;cursor:pointer}'
+      + '.mcl-check input{accent-color:var(--dsw-alias-state-business-primary);margin:0;cursor:pointer}'
+      + '.mcl-check input:disabled{cursor:not-allowed}';
 
     /** 随组件挂载 / 卸载的样式节点（两个组件各带一份，重复应用无副作用）。 */
     function StyleTag() {
@@ -567,6 +661,33 @@ window.__ModuleLoader__.load({
       var cleanArmed = cleanPair[0];
       var setCleanArmed = cleanPair[1];
 
+      // 预设列表：打开弹层时从宿主 Config 命名空间拉一次（+订阅变更）。
+      // 拿不到 configForms 时退化为只显示「全局预设」，不影响其余控件。
+      var presetPair = React.useState(function () {
+        var value = readConfigValue(hostCtx);
+        return value == null ? null : presetRowsOf(value);
+      });
+      var presetRows = presetPair[0];
+      var setPresetRows = presetPair[1];
+      React.useEffect(function () {
+        var ctx = hostCtx;
+        var forms = configFormsOf(ctx);
+        if (!forms) return undefined;
+        var form = null;
+        try {
+          form = forms.get(CONFIG_NS);
+        } catch (error) {
+          return undefined;
+        }
+        if (!form || typeof form.subscribe !== 'function') return undefined;
+        var sync = function () {
+          var value = readConfigValue(ctx);
+          setPresetRows(value == null ? null : presetRowsOf(value));
+        };
+        sync();
+        return form.subscribe(sync);
+      }, []);
+
       // 投影值真正变化时（一次成功提交之后）回灌草稿；依赖是原始值，
       // 因此宿主每帧推新对象也不会把用户正在输入的内容冲掉。
       React.useEffect(function () {
@@ -616,7 +737,40 @@ window.__ModuleLoader__.load({
           + ' · ' + t('panel.status.archived', { count: archived })
         : t('panel.status.off');
 
+      // 当前会话生效的预设：投影折叠出 preset.id/label；没选过或全局默认 → 「全局预设」。
+      var presetId = view != null && typeof view.preset === 'object' && view.preset != null
+        ? String(view.preset.id || '')
+        : '';
+      var presetModified = view != null && typeof view.preset === 'object' && view.preset != null
+        ? view.preset.modified === true
+        : false;
+      var presetOptions = [{ id: '', name: t('preset.global') }].concat(presetRows || []);
+      var presetKnown = presetId === '' || presetOptions.some(function (row) { return row.id === presetId; });
+      if (presetId !== '' && !presetKnown) {
+        presetOptions.push({
+          id: presetId,
+          name: (view.preset && view.preset.label) || presetId
+        });
+      }
+
       var rows = [];
+
+      rows.push(h('div', { className: 'mcl-row', key: 'preset' },
+        h('span', { className: 'mcl-label' }, t('preset.label')),
+        h('select', {
+          className: 'mcl-select',
+          value: presetId,
+          disabled: busy || presetRows == null && presetId === '',
+          'aria-label': t('preset.label'),
+          title: presetRows == null ? t('preset.unavailable') : t('preset.label'),
+          onChange: function (event) {
+            var next = event.target.value;
+            run(next === '' ? '/memory-lab preset reset' : '/memory-lab preset ' + next);
+          }
+        }, presetOptions.map(function (row) {
+          var name = row.id === presetId && presetModified ? row.name + ' · ' + t('preset.modified') : row.name;
+          return h('option', { key: row.id, value: row.id }, name);
+        }))));
 
       rows.push(h('div', { className: 'mcl-row', key: 'enable' },
         h('span', { className: 'mcl-label' }, t('panel.enable')),
@@ -709,6 +863,327 @@ window.__ModuleLoader__.load({
     }
     //#endregion
 
+    //#region 插件设置页卡片（Settings → 插件 → 上下文降温）
+    var CARD_HINT_TEXT = '降温 = 把已完成的工具操作换成小回执，保住前缀缓存。全局默认作用于新会话；预设可按模型一键套用。';
+
+    function clampInt(value, min, max, fallback) {
+      var n = Math.round(Number(value));
+      if (!isFinite(n)) return fallback;
+      return Math.min(max, Math.max(min, n));
+    }
+
+    /** 把任意配置片段收敛成 5 字段设置值。 */
+    function settingsValueOf(entry) {
+      var source = entry && typeof entry === 'object' ? entry : {};
+      var inner = source.settings && typeof source.settings === 'object' ? source.settings : source;
+      return {
+        retainOperations: clampInt(inner.retainOperations, 0, 200, 5),
+        archiveBatchSize: clampInt(inner.archiveBatchSize, 1, 200, 5),
+        auto: inner.auto !== false,
+        autoRecall: inner.autoRecall !== false,
+        autoRestore: inner.autoRestore !== false
+      };
+    }
+
+    /** 把 Config 值收敛成卡片草稿：{ defaults, presets: [{id, name, settings}] }。 */
+    function draftFromValue(value) {
+      var source = value && typeof value === 'object' ? value : {};
+      var presets = Array.isArray(source.presets) ? source.presets : [];
+      return {
+        defaults: settingsValueOf(source.defaults),
+        presets: presets.map(function (entry, index) {
+          var safe = entry && typeof entry === 'object' ? entry : {};
+          return {
+            id: typeof safe.id === 'string' && safe.id ? safe.id : 'preset-' + (index + 1),
+            name: typeof safe.name === 'string' && safe.name ? safe.name : '预设 ' + (index + 1),
+            settings: settingsValueOf(safe)
+          };
+        })
+      };
+    }
+
+    function sameDraft(a, b) {
+      return JSON.stringify(a) === JSON.stringify(b);
+    }
+
+    function configSnapshotOf(form) {
+      try {
+        var snapshot = form.getSnapshot();
+        if (snapshot && typeof snapshot === 'object' && snapshot.value && typeof snapshot.value === 'object') {
+          return snapshot;
+        }
+      } catch (error) { /* 读取失败按未就绪处理 */ }
+      return null;
+    }
+
+    /** 数字输入：失焦/回车时把合法值写回草稿，非法时回落原值。 */
+    function numberInputNode(value, min, max, disabled, onCommit) {
+      var pair = React.useState(String(value));
+      var text = pair[0];
+      var setText = pair[1];
+      var commit = function () {
+        var n = Math.round(Number(text));
+        if (isFinite(n)) onCommit(clampInt(n, min, max, value));
+        else setText(String(value));
+      };
+      return h('input', {
+        className: 'mcl-input',
+        type: 'number',
+        min: min,
+        max: max,
+        step: 1,
+        disabled: disabled,
+        value: text,
+        onChange: function (e) { setText(e.target.value); },
+        onBlur: commit,
+        onKeyDown: function (e) { if (e.key === 'Enter') commit(); }
+      });
+    }
+
+    /** 开关：checkbox + 文案。 */
+    function checkNode(checked, label, disabled, onToggle) {
+      return h('label', { className: 'mcl-check' },
+        h('input', {
+          type: 'checkbox',
+          disabled: disabled,
+          checked: checked,
+          onChange: function (e) { onToggle(e.target.checked); }
+        }),
+        label);
+    }
+
+    /** 单个预设的编辑行（改名 + 五个字段 + 删除）。 */
+    function presetRowNode(row, index, total, disabled, onChange) {
+      var patch = function (partial) {
+        onChange(function (prev) {
+          var next = prev.slice();
+          next[index] = Object.assign({}, prev[index], partial);
+          return next;
+        });
+      };
+      var patchSettings = function (partial) {
+        patch({ settings: Object.assign({}, row.settings, partial) });
+      };
+      var remove = function () {
+        onChange(function (prev) {
+          var next = prev.slice();
+          next.splice(index, 1);
+          return next;
+        });
+      };
+      return h('div', { className: 'mcl-card-row', key: row.id + '#' + index },
+        h('input', {
+          className: 'mcl-name',
+          type: 'text',
+          value: row.name,
+          disabled: disabled,
+          title: '预设名称（可改名，会话内按名称或 id 引用）',
+          onChange: function (e) { patch({ name: e.target.value }); }
+        }),
+        numberInputNode(row.settings.retainOperations, 0, 200, disabled, function (v) {
+          patchSettings({ retainOperations: v });
+        }),
+        numberInputNode(row.settings.archiveBatchSize, 1, 200, disabled, function (v) {
+          patchSettings({ archiveBatchSize: v });
+        }),
+        checkNode(row.settings.auto, '自动', disabled, function (v) { patchSettings({ auto: v }); }),
+        checkNode(row.settings.autoRecall, '回注', disabled, function (v) { patchSettings({ autoRecall: v }); }),
+        checkNode(row.settings.autoRestore, '恢复', disabled, function (v) { patchSettings({ autoRestore: v }); }),
+        total > 1 ? h('button', {
+          className: 'mcl-button',
+          type: 'button',
+          'data-danger': 'true',
+          disabled: disabled,
+          onClick: remove
+        }, '删除') : null);
+    }
+
+    /**
+     * 设置页卡片：读写本插件 Config 命名空间（defaults + presets）。
+     * 数据面走 plugin-manager 注入的 form（settings 域 ConfigFormController），
+     * 只在 view === 'page' 且 form 可用时渲染编辑器，其余视图渲染一行摘要。
+     */
+    /**
+     * 归一化渲染器传入的 form 形态。
+     * - 原始控制器（dsh-client-ui-settings 的 ConfigFormController）：getSnapshot / subscribe / mutate。
+     * - v0.6.0 插件管理页薄面（dsh-client-ui-plugin-manager formFor）：{ state: <快照>, mutate }，
+     *   渲染器每次页面渲染重新求值快照，不提供 subscribe。
+     * 归一成 { getSnapshot, mutate, subscribe? }，没有的成员就不出现。
+     */
+    function normalizeFormFace(form) {
+      if (!form || typeof form !== 'object') return null;
+      if (typeof form.getSnapshot === 'function') return form;
+      if (form.state && typeof form.mutate === 'function') {
+        return {
+          getSnapshot: function () { return form.state; },
+          mutate: form.mutate
+        };
+      }
+      return null;
+    }
+
+    function MemorySettingsCard(props) {
+      var form = normalizeFormFace(props && props.form);
+      var view = props && props.view ? props.view : 'page';
+      if (view !== 'page' || !form) {
+        return h('div', { className: 'mcl-card' },
+          h(StyleTag, { key: 'style' }),
+          h('p', { className: 'mcl-card-hint' }, CARD_HINT_TEXT));
+      }
+
+      var snapshot = configSnapshotOf(form);
+      var revisionPair = React.useState(0);
+      var force = revisionPair[1];
+      var revision = snapshot ? snapshot.revision : null;
+
+      var draftPair = React.useState(null);
+      var draft = draftPair[0];
+      var setDraft = draftPair[1];
+
+      // 薄面 form（v0.6.0 插件管理页）没有 subscribe：保存成功后渲染器不一定立即
+      // 重算快照，这里保留一份「刚保存值」做乐观视图，等渲染器带来新快照后自动对齐。
+      var savedPair = React.useState(null);
+      var saved = savedPair[0];
+      var setSaved = savedPair[1];
+
+      var errorPair = React.useState('');
+      var error = errorPair[0];
+      var setError = errorPair[1];
+
+      var busyPair = React.useState(false);
+      var busy = busyPair[0];
+      var setBusy = busyPair[1];
+
+      React.useEffect(function () {
+        if (revision === null) return undefined;
+        setDraft(null); // 草稿失效（外部保存/他端修改）→ 回到服务端值
+        return undefined;
+      }, [revision]);
+
+      React.useEffect(function () {
+        if (typeof form.subscribe !== 'function') return undefined;
+        return form.subscribe(function () { force(function (n) { return n + 1; }); });
+      }, []);
+
+      if (!snapshot) {
+        return h('div', { className: 'mcl-card' },
+          h(StyleTag, { key: 'style' }),
+          h('p', { className: 'mcl-card-hint' }, '配置加载中…（宿主尚未服务本插件的设置命名空间）'));
+      }
+
+      var server = draftFromValue(snapshot.value);
+      // 服务端快照一旦离开「刚保存值」（渲染器重算后的外部变更），放回服务端视图
+      if (saved && server && !sameDraft(server, saved)) {
+        setSaved(null);
+      }
+      var current = draft || saved || server;
+      var dirty = !sameDraft(current, saved || server);
+
+      var save = function () {
+        if (!dirty || busy) return;
+        var ops = [];
+        if (!sameDraft(current.defaults, server.defaults)) {
+          ops.push({ op: 'set', path: ['defaults'], value: current.defaults });
+        }
+        if (!sameDraft(current.presets, server.presets)) {
+          ops.push({ op: 'set', path: ['presets'], value: current.presets });
+        }
+        if (ops.length === 0) return;
+        setBusy(true);
+        setError('');
+        Promise.resolve(form.mutate(ops)).then(function () {
+          setBusy(false);
+          setSaved(current); // 乐观视图：渲染器重算快照前先显示刚提交的值
+          setDraft(null);
+        }, function (e) {
+          setBusy(false);
+          setError(e && e.message ? e.message : String(e));
+        });
+      };
+
+      var discard = function () { setDraft(null); setError(''); };
+
+      var wrapSet = function (updater) {
+        setDraft(function (prev) {
+          var base = prev || server;
+          var next = typeof updater === 'function' ? updater(base) : updater;
+          return next;
+        });
+      };
+
+      return h('div', { className: 'mcl-card' },
+        h(StyleTag, { key: 'style' }),
+        h('p', { className: 'mcl-card-hint' }, CARD_HINT_TEXT),
+        h('div', { className: 'mcl-card-block' },
+          h('p', { className: 'mcl-card-title' }, '全局默认设置'),
+          h('div', { className: 'mcl-card-row' },
+            h('span', { className: 'mcl-card-hint' }, '保留最近操作'),
+            numberInputNode(current.defaults.retainOperations, 0, 200, busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { retainOperations: v }) });
+              });
+            }),
+            h('span', { className: 'mcl-card-hint' }, '归档批量'),
+            numberInputNode(current.defaults.archiveBatchSize, 1, 200, busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { archiveBatchSize: v }) });
+              });
+            }),
+            checkNode(current.defaults.auto, '自动降温', busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { auto: v }) });
+              });
+            }),
+            checkNode(current.defaults.autoRecall, '命中回注', busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { autoRecall: v }) });
+              });
+            }),
+            checkNode(current.defaults.autoRestore, '自动恢复', busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { autoRestore: v }) });
+              });
+            })),
+          h('p', { className: 'mcl-card-hint' }, '新会话开启降温时未选预设即用此默认值（= 弹层里的「全局预设」）。')),
+        h('div', { className: 'mcl-card-block' },
+          h('div', { className: 'mcl-card-row' },
+            h('p', { className: 'mcl-card-title' }, '预设'),
+            h('button', {
+              className: 'mcl-button',
+              type: 'button',
+              disabled: busy,
+              onClick: function () {
+                wrapSet(function (prev) {
+                  var next = prev.presets.slice();
+                  next.push({
+                    id: 'preset-' + Date.now().toString(36),
+                    name: '新预设 ' + (next.length + 1),
+                    settings: Object.assign({}, prev.defaults)
+                  });
+                  return Object.assign({}, prev, { presets: next });
+                });
+              }
+            }, '新增预设')),
+          current.presets.length === 0
+            ? h('p', { className: 'mcl-card-empty' }, '还没有预设；新增后可在会话弹层里一键切换。')
+            : current.presets.map(function (row, index) {
+              return presetRowNode(row, index, current.presets.length, busy, function (updater) {
+                wrapSet(function (prev) {
+                  return Object.assign({}, prev, { presets: updater(prev.presets) });
+                });
+              });
+            }),
+          h('p', { className: 'mcl-card-hint' }, '每行：名称 · 保留 · 批量 · 自动 · 回注 · 恢复')),
+        dirty || error || busy
+          ? h('div', { className: 'mcl-card-row' },
+            h('button', { className: 'mcl-button', type: 'button', disabled: busy, onClick: save }, '保存更改'),
+            dirty && !busy ? h('button', { className: 'mcl-button', type: 'button', onClick: discard }, '放弃更改') : null,
+            dirty ? h('span', { className: 'mcl-card-hint' }, '保存立即生效（已启用会话的设置继续从会话日志折叠）') : null)
+          : null,
+        error ? h('p', { className: 'mcl-error', role: 'alert' }, error) : null);
+    }
+    //#endregion
+
     //#region 注册
     /**
      * 座位注入面：`run(line)` 走宿主 `ctx.remote.commands.execute`。
@@ -765,13 +1240,34 @@ window.__ModuleLoader__.load({
           }
         };
       }, 'dsh-memory-context-lab: slots');
+
+      // 3) 插件设置页卡片：仅在宿主设置域服务本插件命名空间（存在 Config schema）
+      //    时挂到插件管理页的 plugins.row.config 座位。DSH 桌面 0.2.0-rc.2 / 插件运行时
+      //    v0.6.0 核验：插件列表页每个组件行按 `<包名>#<组件 id>` 生成 key，名字可点、
+      //    详情页设置区都由该座位驱动（renderer 传 { view: 'page', form }）。
+      //    settings.plugins.tab（设置 → 插件 tab 条）在 v0.6.0 客户端不渲染第三方条目，
+      //    不能作座位（2026-10-11 运行时 slot 树核验：注册后 children 仍为空）。
+      //    configForms 缺失时整块跳过。
+      var configForms = configFormsOf(ctx);
+      if (configForms && typeof configForms.whileServed === 'function') {
+        ctx.effect(function () {
+          return configForms.whileServed([CONFIG_NS], function () {
+            return ctx.slots.inject('plugins.row.config', function () {
+              return ctx.slots.register({
+                name: 'plugins.row.config',
+                key: SETTINGS_CARD_KEY
+              }, MemorySettingsCard);
+            });
+          });
+        }, 'dsh-memory-context-lab: settings card');
+      }
     }
     //#endregion
 
     exports.apply = apply;
     // `remote`/`remote.commands` 是宿主 Web 外壳的常驻服务（ui-plan 徽章同样声明它们），
     // 声明后激活顺序正确；组件仍在调用期解析，缺通道时显示一行可读错误而不是整块消失。
-    exports.inject = ['slots', 'locale', 'remote', 'remote.commands'];
+    exports.inject = ['slots', 'locale', 'remote', 'remote.commands', 'configForms'];
     return module.exports;
   }
 });

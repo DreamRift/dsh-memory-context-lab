@@ -1,6 +1,7 @@
 {
   "name": "dsh-memory-context-lab",
-  "version": "0.5.0",
+  "version": "0.6.0",
+  "private": true,
   "description": "按会话启用的上下文降温：把已执行完的操作沉入隔离冷库，保持前缀缓存命中",
   "type": "module",
   "main": "src/index.mjs",
@@ -25,15 +26,22 @@
         "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
   },
   "peerDependencies": {
-    "@furongjun1999/dsh-memory": "0.8.1"
+    "@furongjun1999/dsh-memory": "0.8.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "scripts": {
-    "test": "node test/core.test.mjs && node test/cooling.test.mjs && node test/session.test.mjs && node test/client.test.mjs && node test/install.test.mjs"
+    "test": "node test/core.test.mjs && node test/config-contract.test.mjs && node test/cooling.test.mjs && node test/session.test.mjs && node test/client.test.mjs && node test/install.test.mjs"
   },
   "engines": {
     "node": ">=22.19"

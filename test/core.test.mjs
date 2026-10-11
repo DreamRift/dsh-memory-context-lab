@@ -254,16 +254,65 @@ test('the projection folds settings from command/run records', () => {
   let state = initProjectionState()
   const run = (args) => { state = applyEvent(state, { type: 'command/run', seq: state.revision + 100, data: { name: 'memory-lab', args } }) }
   run('on')
-  run('set batch 5')
+  run('set batch 8')
   run('set retain 3')
   run('set auto off')
   const view = viewOf(state)
   assert.equal(view.enabled, true)
-  assert.equal(view.archiveBatchSize, 5)
+  assert.equal(view.archiveBatchSize, 8)
   assert.equal(view.retainOperations, 3)
   assert.equal(view.auto, false)
   assert.equal(view.autoRecall, true)
-  assert.ok(view.revision >= 4)
+  assert.equal(view.revision, 4)
+  assert.equal(view.preset.id, '')
+  assert.equal(view.preset.label, '全局预设')
+  assert.equal(view.preset.modified, false)
+})
+
+test('the projection folds preset commands and flags manual adjustments', () => {
+  const presets = [
+    { id: 'eco', name: 'GLM 5.3 Flash 省流', settings: { retainOperations: 5, archiveBatchSize: 3, auto: true, autoRecall: true, autoRestore: true } },
+    { id: 'ds', name: 'DeepSeek V4.1 Flash 省流', settings: { retainOperations: 5, archiveBatchSize: 16, auto: true, autoRecall: true, autoRestore: true } },
+  ]
+  const context = { presets, defaults: { retainOperations: 5, archiveBatchSize: 5, auto: true, autoRecall: true, autoRestore: true } }
+  let state = initProjectionState()
+  const run = (args) => { state = applyEvent(state, { type: 'command/run', seq: state.revision + 200, data: { name: 'memory-lab', args } }, context) }
+
+  // id 与名称都能命中；折叠进设置字段并记录基线。
+  run('preset ds')
+  assert.equal(state.presetId, 'ds')
+  assert.equal(state.presetLabel, 'DeepSeek V4.1 Flash 省流')
+  assert.equal(state.archiveBatchSize, 16)
+  run('preset eco')
+  assert.equal(state.presetId, 'eco')
+  assert.equal(state.archiveBatchSize, 3)
+
+  // 预设之后的手动 set 不清除选择，但标记「已调整」。
+  run('set retain 8')
+  let view = viewOf(state)
+  assert.equal(view.preset.id, 'eco')
+  assert.equal(view.preset.modified, true)
+  assert.equal(view.retainOperations, 8)
+
+  // 回到全局预设：恢复 defaults 并清空选择。
+  run('preset reset')
+  view = viewOf(state)
+  assert.equal(view.preset.id, '')
+  assert.equal(view.preset.label, '全局预设')
+  assert.equal(view.preset.modified, false)
+  assert.equal(view.retainOperations, 5)
+  assert.equal(view.archiveBatchSize, 5)
+
+  // 不存在的预设不改变状态。
+  const before = { ...state }
+  assert.equal(applyEvent(state, { type: 'command/run', seq: 999, data: { name: 'memory-lab', args: 'preset nope' } }, context), state)
+  assert.deepEqual(state, before)
+
+  // 无 context 时回退内置预设，仍可折叠。
+  state = initProjectionState()
+  state = applyEvent(state, { type: 'command/run', seq: 1, data: { name: 'memory-lab', args: 'preset glm-5.3-flash-eco' } })
+  assert.equal(state.presetId, 'glm-5.3-flash-eco')
+  assert.equal(state.archiveBatchSize, 3)
 })
 
 test('the projection ignores other commands and log-only events', () => {
@@ -319,6 +368,13 @@ test('the projection view is plain JSON with no undefined values', () => {
   const view = viewOf(initProjectionState())
   for (const [key, value] of Object.entries(view)) {
     assert.notEqual(value, undefined, `${key} must not be undefined`)
+    if (key === 'preset') {
+      for (const [inner, innerValue] of Object.entries(value)) {
+        assert.notEqual(innerValue, undefined, `preset.${inner} must not be undefined`)
+        assert.ok(['boolean', 'number', 'string'].includes(typeof innerValue), `preset.${inner} must be a primitive`)
+      }
+      continue
+    }
     assert.ok(['boolean', 'number', 'string'].includes(typeof value) || value === null, `${key} must be a primitive`)
   }
   assert.deepEqual(JSON.parse(JSON.stringify(view)), view)

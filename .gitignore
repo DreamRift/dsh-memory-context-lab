@@ -6,3 +6,4 @@ build/
 coverage/
 .env
 .env.*
+.npm-cache/

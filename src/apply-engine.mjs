@@ -25,6 +25,7 @@ import {
   summarizeOutcomes,
 } from './apply.mjs'
 import {
+  MAX_BATCH_RELEASE_TOKENS,
   MAX_OPERATIONS_PER_BATCH,
   MIN_NET_RELEASE_TOKENS,
   MIN_OPERATION_CHARS,
@@ -184,6 +185,15 @@ export function createEngine(dependencies) {
    */
   function surfaceViewOf(record, measuredNodes, settings) {
     const session = record.agent.session
+    // Surface seq of the newest assistant message (C-12): the model is still
+    // producing this turn and may send evidence at any time, so operations at
+    // or after this seq are fenced out of every candidate set.
+    let lastAssistantSeq = null
+    for (const node of session.surface.nodes) {
+      if (node?.type === 'assistant/message' && Number.isInteger(node.seq)) {
+        lastAssistantSeq = Math.max(lastAssistantSeq ?? -1, node.seq)
+      }
+    }
     return collectOperationCandidates({
       surfaceNodes: [...session.surface.nodes],
       eventAt: (seq) => session.eventAt(seq),
@@ -192,6 +202,7 @@ export function createEngine(dependencies) {
       openTurn: openTurnOf(session),
       archivedRanges: pendingReceipts(record).map((row) => ({ start: row.rangeStart, end: row.rangeEnd })),
       minimumChars: MIN_OPERATION_CHARS,
+      lastAssistantSeq,
     })
   }
 
@@ -214,6 +225,9 @@ export function createEngine(dependencies) {
     const plan = planCooling({
       candidates: view.candidates,
       meter,
+      // C-12 double fence: even callers handing stale candidates cannot plan
+      // the model's current turn away.
+      archiveFromSeq: view.lastAssistantSeq,
       nodeIdFor: (candidate) => {
         const rangeStart = candidate.rangeStart
         const existing = nodeClaimOf(record, rangeStart)
@@ -232,6 +246,9 @@ export function createEngine(dependencies) {
       batchSize: settings.archiveBatchSize,
       maxOperations: MAX_OPERATIONS_PER_BATCH,
       minNetReleaseTokens: MIN_NET_RELEASE_TOKENS,
+      // C-12/C-07 sizing: one batch cannot release more than this many
+      // estimated tokens; the rest waits for the next measure.
+      maxReleaseTokens: MAX_BATCH_RELEASE_TOKENS,
     })
     // A dry-run must leave no claims behind: it writes nothing and its idea of
     // "the plan" is disposable. A committed measure keeps them so the batch (and
@@ -254,7 +271,7 @@ export function createEngine(dependencies) {
   /** Commit one batch. Each unit is independently durable. */
   async function runBatch(record, occupancy, signal) {
     const units = occupancy.plan.units
-    if (!units.length) return { outcomes: [], releasedTokens: 0, applied: 0, failed: [] }
+    if (!units.length) return { outcomes: [], releasedTokens: 0, applied: 0, failed: [], releaseCapped: occupancy.plan.releaseCapped === true }
     const client = await ensureClient(record)
     const outcomes = await applyOperations({
       session: record.agent.session,
@@ -332,7 +349,14 @@ export function createEngine(dependencies) {
         record.occupancyError = error instanceof Error ? error.message : String(error)
       }
     }
-    return { outcomes, releasedTokens, applied, failed }
+    return {
+      outcomes,
+      releasedTokens,
+      applied,
+      failed,
+      // Surfaced so the batch report can explain a short batch (C-08).
+      releaseCapped: occupancy.plan.releaseCapped === true,
+    }
   }
 
   /** Lazily open the isolated cold store for one session. */
@@ -520,6 +544,15 @@ export function createEngine(dependencies) {
       lines.push('占用率：尚未测量（下一次请求前的稳定边界会自动测量）。', formatCacheLine(cacheStatsOf(lastUsageOf(record.agent.session))))
       const stored = record.state.lastMeasurement
       if (stored) lines.push(formatStoredMeasurement(stored))
+    }
+    // C-01/C-08 visibility: the receipt-view probe result is decided once at
+    // enablement and every recall depends on it, so surface it instead of
+    // letting an unsupported store degrade recall into an empty digest.
+    if (record.client?.receiptView) {
+      const probe = record.client.receiptView
+      if (probe.supported === true) lines.push('冷库读取：receipt 视图可用（回执可召回）。')
+      else if (probe.supported === false) lines.push(`冷库读取：receipt 视图不受支持——回注将失败而不是回退正式灵枢（${probe.reason ?? 'store 拒绝 view 参数'}）。`)
+      else lines.push('冷库读取：receipt 视图未确认（探测暂不可达）；召回仍会携带 view 参数，被拒时按失败处理。')
     }
     const lastAction = record.state.lastAction ?? record.lastAction
     if (lastAction) lines.push(`最近一次：${lastAction}`)

@@ -53,6 +53,7 @@ export const SKIP_REASONS = Object.freeze({
   'too-large': '正文超出可回读校验的上限（写入后无法整体回读）',
   'protected-system-head': 'system 指令节点',
   'protected-latest-user': '最新用户消息',
+  'not-yet-exposed': '属于模型尚未发送完证据的当前轮次',
   'below-min-release': '净释放低于最小阈值',
 })
 
@@ -210,6 +211,10 @@ export function collectOperationCandidates(view) {
     openTurn,
     archivedRanges = [],
     minimumChars = MIN_OPERATION_CHARS,
+    // Surface seq of the newest assistant message. Everything from here on is
+    // still part of the turn the model is living in right now: it may send new
+    // evidence at any time, so these nodes are never batched away (C-12).
+    lastAssistantSeq = null,
   } = view
   const total = surfaceNodes.length
   const nodeAt = (index) => eventAt(surfaceNodes[index])
@@ -223,7 +228,11 @@ export function collectOperationCandidates(view) {
   if (total > 0 && nodeAt(0)?.type === 'system/message') protect(0, 'protected-system-head')
 
   // The user's own request is never archived: it is the task statement, and a
-  // receipt in its place would leave the model without the question.
+  // receipt in its place would leave the model without the question. The
+  // newest user message is protected explicitly, and everything after the last
+  // assistant message is fenced by `not-yet-exposed` below (C-12) — so an
+  // older user message may only be consumed together with the whole turn that
+  // already answered it, never alone and never while the turn is open.
   const latestUserIndex = (() => {
     for (let index = total - 1; index >= 0; index -= 1) {
       if (nodeAt(index)?.type === 'user/message') return index
@@ -266,6 +275,13 @@ export function collectOperationCandidates(view) {
     if (protectedIdx.has(index)) continue
     if (archivedStarts.has(seq)) {
       skip.set(seq, 'already-archived')
+      continue
+    }
+    // The open turn's own operations stay visible: the model is producing them
+    // and may still send evidence (C-12). archiveNow re-selects this range on
+    // the next turn's first ask, when the evidence has actually been sent.
+    if (lastAssistantSeq !== null && seq >= lastAssistantSeq) {
+      skip.set(seq, 'not-yet-exposed')
       continue
     }
     // Reasoning is archivable: it is this node's own text, and in a thinking-heavy
@@ -399,7 +415,7 @@ export function collectOperationCandidates(view) {
   const skipped = [...skip.entries()]
     .map(([seq, reason]) => ({ seq, reason, description: describeSkip(reason) }))
     .sort((a, b) => a.seq - b.seq)
-  return { candidates, skipped }
+  return { candidates, skipped, lastAssistantSeq }
 }
 
 /**
@@ -429,12 +445,23 @@ export function planCooling({
   batchSize = 1,
   maxOperations = 64,
   minNetReleaseTokens = 128,
+  // C-12 fence, enforced here too in case a caller hands in stale candidates:
+  // operations at or after this surface seq belong to the model's current turn.
+  archiveFromSeq = null,
+  // One-batch release ceiling in estimated tokens: a burst of huge operations
+  // must not empty the whole backlog in a single step (C-07 sizing).
+  maxReleaseTokens = Number.POSITIVE_INFINITY,
 }) {
   const units = []
   const rejected = []
   let plannedReleaseTokens = 0
+  let releaseCapped = false
 
   function admit(candidate) {
+    if (archiveFromSeq !== null && candidate.rangeStart >= archiveFromSeq) {
+      rejected.push({ rangeStart: candidate.rangeStart, reason: 'not-yet-exposed', description: describeSkip('not-yet-exposed') })
+      return false
+    }
     if (units.length >= maxOperations) return false
     const nodeId = nodeIdFor(candidate)
     const hash = archiveMac(candidate.body)
@@ -457,6 +484,15 @@ export function planCooling({
       rejected.push({ rangeStart: candidate.rangeStart, reason: 'below-min-release', description: describeSkip('below-min-release') })
       return false
     }
+    if (plannedReleaseTokens > 0 && plannedReleaseTokens + netReleaseTokens > maxReleaseTokens) {
+      // Soft ceiling (C-07/C-12): once the batch holds work, stop before
+      // exceeding it; the rest waits for the next batch. A batch's first
+      // candidate is always admitted — hard-rejecting a lone oversized
+      // operation would livelock it as an eternal candidate instead of
+      // archiving and parking it.
+      releaseCapped = true
+      return false
+    }
     units.push({ ...candidate, nodeId, hash, receipt, receiptTokens, netReleaseTokens })
     plannedReleaseTokens += netReleaseTokens
     return true
@@ -476,6 +512,7 @@ export function planCooling({
       // the remainder simply stays candidates for the next measure.
       if (baselineUnits >= threshold) break
       if (units.length >= maxOperations) break
+      if (releaseCapped) break
       if (admit(candidate)) baselineUnits += 1
     }
   }
@@ -485,6 +522,8 @@ export function planCooling({
     units,
     rejected,
     plannedReleaseTokens,
+    /** True when the released-token ceiling stopped this batch early (C-07/C-12). */
+    releaseCapped,
     archivedFromRetained,
     archivedFromOpenTurn: units.filter((unit) => unit.inOpenTurn).length,
     baselineRetention: retainOperations,
@@ -861,6 +900,16 @@ export function occupancyLines(occupancy) {
       lines.push(`其中 ${plan.archivedFromOpenTurn} 个属于当前尚未结束的回合。`)
     }
   }
+  if (plan.releaseCapped) {
+    lines.push(`本批释放达到单批上限，其余候选留到下一批（防止证据一次性大面积退出上下文）。`)
+  }
+  // C-08: when nothing is archivable the report must say why, not just "0".
+  if (!view.candidates.length && view.skipped.length) {
+    const tally = new Map()
+    for (const entry of view.skipped) tally.set(entry.description ?? entry.reason, (tally.get(entry.description ?? entry.reason) ?? 0) + 1)
+    const parts = [...tally.entries()].map(([label, count]) => `${label} ${count} 条`)
+    lines.push(`暂无候选：${parts.join('；')}。新证据发送完、离开保留窗口后自动进入下一批。`)
+  }
   lines.push(`已归档操作：${archivedCount} 个`)
   return lines
 }
@@ -873,6 +922,7 @@ export function formatBatchReport(result) {
     lines.push(`- seq ${outcome.rangeStart}–${outcome.rangeEnd} / ${outcome.tools.join('、')}：${label}${outcome.reason ? ` — ${outcome.reason}` : ''}`)
   }
   if (result.failed.length) lines.push('失败或跳过的单元保留了原文；已归档单元的回执仍然有效。')
+  if (result.releaseCapped) lines.push('本批释放达到单批上限，其余候选留到下一批。')
   return lines.join('\n')
 }
 

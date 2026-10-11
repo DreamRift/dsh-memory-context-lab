@@ -1,25 +1,34 @@
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import {
   archiveNodeId,
   BOOLEAN_SETTINGS,
+  BUILTIN_PRESETS,
   COMMAND_NAME,
   DEFAULT_SETTINGS,
   escapePromptBraces,
   foldCommandIntoState,
+  formatPresetValue,
   formatRatio,
+  GLOBAL_PRESET_LABEL,
   initialProjectionState,
   MAX_RECALL_QUERY_CHARS,
+  normalizePresets,
   normalizeSettings,
   NUMERIC_SETTINGS,
   parseNumericSetting,
   parseOperation,
+  PRESET_RESET_WORDS,
   renderRecallBlock,
+  resolvePreset,
   SettingsError,
 } from './core.mjs'
 import { cleanDecision, recallQueryFrom } from './apply.mjs'
 import { createEngine } from './apply-engine.mjs'
-import { memoryContextLabProjection } from './projection.mjs'
+import { createMemoryContextLabProjection } from './projection.mjs'
 import { TemporaryLingshuClient } from './lingshu-lab-client.mjs'
 import {
   globalSuppressionCoordinator,
@@ -30,6 +39,7 @@ import {
   labRootFor,
   readSessionState,
   removeSessionDirectory,
+  SessionStateDamagedError,
   writeSessionState,
 } from './storage.mjs'
 
@@ -37,6 +47,129 @@ export const name = 'memory-context-lab'
 export const inject = ['commands', 'sessionProjections']
 
 const requireFromPlugin = createRequire(import.meta.url)
+
+/**
+ * Load the vendored schemastery fork for the settings-page schema.
+ *
+ * The copy lives in this plugin's `node_modules` (same pattern the web-search
+ * pool plugin uses). Under the installed profile junction the bare specifier
+ * cannot be resolved — Node walks `.dsh/profiles/desktop/node_modules` upward,
+ * which has no `@deepseek-ai` — so also try the realpath of this module (the
+ * junction target's own `node_modules`). When it cannot be loaded the plugin
+ * still works: `Config` stays undefined, the loader does not serve a settings
+ * namespace, and only the global-defaults / preset editor is absent — commands
+ * keep running.
+ */
+function loadSchemastery() {
+  const candidates = []
+  try {
+    candidates.push(requireFromPlugin('@deepseek-ai/schemastery'))
+  } catch {}
+  try {
+    candidates.push(requireFromPlugin(realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'node_modules', '@deepseek-ai', 'schemastery'))))
+  } catch {}
+  for (const candidate of candidates) {
+    try {
+      const mod = candidate?.default?.object ? candidate.default : candidate
+      if (typeof mod?.object === 'function') return mod
+    } catch {}
+  }
+  return null
+}
+
+/**
+ * Load the vendored cosmokit fork for the shared volatile-reference protocol.
+ *
+ * Mirrors `loadSchemastery()`: tries the bare specifier first, then the
+ * realpath of this module's vendored copy. The loaded copy only needs to
+ * recognise the shared protocol symbol (`Symbol.for`), so a version skew with
+ * the host's own cosmokit is harmless — the protocol is defined cross-copy.
+ */
+function loadCosmokit() {
+  const candidates = []
+  try {
+    candidates.push(requireFromPlugin('@deepseek-ai/cosmokit'))
+  } catch {}
+  try {
+    candidates.push(requireFromPlugin(realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'node_modules', '@deepseek-ai', 'cosmokit'))))
+  } catch {}
+  for (const candidate of candidates) {
+    try {
+      const mod = candidate?.default?.isVolatile ? candidate.default : candidate
+      if (typeof mod?.isVolatile === 'function' && typeof mod?.createVolatile === 'function') return mod
+    } catch {}
+  }
+  return null
+}
+
+const SCHEMAS = loadSchemastery()
+const KIT = loadCosmokit()
+
+/**
+ * Normalize a config field value the host may hand over as a volatile
+ * reference (a frozen `{ get(), [Symbol.for("cosmokit.volatile.write")] }`).
+ * Hosts wrap volatile schema fields this way on startup, so every read of
+ * such a field goes through this helper; plain values pass through.
+ */
+function unwrapVolatile(value) {
+  return KIT?.isVolatile(value) ? value.get() : value
+}
+
+/** Wrap fresh rows in the shared volatile protocol when cosmokit is present. */
+function asVolatile(value) {
+  return KIT ? KIT.createVolatile(value) : value
+}
+
+/** One flattened preset row as stored in the plugin config and edited on the settings page. */
+function presetToConfigRow(preset) {
+  return Object.freeze({
+    id: preset.id,
+    name: preset.name,
+    retainOperations: preset.settings.retainOperations,
+    archiveBatchSize: preset.settings.archiveBatchSize,
+    auto: preset.settings.auto,
+    autoRecall: preset.settings.autoRecall,
+    autoRestore: preset.settings.autoRestore,
+  })
+}
+
+/** The plugin-shipped presets double as the schema default for fresh installs. */
+const SHIPPED_PRESET_ROWS = BUILTIN_PRESETS.map(presetToConfigRow)
+
+function buildConfigSchema() {
+  if (!SCHEMAS) return undefined
+  const settingFields = {
+    retainOperations: SCHEMAS.natural().max(200).default(5)
+      .i18n({ 'zh-CN': '保留最近操作数', en: 'Retained recent operations' }),
+    archiveBatchSize: SCHEMAS.natural().max(200).default(5)
+      .i18n({ 'zh-CN': '归档批量阈值', en: 'Archive batch size' }),
+    auto: SCHEMAS.boolean().default(true)
+      .i18n({ 'zh-CN': '自动降温', en: 'Auto cooling' }),
+    autoRecall: SCHEMAS.boolean().default(true)
+      .i18n({ 'zh-CN': '命中回注', en: 'Recall on hit' }),
+    autoRestore: SCHEMAS.boolean().default(true)
+      .i18n({ 'zh-CN': '停用时恢复原文', en: 'Restore originals on disable' }),
+  }
+  return SCHEMAS.object({
+    defaults: SCHEMAS.object(settingFields)
+      // Volatile fields never leave the root config object; the host stores a
+      // detached reference instead of inlining rows, so preset rows are not
+      // frozen into the persisted defaults when one session mutates them.
+      .volatile()
+      .i18n({ 'zh-CN': '全局默认设置', en: 'Global defaults' }),
+    presets: SCHEMAS.array(
+      SCHEMAS.object({
+        id: SCHEMAS.string().required().i18n({ 'zh-CN': '稳定标识', en: 'Stable id' }),
+        name: SCHEMAS.string().required().i18n({ 'zh-CN': '预设名称', en: 'Preset name' }),
+        ...settingFields,
+      }),
+    ).default(SHIPPED_PRESET_ROWS)
+      .volatile()
+      .i18n({ 'zh-CN': '预设（可新增、改名、编辑；切换在对话框的「降温」面板里）', en: 'Presets (add, rename, edit; switch them in the cooling panel)' }),
+  })
+}
+
+export const Config = buildConfigSchema()
 
 /**
  * Probe the running host's own package version instead of assuming one.
@@ -66,6 +199,8 @@ const HELP = [
   '/memory-lab set auto on|off     自动降温开关（默认开）。',
   '/memory-lab set recall on|off   命中回注开关（默认开）。',
   '/memory-lab set autorestore on|off  停用时是否恢复原文并清数据（默认开）。',
+  '/memory-lab preset              查看全局预设与可用预设列表。',
+  '/memory-lab preset <名称>|reset 应用整组预设；reset 回到全局预设。新增/改名/编辑在设置页。',
   '/memory-lab now                 立即测量并按当前规则归档一批。',
   '/memory-lab dry-run             只做估算与候选选择，零副作用。',
   '/memory-lab restore             把与回执一致且活动面稳定的操作恢复为原文。',
@@ -124,7 +259,7 @@ function sessionIdOf(session) {
  *   caller must then keep the durable settings, since folding an empty log would
  *   silently reset a stored configuration back to the defaults.
  */
-function settingsFromSessionLog(session) {
+function settingsFromSessionLog(session, context = null) {
   let events
   try {
     // `snapshotEvents()` covers inherited (resumed/forked) records too, which is
@@ -144,16 +279,54 @@ function settingsFromSessionLog(session) {
     const data = event.data ?? {}
     if (data.name !== COMMAND_NAME) continue
     seen += 1
-    foldCommandIntoState(state, typeof data.args === 'string' ? data.args : '')
+    foldCommandIntoState(state, typeof data.args === 'string' ? data.args : '', context)
   }
   return seen > 0 ? normalizeSettings(state) : null
 }
 
-export async function apply(ctx) {
+export async function apply(ctx, config) {
   const labRoot = labRootFor()
   const records = new Map()
   const absent = new Set()
+  /** C-11: sessions whose durable state exists but cannot be trusted. */
+  const damagedSessions = new Map()
+  /**
+   * Damage notice for a session whose state file exists but is unreadable
+   * (C-11). Returns null when the session is not damaged. The notice never
+   * says "never enabled" and never purges anything; only the explicit
+   * `clean confirm delete-session` may drop the cold store.
+   */
+  function damagedNotice(sessionId) {
+    const damaged = damagedSessions.get(sessionId)
+    if (!damaged) return null
+    return {
+      kind: 'error',
+      text: `本会话的降温状态文件损坏（${damaged.reason}）。`
+        + '插件已停止干预：不会归档、恢复或清理该会话，冷库数据原样保留。'
+        + '确认放弃原文后可删除冷库：/memory-lab clean confirm delete-session。',
+    }
+  }
   const activeOperations = new Set()
+
+  /**
+   * Global defaults from the plugin config (settings page), with the same
+   * clamping `normalizeSettings` applies everywhere else. Volatile fields may
+   * arrive as detached references the host stored outside the root config.
+   */
+  function resolveDefaultsSettings() {
+    return normalizeSettings(unwrapVolatile(config?.defaults) ?? DEFAULT_SETTINGS)
+  }
+
+  /**
+   * User-managed presets from the plugin config. Shipped presets are only the
+   * schema default for fresh installs; once the user edits the list the saved
+   * value (even an empty one) wins.
+   */
+  function resolveGlobalPresets() {
+    return normalizePresets(unwrapVolatile(config?.presets) ?? BUILTIN_PRESETS)
+  }
+
+  const buildFoldContext = () => ({ presets: resolveGlobalPresets(), defaults: resolveDefaultsSettings() })
 
   let dependencies
   try {
@@ -238,10 +411,25 @@ export async function apply(ctx) {
       return existing
     }
     if (absent.has(sessionId)) return null
+    // C-11: a session whose state file is damaged is remembered as damaged —
+    // never folded into `absent`. Status surfaces the damage; automatic hooks
+    // skip the session (no archive, no restore, no clean-up) until a command
+    // resolves the damage explicitly.
+    const damaged = damagedSessions.get(sessionId)
+    if (damaged) return null
     let found
     try {
       found = await readSessionState(labRoot, sessionId)
     } catch (error) {
+      if (error instanceof SessionStateDamagedError) {
+        damagedSessions.set(sessionId, {
+          reason: error.reason,
+          directory: error.directory,
+          at: new Date().toISOString(),
+        })
+        ctx.logger.warn(`memory-context-lab: session state damaged (${sessionId}): ${error.reason}`)
+        return null
+      }
       ctx.logger.warn(`memory-context-lab: cannot read session state: ${error instanceof Error ? error.message : String(error)}`)
       absent.add(sessionId)
       return null
@@ -254,7 +442,7 @@ export async function apply(ctx) {
     // records, so adopting anything else would let the displayed target differ
     // from the one the engine actually enforces. Applied before the record is
     // built so the record cannot capture the stale file values.
-    const folded = settingsFromSessionLog(agent?.session)
+    const folded = settingsFromSessionLog(agent?.session, buildFoldContext())
     if (folded) found.state.settings = folded
     const record = makeRecord({ agent, sessionId, directory: found.directory, state: found.state })
     records.set(sessionId, record)
@@ -274,6 +462,22 @@ export async function apply(ctx) {
     const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : null
     if (!agent) return null
     return adopt(agent)
+  }
+
+  /**
+   * C-11: after an adopt that came back null, distinguish a genuinely absent
+   * session from one whose durable state is damaged. Returns an error payload
+   * when the session is damaged, null when it is simply not enabled.
+   */
+  function damagedNotice(sessionId) {
+    const damaged = damagedSessions.get(sessionId)
+    if (!damaged) return null
+    return {
+      kind: 'error',
+      text: `会话状态文件损坏，降温已停止干预本会话（${damaged.reason}）。`
+        + '冷库数据保留，未做任何恢复或清理。'
+        + '要丢弃冷库（原文将无法恢复）：/memory-lab clean confirm delete-session。',
+    }
   }
 
   async function disposeRecord(record) {
@@ -377,8 +581,13 @@ export async function apply(ctx) {
 
   // ── Session projection ───────────────────────────────────────────────────
   // Settings and receipt counts are folded from the session log itself; see
-  // `projection.mjs` for why that is what makes resume and fork correct.
-  const projection = memoryContextLabProjection
+  // `projection.mjs` for why that is what makes resume and fork correct. The
+  // fold context (presets + global defaults) is read fresh at every fold so a
+  // settings-page edit is reflected on the next replay without a manual sync.
+  const projection = createMemoryContextLabProjection({
+    getPresets: resolveGlobalPresets,
+    getDefaults: resolveDefaultsSettings,
+  })
 
   // ── Command surface ──────────────────────────────────────────────────────
   async function commandHandler(invocation) {
@@ -388,7 +597,14 @@ export async function apply(ctx) {
     if (operation === 'help') return { kind: 'success', text: HELP }
 
     if (operation === 'status') {
+      // Adopt first: it classifies the session (active / absent / damaged,
+      // C-11). A damaged session must surface as damage, never as "never
+      // enabled".
       const record = records.get(sessionId) ?? await adopt(invocation.agent)
+      if (!record) {
+        const notice = damagedNotice(sessionId)
+        if (notice) return notice
+      }
       return { kind: 'success', text: engine.formatStatus(record) }
     }
 
@@ -400,8 +616,8 @@ export async function apply(ctx) {
           const existing = await readSessionState(labRoot, sessionId)
           // Seed from the log, not from the defaults: a `set` issued before `on`
           // is still the user's latest intent, and the panel already shows it.
-          const folded = settingsFromSessionLog(invocation.agent.session)
-          const created = existing ?? await createSessionState(labRoot, sessionId, folded ?? { ...DEFAULT_SETTINGS })
+          const folded = settingsFromSessionLog(invocation.agent.session, buildFoldContext())
+          const created = existing ?? await createSessionState(labRoot, sessionId, folded ?? resolveDefaultsSettings())
           if (folded) created.state.settings = folded
           created.state.enabled = true
           await writeSessionState(created.directory, created.state)
@@ -432,6 +648,8 @@ export async function apply(ctx) {
       if (remainder) return { kind: 'error', text: '用法：/memory-lab off' }
       const record = records.get(sessionId) ?? await adopt(invocation.agent)
       if (!record) {
+        const notice = damagedNotice(sessionId)
+        if (notice) return notice
         // A directory can outlive the enable (an earlier run, or a resume in a new
         // process). Reclaim it when nothing depends on it, so `off` is idempotent
         // and never leaves plugin data behind.
@@ -532,9 +750,56 @@ export async function apply(ctx) {
       return { kind: 'success', text: `${numeric?.label ?? boolean.label}已设为 ${shown}。` }
     }
 
+    if (operation === 'preset') {
+      const query = remainder.trim()
+      const presets = resolveGlobalPresets()
+      if (!query) {
+        const defaults = resolveDefaultsSettings()
+        const lines = [
+          `全局预设：保留 ${defaults.retainOperations} / 批量 ${defaults.archiveBatchSize} / 自动 ${defaults.auto ? '开' : '关'} / 回注 ${defaults.autoRecall ? '开' : '关'} / 恢复 ${defaults.autoRestore ? '开' : '关'}。`,
+          '可用预设：',
+          ...presets.map((preset) => `  ${preset.name} — ${formatPresetValue(preset.settings)}（预设名含空格时按完整名称输入）`),
+          '用法：/memory-lab preset <名称> 应用整组预设；/memory-lab preset reset 回到全局预设；新增/改名/编辑在设置页。',
+        ]
+        if (presets.length === 0) lines.splice(2, 1, '  （暂无预设；可在设置页新增，或恢复为默认附带的两个模型预设）')
+        return { kind: 'success', text: lines.join('\n') }
+      }
+      const entry = resolvePreset(presets, query)
+      if (query === 'reset' || query === '默认' || query === '全局' || query === 'global') {
+        const defaults = resolveDefaultsSettings()
+        const record = records.get(sessionId) ?? await adopt(invocation.agent)
+        if (record) {
+          await runMaintenance(invocation, async () => {
+            record.state.settings = normalizeSettings(defaults)
+            await persist(record)
+          })
+        }
+        return { kind: 'success', text: `已回到全局预设：${formatPresetValue(defaults)}。` }
+      }
+      if (!entry) {
+        const names = presets.map((preset) => preset.name).join('、') || '（无）'
+        return { kind: 'error', text: `找不到预设「${query}」。可用：${names}；或用 reset 回到全局预设。` }
+      }
+      const record = records.get(sessionId) ?? await adopt(invocation.agent)
+      if (!record) {
+        // Same contract as `set` before `on`: the command is already in the log
+        // and `on` will fold it — validate the preset exists, then report so.
+        return { kind: 'success', text: `已记下预设「${entry.name}」；在本会话执行 /memory-lab on 后生效（${formatPresetValue(entry.settings)}）。` }
+      }
+      await runMaintenance(invocation, async () => {
+        record.state.settings = normalizeSettings(entry.settings)
+        await persist(record)
+      })
+      return { kind: 'success', text: `预设「${entry.name}」已应用：${formatPresetValue(entry.settings)}。` }
+    }
+
     if (operation === 'now' || operation === 'dry-run') {
       const record = records.get(sessionId) ?? await adopt(invocation.agent)
-      if (!record) return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
+      if (!record) {
+        const notice = damagedNotice(sessionId)
+        if (notice) return notice
+        return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
+      }
       try {
         return await runMaintenance(invocation, (signal) => engine.runOnce(record, signal, { dryRun: operation === 'dry-run' }))
       } catch (error) {
@@ -544,7 +809,11 @@ export async function apply(ctx) {
 
     if (operation === 'restore') {
       const record = records.get(sessionId) ?? await adopt(invocation.agent)
-      if (!record) return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
+      if (!record) {
+        const notice = damagedNotice(sessionId)
+        if (notice) return notice
+        return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
+      }
       if (remainder) return { kind: 'error', text: '用法：/memory-lab restore' }
       try {
         return await runMaintenance(invocation, () => engine.runRestore(record))
@@ -561,7 +830,31 @@ export async function apply(ctx) {
       }
       try {
         const guard = await runMaintenance(invocation, async () => {
-          const live = records.get(sessionId) ?? await adopt(invocation.agent)
+          // C-11: adopt throws for a damaged session (that is how the damage
+          // is sticky). Here the damage itself is the case we are handling, so
+          // fall through with no live record and let the branch below decide.
+          let live = records.get(sessionId)
+          if (!live && !damagedSessions.has(sessionId)) live = await adopt(invocation.agent)
+          // C-11: the durable file is unreadable, so no receipt accounting is
+          // possible — deletion needs explicit confirmation and then removes
+          // the whole session directory.
+          if (damagedSessions.has(sessionId)) {
+            if (!confirmDelete) {
+              return {
+                damaged: true,
+                confirmDelete,
+              }
+            }
+            if (live) {
+              await disposeRecord(live)
+              records.delete(sessionId)
+            }
+            const damaged = damagedSessions.get(sessionId)
+            await removeSessionDirectory(labRoot, damaged.directory)
+            damagedSessions.delete(sessionId)
+            absent.add(sessionId)
+            return { refused: false, removed: true }
+          }
           // The durable file is the authority for what still depends on the cold
           // store; a stale in-memory record must never be able to authorize a
           // delete that orphans a receipt.
@@ -586,6 +879,13 @@ export async function apply(ctx) {
           absent.add(sessionId)
           return { refused: false, removed: true }
         })
+        if (guard.damaged) {
+          return {
+            kind: 'error',
+            text: '会话状态文件损坏，无法核对依赖冷库的已归档操作。'
+              + '原文可能无法恢复，确认后才能删除整个会话目录：/memory-lab clean confirm delete-session。',
+          }
+        }
         if (guard.refused) {
           return {
             kind: 'error',
@@ -753,7 +1053,7 @@ export async function apply(ctx) {
       definitionId: 'dsh-memory-context-lab/control',
       name: COMMAND_NAME,
       description: 'Archive finished operations into an isolated cold store to reduce context',
-      input: { hint: 'on | off | status | set retain|batch|auto|recall|autorestore <value> | now | dry-run | restore | clean | help' },
+      input: { hint: 'on | off | status | preset [名称|reset] | set retain|batch|auto|recall|autorestore <value> | now | dry-run | restore | clean | help' },
       handler: (invocation) => {
         const pending = commandHandler(invocation)
         activeOperations.add(pending)
@@ -763,3 +1063,7 @@ export async function apply(ctx) {
     })
   }, 'memory-context-lab lifecycle')
 }
+
+// cordis 只从插件对象本身读 Config（runtime.Config = plugin.Config），
+// 顶层 `export const Config` 不会生效，必须挂到 apply 上，设置域才会 serve 本命名空间。
+apply.Config = Config
