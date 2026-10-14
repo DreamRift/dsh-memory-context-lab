@@ -318,18 +318,27 @@ export class TemporaryLingshuClient {
     })
     const client = new TemporaryLingshuClient({ bridge, sessionId })
     await bridge.start(signal)
-    const listing = await bridge.request('tools/list', {}, signal)
-    const tools = Array.isArray(listing?.tools) ? listing.tools : []
-    const names = new Set(tools.map((tool) => tool?.name))
-    if (!names.has('mdcg_remember') || !names.has('cg') || !names.has('mdcg_get')) {
+    // Everything past start() owns a live child process. A rejection anywhere in
+    // the handshake used to escape create() and leak that python process and its
+    // pipes for the life of the host: only the missing-tools branch stopped the
+    // bridge, so a tools/list timeout, an aborted signal or a broken pipe left an
+    // orphan behind on every failed enable.
+    try {
+      const listing = await bridge.request('tools/list', {}, signal)
+      const tools = Array.isArray(listing?.tools) ? listing.tools : []
+      const names = new Set(tools.map((tool) => tool?.name))
+      if (!names.has('mdcg_remember') || !names.has('cg') || !names.has('mdcg_get')) {
+        throw new Error('隔离冷库未暴露 mdcg_remember/cg/mdcg_get，已拒绝启用降温。')
+      }
+      // Startup capability probe: one read-only call, recorded for diagnostics
+      // (C-08). Inconclusive results do not block enablement; every real recall
+      // still carries the receipt view and fails explicitly if rejected.
+      await client.probeReceiptView(signal)
+      return client
+    } catch (error) {
       await bridge.stop().catch(() => {})
-      throw new Error('隔离冷库未暴露 mdcg_remember/cg/mdcg_get，已拒绝启用降温。')
+      throw error
     }
-    // Startup capability probe: one read-only call, recorded for diagnostics
-    // (C-08). Inconclusive results do not block enablement; every real recall
-    // still carries the receipt view and fails explicitly if rejected.
-    await client.probeReceiptView(signal)
-    return client
   }
 
   async callTool(name, args, signal) {

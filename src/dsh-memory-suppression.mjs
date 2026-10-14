@@ -76,10 +76,17 @@ export function createSuppressionCoordinator(MdcgClient) {
 
   function install() {
     if (installed) return
+    // Pre-flight every method before touching the prototype. Patching inside the
+    // same loop meant a later missing method left the earlier ones already
+    // replaced while installed stayed false -- restore() would then never run, and
+    // the global dsh-memory hooks stayed half-patched for the life of the process.
+    const plan = []
     for (const method of methods) {
       const original = prototype[method]
       if (typeof original !== 'function') throw new Error(`dsh-memory 0.8.1 缺少 MdcgClient.${method}，已拒绝启用抑制。`)
-      originals.set(method, Object.getOwnPropertyDescriptor(prototype, method))
+      plan.push({ method, original, descriptor: Object.getOwnPropertyDescriptor(prototype, method) })
+    }
+    for (const { method, original, descriptor } of plan) {
       const wrapper = function memoryContextLabSuppressedCall(...args) {
         const sessionId = sessionFor(method, args)
         if (!sessionId || !isActive(sessionId)) return original.apply(this, args)
@@ -87,6 +94,7 @@ export function createSuppressionCoordinator(MdcgClient) {
         return Promise.resolve(fallbackFor(method))
       }
       patched.set(method, wrapper)
+      originals.set(method, descriptor)
       Object.defineProperty(prototype, method, {
         configurable: true,
         enumerable: false,
@@ -103,7 +111,13 @@ export function createSuppressionCoordinator(MdcgClient) {
       // Avoid overwriting a later compatible owner if a hot reload changed it.
       if (prototype[method] !== patched.get(method)) continue
       const descriptor = originals.get(method)
-      if (descriptor) Object.defineProperty(prototype, method, descriptor)
+      if (descriptor) {
+        Object.defineProperty(prototype, method, descriptor)
+      } else {
+        // The method was inherited, so install() created an own property that
+        // shadows it; deleting that own property is the only way back.
+        delete prototype[method]
+      }
     }
     originals.clear()
     patched.clear()
@@ -123,6 +137,10 @@ export function createSuppressionCoordinator(MdcgClient) {
         const count = active.get(sid) ?? 0
         if (count <= 1) active.delete(sid)
         else active.set(sid, count - 1)
+        // The counters describe one acquisition. Keeping them past the last
+        // release is how a long-lived host accumulated two integers per session
+        // forever, so they go when the session stops being suppressed.
+        if (!isActive(sid)) stats.delete(sid)
         if (active.size === 0) restore()
       },
       stats() {
@@ -137,6 +155,7 @@ export function createSuppressionCoordinator(MdcgClient) {
     activeCount: () => active.size,
     dispose: () => {
       active.clear()
+      stats.clear()
       restore()
     },
   }

@@ -34,15 +34,23 @@
   },
   "peerDependencies": {
     "@furongjun1999/dsh-memory": "0.8.1",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/cosmokit": "^1.8.5"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/schemastery": {
       "optional": true
+    },
+    "@deepseek-ai/cosmokit": {
+      "optional": true
     }
   },
+  "devDependencies": {
+    "@deepseek-ai/cosmokit": "^1.8.5",
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
   "scripts": {
-    "test": "node test/entry-coverage.test.mjs && node test/core.test.mjs && node test/config-contract.test.mjs && node test/cooling.test.mjs && node test/session.test.mjs && node test/client.test.mjs && node test/install.test.mjs && node test/protection.test.mjs && node test/v2-store.test.mjs && node test/v2-readback.test.mjs && node test/v2-engine.test.mjs && node test/v2-guard.test.mjs && node test/v2-import.test.mjs && node test/v2-runtime.test.mjs && node test/v2-fork.test.mjs && node test/v2-matrix.test.mjs && node test/v2-tool.test.mjs && node test/v2-retrieval.test.mjs && node test/v2-workingset.test.mjs && node test/v2-card-budget.test.mjs && node test/v2-regression.test.mjs && node test/v2-e2e.test.mjs && node test/v2-lingshu-backend.test.mjs && node test/v2-lingshu-integration.test.mjs && node test/plan-first.test.mjs && node test/fullhistory.test.mjs",
+    "test": "node test/entry-coverage.test.mjs && node test/core.test.mjs && node test/config-contract.test.mjs && node test/cooling.test.mjs && node test/session.test.mjs && node test/client.test.mjs && node test/install.test.mjs && node test/protection.test.mjs && node test/v2-store.test.mjs && node test/v2-readback.test.mjs && node test/v2-engine.test.mjs && node test/v2-guard.test.mjs && node test/v2-import.test.mjs && node test/v2-runtime.test.mjs && node test/v2-fork.test.mjs && node test/v2-matrix.test.mjs && node test/v2-tool.test.mjs && node test/v2-retrieval.test.mjs && node test/v2-workingset.test.mjs && node test/v2-card-budget.test.mjs && node test/v2-regression.test.mjs && node test/v2-e2e.test.mjs && node test/v2-lingshu-backend.test.mjs && node test/v2-lingshu-integration.test.mjs && node test/plan-first.test.mjs && node test/fullhistory.test.mjs && node test/reliability.test.mjs",
     "probe:host": "node test/helpers/host-schema-probe.mjs",
     "probe:revert": "node scripts/revert-probe.mjs",
     "pack:test": "node scripts/pack-test-package.mjs"

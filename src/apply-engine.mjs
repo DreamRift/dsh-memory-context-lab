@@ -248,6 +248,19 @@ export function makeOrdinalAllocator(record) {
  *
  * See `nodeClaimOf`.
  */
+/**
+ * Receipts still shadowing the active surface.
+ *
+ * A verify-failed row counts. The replacement WAS appended -- that is why the
+ * original text is no longer on the surface -- and only the post-commit checks
+ * disagreed. Treating it as not-pending left the shadowed original with no row
+ * for restore to read back, so that text could never be recovered.
+ */
+export function pendingReceipts(record) {
+  const archive = Array.isArray(record?.state?.archive) ? record.state.archive : []
+  return archive.filter((row) => row.status === 'applied' || row.status === 'verify-failed')
+}
+
 export function createEngine(dependencies) {
   const { persist, nodeIdFor, hostVersion, services, logger } = dependencies
 
@@ -457,10 +470,6 @@ export function createEngine(dependencies) {
   }
 
   /** Receipts still shadowing the active surface. */
-  function pendingReceipts(record) {
-    return record.state.archive.filter((row) => row.status === 'applied')
-  }
-
   /**
    * Durable per-range cold-node claims.
    *
@@ -699,7 +708,11 @@ export function createEngine(dependencies) {
       // P1-5：批次摘要回执的 marker 必须与本引擎其他回执一致（v1/v2 各有 marker）。
       receiptMarker: dependencies.receiptMarker ?? RECEIPT_MARKER,
       onOutcome: async (outcome) => {
-        if (outcome.state !== 'applied') return
+        // verify-failed must reach the ledger too. The replacement was appended
+        // and the original text is shadowed, so the cold record is the ONLY copy
+        // left -- dropping the row made a failed commit indistinguishable from one
+        // that never happened, and left no handle for restore.
+        if (outcome.state !== 'applied' && outcome.state !== 'verify-failed') return
         // 成功即清账：这个区间的尝试计数、停摆记录都作废，否则一次成功之后
         // 它还会因为旧计数被当成"快停摆了"（P0-1）。
         if (Number.isInteger(outcome.rangeStart)) {
@@ -720,6 +733,10 @@ export function createEngine(dependencies) {
           hash: outcome.hash,
           chars: outcome.chars,
           originalTokens: outcome.originalTokens,
+          // Kept so the restore guard can compute the real growth of restoring
+          // (original minus receipt): the receipt tokens are already inside the
+          // measured assembly, so adding the full original double-counts them.
+          receiptTokens: Number.isFinite(Number(outcome.receiptTokens)) ? Number(outcome.receiptTokens) : undefined,
           // P0-2 对账：prune 里那份同一个数，落盘才能事后解释「回执 Σ 和
           // shadowedTokenCount 为什么不等」。
           shadowedTokenCount: Number.isFinite(Number(outcome.shadowedTokenCount)) ? Number(outcome.shadowedTokenCount) : undefined,
@@ -738,7 +755,8 @@ export function createEngine(dependencies) {
           // P1-5：批次摘要回执的成员数随行落盘——恢复分组与对账都靠它。
           batchSize: Number.isInteger(outcome.batchSize) && outcome.batchSize > 1 ? outcome.batchSize : undefined,
           appliedAt: new Date().toISOString(),
-          status: 'applied',
+          // The row records how the commit actually ended, not the happy path.
+          status: outcome.state,
         })
         await persist(record)
       },
@@ -751,7 +769,10 @@ export function createEngine(dependencies) {
     if (applied > 0 && record.state.usageWatch?.pending) {
       record.state.usageWatch.batchReplacements = applied
     }
-    const failed = outcomes.filter((outcome) => outcome.state !== 'applied')
+    // verify-failed is NOT a cold-write failure: its chunks were written and
+    // verified, so it must stay out of the orphan-cleanup and retry-ledger paths
+    // below. Deleting its cold nodes would destroy the only copy of the original.
+    const failed = outcomes.filter((outcome) => outcome.state !== 'applied' && outcome.state !== 'verify-failed')
     // 实际写入的记录数：一段可能分多块，账本按真实记录数记，不用替换段数顶替。
     const recordsWritten = outcomes.reduce(
       (sum, outcome) => sum + (outcome.state === 'applied' ? (outcome.chunkCount ?? 1) : 0),
@@ -903,7 +924,8 @@ export function createEngine(dependencies) {
       receiptMarker: dependencies.receiptMarker ?? RECEIPT_MARKER,
     })
     for (const outcome of outcomes) {
-      const stored = record.state.archive.find((row) => row.rangeStart === outcome.rangeStart && row.status === 'applied')
+      const stored = record.state.archive.find((row) => row.rangeStart === outcome.rangeStart
+        && (row.status === 'applied' || row.status === 'verify-failed'))
       if (!stored) continue
       stored.status = outcome.state === 'restored' ? 'restored' : `restore-skipped: ${outcome.reason}`
       if (outcome.state === 'restored') stored.restoredSeq = outcome.restoredSeq
@@ -988,7 +1010,19 @@ export function createEngine(dependencies) {
       await rememberMeasurement(record, occupancy, { action: 'failed', reason })
       return { action: 'failed', applied: 0, reason, releasedTokens: 0, cacheStats: occupancy.cacheStats }
     }
-    await rememberMeasurement(record, occupancy, { action: 'applied', reason: '' })
+    // The occupancy captured before the batch describes a surface that no longer
+    // exists: the batch archived units and put receipts in their place. Recording
+    // that stale value made status report an assembled-token count the user could
+    // no longer see. Re-measure once so the stored number matches the surface.
+    let afterBatch = occupancy
+    try {
+      afterBatch = await measureOccupancy(record, signal)
+      record.occupancy = afterBatch
+      record.occupancyError = null
+    } catch (error) {
+      record.occupancyError = error instanceof Error ? error.message : String(error)
+    }
+    await rememberMeasurement(record, afterBatch, { action: 'applied', reason: '' })
     return {
       action: 'applied',
       applied: result.applied,

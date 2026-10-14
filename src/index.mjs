@@ -26,6 +26,7 @@ import {
   PRESET_RESET_WORDS,
   renderRecallBlock,
   resolvePreset,
+  restoreGrowth,
   SettingsError,
 } from './core.mjs'
 import { cleanDecision, recallQueryFrom } from './apply.mjs'
@@ -570,13 +571,17 @@ export async function apply(ctx, config) {
 
     if (before > 0 && settings.autoRestore) {
       if (guardWindow) {
-        const total = engine.pendingReceipts(record)
-          .reduce((sum, row) => sum + (Number(row.originalTokens) || 0), 0)
+        const pending = engine.pendingReceipts(record)
         try {
           const occupancy = await engine.measureOccupancy(record, signal)
-          if (occupancy.host.assembledTokens + total > occupancy.host.contextWindow) {
+          const growth = restoreGrowth(pending, {
+            assembledTokens: occupancy.host.assembledTokens,
+            contextWindow: occupancy.host.contextWindow,
+          })
+          if (growth.overflow) {
             refused = {
-              total,
+              total: growth.total,
+              heldByReceipts: growth.heldByReceipts,
               assembled: occupancy.host.assembledTokens,
               window: occupancy.host.contextWindow,
             }

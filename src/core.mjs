@@ -321,14 +321,31 @@ export function formatRatio(value) {
 }
 
 /** Normalize any partial settings object onto the defaults. */
+/**
+ * Accept a numeric setting only when it is an integer inside its declared range.
+ *
+ * The command path goes through parseNumericSetting, which THROWS on bad input.
+ * This one is for the normalisation path, where the value may come from a settings
+ * file, a preset, or an older version; there the established contract is
+ * "unusable falls back to the default", so an out-of-range value is rejected here
+ * rather than clamped onto the boundary.
+ *
+ * Both bounds matter. Checking the lower bound alone (the previous behaviour) let
+ * retainOperations: 1e9 through untouched, so one bad settings file could ask the
+ * plugin to retain a million operations.
+ */
+export function boundedNumericSetting(raw, spec) {
+  if (!Number.isInteger(raw)) return undefined
+  if (raw < spec.min || raw > spec.max) return undefined
+  return raw
+}
+
 export function normalizeSettings(raw) {
   const value = raw && typeof raw === 'object' ? raw : {}
-  const retain = Number.isInteger(value.retainOperations) && value.retainOperations >= 0
-    ? value.retainOperations
-    : DEFAULT_SETTINGS.retainOperations
-  const batch = Number.isInteger(value.archiveBatchSize) && value.archiveBatchSize >= 1
-    ? value.archiveBatchSize
-    : DEFAULT_SETTINGS.archiveBatchSize
+  const retain = boundedNumericSetting(value.retainOperations, NUMERIC_SETTINGS.retain)
+    ?? DEFAULT_SETTINGS.retainOperations
+  const batch = boundedNumericSetting(value.archiveBatchSize, NUMERIC_SETTINGS.batch)
+    ?? DEFAULT_SETTINGS.archiveBatchSize
   return {
     retainOperations: retain,
     archiveBatchSize: batch,
@@ -811,7 +828,7 @@ export function extractCallLocator(call, limit = 60) {
 
 function clipLocator(value, limit) {
   const text = String(value).replace(/\s+/g, ' ').trim()
-  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`
+  return truncateCodePoints(text, limit)
 }
 
 function formatLocatorLine(tools, callIds, locators) {
@@ -1015,9 +1032,49 @@ export function normalizeRecallPayload(payload, maxHits = MAX_RECALL_HITS) {
   return { status: RECALL_STATUS.OK, summaries }
 }
 
+/**
+ * Truncate to a budget counted in CODE POINTS, not UTF-16 units.
+ *
+ * String.prototype.slice counts UTF-16 code units, so a cut that lands inside a
+ * surrogate pair leaves a lone high surrogate: it renders as a replacement
+ * character and, once written into a message, is a permanently broken sequence.
+ * Counting with Array.from keeps emoji and any astral-plane character whole.
+ */
+/**
+ * Tokens a restore would ADD to the surface, and whether that overflows.
+ *
+ * Restoring swaps each receipt for the original it replaced, so the growth is
+ * (original - receipt): the receipt tokens are already inside the measured
+ * assembly. Counting the full original instead double-counts that share and
+ * refuses restores that would have fit, pushing the user to delete the session
+ * -- the opposite of the guard's purpose.
+ *
+ * @returns { growth, heldByReceipts, total, overflow }
+ */
+export function restoreGrowth(pending, { assembledTokens, contextWindow }) {
+  const rows = Array.isArray(pending) ? pending : []
+  const total = rows.reduce((sum, row) => sum + (Number(row?.originalTokens) || 0), 0)
+  const heldByReceipts = rows.reduce((sum, row) => sum + (Number(row?.receiptTokens) || 0), 0)
+  const growth = total - heldByReceipts
+  return {
+    total,
+    heldByReceipts,
+    growth,
+    overflow: assembledTokens + growth > contextWindow,
+  }
+}
+
+export function truncateCodePoints(text, limit) {
+  const value = String(text ?? '')
+  if (value.length <= limit) return value
+  const points = Array.from(value)
+  if (points.length <= limit) return value
+  return `${points.slice(0, Math.max(0, limit - 1)).join('')}…`
+}
+
 export function displayPreview(value, limit = MAX_PREVIEW_CHARS) {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
-  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`
+  return truncateCodePoints(text, limit)
 }
 
 /** Return true only for a strict child path; the base itself never qualifies. */
