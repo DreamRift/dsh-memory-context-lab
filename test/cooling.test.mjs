@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   applyOneOperation,
+  applyOperations,
   cacheStatsOf,
   cleanDecision,
   collectOperationCandidates,
@@ -20,6 +21,8 @@ import {
   coldRecordBody,
   MAX_OPERATION_BYTES,
   MIN_OPERATION_CHARS,
+  RECEIPT_FORMAT_BATCH,
+  RECEIPT_FORMAT_VERSION,
 } from '../src/core.mjs'
 import { buildSession, FakeColdStore, fakeMeter, operation, SurfaceError } from './helpers/fake-host.mjs'
 
@@ -36,7 +39,7 @@ function viewOf(session, { retainOperations = 0 } = {}) {
   })
 }
 
-function planFor(session, { retainOperations = 0, batchSize = 1, archivedRanges = [] } = {}) {
+function planFor(session, { retainOperations = 0, batchSize = 1, archivedRanges = [], receiptMarker } = {}) {
   const measured = fakeMeter.measure(session)
   const view = collectOperationCandidates({
     surfaceNodes: session.surface.nodes,
@@ -55,6 +58,7 @@ function planFor(session, { retainOperations = 0, batchSize = 1, archivedRanges 
     batchSize,
     maxOperations: 64,
     minNetReleaseTokens: 128,
+    ...(receiptMarker ? { receiptMarker } : {}),
   })
   return { view, plan }
 }
@@ -583,6 +587,9 @@ test('the archived body keeps the assistant reasoning, so restore is not lossy',
     callIds: plan.units[0].callIds,
     chars: plan.units[0].chars,
     originalTokens: plan.units[0].originalTokens,
+    locators: outcome.locators ?? [],
+    statuses: outcome.statuses ?? [],
+    receiptFormat: outcome.receiptFormat,
     chunkCount: 1,
   }] })
   assert.equal(restored[0].state, 'restored')
@@ -653,6 +660,9 @@ test('a body far larger than one cold node is split, verified per chunk, and res
       chars: outcome.chars,
       originalTokens: outcome.originalTokens,
       replacementSeq: outcome.replacementSeq,
+      locators: outcome.locators ?? [],
+      statuses: outcome.statuses ?? [],
+      receiptFormat: outcome.receiptFormat,
       chunkCount: outcome.chunkCount,
       status: 'applied',
     }],
@@ -698,7 +708,9 @@ test('a missing chunk refuses the restore instead of writing a partial body', as
     receipts: [{
       rangeStart: outcome.rangeStart, rangeEnd: outcome.rangeEnd, callIds: outcome.callIds, tools: outcome.tools,
       nodeId: outcome.nodeId, hash: outcome.hash, chars: outcome.chars, originalTokens: outcome.originalTokens,
-      replacementSeq: outcome.replacementSeq, chunkCount: outcome.chunkCount, status: 'applied',
+      replacementSeq: outcome.replacementSeq, chunkCount: outcome.chunkCount,
+      locators: outcome.locators ?? [], statuses: outcome.statuses ?? [], receiptFormat: outcome.receiptFormat,
+      status: 'applied',
     }],
   })
   assert.equal(restored[0].state, 'skipped')
@@ -793,6 +805,9 @@ test('a body with CRLF round-trips the store byte-identically', async () => {
     chars: outcome.chars,
     originalTokens: outcome.originalTokens,
     replacementSeq: outcome.replacementSeq,
+    locators: outcome.locators ?? [],
+    statuses: outcome.statuses ?? [],
+    receiptFormat: outcome.receiptFormat,
     chunkCount: outcome.chunkCount,
     status: 'applied',
   }
@@ -868,6 +883,9 @@ test('restore returns the archived body and the surface accepts the replacement'
       chars: outcome.chars,
       originalTokens: outcome.originalTokens,
       replacementSeq: outcome.replacementSeq,
+      locators: outcome.locators ?? [],
+      statuses: outcome.statuses ?? [],
+      receiptFormat: outcome.receiptFormat,
       status: 'applied',
     })
   }
@@ -1008,10 +1026,20 @@ test('recallQueryFrom reads the claimed batch, skipping our own injections', () 
   assert.equal(recallQueryFrom([]), null)
   assert.equal(recallQueryFrom(undefined), null)
 
-  // A first-party prompt under another source kind is a last-resort fallback.
-  assert.equal(recallQueryFrom([{ id: 'm9', role: 'user', content: [{ type: 'text', text: '间接' }], source: { kind: 'some-plugin' } }]).id, 'm9')
+  // A prompt under another source kind is NOT a fallback any more: in the real
+  // session the host's per-step `time-context` snapshot won this branch, and
+  // because its id changes every step the recallQueryId dedup never fired.
+  assert.equal(recallQueryFrom([{ id: 'm9', role: 'user', content: [{ type: 'text', text: '间接' }], source: { kind: 'some-plugin' } }]), null)
+  assert.equal(recallQueryFrom([{ id: 'm10', role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 1' }], source: { kind: 'time-context' } }]), null)
+  assert.equal(recallQueryFrom([{ id: 'm11', role: 'user', content: [{ type: 'text', text: 'runtime' }], source: { kind: 'runtime-context' } }]), null)
   // An empty batch entry is skipped rather than returned as an empty query.
   assert.equal(recallQueryFrom([{ id: 'm8', role: 'user', content: [], source: { kind: 'user' } }]), null)
+  // A snapshot later in the batch must not shadow the human prompt before it.
+  const mixed = [
+    { id: 'h1', role: 'user', content: [{ type: 'text', text: '人类提问' }], source: { kind: 'user' } },
+    { id: 's1', role: 'user', content: [{ type: 'text', text: '环境快照' }], source: { kind: 'time-context' } },
+  ]
+  assert.deepEqual(recallQueryFrom(mixed), { id: 'h1', text: '人类提问' })
 })
 
 test('cleanDecision refuses while receipts still shadow the surface', () => {
@@ -1119,4 +1147,128 @@ test('a node held by different content refuses the write with an explicit reason
   for (const seq of unit.shadowedSeqs) {
     assert.ok(session.surface.nodes.includes(seq), `seq ${seq} must still be on the surface`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// P1-5：批次内相邻单元合并为一条批次摘要回执（format-3），整组一次恢复
+// ---------------------------------------------------------------------------
+
+test('P1-5：相邻单元共用一条批次摘要回执，成员行带冷记录与 hash，整组一次恢复', async () => {
+  const session = buildSession({ operations: 4, resultChars: 4000 })
+  const { plan } = planFor(session, { retainOperations: 0, batchSize: 4, receiptMarker: 'V2-RECEIPT' })
+  assert.equal(plan.units.length, 4, '夹具需要 4 个相邻单元')
+  const store = new FakeColdStore()
+
+  const outcomes = await applyOperations({
+    session,
+    client: store,
+    units: plan.units,
+    meter: fakeMeter,
+    hostVersion: 'test',
+    receiptMarker: 'V2-RECEIPT',
+  })
+  const applied = outcomes.filter((outcome) => outcome.state === 'applied')
+  assert.equal(applied.length, 4, `全部单元都应 applied：${JSON.stringify(outcomes.map((o) => [o.state, o.reason]))}`)
+
+  // 合并：相邻单元共用同一条替换消息。
+  const replacementSeqs = new Set(applied.map((outcome) => outcome.replacementSeq))
+  assert.equal(replacementSeqs.size, 1, '相邻单元必须共用一条批次摘要回执（否则回执数没降下来）')
+  for (const outcome of applied) {
+    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_BATCH, '合并回执必须按 format-3 记账')
+    assert.equal(outcome.batchSize, 4, '成员数随行落盘，恢复分组靠它')
+  }
+
+  // 摘要正文：样板只付一次，成员行逐条带冷记录与 hash。
+  const receiptText = session.eventAt(applied[0].replacementSeq).data.content.map((block) => block.text).join('')
+  assert.match(receiptText, /批次归档：4 个相邻操作/)
+  assert.match(receiptText, /^V2-RECEIPT/m, '批次摘要沿用引擎的 marker')
+  assert.ok(!receiptText.includes('工具：read'), '逐条样板（「工具：」头）不得再重复')
+  for (const outcome of applied) {
+    assert.ok(receiptText.includes(outcome.nodeId), `摘要必须列出成员冷记录 ${outcome.nodeId}`)
+    assert.ok(receiptText.includes(String(outcome.hash).slice(0, 12)), '摘要必须列出成员 hash')
+  }
+  // 活动面：全部被遮蔽 seq 退热，只剩一条回执。
+  for (const outcome of applied) {
+    for (const seq of [outcome.rangeStart, outcome.rangeEnd]) {
+      assert.equal(session.surface.nodes.includes(seq), false, `seq ${seq} 应已退热`)
+    }
+  }
+
+  // 恢复：按归档行整组还原，全部成员原文按序拼接进一条消息。
+  const rows = applied.map((outcome) => ({
+    rangeStart: outcome.rangeStart,
+    rangeEnd: outcome.rangeEnd,
+    callIds: outcome.callIds,
+    tools: outcome.tools,
+    nodeId: outcome.nodeId,
+    hash: outcome.hash,
+    chars: outcome.chars,
+    originalTokens: outcome.originalTokens,
+    replacementSeq: outcome.replacementSeq,
+    locators: outcome.locators ?? [],
+    statuses: outcome.statuses ?? [],
+    receiptFormat: outcome.receiptFormat,
+    batchSize: outcome.batchSize,
+    chunkCount: outcome.chunkCount ?? 1,
+  }))
+  const restored = await restoreReceipts({ session, client: store, receipts: rows, receiptMarker: 'V2-RECEIPT' })
+  assert.equal(restored.filter((outcome) => outcome.state === 'restored').length, 4, `整组都应 restored：${JSON.stringify(restored.map((o) => [o.state, o.reason]))}`)
+  const restoredSeqs = new Set(restored.map((outcome) => outcome.restoredSeq))
+  assert.equal(restoredSeqs.size, 1, '整组恢复是一次替换')
+  const bodies = session.eventAt(restored[0].restoredSeq).data.content.map((block) => block.text).join('')
+  for (const row of rows) {
+    const node = store.nodes.get(archiveChunkNodeId(row.nodeId, 0))
+    assert.ok(bodies.includes(coldRecordBody(node.content).slice(0, 80)), '每个成员的原文都要回来')
+  }
+})
+
+test('P1-5：单元不相邻时断开成两条回执；单单元 run 保持逐条回执（字节兼容旧行为）', async () => {
+  const session = buildSession({ operations: 4, resultChars: 4000 })
+  const { plan } = planFor(session, { retainOperations: 0, batchSize: 4, receiptMarker: 'V2-RECEIPT' })
+  // 跳过第 2 个单元：0 与 2、3 之间隔着未归档的 seq → 必须断成 [0] 与 [2,3]。
+  const units = [plan.units[0], plan.units[2], plan.units[3]]
+  const store = new FakeColdStore()
+  const outcomes = await applyOperations({
+    session,
+    client: store,
+    units,
+    meter: fakeMeter,
+    hostVersion: 'test',
+    receiptMarker: 'V2-RECEIPT',
+  })
+  const applied = outcomes.filter((outcome) => outcome.state === 'applied')
+  assert.equal(applied.length, 3)
+  const replacementSeqs = new Set(applied.map((outcome) => outcome.replacementSeq))
+  assert.equal(replacementSeqs.size, 2, '中间隔着未归档节点时必须断成两条回执')
+
+  const single = applied.find((outcome) => outcome.batchSize === undefined)
+  assert.ok(single, '单单元 run 必须存在')
+  assert.equal(single.receiptFormat, RECEIPT_FORMAT_VERSION, '单单元 run 保持 format-2 逐条回执')
+  const singleText = session.eventAt(single.replacementSeq).data.content.map((block) => block.text).join('')
+  assert.match(singleText, /^V2-RECEIPT/m)
+  assert.match(singleText, /工具：/, '逐条回执保持原样板')
+
+  const merged = applied.filter((outcome) => outcome.batchSize === 2)
+  assert.equal(merged.length, 2, '其余两个相邻单元合并')
+  const mergedText = session.eventAt(merged[0].replacementSeq).data.content.map((block) => block.text).join('')
+  assert.match(mergedText, /批次归档：2 个相邻操作/)
+
+  // 混合恢复：单条走旧路径、摘要走分组路径，互不干扰。
+  const rows = applied.map((outcome) => ({
+    rangeStart: outcome.rangeStart,
+    rangeEnd: outcome.rangeEnd,
+    callIds: outcome.callIds,
+    tools: outcome.tools,
+    nodeId: outcome.nodeId,
+    hash: outcome.hash,
+    chars: outcome.chars,
+    originalTokens: outcome.originalTokens,
+    replacementSeq: outcome.replacementSeq,
+    locators: outcome.locators ?? [],
+    statuses: outcome.statuses ?? [],
+    receiptFormat: outcome.receiptFormat,
+    chunkCount: outcome.chunkCount ?? 1,
+  }))
+  const restored = await restoreReceipts({ session, client: store, receipts: rows, receiptMarker: 'V2-RECEIPT' })
+  assert.equal(restored.filter((outcome) => outcome.state === 'restored').length, 3, `全部应 restored：${JSON.stringify(restored.map((o) => [o.state, o.reason]))}`)
 })

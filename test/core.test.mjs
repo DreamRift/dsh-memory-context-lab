@@ -16,17 +16,25 @@ import {
   formatRecallDigest,
   initialProjectionState,
   isReceiptMessage,
+  MAX_RECALL_HITS,
   normalizeColdBody,
+  normalizeRecallPayload,
   normalizeSettings,
   NUMERIC_SETTINGS,
+  PACKAGE_NAME,
+  PACKAGE_VERSION,
   parseNumericSetting,
   parseOperation,
-  recallSummaries,
+  RECALL_STATUS,
   renderRecallBlock,
   SettingsError,
   textFromContent,
 } from '../src/core.mjs'
+import { recallDigest } from '../src/apply.mjs'
 import { applyEvent, initProjectionState, viewOf } from '../src/projection.mjs'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 test('parseOperation splits the verb from its literal remainder', () => {
   assert.deepEqual(parseOperation(''), { operation: 'status', remainder: '' })
@@ -63,16 +71,28 @@ test('numeric settings reject out-of-range and malformed values', () => {
 })
 
 test('normalizeSettings falls back to defaults for anything unusable', () => {
-  assert.deepEqual(normalizeSettings(undefined), { ...DEFAULT_SETTINGS })
-  assert.deepEqual(normalizeSettings({ retainOperations: -1, auto: 'yes' }), { ...DEFAULT_SETTINGS })
+  // protectBudgetTokens 属于证据安全层，不进预设快照，但 normalizeSettings
+  // 必须完整回传它（否则 set 写回会把它删掉、保护层回退默认）。
+  const SNAPSHOT = {
+    retainOperations: DEFAULT_SETTINGS.retainOperations,
+    archiveBatchSize: DEFAULT_SETTINGS.archiveBatchSize,
+    auto: DEFAULT_SETTINGS.auto,
+    autoRecall: DEFAULT_SETTINGS.autoRecall,
+    autoRestore: DEFAULT_SETTINGS.autoRestore,
+    protectBudgetTokens: DEFAULT_SETTINGS.protectBudgetTokens,
+  }
+  assert.deepEqual(normalizeSettings(undefined), SNAPSHOT)
+  assert.deepEqual(normalizeSettings({ retainOperations: -1, auto: 'yes' }), SNAPSHOT)
   // A batch threshold below 1 would mean "never submit", which is not a state the
   // planner can express; anything unusable falls back to the default.
-  assert.deepEqual(normalizeSettings({ archiveBatchSize: 0 }), { ...DEFAULT_SETTINGS })
-  assert.deepEqual(normalizeSettings({ archiveBatchSize: 2.5 }), { ...DEFAULT_SETTINGS })
+  assert.deepEqual(normalizeSettings({ archiveBatchSize: 0 }), SNAPSHOT)
+  assert.deepEqual(normalizeSettings({ archiveBatchSize: 2.5 }), SNAPSHOT)
   // Retired occupancy keys are no longer folded back in: they are gone from
   // DEFAULT_SETTINGS, so normalizeSettings must not resurrect them either.
   const kept = normalizeSettings({ targetOccupancy: 0.5, retainOperations: 3, archiveBatchSize: 4, releaseMarginRatio: 0.1, auto: false, autoRecall: false, autoRestore: false })
-  assert.deepEqual(kept, { retainOperations: 3, archiveBatchSize: 4, auto: false, autoRecall: false, autoRestore: false })
+  assert.deepEqual(kept, { retainOperations: 3, archiveBatchSize: 4, auto: false, autoRecall: false, autoRestore: false, protectBudgetTokens: DEFAULT_SETTINGS.protectBudgetTokens })
+  // 写回路径不丢保护预算：显式值原样保留。
+  assert.equal(normalizeSettings({ protectBudgetTokens: 8192 }).protectBudgetTokens, 8192)
 })
 
 test('the stop-time restore switch is user-settable and defaults on', () => {
@@ -236,13 +256,31 @@ test('the recall block breaks its own boundary markers and prompt braces', () =>
 })
 
 test('recall summaries survive the common md_cg envelopes', () => {
-  const rows = recallSummaries({ results: [{ id: 'n1', content: 'c'.repeat(900), score: 0.5 }] })
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0].id, 'n1')
-  assert.ok(rows[0].preview.length <= 700)
-  assert.equal(recallSummaries({}).length, 0)
+  // 唯一规范化入口：`normalizeRecallPayload`（审计 P2-5(c) 删掉了旧的
+  // `recallSummaries` 重复实现，它把 ok:false 吞成空摘要）。
+  const ok = normalizeRecallPayload({ results: [{ id: 'n1', content: 'c'.repeat(900), score: 0.5 }] })
+  assert.equal(ok.status, RECALL_STATUS.OK)
+  assert.equal(ok.summaries.length, 1)
+  assert.equal(ok.summaries[0].id, 'n1')
+  assert.ok(ok.summaries[0].preview.length <= 700)
+  // 命中上限照旧生效。
+  const many = normalizeRecallPayload({ results: Array.from({ length: 9 }, (_, i) => ({ id: `n${i}`, content: 'x' })) })
+  assert.equal(many.summaries.length, MAX_RECALL_HITS)
+
+  // 空结果信封 = 真的没有命中（ok，零条）。
+  const empty = normalizeRecallPayload({ results: [] })
+  assert.equal(empty.status, RECALL_STATUS.OK)
+  assert.equal(empty.summaries.length, 0)
+
+  // 后端拒答不得被读成「库里没有」：必须是 unsupported，并带上原因。
+  const refused = normalizeRecallPayload({ ok: false, error: { message: 'backend offline' } })
+  assert.equal(refused.status, RECALL_STATUS.UNSUPPORTED)
+  assert.equal(refused.summaries.length, 0)
+  assert.equal(refused.reason, 'backend offline')
+  assert.equal(normalizeRecallPayload({}).status, RECALL_STATUS.UNSUPPORTED)
+
   assert.equal(formatRecallDigest([]), '')
-  assert.ok(formatRecallDigest(rows, 100).length <= 100)
+  assert.ok(formatRecallDigest(ok.summaries, 100).length <= 100)
 })
 
 test('archive node ids are stable and filesystem-safe', () => {

@@ -439,6 +439,40 @@ export class TemporaryLingshuClient {
     return this.callTool('mdcg_service_info', {}, signal)
   }
 
+  /**
+   * Soft-delete one cold node this plugin itself wrote (P0-1 的「先删后写」).
+   *
+   * `mdcg_forget` moves the node to the store's `trash/` with an audit entry —
+   * it is the only removal primitive the isolated store exposes, and it is
+   * scoped to a single explicit `node_id`, so it can never widen into a
+   * bulk delete. It is called **only** for nodes whose ids this plugin minted
+   * and whose receipts were never committed: after a retry that had to re-mint
+   * an ordinal, those bytes are unreferenced leftovers.
+   *
+   * Never throws into the archive path: a store that refuses (protected node,
+   * autonomy tier that returns a change ticket instead of deleting, older
+   * server without the tool) reports `{ ok: false, reason }` and the caller
+   * counts the node as residue and says so in status.
+   */
+  async forgetNode(nodeId, signal, reason = '上下文降温：重试换号后清理无引用冷节点') {
+    let result
+    try {
+      result = await this.callTool('mdcg_forget', { node_id: nodeId, reason }, signal)
+    } catch (error) {
+      return { ok: false, nodeId, reason: String(error?.message ?? error).slice(0, 200) }
+    }
+    if (result && typeof result === 'object') {
+      if (result.ok === false) {
+        return { ok: false, nodeId, reason: String(result.error ?? result.hint ?? '冷库拒绝删除').slice(0, 200) }
+      }
+      if (result.deleted === false || result.committed === false) {
+        return { ok: false, nodeId, reason: String(result.reason ?? result.hint ?? '冷库未删除（可能转入复核）').slice(0, 200) }
+      }
+      return { ok: true, nodeId, result }
+    }
+    return { ok: true, nodeId, result }
+  }
+
   async close() {
     await this.bridge.stop()
   }

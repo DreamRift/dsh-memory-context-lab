@@ -25,19 +25,32 @@ import { createHmac } from 'node:crypto'
 import { randomUUID } from 'node:crypto'
 import {
   archiveChunkNodeId,
+  buildBatchReceipt,
   buildReceipt,
   chunkArchiveBody,
   coldRecordBody,
+  extractCallLocator,
   formatRecallDigest,
+  isHumanAuthoredMessage,
+  isPluginAuthoredMessage,
   MAX_OPERATION_BYTES,
   MAX_OPERATION_LINES,
   MAX_OPERATION_TOTAL_BYTES,
+  MAX_RECALL_DIGEST_CHARS,
   MIN_OPERATION_CHARS,
   normalizeColdBody,
+  normalizeRecallPayload,
   PACKAGE_NAME,
-  recallSummaries,
+  PLUGIN_SOURCE_FORMS,
+  RECALL_STATUS,
+  RECEIPT_FORMAT_BATCH,
+  RECEIPT_FORMAT_LEGACY,
+  RECEIPT_FORMAT_VERSION,
+  RECEIPT_MARKER,
+  resultStatusOf,
   textFromContent,
 } from './core.mjs'
+import { contentHasPlanToolCall } from './plan-first.mjs'
 
 /** Human-readable reasons a surface node or range is not archivable, keyed by code. */
 export const SKIP_REASONS = Object.freeze({
@@ -48,11 +61,14 @@ export const SKIP_REASONS = Object.freeze({
   'no-content': '工具结果没有可读正文',
   'non-text-content': '工具结果含非文本块（图片／二进制／结构化），无法保真',
   'no-call-id': '工具结果缺少可配对的 callId',
+  'duplicate-call-id': '同一操作内出现重复的 callId，无法证明哪个结果答复哪次调用',
   'unpaired': '未找到与调用一一对应且紧邻的工具结果',
+  'parked-retry-exhausted': '重试达上界已停摆（原文保留，原因见 status）',
   'too-short': '正文短于最小归档阈值',
   'too-large': '正文超出可回读校验的上限（写入后无法整体回读）',
   'protected-system-head': 'system 指令节点',
   'protected-latest-user': '最新用户消息',
+  'protected-plan-artifact': '计划工件（exit_plan_mode 调用与计划全文）全程保留',
   'not-yet-exposed': '属于模型尚未发送完证据的当前轮次',
   'below-min-release': '净释放低于最小阈值',
 })
@@ -210,10 +226,19 @@ export function collectOperationCandidates(view) {
     retainOperations = 0,
     openTurn,
     archivedRanges = [],
+    // Ranges that already spent their retry budget (P0-1). They are removed from
+    // the candidate set — a permanently failing range must not loop forever — but
+    // the removal is *reported* (status lists them with their attempt count), so
+    // "not archived" is never confused with "nothing left to do".
+    parkedRanges = [],
+    // 插件自己写下的活动面序号（归档替换点、`restore` 出来的正文）。老日志里的
+    // 恢复正文没有 `form`、正文又是原文，形状上与人类输入无法区分；这份账本由插件
+    // 自己的状态文件提供，是唯一能覆盖老日志的判据（P1-4）。
+    pluginWrittenSeqs = [],
     minimumChars = MIN_OPERATION_CHARS,
     // Surface seq of the newest assistant message. Everything from here on is
     // still part of the turn the model is living in right now: it may send new
-    // evidence at any time, so these nodes are never batched away (C-12).
+    // evidence at any moment, so these nodes are never batched away (C-12).
     lastAssistantSeq = null,
   } = view
   const total = surfaceNodes.length
@@ -233,9 +258,18 @@ export function collectOperationCandidates(view) {
   // assistant message is fenced by `not-yet-exposed` below (C-12) — so an
   // older user message may only be consumed together with the whole turn that
   // already answered it, never alone and never while the turn is open.
+  //
+  // "User message" means human-authored here: the plugin injects its own
+  // receipts/cards/recall packs as `user/message` too, and letting one of them
+  // own this slot is exactly how the working-state card ended up reporting the
+  // plugin's own receipt as "the current human request" (audit P0-3).
+  // `pluginWrittenSeqs` 额外覆盖老日志里那些没有 form 的恢复正文（P1-4）。
+  const writtenSeqs = new Set(pluginWrittenSeqs)
   const latestUserIndex = (() => {
     for (let index = total - 1; index >= 0; index -= 1) {
-      if (nodeAt(index)?.type === 'user/message') return index
+      if (writtenSeqs.has(surfaceNodes[index])) continue
+      const node = nodeAt(index)
+      if (node?.type === 'user/message' && isHumanAuthoredMessage(node)) return index
     }
     return -1
   })()
@@ -259,6 +293,7 @@ export function collectOperationCandidates(view) {
   }
 
   const archivedStarts = new Set((archivedRanges ?? []).map((range) => range.start))
+  const parkedStarts = new Set((parkedRanges ?? []).map((range) => (typeof range === 'number' ? range : range?.start)))
   const candidates = []
   const bySurfaceIndex = new Map()
   for (let index = 0; index < total; index += 1) bySurfaceIndex.set(index, nodeAt(index))
@@ -277,6 +312,10 @@ export function collectOperationCandidates(view) {
       skip.set(seq, 'already-archived')
       continue
     }
+    if (parkedStarts.has(seq)) {
+      skip.set(seq, 'parked-retry-exhausted')
+      continue
+    }
     // The open turn's own operations stay visible: the model is producing them
     // and may still send evidence (C-12). archiveNow re-selects this range on
     // the next turn's first ask, when the evidence has actually been sent.
@@ -292,15 +331,38 @@ export function collectOperationCandidates(view) {
       skip.set(seq, 'assistant-not-eligible')
       continue
     }
+    // 计划工件：exit_plan_mode 的调用参数就是计划全文，按需求全程保留在热上下文。
+    // 这里跳过的是「操作头」，其配对结果随后由 orphan-result 规则跳过（仍可见）。
+    if (contentHasPlanToolCall(content)) {
+      skip.set(seq, 'protected-plan-artifact')
+      continue
+    }
     const callIds = calls.map((block) => (typeof block.id === 'string' ? block.id : ''))
     if (callIds.some((id) => !id)) {
       skip.set(seq, 'no-call-id')
+      continue
+    }
+    // 重复 callId：宿主契约要求同一条助手消息内 id 唯一。这里按位置配对，重复 id
+    // 会让"哪个结果答复哪次调用"无法证明，冷记录头部也会写成 calls: dup,dup。
+    // 宁可整段不归档，也不留下无法核验的配对。
+    if (new Set(callIds).size !== callIds.length) {
+      skip.set(seq, 'duplicate-call-id')
       continue
     }
     if (calls.some((block) => typeof block.name !== 'string' || !block.name)) {
       skip.set(seq, 'not-an-operation')
       continue
     }
+    // Source coordinates for the cold store's pairing index. They are read off
+    // the live host events here — the only place that still has them — and
+    // carried through the plan so the adapter can write schema-legal
+    // `operation.call` / `operation.result` refs. Deriving them later, or
+    // inventing them in the adapter, would be fabrication.
+    const callBlockIndexes = []
+    for (const [blockIndex, block] of content.entries()) {
+      if (block?.type === 'tool-call') callBlockIndexes.push(blockIndex)
+    }
+    const assistantMessageId = assistant.data?.message?.id ?? null
 
     // The results must answer exactly these calls, in order, immediately after
     // the assistant node. Anything else means this is not one clean operation.
@@ -339,6 +401,9 @@ export function collectOperationCandidates(view) {
         name: calls[callIndex].name,
         arguments: typeof calls[callIndex].arguments === 'string' ? calls[callIndex].arguments : '',
         text: resultTextOf(blocks),
+        callId,
+        blockIndex: callBlockIndexes[callIndex] ?? null,
+        resultMessageId: resultNode.data?.message?.id ?? null,
       })
       cursor += 1
     }
@@ -390,6 +455,13 @@ export function collectOperationCandidates(view) {
       originalTokens += measuredNodes[scan]?.heuristicTokens ?? measuredNodes[scan]?.tokens ?? 0
     }
 
+    // Deterministic receipt metadata (C-13). Both are read straight off the
+    // call arguments and the result text — no model call, no summary — and they
+    // are computed here, once, so the receipt written at commit time and the
+    // receipt rebuilt at restore time are byte-identical.
+    const locators = calls.map((block) => extractCallLocator(block))
+    const statuses = entries.map((entry) => resultStatusOf(entry.text))
+
     candidates.push({
       rangeStart: seq,
       rangeEnd: surfaceNodes[endIndex],
@@ -398,13 +470,28 @@ export function collectOperationCandidates(view) {
       shadowedSeqs: surfaceNodes.slice(index, endIndex + 1),
       callIds,
       tools: entries.map((entry) => entry.name),
+      locators,
+      statuses,
+      /**
+       * 真实来源坐标（与 callIds 同序）：冷库配对索引只照抄这些字段，
+       * 缺失时如实标 null，由适配器决定跳过而不是伪造。
+       */
+      sources: entries.map((entry) => ({
+        callId: entry.callId,
+        toolName: entry.name,
+        blockIndex: entry.blockIndex,
+        messageId: assistantMessageId,
+        resultMessageId: entry.resultMessageId,
+      })),
       body,
       chars: body.length,
       originalTokens,
       turn,
       step: assistant.data?.step,
-      /** Cold nodes this operation will occupy; 1 unless the body is large. */
-      chunkCount: chunkArchiveBody(body).length,
+      /** Cold nodes this operation will occupy; 1 unless the body is large.
+       * 与应用端同口径（canonicalizeBody 后再分块），避免正文需要规范化时
+       * 计划期计数与实际占用漂移。 */
+      chunkCount: chunkArchiveBody(canonicalizeBody(body)).length,
       /** Inside the newest `retainOperations` operations: the baseline, not a fence. */
       withinRetention: index >= retentionFromIndex,
       inOpenTurn,
@@ -451,30 +538,57 @@ export function planCooling({
   // One-batch release ceiling in estimated tokens: a burst of huge operations
   // must not empty the whole backlog in a single step (C-07 sizing).
   maxReleaseTokens = Number.POSITIVE_INFINITY,
+  // Receipt identity marker: v1 uses the default, v2 passes its own so the two
+  // engines' receipts never impersonate each other in the log.
+  receiptMarker = RECEIPT_MARKER,
+  // Optional per-candidate gate. v2 passes the exposure/pairing guard here so a
+  // guarded range is rejected before a node id is rented — the same discipline
+  // as `not-yet-exposed`: rejection must leave no claim behind. v1 passes
+  // nothing and keeps its behaviour unchanged.
+  guard = null,
+  // Optional receipt renderer. v1's receipt names tools and callIds; v2 also
+  // archives spans that have neither (plain user/assistant text, old receipts,
+  // old cards), and a tool-shaped receipt would misdescribe them. The default
+  // keeps v1 byte-identical.
+  receiptOf = null,
 }) {
   const units = []
   const rejected = []
   let plannedReleaseTokens = 0
   let releaseCapped = false
 
-  function admit(candidate) {
-    if (archiveFromSeq !== null && candidate.rangeStart >= archiveFromSeq) {
-      rejected.push({ rangeStart: candidate.rangeStart, reason: 'not-yet-exposed', description: describeSkip('not-yet-exposed') })
-      return false
-    }
-    if (units.length >= maxOperations) return false
+  /**
+   * 尺寸／净释放预判 + 组装单元（**有副作用**：会租用冷节点 id）。
+   *
+   * 只对已经通过保护门禁的候选调用；调用者必须先确认"可能凑够一批"，否则
+   * 等待期里每个候选都会被白租一个节点 id。v2 的跨度回执走 `receiptOf` 缝，
+   * 缺省保持 v1 的逐字节形态。
+   */
+  function prepare(candidate) {
     const nodeId = nodeIdFor(candidate)
     const hash = archiveMac(candidate.body)
-    const receipt = buildReceipt({
-      tools: candidate.tools,
-      range: { start: candidate.rangeStart, end: candidate.rangeEnd },
-      callIds: candidate.callIds,
-      nodeId,
-      hash,
-      chars: candidate.chars,
-      tokens: candidate.originalTokens,
-      chunks: candidate.chunkCount ?? 1,
-    })
+    const receipt = typeof receiptOf === 'function'
+      ? receiptOf(candidate, {
+        nodeId,
+        hash,
+        chars: candidate.chars,
+        tokens: candidate.originalTokens,
+        chunks: candidate.chunkCount ?? 1,
+        marker: receiptMarker,
+      })
+      : buildReceipt({
+        tools: candidate.tools,
+        range: { start: candidate.rangeStart, end: candidate.rangeEnd },
+        callIds: candidate.callIds,
+        nodeId,
+        hash,
+        chars: candidate.chars,
+        tokens: candidate.originalTokens,
+        chunks: candidate.chunkCount ?? 1,
+        marker: receiptMarker,
+        locators: candidate.locators ?? [],
+        statuses: candidate.statuses ?? [],
+      })
     const receiptTokens = meter.estimateMessage({
       role: 'user',
       content: [{ type: 'text', text: receipt }],
@@ -482,38 +596,91 @@ export function planCooling({
     const netReleaseTokens = candidate.originalTokens - receiptTokens
     if (netReleaseTokens < minNetReleaseTokens) {
       rejected.push({ rangeStart: candidate.rangeStart, reason: 'below-min-release', description: describeSkip('below-min-release') })
-      return false
+      return null
     }
-    if (plannedReleaseTokens > 0 && plannedReleaseTokens + netReleaseTokens > maxReleaseTokens) {
-      // Soft ceiling (C-07/C-12): once the batch holds work, stop before
-      // exceeding it; the rest waits for the next batch. A batch's first
-      // candidate is always admitted — hard-rejecting a lone oversized
-      // operation would livelock it as an eternal candidate instead of
-      // archiving and parking it.
-      releaseCapped = true
-      return false
-    }
-    units.push({ ...candidate, nodeId, hash, receipt, receiptTokens, netReleaseTokens })
-    plannedReleaseTokens += netReleaseTokens
-    return true
+    return { ...candidate, nodeId, hash, receipt, receiptTokens, netReleaseTokens }
   }
 
-  // Retention, always on: archive everything older than the newest N
-  // operations once `batchSize` of them have piled up.
+  // ── 阶段 1：保护门禁（无副作用）────────────────────────────────────────────
+  //
+  // 顺序按契约固定：结构合格 → 排除硬保护／有效额外保护 → 排除最近 N 个操作
+  // → 检查尺寸／净释放 → **对剩余合格候选计数** → 攒够 B 个才提交。
+  //
+  // 上一版把"窗口外数量"当成够批依据，于是"10 个窗口外、8 个受保护、B=5"这种
+  // 情况会立即提交只剩 2 段的短批——既违背 B 的语义，又在受保护比例高时频繁
+  // 替换历史（每次替换都要重算前缀缓存）。现在门槛只数**过滤后**仍合格的候选。
   const outOfWindow = candidates.filter((candidate) => !candidate.withinRetention)
   const threshold = Math.max(1, batchSize)
-  const baselineReady = outOfWindow.length >= threshold
+  const admissible = []
+  for (const candidate of outOfWindow) {
+    if (archiveFromSeq !== null && candidate.rangeStart >= archiveFromSeq) {
+      rejected.push({ rangeStart: candidate.rangeStart, reason: 'not-yet-exposed', description: describeSkip('not-yet-exposed') })
+      continue
+    }
+    if (typeof guard === 'function') {
+      // 门禁先于任何副作用（不发节点 id、不写声明）：被拒的候选不得留下痕迹。
+      const verdict = guard(candidate)
+      if (verdict && verdict.safe !== true) {
+        rejected.push({
+          rangeStart: candidate.rangeStart,
+          reason: verdict.code ?? 'guard-rejected',
+          description: verdict.reason || '守卫层拒绝降温',
+        })
+        continue
+      }
+    }
+    admissible.push(candidate)
+  }
+
+  // ── 够批门槛只数「插件自己造的」以外的候选（countable）──────────────────────
+  //
+  // 插件注入的工作状态卡/回注包也是合法候选（否则旧卡永远退不了热），但它们**不能
+  // 计入够批门槛**：卡片由插件自己产生，替换掉旧卡会立刻注入新卡，新卡再凑满下一批，
+  // 于是插件把自己写进了自激循环。实测会话 181 个批次里 484 条 turn.user 全是插件卡片，
+  // 4 条真实人类消息一条都没被归档——批次完全由插件自激撑起。
+  //
+  // 拆成两堆：`countable` 决定是否够批；`piggyback` 只在批次已经因为 countable 够批时
+  // 搭车替换（它们本来就在候选里，不搭车就会一直占着常驻窗口）。这样卡片的常驻上限
+  // 天然是「到下一次够批为止」，不需要另加注入侧机制。
+  const countable = admissible.filter((candidate) => candidate.pluginAuthored !== true)
+  const piggyback = admissible.filter((candidate) => candidate.pluginAuthored === true)
+
+  // ── 阶段 2：尺寸／净释放预判（有副作用，但只在可能够批时执行）──────────────
+  //
+  // 找到 `threshold` 个合格候选就停：够批与否已经确定，没必要为整条积压租节点。
+  // 搭车的卡片不占门槛名额，所以先取 countable，再补 piggyback。
+  const ready = []
+  if (countable.length >= threshold) {
+    for (const candidate of countable) {
+      if (ready.length >= threshold) break
+      const unit = prepare(candidate)
+      if (unit) ready.push(unit)
+    }
+    for (const candidate of piggyback) {
+      const unit = prepare(candidate)
+      if (unit) ready.push(unit)
+    }
+  }
+
+  // ── 阶段 3：提交（严格批上限 + 单批释放软上限）────────────────────────────
+  const baselineReady = ready.length >= threshold
   let baselineUnits = 0
   if (baselineReady) {
-    for (const candidate of outOfWindow) {
-      // Strict batch cap: submit the OLDEST `batchSize` operations, never the
-      // whole backlog. Each submitted batch re-bills the prefix cache from its
-      // earliest touched node, and the user-visible contract is "N per batch";
-      // the remainder simply stays candidates for the next measure.
+    for (const unit of ready) {
       if (baselineUnits >= threshold) break
       if (units.length >= maxOperations) break
-      if (releaseCapped) break
-      if (admit(candidate)) baselineUnits += 1
+      if (plannedReleaseTokens > 0 && plannedReleaseTokens + unit.netReleaseTokens > maxReleaseTokens) {
+        // Soft ceiling (C-07/C-12): once the batch holds work, stop before
+        // exceeding it; the rest waits for the next batch. A batch's first
+        // candidate is always admitted — hard-rejecting a lone oversized
+        // operation would livelock it as an eternal candidate instead of
+        // archiving and parking it.
+        releaseCapped = true
+        break
+      }
+      units.push(unit)
+      plannedReleaseTokens += unit.netReleaseTokens
+      baselineUnits += 1
     }
   }
 
@@ -531,7 +698,21 @@ export function planCooling({
     effectiveRetention: Math.max(0, retainOperations - archivedFromRetained),
     /** Retention bookkeeping, so callers can say "waiting for the batch to fill". */
     batchSize: threshold,
+    /** 结构合格且在保留窗口之外——**保护判定前**的数量（不是够批依据）。 */
     outOfWindowCount: outOfWindow.length,
+    /** 排除硬保护／有效额外保护后仍合格的候选数：B 的门槛只数这个。 */
+    admissibleCount: admissible.length,
+    /** 再排除尺寸／净释放不合格后的数量（未够批时不会为整条积压租节点，故可能小于 admissibleCount）。 */
+    readyCount: ready.length,
+    /**
+     * 未够批时还差几个合格候选。区分两种情况：
+     * - 保护过滤后就不够：还差 `threshold - admissible.length` 个（这才是用户该知道的数）；
+     * - 保护过滤后够、但尺寸／净释放被刷掉：还差 `threshold - ready.length` 个。
+     * 用 `ready.length` 一种口径会在高保护比例下报出虚高的差额，把"被保护挡下"说成"攒批中"。
+     */
+    shortfall: admissible.length >= threshold
+      ? Math.max(0, threshold - ready.length)
+      : threshold - admissible.length,
     baselineReady,
     baselineUnits,
   }
@@ -640,42 +821,59 @@ export function bodyFromSurface(session, unit) {
  * record, read it back and verify the hash, append the log-only prune record,
  * then the single replacement node, then verify the resulting surface.
  */
-export async function applyOneOperation({ session, client, unit, meter, hostVersion, signal }) {
-  const base = {
+/** Outcome fields every per-unit row carries, independent of how the batch commits. */
+function unitBaseOf(unit) {
+  return {
     rangeStart: unit.rangeStart,
     rangeEnd: unit.rangeEnd,
     callIds: unit.callIds,
     tools: unit.tools,
+    // 被替换对象的种类（工具操作 / 普通历史段）随 outcome 一路带到冷写与归档行：
+    // 归档行只记 range 与工具名，审计时 67 条 span 记录全被读成 `operation`，
+    // 非工具跨度（用户/助手正文、旧回执）在账本里无法与工具操作区分（P2-5(h)）。
+    // 非字符串一律归一成 null，避免把 `undefined` 写进持久状态。
+    spanKind: typeof unit.spanKind === 'string' && unit.spanKind ? unit.spanKind : null,
     nodeId: unit.nodeId,
     hash: unit.hash,
     chars: unit.chars,
     originalTokens: unit.originalTokens,
     receiptTokens: unit.receiptTokens,
     netReleaseTokens: unit.netReleaseTokens,
+    // Receipt metadata travels with the outcome so the durable row can rebuild
+    // the exact same receipt text at restore time (see `restoreReceipts`).
+    locators: unit.locators ?? [],
+    statuses: unit.statuses ?? [],
+    receiptFormat: RECEIPT_FORMAT_VERSION,
   }
-  throwIfAborted(signal)
+}
 
-  const shadowed = rangeStillCurrent(session, unit)
-  if (!shadowed) return { ...base, state: 'stale', reason: '目标区间已不在活动面（surface 已变化）' }
-  // Re-derive the body from the live events and require it to equal the planned
-  // one up to line endings. This is the drift check: the surface range being
-  // present is not enough, because a same-shaped range could hold different
-  // content. The store normalizes CRLF→LF, so the comparison is canonical.
-  const liveBody = bodyFromSurface(session, unit)
-  if (liveBody === null || canonicalHash(liveBody) !== canonicalHash(unit.body)) {
-    return { ...base, state: 'stale', reason: '来源正文已变化（hash 不符）' }
-  }
-
-  // Persist the body as one or more cold nodes. A body larger than one node's
-  // read-back limit is split on line boundaries; every chunk is verified on its
-  // own, so read-back fidelity is preserved no matter how large the operation
-  // is. This is what keeps a big `read` or `edit` archivable at all.
-  // Chunks are canonicalized before they are hashed and written: the store
-  // normalizes CRLF→LF, so writing the canonical form makes the round-trip
-  // byte-identical and the read-back comparison exact, not just equivalent.
+/**
+ * Persist one unit's body as cold chunks (with probe-reuse) and verify read-back.
+ *
+ * 提取自 `applyOneOperation` 的冷写段（P1-5）：批次合并提交需要「先写冷库、
+ * 后统一替换表面」，所以冷写必须能脱离表面替换独立执行。失败语义与原实现一致，
+ * 调用方把它并进自己的 base 字段：
+ *
+ * - 正文为空 → `orphaned`（不可重试，无节点残留）；
+ * - 目标 ordinal 被他人占用 → `cold-write-failed`（不可重试，残留如实上报，
+ *   绝不删除别人的节点）；
+ * - 写入失败 → `cold-write-failed`（可重试；已落地分块保留，重试按 hash 复用）；
+ * - 回读不符 → `orphaned`（可重试；先删后写语义由重试在同一 ordinal 上完成）。
+ *
+ * @returns `{ ok: true, chunkIds }` 或 `{ ok: false, outcome }`。
+ */
+async function writeUnitColdChunks({ client, unit, signal }) {
+  // A body larger than one node's read-back limit is split on line boundaries;
+  // every chunk is verified on its own, so read-back fidelity is preserved no
+  // matter how large the operation is. This is what keeps a big `read` or
+  // `edit` archivable at all. Chunks are canonicalized before they are hashed
+  // and written: the store normalizes CRLF→LF, so writing the canonical form
+  // makes the round-trip byte-identical and the read-back comparison exact,
+  // not just equivalent.
   const chunks = chunkArchiveBody(canonicalizeBody(unit.body))
   if (chunks.length === 0) {
-    return { ...base, state: 'orphaned', reason: '归档正文为空，原文保留' }
+    // 没有正文可写，也没有节点可删；重试不会改变结论，交给 runBatch 的上界收敛。
+    return { ok: false, outcome: { state: 'orphaned', retryable: false, reason: '归档正文为空，原文保留' } }
   }
   const chunkIds = chunks.map((_, index) => archiveChunkNodeId(unit.nodeId, index))
   // Probe before writing. A unit that already wrote some chunks on an earlier
@@ -706,9 +904,18 @@ export async function applyOneOperation({ session, client, unit, meter, hostVers
         continue
       }
       return {
-        ...base,
-        state: 'cold-write-failed',
-        reason: `冷节点 ${chunkIds[index]} 已被不同正文占用，拒绝覆写（保护既有内容），单元保留待重试`,
+        ok: false,
+        outcome: {
+          state: 'cold-write-failed',
+          // 换号是唯一出路：这个 ordinal 已被别人的正文占住，既不能复用也不能覆写。
+          // `retryable: false` 让 runBatch 丢掉声明并把它记成 remint 占用（见 P0-1）。
+          // 绝不删这个节点——无法证明它是我们自己写坏的孤儿，宁可留作残留并如实上报。
+          retryable: false,
+          // 残留（不是我们的可删孤儿）：无法证明这个 id 上的正文是自己写坏的，
+          // 因此绝不删，只在 status 里如实上报，让占用率不被悄悄污染。
+          residueNodeIds: [...chunkIds],
+          reason: `冷节点 ${chunkIds[index]} 已被不同正文占用，拒绝覆写（保护既有内容），换号重试`,
+        },
       }
     }
     writableChunks.push([index, text])
@@ -722,6 +929,14 @@ export async function applyOneOperation({ session, client, unit, meter, hostVers
         range: { start: unit.rangeStart, end: unit.rangeEnd },
         tools: unit.tools,
         callIds: unit.callIds,
+        // Real host coordinates for the cold store's pairing index; only the
+        // v2 client consumes them. v1's client ignores unknown keys.
+        sources: unit.sources ?? null,
+        // v2 用跨度种类区分「工具操作」与普通历史段，回执文案与冷库记录都按它分支。
+        spanKind: unit.spanKind ?? null,
+        // D4：插件来源跨度（工作状态卡/回注包/回执）的作者事实随冷记录落库，
+        // 检索索引同步、命中过滤与回注文案按它区分插件工作资料与人类消息。
+        pluginAuthored: unit.pluginAuthored === true,
         contentHash: index === 0 ? unit.hash : archiveMac(text),
         chunk: index + 1,
         chunkCount: chunks.length,
@@ -733,11 +948,22 @@ export async function applyOneOperation({ session, client, unit, meter, hostVers
     }
   }
   if (writeFailures.length) {
-    // Nothing was replaced, so the originals are intact; the nodes already
-    // written are unreferenced leftovers in this session's own store.
-    return { ...base, state: 'cold-write-failed', reason: `冷库写入失败：${writeFailures.join('；')}` }
+    // Nothing was replaced, so the originals are intact. The chunks that did land
+    // stay under this unit's own ordinal and are deliberately NOT deleted: the
+    // retry's probe finds them by canonical hash and reuses them, so the same
+    // ordinal is re-used instead of minting a new id and leaving the bytes behind
+    // unreferenced (审计 P0-1). The count of cold nodes therefore still matches the
+    // count of receipts after the retry succeeds.
+    return {
+      ok: false,
+      outcome: { state: 'cold-write-failed', retryable: true, reason: `冷库写入失败：${writeFailures.join('；')}` },
+    }
   }
+  return { ok: true, chunkIds, chunks }
+}
 
+/** Read every written chunk back and verify it against the planned body. */
+async function verifyUnitColdChunks({ client, unit, chunkIds, chunks, signal }) {
   // Read every chunk back and verify it. The whole-body hash is checked too, so
   // a mis-ordered or truncated reassembly cannot pass.
   const readBackProblems = []
@@ -765,63 +991,225 @@ export async function applyOneOperation({ session, client, unit, meter, hostVers
     reassembled.push(body)
   }
   if (readBackProblems.length) {
-    return { ...base, state: 'orphaned', reason: `${readBackProblems.join('；')}，原文保留` }
+    // 先删后写（P0-1）：回读对不上说明这个 ordinal 上的字节已经不可信，留着只会
+    // 在每次重试里继续 mismatch。删掉它们、**保留同一个 ordinal**，下一次重试把
+    // 同一批 id 重新写一遍——区间数、回执数、冷库条目数因此重新对齐。
+    return {
+      ok: false,
+      outcome: {
+        state: 'orphaned',
+        retryable: true,
+        orphanNodeIds: [...chunkIds],
+        reason: `${readBackProblems.join('；')}，原文保留`,
+      },
+    }
   }
   if (canonicalHash(reassembled.join('')) !== canonicalHash(unit.body)) {
-    return { ...base, state: 'orphaned', reason: '分块回读拼接后与原文 hash 不符，原文保留并标记 orphaned' }
+    return {
+      ok: false,
+      outcome: {
+        state: 'orphaned',
+        retryable: true,
+        orphanNodeIds: [...chunkIds],
+        reason: '分块回读拼接后与原文 hash 不符，原文保留并标记 orphaned',
+      },
+    }
   }
+  return { ok: true }
+}
+
+/**
+ * Commit one contiguous run of already-written units as a single surface replacement.
+ *
+ * P1-5：一批里**区间相邻**的单元共用一条回执消息——逐条模板回执每批重复同一批
+ * 样板（实测 ≈185k token/会话的重复注入），合并后样板头尾只付一次。语义约束：
+ *
+ * - run 内单元的宿主 seq 必须严格相邻（`prev.rangeEnd + 1 === next.rangeStart`），
+ *   由调用方分组保证；中间隔了不归档的节点（受保护/未够格）就分成两条回执，
+ *   绝不把别人的节点卷进替换范围。
+ * - run 长度为 1 时**字节兼容旧行为**：回执用规划期算好的 `unit.receipt`
+ *   （含 locators/statuses 的 format-2 逐条回执），restore 的旧路径原样可用。
+ * - run 长度 > 1 时用 `buildBatchReceipt`（format-3 批次摘要，`receiptMarker`
+ *   必须由调用方传入——规划期不知道 run 的形状，摘要只能在提交期渲染）；
+ *   每个成员行都带冷记录与 hash，恢复侧按归档行分组重建同一文本后整组还原。
+ * - prune 事件每个 run 一条（shadowedRange 覆盖整段 run）；per-unit 的
+ *   `shadowedTokenCount` 仍逐单元实测并随各自归档行落盘（P0-2 对账口径不变）。
+ *
+ * 失败关闭：替换失败时 run 内**全部**单元按 `orphaned`（可重试）处理——冷节点
+ * 已写好且校验通过，重试在各自 ordinal 上重写；同一 run 同生共死，避免出现
+ * 「半条摘要回执」这种不可归因的状态。
+ */
+function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER, hostVersion }) {
+  const shadowedSeqs = run.flatMap(({ unit }) => unit.shadowedSeqs)
+  const startSeq = run[0].unit.rangeStart
+  const endSeq = run[run.length - 1].unit.rangeEnd
+  // P0-2 对账口径：回执里的「原 ≈N token」与 `compaction/prune.shadowedTokenCount`
+  // 量的是同一个对象、取的都是宿主 meter 的**启发式**那一份（回执 = 规划期
+  // Σ heuristicTokens，prune = 提交期 Σ meter.estimateMessage）。合并提交后
+  // prune 记 run 总和，归档行仍逐单元记自己的那份，对账口径不变。
+  const perUnitTokens = new Map()
+  let shadowedTokens = 0
+  for (const { unit } of run) {
+    const tokens = sumShadowedTokens(session, meter, unit.shadowedSeqs)
+    perUnitTokens.set(unit.nodeId, tokens)
+    shadowedTokens += tokens
+  }
+  const receipt = run.length === 1
+    ? run[0].unit.receipt
+    : buildBatchReceipt({
+      marker: receiptMarker,
+      members: run.map(({ unit, chunkIds }) => ({
+        tools: unit.tools,
+        range: { start: unit.rangeStart, end: unit.rangeEnd },
+        callIds: unit.callIds,
+        nodeId: unit.nodeId,
+        hash: unit.hash,
+        chars: unit.chars,
+        tokens: unit.originalTokens,
+        chunks: chunkIds.length,
+      })),
+    })
 
   let replacement
   try {
-    let shadowedTokenCount = 0
-    for (const seq of unit.shadowedSeqs) {
-      shadowedTokenCount += meter.estimateMessage(session.deriveEventMessage(session.eventAt(seq))) ?? 0
-    }
     const prune = session.append('compaction/prune', {
-      shadowedRange: { start: unit.rangeStart, end: unit.rangeEnd },
-      shadowedSeqs: [...unit.shadowedSeqs],
-      shadowedTokenCount,
+      shadowedRange: { start: startSeq, end: endSeq },
+      shadowedSeqs: [...shadowedSeqs],
+      shadowedTokenCount: shadowedTokens,
     })
     replacement = session.append('user/message', {
       id: randomUUID(),
       role: 'user',
-      content: [{ type: 'text', text: unit.receipt }],
-      source: { kind: 'user' },
+      content: [{ type: 'text', text: receipt }],
+      source: { kind: 'user', form: PLUGIN_SOURCE_FORMS.ARCHIVE_RECEIPT },
     }, {
-      surfaceOp: { op: 'replace', startSeq: unit.rangeStart, endSeq: unit.rangeEnd },
-      sourceEventSeqs: [prune.seq, ...unit.shadowedSeqs],
+      surfaceOp: { op: 'replace', startSeq, endSeq },
+      sourceEventSeqs: [prune.seq, ...shadowedSeqs],
     })
   } catch (error) {
-    return { ...base, state: 'orphaned', reason: `活动面替换失败，原文保留：${messageOf(error)}` }
+    // 活动面替换失败时冷节点已经写好且校验通过，但回执从未提交——这些字节属于
+    // 我们自己的 ordinal 且无人引用。统一按 orphaned 处理：先删后写，下次重试在
+    // 同一个 ordinal 上重写，避免「区间数 / 回执数 / 冷库条目数」三者继续漂移。
+    // 合并 run 的成员同生共死：摘要回执是原子的，半条摘要不可归因。
+    return {
+      outcomes: run.map(({ unit, chunkIds }) => ({
+        ...unitBaseOf(unit),
+        state: 'orphaned',
+        retryable: true,
+        orphanNodeIds: [...chunkIds],
+        reason: `活动面替换失败，原文保留：${messageOf(error)}`,
+      })),
+    }
   }
 
   const problems = []
   const after = session.eventAt(replacement.seq)
   if (!session.surface.nodes.includes(replacement.seq)) problems.push('替换事件未进入活动面')
-  for (const seq of unit.shadowedSeqs) {
+  for (const seq of shadowedSeqs) {
     if (session.surface.nodes.includes(seq)) problems.push(`原节点 seq ${seq} 仍在活动面`)
   }
   if (after?.type !== 'user/message') problems.push('替换事件类型不是 user/message')
-  if (textFromContent(after?.data?.content) !== unit.receipt) problems.push('回执正文未保持')
+  if (textFromContent(after?.data?.content) !== receipt) problems.push('回执正文未保持')
   try {
     session.deriveMessages()
   } catch (error) {
     problems.push(`活动面无法构建下一次请求：${messageOf(error)}`)
   }
-  if (problems.length) {
-    return { ...base, replacementSeq: replacement.seq, state: 'verify-failed', reason: problems.join('；') }
-  }
   return {
-    ...base,
-    replacementSeq: replacement.seq,
-    state: 'applied',
-    reason: '',
-    /** Cold nodes this operation occupies; restore reads them back in order. */
-    chunkCount: chunks.length,
-    chunkIds: [...chunkIds],
-    surfaceGeneration: session.surface.replaceGeneration,
-    hostVersion: hostVersion ?? 'unknown',
+    outcomes: run.map(({ unit, chunkIds }) => ({
+      ...unitBaseOf(unit),
+      ...(problems.length
+        ? { replacementSeq: replacement.seq, state: 'verify-failed', reason: problems.join('；') }
+        : {
+            replacementSeq: replacement.seq,
+            state: 'applied',
+            reason: '',
+            /** Cold nodes this operation occupies; restore reads them back in order. */
+            chunkCount: chunkIds.length,
+            chunkIds: [...chunkIds],
+            /** Same number that went into `compaction/prune`; carried for P0-2 对账. */
+            shadowedTokenCount: perUnitTokens.get(unit.nodeId) ?? 0,
+            surfaceGeneration: session.surface.replaceGeneration,
+            hostVersion: hostVersion ?? 'unknown',
+            ...(run.length > 1
+              ? { receiptFormat: RECEIPT_FORMAT_BATCH, batchSize: run.length }
+              : {}),
+          }),
+    })),
   }
+}
+
+export async function applyOneOperation({ session, client, unit, meter, hostVersion, signal, bodyOf = null }) {
+  const base = unitBaseOf(unit)
+  throwIfAborted(signal)
+
+  const shadowed = rangeStillCurrent(session, unit)
+  if (!shadowed) return { ...base, state: 'stale', reason: '目标区间已不在活动面（surface 已变化）' }
+  // Re-derive the body from the live events and require it to equal the planned
+  // one up to line endings. This is the drift check: the surface range being
+  // present is not enough, because a same-shaped range could hold different
+  // content. The store normalizes CRLF→LF, so the comparison is canonical.
+  const liveBody = typeof bodyOf === 'function' ? bodyOf(session, unit) : bodyFromSurface(session, unit)
+  if (liveBody === null || canonicalHash(liveBody) !== canonicalHash(unit.body)) {
+    return { ...base, state: 'stale', reason: '来源正文已变化（hash 不符）' }
+  }
+
+  const written = await writeUnitColdChunks({ client, unit, signal })
+  if (!written.ok) return { ...base, ...written.outcome }
+  const verified = await verifyUnitColdChunks({ client, unit, chunkIds: written.chunkIds, chunks: written.chunks, signal })
+  if (!verified.ok) return { ...base, ...verified.outcome }
+
+  const committed = commitSurfaceRun({
+    session,
+    meter,
+    run: [{ unit, chunkIds: written.chunkIds }],
+    hostVersion,
+  })
+  return committed.outcomes[0]
+}
+
+/**
+ * Σ of the host meter's estimate over the messages this operation shadows.
+ *
+ * This is exactly what lands in `compaction/prune.shadowedTokenCount`, kept in one
+ * place so the archive row can carry the same number for reconciliation (P0-2).
+ * A meter that cannot measure one event contributes 0 rather than aborting the
+ * archive: the replacement is still correct, only the accounting is degraded.
+ */
+function sumShadowedTokens(session, meter, shadowedSeqs) {
+  let total = 0
+  for (const seq of shadowedSeqs ?? []) {
+    try {
+      total += meter.estimateMessage(session.deriveEventMessage(session.eventAt(seq))) ?? 0
+    } catch {
+      // 单条测不了不影响归档；缺口由 status 的对账行如实体现。
+    }
+  }
+  return total
+}
+
+/**
+ * Reconcile the receipt figure with `compaction/prune.shadowedTokenCount` (P0-2).
+ *
+ * Returns `null` when nothing is comparable (no archived row carries both
+ * numbers). `ratio` is `|receipt − prune| / max(prune, 1)`; callers decide the
+ * threshold — the point is that a gap is *reported*, never silently averaged away.
+ */
+export function tokenAccountingOf(rows) {
+  let receipt = 0
+  let prune = 0
+  let compared = 0
+  for (const row of rows ?? []) {
+    if (row?.status !== 'applied') continue
+    const r = Number(row.originalTokens)
+    const p = Number(row.shadowedTokenCount)
+    if (!Number.isFinite(r) || !Number.isFinite(p)) continue
+    receipt += r
+    prune += p
+    compared += 1
+  }
+  if (!compared) return null
+  return { receipt, prune, compared, ratio: Math.abs(receipt - prune) / Math.max(prune, 1) }
 }
 
 /**
@@ -836,6 +1224,26 @@ export function lastUsageOf(session) {
   for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
     const event = session.eventAt(seq)
     if (event?.type === 'assistant/message' && event.data?.usage !== undefined) return event.data.usage
+  }
+  return undefined
+}
+
+/**
+ * Same as `lastUsageOf`, but also returns the event seq that carried it.
+ *
+ * C3/O3（usage 观测）：批提交前后各取一次 usage、把差额记成
+ * `observedInvalidationTokens` 的口径需要**幂等结算**——同一个 usage 样本不得
+ * 结算两次。usage 对象本身没有稳定标识，携带它的 `assistant/message` seq 单调
+ * 递增，正好当标识用：`sample.seq > pending.seq` 才说明「批后出现了新完成的请求」。
+ *
+ * @returns `{ seq, usage }` or `undefined` when no completed request reported usage.
+ */
+export function lastUsageWithSeqOf(session) {
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
+    if (event?.type === 'assistant/message' && event.data?.usage !== undefined) {
+      return { seq, usage: event.data.usage }
+    }
   }
   return undefined
 }
@@ -888,10 +1296,20 @@ export function occupancyLines(occupancy) {
     formatCacheLine(cacheStats),
     `候选：${view.candidates.length} 个完整操作可归档（已保护／不合格 ${view.skipped.length} 条）；本批计划释放 ≈${plan.plannedReleaseTokens} token（含回执成本）`,
     `保留最近 ${plan.baselineRetention} 个操作（一直生效）：窗口外待归档 ${plan.outOfWindowCount} 个，`
+    + `其中合格 ${plan.admissibleCount ?? plan.outOfWindowCount} 个，`
     + (plan.baselineReady
       ? `已攒够 ${plan.batchSize} 个，本批提交`
-      : `未攒够 ${plan.batchSize} 个，暂不提交（攒够即归档，与占用率无关）`),
+      : `未攒够 ${plan.batchSize} 个（还差 ${plan.shortfall ?? 0} 个），暂不提交（攒够即归档，与占用率无关）`),
   ]
+  // 够批门槛只数过滤后的合格候选。当保护挡下的比窗口外总数还多时，"窗口外 10 个
+  // 却不够 5 个"必须被解释清楚，否则报告看起来像自相矛盾。
+  if (!plan.baselineReady && plan.outOfWindowCount > (plan.admissibleCount ?? 0)) {
+    const held = plan.outOfWindowCount - (plan.admissibleCount ?? 0)
+    const sized = (plan.admissibleCount ?? 0) - (plan.readyCount ?? plan.admissibleCount ?? 0)
+    lines.push(`本批暂不提交的原因：窗口外 ${plan.outOfWindowCount} 个里有 ${held} 个被硬保护／有效额外保护挡下`
+      + (sized > 0 ? `，另有 ${sized} 个不合格（尺寸／净释放）` : '')
+      + `，过滤后只剩 ${plan.readyCount ?? plan.admissibleCount ?? 0} 个，不到批量阈值 ${plan.batchSize}。`)
+  }
   if (plan.units.length) {
     lines.push(
       `本批构成：保留窗口外 ${plan.baselineUnits} 个（保留基线 ${plan.baselineRetention} 个未被动用）`,
@@ -909,6 +1327,31 @@ export function occupancyLines(occupancy) {
     for (const entry of view.skipped) tally.set(entry.description ?? entry.reason, (tally.get(entry.description ?? entry.reason) ?? 0) + 1)
     const parts = [...tally.entries()].map(([label, count]) => `${label} ${count} 条`)
     lines.push(`暂无候选：${parts.join('；')}。新证据发送完、离开保留窗口后自动进入下一批。`)
+  }
+  // 候选存在但一个都没通过门禁时，「计划释放 ≈0」必须带原因：否则用户只看到 0，
+  // 无法区分「还没攒够」和「每次都被门禁拒掉」（后者在真实宿主上曾是永久 no-op）。
+  if (!plan.units.length && Array.isArray(plan.rejected) && plan.rejected.length) {
+    const tally = new Map()
+    for (const entry of plan.rejected) {
+      const label = entry.description ?? entry.reason ?? '未说明'
+      tally.set(label, (tally.get(label) ?? 0) + 1)
+    }
+    const parts = [...tally.entries()].map(([label, count]) => `${label} ${count} 条`)
+    const sample = plan.rejected.slice(0, 4).map((entry) => `seq ${entry.rangeStart}`).join('、')
+    lines.push(`候选被门禁拒绝 ${plan.rejected.length} 个（${sample}${plan.rejected.length > 4 ? ' …' : ''}）：${parts.join('；')}。`)
+  }
+  // 活跃证据保护：为什么某段留下、何时解除、成本多少。由保护集渲染后传进来，
+  // 本模块不认识保护来源的语义，只负责按顺序展示。
+  if (Array.isArray(occupancy.protectionLines) && occupancy.protectionLines.length) {
+    lines.push(...occupancy.protectionLines)
+  }
+  const held = (plan.rejected ?? []).filter((row) => row.reason === 'protected-evidence'
+    || row.reason === 'protected-range-overlap'
+    || row.reason === 'stale-protection')
+  if (held.length) {
+    lines.push(`本批有 ${held.length} 个候选被活跃证据保护挡下（未为凑批量而跨越受保护节点）：`)
+    for (const row of held.slice(0, 6)) lines.push(`- seq ${row.rangeStart}：${row.description}`)
+    if (held.length > 6) lines.push(`- …其余 ${held.length - 6} 个见保护集明细。`)
   }
   lines.push(`已归档操作：${archivedCount} 个`)
   return lines
@@ -949,32 +1392,125 @@ export function cleanDecision({ pendingReceipts, confirmDelete }) {
   return { refuse: false, pending: pendingReceipts }
 }
 
-/** Run one batch, committing each unit independently and reporting every outcome. */
-export async function applyOperations({ session, client, units, meter, hostVersion, signal, onOutcome }) {
+/**
+ * Commit one planned batch.
+ *
+ * `guard` is re-evaluated **immediately before each write**, not just at plan
+ * time. The plan is a snapshot: protection is derived from the surface and from
+ * durable state, and both can move between planning and committing (a user
+ * `/memory-lab pin`, a new recall delivery, a freshly closed tool call). Without
+ * the re-check a range that became protected after planning would still be
+ * replaced — the exact "stale plan still commits" failure. A revoked unit is
+ * skipped with its own state, is never counted as applied, and keeps its cold
+ * node claim so the next measurement reuses the same id (idempotent).
+ */
+export async function applyOperations({ session, client, units, meter, hostVersion, signal, onOutcome, guard = null, bodyOf = null, receiptMarker = RECEIPT_MARKER }) {
   const outcomes = []
+
+  // ── 阶段 1：逐单元门禁复核 + 冷写（不替换表面）────────────────────────────
+  //
+  // P1-5 把「写冷库」与「替换表面」拆开：替换要等一批里全部冷写就绪后按相邻
+  // run 合并提交。规划只是快照，保护集合可能在这之后变化（用户 pin、新的回注
+  // 投递、刚闭合的调用），守卫仍在**每次写入前**重新判定——被撤销的单元原文
+  // 保留、不计入成功、不留冷写痕迹。
+  const written = []
   for (const unit of units) {
+    if (typeof guard === 'function') {
+      const verdict = guard(unit)
+      if (verdict && verdict.safe !== true) {
+        const revoked = {
+          ...unitBaseOf(unit),
+          state: 'guard-revoked',
+          reason: `提交前复核：规划后新增保护，原文保留。${verdict.reason ?? ''}`,
+        }
+        outcomes.push(revoked)
+        if (onOutcome) await onOutcome(revoked)
+        continue
+      }
+    }
     let outcome
     try {
-      outcome = await applyOneOperation({ session, client, unit, meter, hostVersion, signal })
+      throwIfAborted(signal)
+      const shadowed = rangeStillCurrent(session, unit)
+      if (!shadowed) {
+        outcome = { ...unitBaseOf(unit), state: 'stale', reason: '目标区间已不在活动面（surface 已变化）' }
+      } else {
+        // Re-derive the body from the live events and require it to equal the
+        // planned one up to line endings (drift check; the store normalizes
+        // CRLF→LF, so the comparison is canonical).
+        const liveBody = typeof bodyOf === 'function' ? bodyOf(session, unit) : bodyFromSurface(session, unit)
+        if (liveBody === null || canonicalHash(liveBody) !== canonicalHash(unit.body)) {
+          outcome = { ...unitBaseOf(unit), state: 'stale', reason: '来源正文已变化（hash 不符）' }
+        } else {
+          const writtenChunks = await writeUnitColdChunks({ client, unit, signal })
+          if (writtenChunks.ok) {
+            const verified = await verifyUnitColdChunks({
+              client,
+              unit,
+              chunkIds: writtenChunks.chunkIds,
+              chunks: writtenChunks.chunks,
+              signal,
+            })
+            if (verified.ok) written.push({ unit, chunkIds: writtenChunks.chunkIds })
+            else outcome = { ...unitBaseOf(unit), ...verified.outcome }
+          } else {
+            outcome = { ...unitBaseOf(unit), ...writtenChunks.outcome }
+          }
+        }
+      }
     } catch (error) {
       if (signal?.aborted) throw error
       outcome = {
-        rangeStart: unit.rangeStart,
-        rangeEnd: unit.rangeEnd,
-        callIds: unit.callIds,
-        tools: unit.tools,
-        nodeId: unit.nodeId,
-        hash: unit.hash,
-        chars: unit.chars,
-        originalTokens: unit.originalTokens,
-        receiptTokens: unit.receiptTokens,
-        netReleaseTokens: unit.netReleaseTokens,
+        ...unitBaseOf(unit),
         state: 'orphaned',
         reason: `事务异常，原文保留：${messageOf(error)}`,
       }
     }
-    outcomes.push(outcome)
-    if (onOutcome) await onOutcome(outcome)
+    if (outcome) {
+      outcomes.push(outcome)
+      if (onOutcome) await onOutcome(outcome)
+    }
+  }
+
+  // ── 阶段 2：相邻成功单元组成连续 run，逐 run 提交一条回执──────────────────
+  //
+  // 相邻判定以**活动面节点**为准：两个单元之间只要不存在任何活动面节点就相邻
+  // （`turn/start`、`turn/end` 这类非表面事件夹在中间不算间隔——表面替换本来就
+  // 不会遮蔽它们）。中间隔了不归档的活动面节点（受保护、未够格、或本批冷写失败
+  // 的单元）就断开成两条回执——绝不把没有归档的节点卷进替换范围。run 长度为 1
+  // 时回执与逐条替换字节一致（旧行为）。
+  const surfaceSeqs = new Set(session.surface.nodes)
+  const adjacentOnSurface = (left, right) => {
+    if (!(left.rangeEnd < right.rangeStart)) return false
+    for (const seq of surfaceSeqs) {
+      if (seq > left.rangeEnd && seq < right.rangeStart) return false
+    }
+    return true
+  }
+  let index = 0
+  while (index < written.length) {
+    let end = index + 1
+    while (end < written.length && adjacentOnSurface(written[end - 1].unit, written[end].unit)) end += 1
+    const run = written.slice(index, end)
+    index = end
+    let committed
+    try {
+      committed = commitSurfaceRun({ session, meter, run, receiptMarker, hostVersion })
+    } catch (error) {
+      if (signal?.aborted) throw error
+      committed = {
+        outcomes: run.map(({ unit, chunkIds }) => ({
+          ...unitBaseOf(unit),
+          state: 'orphaned',
+          reason: `事务异常，原文保留：${messageOf(error)}`,
+          orphanNodeIds: [...chunkIds],
+        })),
+      }
+    }
+    for (const outcome of committed.outcomes) {
+      outcomes.push(outcome)
+      if (onOutcome) await onOutcome(outcome)
+    }
   }
   return outcomes
 }
@@ -983,8 +1519,43 @@ export async function applyOperations({ session, client, units, meter, hostVersi
  * Restore receipts whose replacement is still the current surface node and
  * whose cold body still matches the recorded hash. Anything else is skipped
  * with a reason; no new event is overwritten.
+ *
+ * P1-5：批次摘要回执（format-3）按 `replacementSeq` 分组整组恢复——同一摘要的
+ * 成员行必须连续出现在行列表里且共享同一个替换 seq；摘要正文按归档行重建并
+ * 逐字节比对后，一次性替换为**全部成员原文按序拼接**的单条消息。任何成员的
+ * 冷节点缺失/hash 不符都让**整组**跳过（fail-closed）：半组恢复会让摘要指向
+ * 已经不在冷库里的成员，比全部不恢复更糟。逐条回执（format 1/2）走原路径不变。
  */
-export async function restoreReceipts({ session, client, receipts, onOutcome }) {
+export async function restoreReceipts({ session, client, receipts, onOutcome, receiptMarker = RECEIPT_MARKER }) {
+  const outcomes = []
+  const groups = []
+  for (const receipt of receipts ?? []) {
+    const batch = receipt?.receiptFormat === RECEIPT_FORMAT_BATCH
+    const last = groups[groups.length - 1]
+    if (batch && last?.batch && last.rows[0].replacementSeq === receipt.replacementSeq) last.rows.push(receipt)
+    else groups.push({ batch, rows: [receipt] })
+  }
+  for (const group of groups) {
+    const receiptsInGroup = group.rows
+    if (group.batch && receiptsInGroup.length > 1) {
+      await restoreBatchGroup({ session, client, receipts: receiptsInGroup, onOutcome, receiptMarker, outcomes })
+      continue
+    }
+    for (const receipt of receiptsInGroup) {
+      await restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes })
+    }
+  }
+  return outcomes
+}
+
+/** Restore one format-1/2 per-unit receipt (legacy path, byte-identical behavior). */
+async function restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes }) {
+  const local = await restoreLegacyReceipt({ session, client, receipts: [receipt], receiptMarker })
+  outcomes.push(...local)
+  if (onOutcome) for (const outcome of local) await onOutcome(outcome)
+}
+
+async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }) {
   const outcomes = []
   for (const receipt of receipts) {
     const base = {
@@ -1004,6 +1575,12 @@ export async function restoreReceipts({ session, client, receipts, onOutcome }) 
       outcomes.push({ ...base, state: 'skipped', reason: '回执节点不再是预期类型（surface 冲突）' })
       continue
     }
+    // Rebuild the receipt with the format the row was actually written in.
+    // Rows written before the locator/status lines existed carry no
+    // `receiptFormat`; defaulting them to the legacy format keeps their receipt
+    // byte-reproducible, so an old receipt still restores instead of being
+    // rejected as "changed".
+    const formatVersion = Number.isInteger(receipt.receiptFormat) ? receipt.receiptFormat : RECEIPT_FORMAT_LEGACY
     const expected = buildReceipt({
       tools: receipt.tools ?? [],
       range: { start: receipt.rangeStart, end: receipt.rangeEnd },
@@ -1013,6 +1590,10 @@ export async function restoreReceipts({ session, client, receipts, onOutcome }) 
       chars: receipt.chars ?? 0,
       tokens: receipt.originalTokens ?? 0,
       chunks: receipt.chunkCount ?? 1,
+      marker: receiptMarker,
+      formatVersion,
+      locators: Array.isArray(receipt.locators) ? receipt.locators : [],
+      statuses: Array.isArray(receipt.statuses) ? receipt.statuses : [],
     })
     if (textFromContent(current.data?.content) !== expected) {
       outcomes.push({ ...base, state: 'skipped', reason: '回执正文已变化，拒绝覆盖' })
@@ -1057,7 +1638,7 @@ export async function restoreReceipts({ session, client, receipts, onOutcome }) 
         id: randomUUID(),
         role: 'user',
         content: [{ type: 'text', text: body }],
-        source: { kind: 'user' },
+        source: { kind: 'user', form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
       }, {
         surfaceOp: { op: 'replace', startSeq: receipt.replacementSeq, endSeq: receipt.replacementSeq },
         sourceEventSeqs: [receipt.replacementSeq],
@@ -1067,14 +1648,122 @@ export async function restoreReceipts({ session, client, receipts, onOutcome }) 
       outcomes.push({ ...base, state: 'skipped', reason: `恢复替换失败：${messageOf(error)}` })
     }
   }
-  if (onOutcome) for (const outcome of outcomes) await onOutcome(outcome)
   return outcomes
 }
 
-/** Search the isolated cold store and return the bounded digest for tail injection. */
+/**
+ * Restore one batch-summary group: rebuild the summary text from the member
+ * rows, verify it byte-for-byte against the surface, then replace it once with
+ * all member bodies joined in order.
+ *
+ * 整组同生共死（fail-closed）：任何一个成员的冷节点缺失或 hash 不符，整组跳过
+ * 并逐行给出同一个原因——半组恢复会让摘要指向已经不在冷库里的成员。
+ */
+async function restoreBatchGroup({ session, client, receipts, onOutcome, receiptMarker, outcomes }) {
+  const baseOf = (receipt) => ({
+    rangeStart: receipt.rangeStart,
+    rangeEnd: receipt.rangeEnd,
+    nodeId: receipt.nodeId,
+    replacementSeq: receipt.replacementSeq,
+    hash: receipt.hash,
+  })
+  const skipAll = (reason) => {
+    const skipped = receipts.map((receipt) => ({ ...baseOf(receipt), state: 'skipped', reason }))
+    outcomes.push(...skipped)
+    if (onOutcome) return Promise.all(skipped.map((outcome) => onOutcome(outcome)))
+    return undefined
+  }
+
+  const replacementSeq = receipts[0].replacementSeq
+  const nodes = session.surface.nodes
+  if (!nodes.includes(replacementSeq)) return skipAll('回执节点已不在活动面')
+  const current = session.eventAt(replacementSeq)
+  if (current?.type !== 'user/message') return skipAll('回执节点不再是预期类型（surface 冲突）')
+
+  const expected = buildBatchReceipt({
+    marker: receiptMarker,
+    members: receipts.map((receipt) => ({
+      tools: receipt.tools ?? [],
+      range: { start: receipt.rangeStart, end: receipt.rangeEnd },
+      callIds: receipt.callIds ?? [],
+      nodeId: receipt.nodeId,
+      hash: receipt.hash,
+      chars: receipt.chars ?? 0,
+      tokens: receipt.originalTokens ?? 0,
+      chunks: receipt.chunkCount ?? 1,
+    })),
+  })
+  if (textFromContent(current.data?.content) !== expected) return skipAll('回执正文已变化，拒绝覆盖')
+
+  // 逐成员读冷节点并核对各自 hash；任何成员失败整组跳过。
+  const bodies = []
+  for (const receipt of receipts) {
+    const chunkCount = Number.isInteger(receipt.chunkCount) && receipt.chunkCount > 0 ? receipt.chunkCount : 1
+    const parts = []
+    let readProblem = null
+    for (let index = 0; index < chunkCount; index += 1) {
+      const nodeId = archiveChunkNodeId(receipt.nodeId, index)
+      let readBack
+      try {
+        readBack = await client.getNode(nodeId)
+      } catch (error) {
+        readProblem = `${receipt.nodeId} 冷节点不可读（第 ${index + 1}/${chunkCount} 段）：${messageOf(error)}`
+        break
+      }
+      if (!readBack || readBack.ok === false || typeof readBack.content !== 'string') {
+        readProblem = `${receipt.nodeId} 冷节点缺失（第 ${index + 1}/${chunkCount} 段），拒绝伪造恢复`
+        break
+      }
+      parts.push(normalizeColdBody(coldRecordBody(readBack.content)))
+    }
+    if (readProblem) return skipAll(readProblem)
+    const body = parts.join('')
+    if (archiveMac(body) !== receipt.hash) return skipAll(`${receipt.nodeId} 冷节点 hash 与回执不符`)
+    bodies.push(body)
+  }
+
+  try {
+    // 成员原文按序拼成一条恢复消息（与逐条恢复一样「一条 user 消息承载原文正文，
+    // 不还原原节点结构」）；空行分隔各成员，边界仍可按冷记录 ID 逐条回读。
+    const restored = session.append('user/message', {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: bodies.join('\n') }],
+      source: { kind: 'user', form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
+    }, {
+      surfaceOp: { op: 'replace', startSeq: replacementSeq, endSeq: replacementSeq },
+      sourceEventSeqs: [replacementSeq],
+    })
+    const restoredRows = receipts.map((receipt) => ({ ...baseOf(receipt), state: 'restored', reason: '', restoredSeq: restored.seq }))
+    outcomes.push(...restoredRows)
+    if (onOutcome) for (const outcome of restoredRows) await onOutcome(outcome)
+  } catch (error) {
+    await skipAll(`恢复替换失败：${messageOf(error)}`)
+  }
+}
+
+/**
+ * Search the isolated cold store and return the bounded digest for tail injection.
+ *
+ * 失败必须能被上层区分出来，不能吞成一个空串（审计 P2-5(c)）：空串在下游与
+ * 「确实没有匹配」完全同形，模型会以为这段工作从未存在过并重做。所以这里用
+ * `normalizeRecallPayload` 作为唯一规范化入口，并把状态原样带出去：
+ *
+ * - `ok` 且没有命中 → `text` 为空（真的没有匹配，不注入）；
+ * - `unsupported`   → `text` 为空，但 `status`/`reason` 非空，调用方据此记日志、
+ *   记状态，而不是把它当成「没有相关信息」。
+ *
+ * @returns `{ status, text, reason, entries }`；`entries` 是本轮摘要对应的原始
+ *   命中行（调用方要按 id 记账时用，不去反解析文本）。
+ */
 export async function recallDigest({ client, query, signal, limit = 5 }) {
   const payload = await client.recall(query, signal, limit)
-  return formatRecallDigest(recallSummaries(payload, limit))
+  const normalized = normalizeRecallPayload(payload, limit)
+  if (normalized.status !== RECALL_STATUS.OK) {
+    return { status: normalized.status, text: '', reason: normalized.reason ?? '', entries: [] }
+  }
+  const summaries = normalized.summaries
+  return { status: RECALL_STATUS.OK, text: formatRecallDigest(summaries, MAX_RECALL_DIGEST_CHARS), reason: '', entries: summaries }
 }
 
 /**
@@ -1089,19 +1778,22 @@ export async function recallDigest({ client, query, signal, limit = 5 }) {
  */
 export function recallQueryFrom(messages) {
   if (!Array.isArray(messages)) return null
-  let fallback = null
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
     if (!message || message.role !== 'user') continue
-    const kind = message.source?.kind
-    if (kind === PACKAGE_NAME) continue
+    // 插件自己注入的卡片 / 回注包 / 回执一律不作为查询：它们不是人类提问，
+    // 拿它们当查询只会让回注内容自己触发自己（审计 P0-3 的「召回触发」）。
+    if (message.source?.kind === PACKAGE_NAME) continue
+    if (isPluginAuthoredMessage(message)) continue
+    // 只接受人类本人写的提示。此前这里有一条「别的 source kind 也先留着当兜底」
+    // 的分支，实测（session-7c6b98e7）里它 15 次回注中有 12 次选中了宿主的
+    // `time-context` 环境快照：快照 id 每步都新，`recallQueryId` 去重因此永远
+    // 失效，每个新快照都触发一次回注，且命中的是与本步无关的历史 read/pwsh 记录。
+    // 拿不到人类提示就返回 null —— 失败关闭，宁可不回注，也不拿环境快照当查询。
+    if (!isHumanAuthoredMessage(message)) continue
     const text = textFromContent(message.content)
     if (!text) continue
-    const candidate = { id: typeof message.id === 'string' ? message.id : `index-${index}`, text }
-    if (kind === 'user') return candidate
-    // A first-party prompt under another source kind is still a better query
-    // than nothing, so it is kept only as a fallback.
-    if (!fallback) fallback = candidate
+    return { id: typeof message.id === 'string' ? message.id : `index-${index}`, text }
   }
-  return fallback
+  return null
 }

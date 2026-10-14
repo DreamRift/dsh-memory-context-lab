@@ -29,6 +29,7 @@ function createStubContext({ labRoot, archivedIds }) {
   const prependEvents = []
   const commands = []
   const projections = []
+  const tools = []
   const cleanups = []
   const warnings = []
   /** Live agents by session id, as the host registry would expose them. */
@@ -97,6 +98,17 @@ function createStubContext({ labRoot, archivedIds }) {
         return () => {}
       },
     },
+    // v2 的只读召回工具走反应式注入；这里提供 tools 服务让注册真的发生。
+    tools: {
+      register(definition) {
+        tools.push(definition)
+        return () => {}
+      },
+    },
+    inject(deps, callback) {
+      if (deps.every((dep) => context[dep] !== undefined)) callback(context)
+      return { dispose() {} }
+    },
     async _dispose() {
       for (const cleanup of cleanups.splice(0).reverse()) {
         try { await cleanup?.() } catch { /* teardown is best-effort in the stub */ }
@@ -156,16 +168,17 @@ async function withTempLab(name, body) {
   }
 }
 
-test('the plugin registers exactly one command and one projection', async () => {
+test('the plugin registers one command per engine and one projection', async () => {
   await withTempLab('register', async (labRoot) => {
     const ctx = await harness({ labRoot })
-    assert.equal(ctx._commands.length, 1)
-    assert.equal(ctx._commands[0].name, 'memory-lab')
+    // v1 与 v2 各注册一个命令，且工具集不随 on/off 增删。
+    assert.equal(ctx._commands.length, 2)
+    const names = ctx._commands.map((command) => command.name).sort()
+    assert.deepEqual(names, ['memory-lab', 'memory-lab2'])
+    const v1 = ctx._commands.find((command) => command.name === 'memory-lab')
+    assert.equal(v1.recordInput, undefined, 'the default records the raw input, which the projection folds')
     assert.equal(ctx._projections.length, 1)
     assert.equal(ctx._projections[0].key, 'memoryContextLab')
-    // The plugin must not add or remove any model-visible tool: the tool set
-    // lives in the request prefix, and changing it invalidates the whole cache.
-    assert.equal(ctx._commands[0].recordInput, undefined, 'the default records the raw input, which the projection folds')
     await ctx._dispose()
   })
 })
@@ -314,6 +327,13 @@ test('the projection rebuilds settings from the session log, not from plugin mem
     autoRecall: false,
     autoRestore: false,
     preset: { id: '', label: GLOBAL_PRESET_LABEL, modified: false },
+    // v2 引入：面板要能区分「哪个引擎持有本会话投影」。v1 会话恒为空串，
+    // 字段固定存在，避免同一 slot 的 schema 随引擎切换而漂移。
+    engine: 'v1',
+    // 开关位：无命令记录时恒为 false（配置默认值由面板叠加显示）。
+    fullHistory: false,
+    planFirst: false,
+    planActive: false,
     archived: 0,
     restored: 0,
     revision: lines.length,
@@ -345,9 +365,11 @@ test('recall is a no-op with nothing archived and fails closed once something is
     const idleSession = buildSession({ operations: 1, id: idleId })
     const { agent: idleAgent } = agentFor(idleSession)
     await run(first, idleAgent, 'on')
-    assert.deepEqual(first._prependEvents, ['agent/pre-step'], 'recall must be a prepended pre-step listener')
+    // 两套引擎各挂一个「回注」pre-step（都 prepend），所以这里出现两次；
+    // 自动降温的两个监听不 prepend，不在这个列表里。
+    assert.deepEqual(first._prependEvents, ['agent/pre-step', 'agent/pre-step'], 'each engine prepends one recall listener')
     const idleListeners = first._listeners.get('agent/pre-step')
-    assert.equal(idleListeners.length, 2, 'both the cooler and recall listen on pre-step')
+    assert.equal(idleListeners.length, 6, 'v1 与 v2 各一个降温 + 一个回注，v2 一个有界工作状态注入，外加计划先行自动化钩子')
 
     const batch = [{
       id: 'user-1',
@@ -397,7 +419,7 @@ test('recall is a no-op with nothing archived and fails closed once something is
       assert.equal(decision.messages.length, 1, 'a failed recall must add nothing')
     }
     assert.ok(
-      second._warnings.some((line) => line.includes('recall skipped')),
+      second._warnings.some((line) => line.includes('recall unavailable (call threw)') || line.includes('recall skipped')),
       `the failure must be logged, not swallowed silently; warnings: ${second._warnings.join(' | ')}`,
     )
     await second._dispose()
@@ -429,7 +451,7 @@ test('automatic cooling delegates the waterfall and never blocks a step on failu
     await run(ctx, agent, 'on')
 
     const listeners = ctx._listeners.get('agent/pre-step')
-    assert.equal(listeners.length, 2)
+    assert.equal(listeners.length, 6, 'v1 与 v2 各一个降温 + 一个回注，v2 一个有界工作状态注入，外加计划先行自动化钩子')
     let called = 0
     const decision = await listeners[0]({ agent, signal: new AbortController().signal }, async () => {
       called += 1

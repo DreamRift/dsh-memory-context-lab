@@ -59,7 +59,7 @@ async function readJson(file) {
  * failure (permissions, IO) throws with `code: 'EDAMAGED'` so callers can fail
  * closed instead of mistaking damage for "never enabled".
  */
-async function readJsonStrict(file) {
+export async function readJsonStrict(file) {
   let text
   try {
     text = await readFile(file, 'utf8')

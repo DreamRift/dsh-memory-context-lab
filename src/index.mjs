@@ -19,8 +19,10 @@ import {
   normalizePresets,
   normalizeSettings,
   NUMERIC_SETTINGS,
+  PACKAGE_NAME,
   parseNumericSetting,
   parseOperation,
+  PLUGIN_SOURCE_FORMS,
   PRESET_RESET_WORDS,
   renderRecallBlock,
   resolvePreset,
@@ -30,6 +32,12 @@ import { cleanDecision, recallQueryFrom } from './apply.mjs'
 import { createEngine } from './apply-engine.mjs'
 import { createMemoryContextLabProjection } from './projection.mjs'
 import { TemporaryLingshuClient } from './lingshu-lab-client.mjs'
+import { assertV2AllowsV1, getEngineRegistry } from './v2/engine.mjs'
+import { EngineV2Error } from './v2/errors.mjs'
+import { createV2Runtime, V2_COMMAND_NAME } from './v2/runtime.mjs'
+import { createLingshuBackendProvider } from './v2/lingshu-backend.mjs'
+import { createPlanFirst } from './plan-first.mjs'
+import { createV2RecallTool } from './v2/tool.mjs'
 import {
   globalSuppressionCoordinator,
   locatePinnedDshMemory,
@@ -44,6 +52,10 @@ import {
 } from './storage.mjs'
 
 export const name = 'memory-context-lab'
+// 只硬依赖 v1 已在用的两个服务。`tools` 故意**不**放进 inject：它是 agent/preset
+// 作用域提供的服务，而本插件挂在 profile 作用域；写成硬依赖会让整个插件（含正在
+// 工作的 v1）在拿不到该服务时加载失败。改为反应式注入 ctx.inject(['tools'], …)，
+// 拿不到就跳过工具注册并告警。
 export const inject = ['commands', 'sessionProjections']
 
 const requireFromPlugin = createRequire(import.meta.url)
@@ -141,7 +153,7 @@ function buildConfigSchema() {
   const settingFields = {
     retainOperations: SCHEMAS.natural().max(200).default(5)
       .i18n({ 'zh-CN': '保留最近操作数', en: 'Retained recent operations' }),
-    archiveBatchSize: SCHEMAS.natural().max(200).default(5)
+    archiveBatchSize: SCHEMAS.natural().max(200).default(DEFAULT_SETTINGS.archiveBatchSize)
       .i18n({ 'zh-CN': '归档批量阈值', en: 'Archive batch size' }),
     auto: SCHEMAS.boolean().default(true)
       .i18n({ 'zh-CN': '自动降温', en: 'Auto cooling' }),
@@ -151,7 +163,19 @@ function buildConfigSchema() {
       .i18n({ 'zh-CN': '停用时恢复原文', en: 'Restore originals on disable' }),
   }
   return SCHEMAS.object({
-    defaults: SCHEMAS.object(settingFields)
+    defaults: SCHEMAS.object({
+      ...settingFields,
+      // 保护预算只存在于全局默认：它不是「一组可切换的降温档位」的一部分，
+      // 预设行保持原有形状，避免把保护策略伪装成模式开关。
+      protectBudgetTokens: SCHEMAS.natural().max(2000000).default(32768)
+        .i18n({ 'zh-CN': '软保护预算（估算 token）', en: 'Soft protection budget (estimated tokens)' }),
+      // 插件级开关的全局默认：只在「无会话内命令记录」时作为面板初始位置与
+      // v2 新账本播种值，不进预设行（同保护预算的理由）。
+      fullHistory: SCHEMAS.boolean().default(false)
+        .i18n({ 'zh-CN': '全历史记忆上下文（v2）', en: 'Full-history memory context (v2)' }),
+      planFirst: SCHEMAS.boolean().default(false)
+        .i18n({ 'zh-CN': '新会话计划先行', en: 'Plan first in new sessions' }),
+    })
       // Volatile fields never leave the root config object; the host stores a
       // detached reference instead of inlining rows, so preset rows are not
       // frozen into the persisted defaults when one session mutates them.
@@ -199,15 +223,23 @@ const HELP = [
   '/memory-lab set auto on|off     自动降温开关（默认开）。',
   '/memory-lab set recall on|off   命中回注开关（默认开）。',
   '/memory-lab set autorestore on|off  停用时是否恢复原文并清数据（默认开）。',
+  '/memory-lab set protect 32768   软保护预算（估算 token）；超预算先释放最弱的软保留，硬保护不动。',
   '/memory-lab preset              查看全局预设与可用预设列表。',
   '/memory-lab preset <名称>|reset 应用整组预设；reset 回到全局预设。新增/改名/编辑在设置页。',
   '/memory-lab now                 立即测量并按当前规则归档一批。',
-  '/memory-lab dry-run             只做估算与候选选择，零副作用。',
+  '/memory-lab dry-run             只做估算与候选选择，零副作用；并解释每段为何保留、为何可归档。',
   '/memory-lab restore             把与回执一致且活动面稳定的操作恢复为原文。',
   '/memory-lab clean               删除本会话的隔离数据（有未恢复回执时会拒绝）。',
+  '/memory-lab pin <seq>           显式保护某个操作，使它不因超过保留窗口而退出（可重复）。',
+  '/memory-lab unpin <seq>         解除该显式保护。',
+  '/memory-lab protect             查看活跃证据保护集：来源、原因、建立序号、解除条件与成本。',
   '',
   '归档单位是「一次完整操作」：助手的工具调用（含参数）加对应的工具结果，整体换成一条回执。',
   '**保留最近 N 个操作是唯一触发线**：不管占用率多少，更旧的操作攒够批量阈值就归档。',
+  '**可归档 = 结构与冷存检查通过 ∧ 不在保留窗口 ∧ 无未闭合调用／在途依赖 ∧ 已可靠曝光 ∧ 不是当前仍需保留的证据 ∧ 满足批量阈值。**',
+  '硬保护来自真实结构与宿主状态（未返回的调用、未曝光结果、待确认副作用、运行中的后台 job、系统／人类约束），',
+  '不因超过 N 个操作而失效；软保留（召回刚读回、任务关联线索）受预算约束，到期即释放。',
+  '路径相同只能作为关联线索，不能证明语义依赖或版本相同——插件不假装能自动理解任务关系。',
   '上下文上限由宿主的自动压缩兜底，插件不再自己看护占用率（历史上从未触发，宿主压缩也从未触发）。',
   '批量阈值是成本杠杆：每提交一批就会让替换点之后的上下文按未命中价重算一次，批次数越多代价越大，',
   '所以攒几个再提交比来一个归档一个便宜得多。',
@@ -318,6 +350,25 @@ export async function apply(ctx, config) {
   }
 
   /**
+   * 设置页的全局默认「全历史记忆上下文」。v2 账本没有旧值时用它播种；
+   * v1 引擎不消费它（v1 无全历史模式）。
+   */
+  function resolveFullHistoryDefault(configObject) {
+    const defaults = unwrapVolatile(configObject?.defaults)
+    return defaults?.fullHistory === true
+  }
+
+  /**
+   * 设置页的全局默认「计划先行」。投影折叠的 planFirst 位没有旧值时以它
+   * 为初值；会话内 `set planfirst` 的折叠结果仍然覆盖它（命令事件在 init
+   * 之后重放）。v1/v2 引擎共用这一位。
+   */
+  function resolvePlanFirstDefault(configObject) {
+    const defaults = unwrapVolatile(configObject?.defaults)
+    return defaults?.planFirst === true
+  }
+
+  /**
    * User-managed presets from the plugin config. Shipped presets are only the
    * schema default for fresh installs; once the user edits the list the saved
    * value (even an empty one) wins.
@@ -385,6 +436,11 @@ export async function apply(ctx, config) {
       occupancy: null,
       occupancyError: null,
       recallQueryId: null,
+      // 当前可见集合与历史注入记录分开：`recallDeliveries` 只在对应回注消息仍在
+      // 活动面上时才算"证据仍可见"，退出后同一冷节点可再次读回。
+      recallDeliveries: [],
+      recallAttempts: [],
+      lastRecall: null,
       lastAction: null,
     }
   }
@@ -587,9 +643,102 @@ export async function apply(ctx, config) {
   const projection = createMemoryContextLabProjection({
     getPresets: resolveGlobalPresets,
     getDefaults: resolveDefaultsSettings,
+    // 插件级 planFirst 配置默认：全新会话的折叠位从它取初值，`set planfirst`
+    // 命令的折叠结果仍然覆盖它（事件折叠在 init 之后）。读取端保持惰性，
+    // 配置页改动在下次重放时生效，与 preset/default 的口径一致。
+    planFirstDefault: () => resolvePlanFirstDefault(config),
   })
 
+  // ── v2 引擎（全历史按需记忆化）────────────────────────────────────────────
+  // 与 v1 并存但互斥：同一会话只允许一个引擎替换模型可见投影。v2 不重定向正式
+  // lingshu_cg；它把 v1 的降温管线接到自己的隔离库上（见 v2/runtime.mjs 顶部说明），
+  // 并固定注册一个只读召回工具（见下方 ctx.inject(['tools'], …)）。
+  // v2 检索后端：接本机已安装的灵枢，但**只**在会话隔离根上起独立子进程
+  // （`buildIsolatedMdcgEnvironment` 会把 MDCG_ROOT/STATE_ROOT/DATA_ROOT 全部改写到
+  // 该会话的 v2 目录）。灵枢里放的是派生索引表示，原文权威仍是本会话 ArchiveStore。
+  // 未定位到 dsh-memory 时如实报不可用，绝不回退正式灵枢根。
+  // 计划先行：宿主 planMode 服务联动（服务缺失时如实降级，不影响降温本体）。
+  const planFirst = createPlanFirst({ services: ctx, logger: ctx.logger })
+
+  /**
+   * 读本插件投影的 planFirst 开关位（从会话日志折叠，不依赖引擎账本）。
+   * 投影不可读时按 false 处理：宁可少联动，不凭记忆猜开关位置。
+   */
+  function readProjectionPlanFirst(session) {
+    try {
+      const state = ctx.sessionProjections?.stateOf?.(session, 'memoryContextLab')
+      return state?.planFirst === true
+    } catch {
+      return false
+    }
+  }
+
+  const v2SemanticBackend = createLingshuBackendProvider({
+    lingshuPackageRoot: dependencies.lingshuPackageRoot,
+    logger: ctx.logger,
+  })
+
+  const v2 = createV2Runtime({
+    labRoot,
+    services,
+    logger: ctx.logger,
+    hostVersion: HOST_VERSION,
+    sessionIdOf: (session) => sessionIdOf(session),
+    recallQueryFrom,
+    defaultSettings: resolveDefaultsSettings,
+    defaultFullHistory: () => resolveFullHistoryDefault(config),
+    onEnabled: (agent) => (readProjectionPlanFirst(agent.session) ? planFirst.enterIfFresh(agent) : null),
+    onPlanFirstToggle: (agent, value) => (value ? planFirst.enterIfFresh(agent) : null),
+    coordinator: dependencies.coordinator,
+    // 同步取用：检索热路径不会隐式起子进程（只在 /memory-lab2 index 时启动）。
+    semanticBackendFor: ({ sessionId, storeRoot }) => v2SemanticBackend.backendFor({ sessionId, storeRoot }),
+    semanticBackendEnsure: ({ sessionId, storeRoot, signal }) => v2SemanticBackend.ensureBackend({ sessionId, storeRoot, signal }),
+    semanticBackendClose: ({ sessionId }) => v2SemanticBackend.close(sessionId),
+    semanticBackendStatus: () => v2SemanticBackend.describe(),
+    semanticBackendFailure: ({ sessionId }) => v2SemanticBackend.failureReason(sessionId),
+    semanticBackendCloseAll: () => v2SemanticBackend.closeAll(),
+  })
+
+  async function v2CommandHandler(invocation) {
+    const pending = v2.commandHandler(invocation)
+    activeOperations.add(pending)
+    pending.finally(() => activeOperations.delete(pending)).catch(() => {})
+    return pending
+  }
+
   // ── Command surface ──────────────────────────────────────────────────────
+  /**
+   * 与 `/memory-lab on` 完全相同的启用路径：命令面与「计划批准后自动启用」
+   * 共用，保证两条入口产生同一份账本与互斥裁决。调用方拿到 record 后自行
+   * 组织文案；抛错（含 EV2ACTIVE）由调用方处理。
+   */
+  async function enableV1(agent, signal) {
+    const sessionId = sessionIdOf(agent.session)
+    // v2 引擎若持有本会话投影，v1 不得同时接管（互斥由 v2/engine.mjs 裁决）。
+    await assertV2AllowsV1(labRoot, sessionId)
+    const record = await runMaintenance({ agent, signal }, async () => {
+      const existing = await readSessionState(labRoot, sessionId)
+      // Seed from the log, not from the defaults: a `set` issued before `on`
+      // is still the user's latest intent, and the panel already shows it.
+      const folded = settingsFromSessionLog(agent.session, buildFoldContext())
+      const created = existing ?? await createSessionState(labRoot, sessionId, folded ?? resolveDefaultsSettings())
+      if (folded) created.state.settings = folded
+      created.state.enabled = true
+      await writeSessionState(created.directory, created.state)
+      const made = makeRecord({
+        agent,
+        sessionId,
+        directory: created.directory,
+        state: created.state,
+      })
+      records.set(sessionId, made)
+      absent.delete(sessionId)
+      return made
+    })
+    ctx.logger.info(`memory-context-lab: enabled for session ${sessionId}`)
+    return record
+  }
+
   async function commandHandler(invocation) {
     const { operation, remainder } = parseOperation(invocation.rawInput)
     const sessionId = sessionIdOf(invocation.agent.session)
@@ -611,37 +760,27 @@ export async function apply(ctx, config) {
     if (operation === 'on') {
       if (remainder) return { kind: 'error', text: '用法：/memory-lab on' }
       if (records.get(sessionId)) return { kind: 'success', text: engine.formatStatus(records.get(sessionId)) }
+      let record
       try {
-        const record = await runMaintenance(invocation, async () => {
-          const existing = await readSessionState(labRoot, sessionId)
-          // Seed from the log, not from the defaults: a `set` issued before `on`
-          // is still the user's latest intent, and the panel already shows it.
-          const folded = settingsFromSessionLog(invocation.agent.session, buildFoldContext())
-          const created = existing ?? await createSessionState(labRoot, sessionId, folded ?? resolveDefaultsSettings())
-          if (folded) created.state.settings = folded
-          created.state.enabled = true
-          await writeSessionState(created.directory, created.state)
-          const made = makeRecord({
-            agent: invocation.agent,
-            sessionId,
-            directory: created.directory,
-            state: created.state,
-          })
-          records.set(sessionId, made)
-          absent.delete(sessionId)
-          return made
-        })
-        ctx.logger.info(`memory-context-lab: enabled for session ${sessionId}`)
-        // Enabling never touches the cold store, so a missing or incompatible
-        // dsh-memory must not block it. The degradation is reported here and
-        // again by any archive attempt, which is where it actually matters.
-        const degraded = dependencies.startupError
-          ? `\n\n注意：隔离冷库当前不可用（${dependencies.startupError instanceof Error ? dependencies.startupError.message : String(dependencies.startupError)}）。设置与状态照常工作，但归档与回注会在尝试时失败关闭，不会改写任何会话内容。`
-          : ''
-        return { kind: 'success', text: `已在本会话启用上下文降温。\n\n${engine.formatStatus(record)}${degraded}` }
+        record = await enableV1(invocation.agent, invocation.signal)
       } catch (error) {
+        if (error instanceof EngineV2Error && error.code === 'EV2ACTIVE') {
+          return { kind: 'error', text: `本会话已由全历史按需记忆化引擎（v2）接管投影。\n请先执行 /memory-lab2 off 退出 v2，再启用维护版降温。` }
+        }
         return { kind: 'error', text: `未启用降温：${error instanceof Error ? error.message : String(error)}` }
       }
+      // 计划先行：启用时若该开关已折叠为开且会话仍全新，立即联动宿主计划模式
+      // （hero 态无 open turn，set() 即时落账，第一条用户消息就在计划引导下运行）。
+      const planNote = readProjectionPlanFirst(invocation.agent.session)
+        ? planFirst.enterIfFresh(invocation.agent)
+        : null
+      // Enabling never touches the cold store, so a missing or incompatible
+      // dsh-memory must not block it. The degradation is reported here and
+      // again by any archive attempt, which is where it actually matters.
+      const degraded = dependencies.startupError
+        ? `\n\n注意：隔离冷库当前不可用（${dependencies.startupError instanceof Error ? dependencies.startupError.message : String(dependencies.startupError)}）。设置与状态照常工作，但归档与回注会在尝试时失败关闭，不会改写任何会话内容。`
+        : ''
+      return { kind: 'success', text: `已在本会话启用上下文降温。\n\n${engine.formatStatus(record)}${planNote ? `\n${planNote.text}` : ''}${degraded}` }
     }
 
     if (operation === 'off') {
@@ -711,10 +850,48 @@ export async function apply(ctx, config) {
       const numeric = NUMERIC_SETTINGS[settingName]
       const boolean = BOOLEAN_SETTINGS[settingName]
       if (!numeric && !boolean) {
-        return { kind: 'error', text: '用法：/memory-lab set retain 10 | batch 10 | auto on|off | recall on|off | autorestore on|off' }
+        return { kind: 'error', text: '用法：/memory-lab set retain 10 | batch 10 | auto on|off | recall on|off | autorestore on|off | protect 32768 | planfirst on|off' }
+      }
+      // 计划先行是插件级开关（两引擎通用），不进 v1 引擎设置账本；开启且会话
+      // 全新时立即联动宿主计划模式，其余情况只记位置。
+      if (settingName === 'planfirst') {
+        if (rawValue !== 'on' && rawValue !== 'off') {
+          return { kind: 'error', text: '计划先行只能是 on 或 off。' }
+        }
+        const note = rawValue === 'on' ? planFirst.enterIfFresh(invocation.agent) : null
+        const recordForPlan = records.get(sessionId)
+        if (recordForPlan) {
+          recordForPlan.state.planFirst = rawValue === 'on'
+          await persist(recordForPlan).catch(() => {})
+        }
+        const lines = [`新会话计划先行已设为 ${rawValue === 'on' ? '开' : '关'}。`]
+        if (note) lines.push(note.text)
+        if (!records.get(sessionId)) lines.push('（本会话尚未启用降温；开关位置已记下，随会话日志折叠生效。）')
+        return { kind: 'success', text: lines.join('\n') }
+      }
+      // 全历史只在 v2 引擎下存在：v1 命令面如实指路，不静默吞掉拼写正确的开关。
+      if (settingName === 'fullhistory') {
+        if (rawValue !== 'on' && rawValue !== 'off') {
+          return { kind: 'error', text: '全历史记忆上下文只能是 on 或 off。' }
+        }
+        return {
+          kind: 'error',
+          text: '全历史记忆上下文只在 v2 引擎下有意义：请用 /memory-lab2 set fullhistory on|off，或在面板开关里启用（面板会自动切换引擎）。',
+        }
       }
       const record = records.get(sessionId) ?? await adopt(invocation.agent)
       if (!record) {
+        // D6：v2 引擎若正持有本会话投影，这里写的 v1 设置永远不会生效——用户
+        // 随后的 /memory-lab on 会被互斥拒绝（EV2ACTIVE），「已记下、on 后生效」
+        // 就是谎报（实测会话 v2 启用后 set batch，v2 的 store.settings 纹丝不动，
+        // 批形态由 v2 自己的批次逻辑决定，用户以为改了却毫无提示）。如实指路。
+        const registry = getEngineRegistry(labRoot, sessionId)
+        if (registry.holder === 'v2') {
+          return {
+            kind: 'error',
+            text: '本会话当前由 v2 引擎（/memory-lab2）持有投影：/memory-lab set 写入的是 v1 设置，对 v2 行为不生效。请改用 /memory-lab2 set batch N（v2 侧同名设置即时生效），或先 /memory-lab2 off 回到 v1。',
+          }
+        }
         // Settings are configuration, not activation, and the host has already
         // written this command into the session log — which is where `on` folds
         // them from. Reporting a failure here would be a lie: the value does take
@@ -804,6 +981,48 @@ export async function apply(ctx, config) {
         return await runMaintenance(invocation, (signal) => engine.runOnce(record, signal, { dryRun: operation === 'dry-run' }))
       } catch (error) {
         return { kind: 'error', text: `操作失败（原文未作静默删除）：${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+
+    if (operation === 'protect') {
+      const record = records.get(sessionId) ?? await adopt(invocation.agent)
+      if (!record) {
+        const notice = damagedNotice(sessionId)
+        if (notice) return notice
+        return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
+      }
+      try {
+        // 无副作用测量：查询保护集不会写状态、不会租用冷节点 id。
+        return await runMaintenance(invocation, async (signal) => {
+          const occupancy = await engine.measureOccupancy(record, signal, { persistClaims: false })
+          return { kind: 'success', text: engine.formatProtection(occupancy) }
+        })
+      } catch (error) {
+        return { kind: 'error', text: `无法读取保护集：${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+
+    if (operation === 'pin' || operation === 'unpin') {
+      const target = remainder.trim()
+      const record = records.get(sessionId) ?? await adopt(invocation.agent)
+      if (!record) {
+        const notice = damagedNotice(sessionId)
+        if (notice) return notice
+        return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
+      }
+      if (!target) {
+        return { kind: 'error', text: `用法：/memory-lab ${operation} <seq>（seq 见 dry-run／protect 报告）` }
+      }
+      try {
+        return await runMaintenance(invocation, async () => {
+          const outcome = operation === 'pin'
+            ? engine.pinOperation(record, target)
+            : engine.unpinOperation(record, target)
+          await persist(record)
+          return { kind: outcome.ok ? 'success' : 'error', text: outcome.text }
+        })
+      } catch (error) {
+        return { kind: 'error', text: `${operation} 失败：${error instanceof Error ? error.message : String(error)}` }
       }
     }
 
@@ -913,6 +1132,79 @@ export async function apply(ctx, config) {
     return { kind: 'error', text: HELP }
   }
 
+  // ── Plan-first automation（自动进入计划模式 + 批准后自动启用降温）────────
+  // 注册在自动降温钩子之前：同一稳定边界上，先完成「批准 → 自动 on」，再让
+  // 自动降温钩子拿到已存在的 record 正常续跑，避免空转一步。
+  // 自动进入只在「全新会话的首个 enter 步」发生一次；自动启用只在
+  // planActive 观察 true→false（计划退出）且 v1 未启用、v2 未接管时发生一次。
+  // 两个内存集合都以宿主会话 id 为键：插件重启后集合为空，但投影折叠位与
+  // plan/mode 落账仍在，重放不会重复进入或重复启用。
+  const autoEnteredPlanSessions = new Set()
+  const autoEnabledCoolingSessions = new Set()
+  const lastObservedPlanActive = new Map()
+  const disposePlanFirstAutomation = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    if (decision?.kind !== 'enter' || signal?.aborted) return decision
+    try {
+      const sessionId = sessionIdOf(agent.session)
+      // 投影折叠位即生效判定：init 由插件级配置播种，`set planfirst` 折叠覆盖。
+      // 折叠位为 false 时本钩子完全静默（含用户显式 set off）。
+      if (!sessionId || !readProjectionPlanFirst(agent.session)) return decision
+
+      // (1) 全新会话自动进入计划模式。pre-step 时首条用户消息已入 surface，
+      //     所以放宽的 fresh 判定允许「无 assistant 消息且 user 消息 ≤ 1」。
+      if (!autoEnteredPlanSessions.has(sessionId)) {
+        const stateBefore = planFirst.planStateOf(agent)
+        if (stateBefore.available && stateBefore.active !== true && planFirst.sessionIsFreshForAutoEnter(agent)) {
+          const result = planFirst.enterIfFresh(agent, { fresh: true })
+          if (result?.outcome === 'committed') {
+            autoEnteredPlanSessions.add(sessionId)
+            ctx.logger.info(`memory-context-lab: plan-first auto-entered fresh session ${sessionId} (via ${result.via})`)
+          } else if (result?.outcome === 'error') {
+            ctx.logger.warn(`memory-context-lab: plan-first auto-enter failed: ${result.reason}`)
+          }
+        } else {
+          // 一旦会话不再全新（或已处于计划模式），永久关闭本会话的自动进入。
+          autoEnteredPlanSessions.add(sessionId)
+        }
+      }
+
+      // (2) 计划批准退出（planActive true→false）→ 自动启用 v1 降温。
+      //     只在未启用且 v2 未接管时触发；EV2ACTIVE 等互斥冲突按静默跳过
+      //     处理（v2 在管时由 v2 自己的机制负责，不抢投影）。
+      const activeNow = planFirst.planStateOf(agent).active === true
+      const activeBefore = lastObservedPlanActive.get(sessionId)
+      lastObservedPlanActive.set(sessionId, activeNow)
+      if (activeBefore === true && activeNow === false && !autoEnabledCoolingSessions.has(sessionId)) {
+        autoEnabledCoolingSessions.add(sessionId)
+        if (!records.get(sessionId)) {
+          try {
+            const record = await enableV1(agent, signal)
+            if (record) {
+              ctx.logger.info(`memory-context-lab: plan approved; cooling auto-enabled for session ${sessionId}`)
+              const messageId = randomUUID()
+              return {
+                ...decision,
+                messages: [...decision.messages, {
+                  id: messageId,
+                  role: 'user',
+                  content: [{ type: 'text', text: escapePromptBraces('[计划已批准] 上下文降温已自动启用（/memory-lab on 等效）；计划工件保持常驻，后续操作以小回执替换、正文沉入会话隔离冷库。') }],
+                  source: { kind: PACKAGE_NAME, form: PLUGIN_SOURCE_FORMS.WORKING_STATE },
+                }],
+              }
+            }
+          } catch (error) {
+            ctx.logger.warn(`memory-context-lab: auto-enable after plan approval skipped: ${error?.message || error}`)
+          }
+        }
+      }
+    } catch (error) {
+      // 自动化是增强：任何失败都不得影响本次请求。
+      ctx.logger.warn(`memory-context-lab: plan-first automation error: ${error?.message || error}`)
+    }
+    return decision
+  })
+
   // ── Automatic cooling at the confirmed stable boundary ───────────────────
   // `agent/pre-step` is a waterfall that runs after the inbox is claimed and
   // before `step/start`, `agent/request`, and request derivation, so a surface
@@ -923,12 +1215,21 @@ export async function apply(ctx, config) {
   const disposeAutoCooling = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (decision?.kind !== 'enter' || signal?.aborted) return decision
+    // 计划模式激活期间挂起自动降温：计划生成与评审依赖完整历史，退热会破坏
+    // 计划阶段的信息完整性。手动命令不受影响（用户显式动作优先）。
+    const suspension = planFirst.coolingSuspensionFor(agent)
+    if (suspension.suspended) {
+      ctx.logger.info(`memory-context-lab: ${suspension.reason}`)
+      return decision
+    }
     try {
       const record = await adopt(agent)
       if (record) {
         const outcome = await engine.runAutoCooling(record, signal)
         if (outcome.action === 'applied') {
           ctx.logger.info(`memory-context-lab: archived ${outcome.applied} operations (~${outcome.releasedTokens} tokens)`)
+        } else if (outcome.action === 'failed') {
+          ctx.logger.warn(`memory-context-lab: archive batch failed (0 units applied): ${outcome.reason}`)
         } else if (outcome.action === 'unavailable') {
           ctx.logger.warn(`memory-context-lab: cooling unavailable: ${outcome.reason}`)
         }
@@ -951,36 +1252,172 @@ export async function apply(ctx, config) {
   const disposeRecall = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (decision?.kind !== 'enter' || signal?.aborted) return decision
+    // 计划模式激活期间不回注：计划阶段需要的上下文由计划本身与完整历史承担。
+    if (planFirst.coolingSuspensionFor(agent).suspended) return decision
+    // Declared outside the try so the failure path can still report the attempt.
+    let recallRecord = null
     try {
       const record = await adopt(agent)
+      recallRecord = record
       if (!record || !engine.settingsOf(record).autoRecall) return decision
       // Nothing archived means nothing to recall, and a search would only
       // surface unrelated cold-store content while permanently growing history.
       if (engine.pendingReceipts(record).length === 0) return decision
       const query = recallQueryFrom(decision.messages)
+      if (query) record.humanPromptSeen = true
       if (!query || record.recallQueryId === query.id) return decision
       // Remember the attempt either way: a failed search must not be retried on
       // every step of the same turn.
       record.recallQueryId = query.id
       const digest = await engine.buildRecall(record, query.text.slice(0, MAX_RECALL_QUERY_CHARS), signal)
-      if (!digest) return decision
-      const text = escapePromptBraces(renderRecallBlock(digest))
+      if (!digest.text) {
+        // 「没有命中」「冷库拒答」「冷库不可用」是三件事，必须分开记：把后端故障
+        // 静默当成"没有相关信息"，模型会以为工作已丢失并重做。空命中不记日志
+        // （那是正常结果），失败一定记。
+        engine.rememberRecall(record, {
+          queryId: query.id,
+          status: digest.status,
+          reason: digest.reason,
+          hits: digest.hits.length,
+          skippedVisible: digest.skippedVisible,
+          truncated: digest.truncated === true,
+          omitted: digest.omitted ?? 0,
+        })
+        if (digest.status !== 'ok') {
+          ctx.logger.warn(`memory-context-lab: recall ${digest.status}: ${digest.reason || 'no reason reported'}（未注入任何内容，也未记为"无相关信息"）`)
+        } else if (digest.skippedVisible > 0) {
+          ctx.logger.info(`memory-context-lab: recall hit ${digest.skippedVisible} node(s) already visible; nothing new injected`)
+        }
+        return decision
+      }
+      // 召回结果临时保护：把刚注入的冷记录（以及本次注入时仍在待归档计划里的
+      // 操作）挂上短期软保护，避免同一稳定边界上"刚读回又归档"。曝光不等于
+      // 理解，所以它只是软保护：带来源、原因、建立序号与解除条件，到期即释放。
+      engine.protectRecall(record, {
+        hits: digest.hits,
+        queryId: query.id,
+        ranges: (record.occupancy?.plan?.units ?? []).map((unit) => ({
+          rangeStart: unit.rangeStart,
+          rangeEnd: unit.rangeEnd,
+          costTokens: Number(unit.originalTokens) || 0,
+        })),
+      })
+      const text = escapePromptBraces(renderRecallBlock(digest.text))
+      const messageId = randomUUID()
+      engine.rememberRecall(record, {
+        messageId,
+        nodeIds: digest.hits.map((hit) => hit.id),
+        queryId: query.id,
+        status: digest.status,
+        hits: digest.hits.length,
+        skippedVisible: digest.skippedVisible,
+        truncated: digest.truncated === true,
+        omitted: digest.omitted ?? 0,
+      })
       return {
         ...decision,
         messages: [...decision.messages, {
-          id: randomUUID(),
+          id: messageId,
           role: 'user',
           content: [{ type: 'text', text }],
-          source: { kind: PACKAGE_NAME, form: 'recall' },
+          source: { kind: PACKAGE_NAME, form: PLUGIN_SOURCE_FORMS.RECALL },
         }],
       }
     } catch (error) {
       // Recall is an enhancement: a cold-store failure must never fail the
       // request, and it must never leave a partially folded decision.
-      ctx.logger.warn(`memory-context-lab: recall skipped: ${error instanceof Error ? error.message : String(error)}`)
+      // 这是"冷库不可用"（调用本身抛错），与"空命中"和"冷库拒答"都不同。
+      // 抛错路径同样要记一次尝试：否则 status 会停留在上一次成功的结果上，
+      // 把一次后端故障显示成一切正常。
+      const reason = error instanceof Error ? error.message : String(error)
+      if (recallRecord) {
+        engine.rememberRecall(recallRecord, {
+          queryId: recallRecord.recallQueryId ?? '',
+          status: 'unavailable',
+          reason,
+        })
+      }
+      ctx.logger.warn(`memory-context-lab: recall unavailable (call threw): ${reason}`)
       return decision
     }
   }, { prepend: true })
+
+  // ── v2 引擎的同位钩子 ─────────────────────────────────────────────────────
+  // 与 v1 完全相同的挂载点与顺序（先 delegate 再动作），但只在 v2 账本启用的
+  // 会话上生效。两套钩子各自 `adopt`，同一会话不会同时命中：v2 的 adopt 只认
+  // v2 状态文件，v1 的 adopt 只认 v1 状态文件，而引擎互斥保证两者不会同时启用。
+  const disposeV2AutoCooling = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    if (decision?.kind !== 'enter' || signal?.aborted) return decision
+    // 与 v1 同一条挂起规则：计划模式激活期间自动降温 no-op。
+    const suspension = planFirst.coolingSuspensionFor(agent)
+    if (suspension.suspended) {
+      ctx.logger.info(`memory-lab2: ${suspension.reason}`)
+      return decision
+    }
+    try {
+      const outcome = await v2.autoCooling(agent, signal)
+      if (outcome.action === 'applied') {
+        ctx.logger.info(`memory-lab2: archived ${outcome.applied} operations (~${outcome.releasedTokens} tokens)`)
+      } else if (outcome.action === 'unavailable') {
+        ctx.logger.warn(`memory-lab2: cooling unavailable: ${outcome.reason}`)
+      }
+    } catch (error) {
+      ctx.logger.warn(`memory-lab2: auto cooling skipped: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return decision
+  })
+
+  const disposeV2Recall = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    if (decision?.kind !== 'enter' || signal?.aborted) return decision
+    // 计划模式激活期间不回注（与 v1 同规则）。
+    if (planFirst.coolingSuspensionFor(agent).suspended) return decision
+    try {
+      return await v2.buildRecall(agent, decision, signal)
+    } catch (error) {
+      ctx.logger.warn(`memory-lab2: recall skipped: ${error instanceof Error ? error.message : String(error)}`)
+      return decision
+    }
+  }, { prepend: true })
+
+  // 有界工作状态注入：只在 v2 启用且本会话已有退热历史时追加一张确定性状态卡。
+  // 失败关闭：注入失败不得阻塞这一步。
+  //
+  // 去重与注入形态（全量卡 / 增量卡）的裁决都在引擎里（`v2.workingSetInjection`，
+  // D1 升级）：固定协议文案只在会话首张与周期性再锚定的全量卡里注入，其余步只
+  // 注入相对上一张全量卡的变化行。裁决需要「注入成功才推进状态」，而注入是否
+  // 发生只有拿到返回值才知道——所以裁决收进引擎，钩子只负责把返回的文本挂上
+  // 稳定 id 追加进消息。
+  const disposeV2WorkingSet = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    if (decision?.kind !== 'enter' || signal?.aborted) return decision
+    // 计划模式激活期间不注入工作状态卡：计划阶段历史保持完整，卡片没有意义。
+    if (planFirst.coolingSuspensionFor(agent).suspended) return decision
+    try {
+      const card = await v2.workingSetInjection(agent)
+      if (!card) return decision
+      const content = escapePromptBraces(card.text)
+      return {
+        ...decision,
+        messages: [
+          ...(Array.isArray(decision.messages) ? decision.messages : []),
+          {
+            // 宿主契约要求每条消息有稳定 id：`Session.create`（= resume/replay）
+            // 会校验 seed 里每条 user/message 都有 id，缺了写入不报错、重放直接
+            // 拒绝，整个会话恢复不了。append 路径不校验，所以这个坑只能靠重放测出来。
+            id: randomUUID(),
+            role: 'user',
+            content: [{ type: 'text', text: content }],
+            source: { kind: PACKAGE_NAME, form: 'working-set' },
+          },
+        ],
+      }
+    } catch (error) {
+      ctx.logger.warn(`memory-lab2: working set skipped: ${error instanceof Error ? error.message : String(error)}`)
+      return decision
+    }
+  })
 
   ctx.effect(() => ctx.sessionProjections.register(projection), 'memory-context-lab: projection')
 
@@ -1036,18 +1473,33 @@ export async function apply(ctx, config) {
     } catch (error) {
       ctx.logger.warn(`memory-context-lab: archive cleanup skipped: ${error instanceof Error ? error.message : String(error)}`)
     }
+    // v2 走同一条收尾语义：恢复原文、置停用、只读保留（不删冷库）。
+    // 归档的会话不会再收到请求，所以这里不带窗口守卫，与 v1 一致。
+    try {
+      const record = v2.records.get(sessionId) ?? await v2.adoptById(sessionId)
+      if (!record) return
+      const outcome = await v2.disableById(sessionId, 'session-archived')
+      ctx.logger.info(`memory-lab2: session archived; restored ${outcome.restored}/${outcome.before}`)
+    } catch (error) {
+      ctx.logger.warn(`memory-lab2: archive cleanup skipped: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   ctx.effect(function* memoryContextLabLifecycle() {
     yield async () => {
       await Promise.allSettled([...activeOperations])
+      disposePlanFirstAutomation()
       disposeAutoCooling()
       disposeRecall()
+      disposeV2AutoCooling()
+      disposeV2Recall()
+      disposeV2WorkingSet()
       disposeArchiveWatch()
       for (const record of records.values()) {
         try { await disposeRecord(record) } catch { /* best-effort teardown */ }
       }
       records.clear()
+      try { await v2.shutdown() } catch { /* best-effort teardown */ }
     }
     yield ctx.commands.register({
       definitionId: 'dsh-memory-context-lab/control',
@@ -1061,7 +1513,56 @@ export async function apply(ctx, config) {
         return pending
       },
     })
+    // v2 命令与 v1 命令并存：不隐藏、不改写 v1 的 schema，也不随 on/off 增删。
+    yield ctx.commands.register({
+      definitionId: 'dsh-memory-context-lab/control-v2',
+      name: V2_COMMAND_NAME,
+      description: 'Full-history on-demand memory (v2): structured records with bounded working state',
+      input: { hint: 'on | off | status | now | dry-run | read <ID...> | history [页大小] | working-set [预算] | recall [查询|id <ID...>] | index [status|sync] | relations | cost | import-v1 | fork <子会话ID> | fork-status | fork-reset <子会话ID> | set auto|recall|batch|retain <value> | help' },
+      handler: (invocation) => v2CommandHandler(invocation),
+    })
+    // 固定注册的只读召回工具：完整模式的一部分，不随 v2 的 on/off 增删 schema。
+    // 未启用 v2 的会话调用它只会得到一条「未启用」结果，工具集恒定。
+    // 走反应式注入：拿不到 `tools` 服务就跳过并告警，不影响 v1。
+    // `ctx.inject` 在依赖缺失时是静默的（回调不触发），所以这里另外显式探一次——
+    // 「悄悄没注册」不可接受，必须留下痕迹；服务后到时会由 inject 补上注册。
+    //
+    // 探测必须走 `ctx.get('tools')`，**不能**写 `ctx.tools`：`tools` 由 agent/preset
+    // 作用域提供，不在本插件的 `inject` 里，而宿主 cordis 的 context 代理对未注入的
+    // 属性读取是**抛错**（`cannot get property "tools" without inject`），不是返回
+    // undefined。抛错点在 lifecycle effect 里，会冒泡出 `apply`，让整个插件加载失败并
+    // 回滚已注册的 effect（投影与两个命令一并消失）——表现就是面板上一切命令都返回
+    // 「命令没有返回结果（可能是未知命令）」。`ctx.get()` 的契约是无注入读取，未提供
+    // 时返回 undefined，正是这里要的语义。
+    if (typeof ctx.get('tools')?.register !== 'function') {
+      ctx.logger?.warn?.('memory-context-lab: 当前作用域拿不到 ctx.tools.register，v2 只读召回工具暂未注册（服务就绪后会自动注册）')
+    }
+    const toolFiber = ctx.inject(['tools'], (inner) => {
+      const disposer = registerV2RecallTool(inner, v2, sessionIdOf)
+      if (disposer) inner.effect(() => disposer, 'memory-context-lab: v2 recall tool')
+    })
+    yield () => { try { toolFiber.dispose?.() } catch { /* best-effort teardown */ } }
   }, 'memory-context-lab lifecycle')
+}
+
+/**
+ * 注册 v2 的只读召回工具。
+ *
+ * 契约（用户已确认的边界）：固定注册、只读、只读本会话 v2 隔离库、
+ * 不重定向正式 `lingshu_cg`、不随 on/off 增删 schema、不隐藏任何原工具。
+ * 宿主没给 `ctx.tools.register` 时返回 null（调用方跳过），不伪造半成品注册路径。
+ */
+function registerV2RecallTool(ctx, runtime, sessionIdOf) {
+  if (!ctx.tools || typeof ctx.tools.register !== 'function') {
+    ctx.logger?.warn?.('memory-context-lab: 宿主未提供 ctx.tools.register，v2 只读召回工具未注册')
+    return null
+  }
+  try {
+    return ctx.tools.register(createV2RecallTool({ runtime, sessionIdOf }))
+  } catch (error) {
+    ctx.logger?.warn?.(`memory-context-lab: v2 只读召回工具注册失败：${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
 }
 
 // cordis 只从插件对象本身读 Config（runtime.Config = plugin.Config），

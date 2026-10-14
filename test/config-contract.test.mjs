@@ -43,3 +43,30 @@ test('explicit user config passes through as volatile refs with user values', ()
   assert.equal(defaults?.retainOperations, 9)
   assert.equal(defaults?.auto, false)
 })
+
+test('默认值单一真源：schema default、投影兜底、客户端 fallback 与 core 的 DEFAULT_SETTINGS 一致', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const path = await import('node:path')
+  const { DEFAULT_SETTINGS } = await import('../src/core.mjs')
+  const { viewOf } = await import('../src/projection.mjs')
+
+  // schema default：宿主设置页给新装用户的全局默认（index.mjs 引 core 常量注册）。
+  const resolved = Config['~standard'].validate({})
+  const defaults = resolved.value.defaults.get()
+  assert.equal(defaults?.archiveBatchSize, DEFAULT_SETTINGS.archiveBatchSize,
+    `schema default 必须等于 core 默认（期望 ${DEFAULT_SETTINGS.archiveBatchSize}）`)
+
+  // 投影兜底：折叠态视图无值时的回落也走 core 默认，不再回落旧值 5。
+  const view = viewOf({})
+  assert.equal(view.archiveBatchSize, DEFAULT_SETTINGS.archiveBatchSize)
+
+  // client.js 兜底：独立 bundle 无法 import core 模块，字面量由本守卫防漂移
+  // （改 core 默认时忘了同步 client.js 会让设置页显示旧值）。
+  const pluginDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
+  const source = readFileSync(path.join(pluginDir, 'src', 'client.js'), 'utf8')
+  const match = /archiveBatchSize:\s*clampInt\(inner\.archiveBatchSize,\s*1,\s*200,\s*(\d+)\)/.exec(source)
+  assert.ok(match, 'client.js 必须保留 archiveBatchSize 的 clampInt 兜底形态（守卫的正则与实现耦合，改动时同步）')
+  assert.equal(Number(match[1]), DEFAULT_SETTINGS.archiveBatchSize,
+    'client.js 兜底字面量必须与 core 的 DEFAULT_SETTINGS.archiveBatchSize 一致')
+})

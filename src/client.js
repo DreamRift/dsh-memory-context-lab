@@ -71,6 +71,14 @@ window.__ModuleLoader__.load({
       'field.auto': '自动降温',
       'field.recall': '自动回注',
       'field.autorestore': '停用时恢复原文',
+      'field.fullHistory': '全历史记忆上下文',
+      'field.fullHistoryHint': '开启后除必要历史（系统头、人类消息、计划工件）外全部退热入本会话隔离灵枢临时记忆，只留不可压缩凭证；「保留最近操作」随之失效，去留由证据保护层自动裁决',
+      'field.planFirst': '新会话计划先行',
+      'field.planFirstHint': '开启后：全新对话第一条消息即自动进入宿主「计划模式」（经 plan/mode 日志落账），计划期间降温/回注挂起；用户批准计划后自动启用上下文降温，计划全文作为指引常驻、全程不归档',
+      'field.retainDisabled': '全历史记忆上下文开启中：保留窗口失效（去留由证据保护层裁决）',
+
+      'panel.status.v2': 'v2 引擎',
+      'panel.status.planActive': '计划模式',
 
       'action.now': '立即降温',
       'action.dryRun': '预演',
@@ -113,6 +121,14 @@ window.__ModuleLoader__.load({
       'field.auto': 'Auto cooling',
       'field.recall': 'Auto recall',
       'field.autorestore': 'Restore text when stopping',
+      'field.fullHistory': 'Full-history memory context',
+      'field.fullHistoryHint': 'When on, everything except essentials (system head, human messages, plan artifacts) cools into this session\u2019s isolated Lingshu scratch memory, leaving only incompressible vouchers; \u201ckeep recent operations\u201d is disabled and evidence protection decides what stays',
+      'field.planFirst': 'Plan first in new sessions',
+      'field.planFirstHint': 'When on, the first message of a brand-new conversation automatically enters host plan mode (via plan/mode log commit); cooling/recall pause while planning, and context cooling auto-enables once the plan is approved, with the plan text kept resident as guidance and never archived',
+      'field.retainDisabled': 'Full-history mode is on: the keep-recent window is disabled (evidence protection decides)',
+
+      'panel.status.v2': 'v2 engine',
+      'panel.status.planActive': 'Plan mode',
 
       'action.now': 'Cool now',
       'action.dryRun': 'Dry run',
@@ -229,6 +245,9 @@ window.__ModuleLoader__.load({
       // 弹层锚定 chip 并向上展开。客户端半侧拿不到 portal，所以用绝对定位；
       // 祖先链（.tools/.row/.card）无 paint containment，不会被裁剪。
       // 上限高度用 vh 兜住矮窗口，超出时弹层内部滚动，而不是顶出视口。
+      // 外点关闭走 veil：全屏透明层压在弹层之下（z-index 39 < 40），点在弹层
+      // 之外的任何位置都落在 veil 上并收起；客户端不注册 window/document 事件。
+      + '.mcl-veil{position:fixed;inset:0;z-index:39;background:transparent;border:0;padding:0;}'
       + '.mcl-pop{position:absolute;bottom:calc(100% + 8px);left:0;z-index:40;box-sizing:border-box;width:320px;max-height:min(420px,60vh);overflow-y:auto;border:0.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:var(--dsw-radius-lg);padding:12px;display:flex;flex-direction:column;gap:8px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}'
       + '.mcl-row{display:flex;align-items:center;gap:8px;min-height:28px}'
       + '.mcl-label{flex:1;min-width:0;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}'
@@ -555,14 +574,13 @@ window.__ModuleLoader__.load({
         if (store.open) store.set({ open: false });
       }
 
-      /** 焦点离开整块（含弹层内部）才收起；点击弹层内的控件不会误关。 */
-      function onBlur(event) {
-        var next = event.relatedTarget;
-        var wrap = event.currentTarget;
-        if (next != null && wrap != null && typeof wrap.contains === 'function' && wrap.contains(next)) return;
-        close();
-      }
-
+      /**
+       * 外点关闭：open 时渲染一块全屏透明 veil（z-index 低于弹层），点在弹层外
+       * 的任何位置都落在 veil 上并收起。不用 blur 判定——弹层内控件在 busy 时
+       * 会被 disabled，焦点跌回 body 触发 relatedTarget=null 的 blur，旧实现
+       * 每次点击一个设置就整层缩回（本会话实测反馈）。不监听 document/window
+       * （沙箱契约：不直接触 DOM 全局），Escape 仍可关闭。
+       */
       function onKeyDown(event) {
         if (event.key !== 'Escape') return;
         event.preventDefault();
@@ -595,10 +613,15 @@ window.__ModuleLoader__.load({
 
       return h(React.Fragment, null,
         h(StyleTag, { key: 'style' }),
+        open ? h('div', {
+          className: 'mcl-veil',
+          key: 'veil',
+          'aria-hidden': 'true',
+          onClick: close
+        }) : null,
         h('span', {
           className: 'mcl-wrap',
           key: 'chip',
-          onBlur: onBlur,
           onKeyDown: onKeyDown
         },
           button,
@@ -650,6 +673,10 @@ window.__ModuleLoader__.load({
       var retain = countOf(view != null ? view.retainOperations : undefined);
       var batch = countOf(view != null ? view.archiveBatchSize : undefined);
       var archived = countOf(view != null ? view.archived : undefined);
+      var engine = view != null && typeof view.engine === 'string' ? view.engine : '';
+      var fullHistory = boolOf(view != null ? view.fullHistory : undefined, false);
+      var planFirst = boolOf(view != null ? view.planFirst : undefined, false);
+      var planActive = boolOf(view != null ? view.planActive : undefined, false);
 
       var retainPair = React.useState(String(retain));
       var retainDraft = retainPair[0];
@@ -705,6 +732,24 @@ window.__ModuleLoader__.load({
         callCommand(props, line, t);
       }
 
+      /**
+       * 顺序执行一组命令（前一条落定才发下一条）。
+       * 全历史开关涉及「停 v1 → 启 v2 → set」三步，乱序会读到中间态；
+       * 任一步失败即停，失败文案留在 store（callCommand 已写入）。
+       */
+      function runSequence(lines) {
+        var promise = Promise.resolve({ ok: true });
+        lines.forEach(function (line) {
+          promise = promise.then(function (prev) {
+            if (prev && prev.ok === false) return prev;
+            return callCommand(props, line, t).then(function () {
+              return store.error != null ? { ok: false } : { ok: true };
+            });
+          });
+        });
+        return promise;
+      }
+
       function commitRetain() {
         var parsed = parseCount(retainDraft);
         if (parsed == null) {
@@ -733,8 +778,10 @@ window.__ModuleLoader__.load({
       }
 
       var statusText = enabled
-        ? t('panel.status.on') + ' · ' + (auto ? t('panel.status.auto') : t('panel.status.manual'))
+        ? t('panel.status.on') + (engine === 'v2' ? ' · ' + t('panel.status.v2') : '')
+          + ' · ' + (auto ? t('panel.status.auto') : t('panel.status.manual'))
           + ' · ' + t('panel.status.archived', { count: archived })
+          + (planActive ? ' · ' + t('panel.status.planActive') : '')
         : t('panel.status.off');
 
       // 当前会话生效的预设：投影折叠出 preset.id/label；没选过或全局默认 → 「全局预设」。
@@ -780,7 +827,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'mcl-status', title: statusText }, statusText)));
 
       rows.push(h('div', { className: 'mcl-row', key: 'retain' },
-        h('span', { className: 'mcl-label' }, t('field.retain')),
+        h('span', { className: 'mcl-label', title: fullHistory ? t('field.retainDisabled') : t('field.retain') }, t('field.retain')),
         h('span', { className: 'mcl-field' },
           h('input', {
             type: 'text',
@@ -789,13 +836,51 @@ window.__ModuleLoader__.load({
             autoComplete: 'off',
             className: 'mcl-input',
             value: retainDraft,
-            disabled: busy,
+            disabled: busy || fullHistory,
             'aria-label': t('field.retain'),
-            title: t('field.retain'),
+            title: fullHistory ? t('field.retainDisabled') : t('field.retain'),
             onChange: function (event) { setRetainDraft(event.target.value); },
             onBlur: commitRetain,
             onKeyDown: onEnter
           }))));
+
+      // 全历史记忆上下文（v2 引擎专属模式）。开启路径按当前引擎分流：
+      // - v1 启用中：先停 v1（恢复原文），再启 v2，最后写入开关；
+      // - v2 启用中 / 未启用任何引擎：直接「启用 v2 + 写开关」（set 需要 v2 账本在场）。
+      // 关闭路径只在 v2 启用中写回 off；其余情形开关本来就是投影默认 false，不发命令。
+      rows.push(h('div', { className: 'mcl-row', key: 'fullHistory' },
+        h('span', { className: 'mcl-label', title: t('field.fullHistoryHint') }, t('field.fullHistory')),
+        switchNode(fullHistory, t('field.fullHistory'), busy, function (next) {
+          if (next) {
+            if (enabled && engine !== 'v2') {
+              runSequence(['/memory-lab off', '/memory-lab2 on', '/memory-lab2 set fullhistory on']);
+            } else if (enabled && engine === 'v2') {
+              run('/memory-lab2 set fullhistory on');
+            } else {
+              runSequence(['/memory-lab2 on', '/memory-lab2 set fullhistory on']);
+            }
+          } else if (enabled && engine === 'v2') {
+            run('/memory-lab2 set fullhistory off');
+          }
+        }),
+        h('span', {
+          className: 'mcl-status',
+          title: t('field.fullHistoryHint')
+        }, fullHistory ? t('panel.status.on') : t('panel.status.off'))));
+
+      // 新会话计划先行：插件级开关（从会话日志折叠，两个引擎通用）。
+      // 「on」由宿主侧联动进入计划模式（仅全新会话；非全新会话由命令输出提示）。
+      rows.push(h('div', { className: 'mcl-row', key: 'planFirst' },
+        h('span', { className: 'mcl-label', title: t('field.planFirstHint') }, t('field.planFirst')),
+        switchNode(planFirst, t('field.planFirst'), busy, function (next) {
+          run('/memory-lab set planfirst ' + (next ? 'on' : 'off'));
+        }),
+        h('span', {
+          className: 'mcl-status',
+          title: t('field.planFirstHint')
+        }, planFirst
+          ? (planActive ? t('panel.status.planActive') : t('panel.status.on'))
+          : t('panel.status.off'))));
 
       rows.push(h('div', { className: 'mcl-row', key: 'batch' },
         h('span', { className: 'mcl-label' }, t('field.batch')),
@@ -872,16 +957,21 @@ window.__ModuleLoader__.load({
       return Math.min(max, Math.max(min, n));
     }
 
-    /** 把任意配置片段收敛成 5 字段设置值。 */
+    /** 把任意配置片段收敛成设置值（5 个降温字段 + 2 个开关位）。 */
     function settingsValueOf(entry) {
       var source = entry && typeof entry === 'object' ? entry : {};
       var inner = source.settings && typeof source.settings === 'object' ? source.settings : source;
+      // 兜底字面量与 src/core.mjs 的 DEFAULT_SETTINGS 对齐（独立 bundle 无法 import
+      // 后端模块，由 config-contract 测试守卫防止两处漂移）：retain=5，batch=10。
       return {
         retainOperations: clampInt(inner.retainOperations, 0, 200, 5),
-        archiveBatchSize: clampInt(inner.archiveBatchSize, 1, 200, 5),
+        archiveBatchSize: clampInt(inner.archiveBatchSize, 1, 200, 10),
         auto: inner.auto !== false,
         autoRecall: inner.autoRecall !== false,
-        autoRestore: inner.autoRestore !== false
+        autoRestore: inner.autoRestore !== false,
+        // 开关位：缺省 false（与投影初始值一致，避免「卡片显示开、会话显示关」）。
+        fullHistory: inner.fullHistory === true,
+        planFirst: inner.planFirst === true
       };
     }
 
@@ -916,14 +1006,19 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    /** 数字输入：失焦/回车时把合法值写回草稿，非法时回落原值。 */
-    function numberInputNode(value, min, max, disabled, onCommit) {
+    /** 数字输入组件：失焦/回车时把合法值写回草稿，非法时回落原值。
+     *  必须以组件方式挂载（h(NumberInput, ...)）：内部持有 useState，普通函数
+     *  调用会破坏 Rules of Hooks（0.9.0-rc.1 审计 H1）。 */
+    function NumberInput(props) {
+      var value = props.value;
+      var min = props.min;
+      var max = props.max;
       var pair = React.useState(String(value));
       var text = pair[0];
       var setText = pair[1];
       var commit = function () {
         var n = Math.round(Number(text));
-        if (isFinite(n)) onCommit(clampInt(n, min, max, value));
+        if (isFinite(n)) props.onCommit(clampInt(n, min, max, value));
         else setText(String(value));
       };
       return h('input', {
@@ -932,12 +1027,16 @@ window.__ModuleLoader__.load({
         min: min,
         max: max,
         step: 1,
-        disabled: disabled,
+        disabled: props.disabled,
         value: text,
         onChange: function (e) { setText(e.target.value); },
         onBlur: commit,
         onKeyDown: function (e) { if (e.key === 'Enter') commit(); }
       });
+    }
+
+    function numberInputNode(value, min, max, disabled, onCommit) {
+      return h(NumberInput, { value: value, min: min, max: max, disabled: disabled, onCommit: onCommit });
     }
 
     /** 开关：checkbox + 文案。 */
@@ -1025,12 +1124,8 @@ window.__ModuleLoader__.load({
     function MemorySettingsCard(props) {
       var form = normalizeFormFace(props && props.form);
       var view = props && props.view ? props.view : 'page';
-      if (view !== 'page' || !form) {
-        return h('div', { className: 'mcl-card' },
-          h(StyleTag, { key: 'style' }),
-          h('p', { className: 'mcl-card-hint' }, CARD_HINT_TEXT));
-      }
-
+      // H1（0.9.0-rc.1 审计）：早返回必须放在全部 hooks 之后，否则视图切换
+      // 会改变 hook 计数。下面先无条件执行 hooks，再按 view/form 分支渲染。
       var snapshot = configSnapshotOf(form);
       var revisionPair = React.useState(0);
       var force = revisionPair[1];
@@ -1061,7 +1156,7 @@ window.__ModuleLoader__.load({
       }, [revision]);
 
       React.useEffect(function () {
-        if (typeof form.subscribe !== 'function') return undefined;
+        if (!form || typeof form.subscribe !== 'function') return undefined;
         return form.subscribe(function () { force(function (n) { return n + 1; }); });
       }, []);
 
@@ -1143,8 +1238,18 @@ window.__ModuleLoader__.load({
               wrapSet(function (prev) {
                 return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { autoRestore: v }) });
               });
+            }),
+            checkNode(current.defaults.fullHistory, '全历史记忆上下文', busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { fullHistory: v }) });
+              });
+            }),
+            checkNode(current.defaults.planFirst, '新会话计划先行', busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { planFirst: v }) });
+              });
             })),
-          h('p', { className: 'mcl-card-hint' }, '新会话开启降温时未选预设即用此默认值（= 弹层里的「全局预设」）。')),
+          h('p', { className: 'mcl-card-hint' }, '新会话开启降温时未选预设即用此默认值（= 弹层里的「全局预设」）；全历史与计划先行只作 v2 新会话的初始开关位。')),
         h('div', { className: 'mcl-card-block' },
           h('div', { className: 'mcl-card-row' },
             h('p', { className: 'mcl-card-title' }, '预设'),

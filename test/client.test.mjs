@@ -230,7 +230,7 @@ test('the bundle registers under the package name and declares its dependencies'
 })
 
 test('applying registers the settings-page card only while the namespace is served', async () => {
-  const { entry } = await loadClient()
+  const { entry, shim } = await loadClient()
   const served = []
   let registered = null
   const configForms = {
@@ -271,7 +271,9 @@ test('applying registers the settings-page card only while the namespace is serv
   assert.equal(card.options.key, 'dsh-memory-context-lab#memory-context-lab')
   assert.equal(typeof card.component, 'function')
   // The card component renders a summary line when no form prop is provided.
-  const summary = card.component({ view: 'summary' })
+  // mount()（而非直调）提供 hook 作用域：卡片组件现在无条件调用 hooks（H1 修复），
+  // 直接 component() 调用会在真实 React 与本 shim 下同样缺作用域。
+  const summary = shim.mount(card.component, { view: 'summary' })
   assert.ok(textOf(summary).length > 0)
 })
 
@@ -522,7 +524,7 @@ test('the stop-time restore switch is exposed, reflects the view, and sends its 
   assert.equal(offNode.props['aria-checked'], false, 'an explicit false must not read as the default')
 })
 
-test('the popover keeps focus inside itself instead of closing on inner focus moves', async () => {
+test('the popover closes via the veil, not on inner focus loss or busy controls', async () => {
   const { entry, shim } = await loadClient()
   const { context, slots } = createClientContext()
   entry.exports.apply(context)
@@ -532,15 +534,18 @@ test('the popover keeps focus inside itself instead of closing on inner focus mo
   const opened = shim.mount(chip.component, chipProps(view))
   const wrap = collect(opened, (node) => node.props && node.props.className === 'mcl-wrap')[0]
 
-  // Focus moving to a control inside the wrap must not collapse the popover.
-  const inner = {}
-  const wrapElement = { contains: (node) => node === inner }
-  assert.doesNotThrow(() => wrap.props.onBlur({ relatedTarget: inner, currentTarget: wrapElement }))
-  assert.equal(popovers(shim.mount(chip.component, chipProps(view))).length, 1, 'inner focus must keep it open')
+  // No blur-based collapse: controls disabling themselves mid-command must not
+  // close the popover (the original "one click, one collapse" bug).
+  assert.equal(wrap.props.onBlur, undefined, 'the wrap must not close on blur')
+  assert.equal(popovers(shim.mount(chip.component, chipProps(view))).length, 1, 'no blur handler means it stays open')
 
-  // Focus leaving the wrap must collapse it.
-  wrap.props.onBlur({ relatedTarget: {}, currentTarget: { contains: () => false } })
-  assert.equal(popovers(shim.mount(chip.component, chipProps(view))).length, 0, 'leaving the wrap must close it')
+  // The outside-click veil exists only while open and clicking it closes.
+  const veils = (mount) => collect(mount, (node) => node.props && node.props.className === 'mcl-veil')
+  assert.equal(veils(opened).length, 1, 'an open popover renders exactly one veil')
+  veils(opened)[0].props.onClick({ preventDefault() {}, stopPropagation() {} })
+  const closed = shim.mount(chip.component, chipProps(view))
+  assert.equal(veils(closed).length, 0, 'closing unmounts the veil')
+  assert.equal(popovers(closed).length, 0, 'closing via the veil collapses the popover')
 })
 
 test('every control in the popover is wired and does not throw', async () => {
