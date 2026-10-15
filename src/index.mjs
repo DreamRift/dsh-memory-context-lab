@@ -415,7 +415,11 @@ export async function apply(ctx, config) {
   // 显式指定不可用即失败关闭（EBACKENDUNAVAILABLE / EBACKENDPINGFAIL），
   // 绝不静默降级。独立运行的关键不变：缺 dsh-memory 时 auto 插件照常启用。
   const retrievalBackendMode = (() => {
-    const raw = unwrapVolatile(ctx.config?.defaults)?.retrievalBackend
+    // `config` 是 apply 的第二个参数；**不要**读 `ctx.config`——宿主 cordis 的
+    // context 代理对未注入属性是抛错（`cannot get property "config" without inject`），
+    // 而本插件的 `inject` 里没有 `config`（见 index.mjs 顶部说明），于是整个插件
+    // 加载失败。与 `resolveDefaultsSettings` 等同源读取保持一致。
+    const raw = unwrapVolatile(config?.defaults)?.retrievalBackend
     return raw === 'local-lexical-v1' || raw === 'lingshu-mdcg-receipt' ? raw : 'auto'
   })()
   // lingshu-backend 动态加载（PR #4 依赖图约定）：主装配路径与 T2 实现解耦，

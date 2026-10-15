@@ -1,6 +1,6 @@
 # dsh-memory-context-lab
 
-按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2 模式）与**计划先行**。当前版本 **0.9.0**（首个正式版），变化见 [CHANGELOG.md](CHANGELOG.md)；设计文档见 [docs/](docs/)。
+按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2 模式）与**计划先行**。当前版本 **0.9.1**（修复 0.9.0 的加载失败缺陷），变化见 [CHANGELOG.md](CHANGELOG.md)；设计文档见 [docs/](docs/)。
 
 > 适用对象：[DeepSeek Harness (DSH)](https://github.com/DeepSeek-ai/DeepSeek-Harness) 桌面端插件体系。
 

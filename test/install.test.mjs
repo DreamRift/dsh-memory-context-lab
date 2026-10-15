@@ -13,7 +13,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { access } from 'node:fs/promises'
+import { access, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -45,6 +45,10 @@ async function exists(target) {
  *    会让 `ctx.tools?.register` 看起来安全，而它在真实宿主里会炸掉整个插件加载。
  *    这里用 getter 复刻该行为：可用时返回值，不可用时抛错——`?.` 拦不住抛错，
  *    因此任何退回直接属性访问的改动都会被本测试挡住。
+ * ③ 同样地，`config` **不是** context 上的属性（它是 apply 的第二个参数，且本插件
+ *    `inject` 里没有 `config`）。0.9.0 正式版曾把一处读取写成 `ctx.config?.defaults`，
+ *    在真实宿主里直接让插件加载失败、插件页显示「异常」；`?.` 同样拦不住代理抛错。
+ *    这里让 `config` 与 `tools` 同形：读取即抛，逼实现走 `config` 参数。
  */
 function createStubContext({ withTools = true } = {}) {
   const listeners = new Map()
@@ -116,6 +120,14 @@ function createStubContext({ withTools = true } = {}) {
     get() {
       if (!withTools) throw new Error('cannot get property "tools" without inject')
       return toolService
+    },
+    configurable: true,
+  })
+  // `config` 同形：它从来不是 context 属性（是 apply 的第二参数），读取必抛。
+  // 这条防线专门挡 0.9.0 那类 `ctx.config?.defaults` 回归——`?.` 拦不住抛错。
+  Object.defineProperty(ctx, 'config', {
+    get() {
+      throw new Error('cannot get property "config" without inject')
     },
     configurable: true,
   })
@@ -249,6 +261,28 @@ test('拿不到 tools 服务时插件照常加载：v1 不受影响，只跳过�
     ctx._warnings.some((warning) => warning.includes('ctx.tools.register')),
     `必须如实告警，实际告警：${ctx._warnings.join(' | ') || '(无)'}`,
   )
+})
+
+test('不得读 ctx.config：config 只走 apply 的第二参数（0.9.0 加载失败回归）', async (t) => {
+  if (!(await exists(installedEntry))) return t.skip('not installed')
+
+  // 静态面：源码里任何 `ctx.config` 读取都是缺陷。宿主 cordis 的 context 代理对
+  // 未注入属性抛错（`cannot get property "config" without inject`），而本插件的
+  // `inject` 只有 commands/sessionProjections——读它等于让整个插件加载失败，
+  // 插件页显示「异常」。`?.` 拦不住代理抛错，所以这条只能靠不写来保证。
+  const source = await readFile(path.join(path.dirname(installedEntry), 'index.mjs'), 'utf8')
+  const offenders = source
+    .split('\n')
+    .map((line, index) => ({ line: line.trim(), number: index + 1 }))
+    .filter(({ line }) => /ctx\s*\.\s*config\b/.test(line) && !line.startsWith('//') && !line.startsWith('*'))
+  assert.deepEqual(offenders, [], `源码不得读 ctx.config（config 是 apply 的第二参数）：${JSON.stringify(offenders)}`)
+
+  // 动态面：替身把 `config` 建模成「读取即抛」（与 tools 同形），因此只要实现
+  // 退回到 `ctx.config`，下面的 apply 就会当场炸掉，而不是静默通过。
+  const module = await import(pathToFileURL(installedEntry).href)
+  const ctx = createStubContext()
+  await module.apply(ctx)
+  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab', 'memory-lab2'])
 })
 
 test('the installed host half registers a command that records its input', async (t) => {
