@@ -32,11 +32,13 @@ import {
 import { cleanDecision, recallQueryFrom } from './apply.mjs'
 import { createEngine, restoreSkippedReceipts } from './apply-engine.mjs'
 import { createMemoryContextLabProjection } from './projection.mjs'
-import { TemporaryLingshuClient } from './lingshu-lab-client.mjs'
 import { assertV2AllowsV1, getEngineRegistry } from './v2/engine.mjs'
 import { EngineV2Error } from './v2/errors.mjs'
 import { createV2Runtime, V2_COMMAND_NAME } from './v2/runtime.mjs'
 import { createLingshuBackendProvider } from './v2/lingshu-backend.mjs'
+import { createV2ClientFactory } from './v2/client-adapter.mjs'
+import { v2SessionDirectoryFor } from './v2/store.mjs'
+import { createCompositeRetrievalBackendProvider } from './v2/retrieval-backend-provider.mjs'
 import { createPlanFirst } from './plan-first.mjs'
 import { createV2RecallTool } from './v2/tool.mjs'
 import {
@@ -397,22 +399,52 @@ export async function apply(ctx, config) {
   /** Optional host-service lookup: never a hard dependency, so a missing one degrades instead of failing the load. */
   const services = { get: (service) => ctx.get(service) }
 
+  // ── 检索后端提供者（设计文档 v1.2 §4）─────────────────────────────────
+  // T2 灵枢（可选，dsh-memory 在位且 mcp_server 握手成功）优先；
+  // T1 本地词法（默认，无外部进程）兜底。独立运行的关键：缺 dsh-memory 时
+  // 插件照常启用，检索如实降级到 T1，状态面写明 T2 不可用原因。
+  const lingshuBackend = createLingshuBackendProvider({
+    lingshuPackageRoot: dependencies.lingshuPackageRoot,
+    logger: ctx.logger,
+  })
+  const retrievalBackend = createCompositeRetrievalBackendProvider({
+    lingshu: lingshuBackend,
+    logger: ctx.logger,
+  })
+
+  /**
+   * v1 引擎的本地客户端工厂（按会话缓存，句柄在 disposeRecord 释放）。
+   *
+   * v1 与 v2 的 client 契约同构（rememberArchived/getNode/recall），两个引擎
+   * 共用同一实现与同一冷库格式：冷写与原文永远在本会话冷库，不依赖外部进程；
+   * 检索走同一梯队（T0 字面 + T1 本地词法，灵枢可用时 T2）。
+   */
+  const v1ClientFactories = new Map()
+
+  function localClientFactoryFor(sessionId) {
+    let factory = v1ClientFactories.get(sessionId)
+    if (!factory) {
+      factory = createV2ClientFactory({
+        labRoot,
+        sessionId,
+        logger: ctx.logger,
+        backendFor: () => retrievalBackend.backendFor({
+          sessionId,
+          storeRoot: v2SessionDirectoryFor(labRoot, sessionId),
+        }),
+      })
+      v1ClientFactories.set(sessionId, factory)
+    }
+    return factory
+  }
+
   const engine = createEngine({
     persist,
     nodeIdFor: (record, ordinal) => archiveNodeId(record.state.key, ordinal),
     hostVersion: HOST_VERSION,
     services,
     logger: ctx.logger,
-    createClient: async (record) => {
-      if (!dependencies.lingshuPackageRoot) {
-        throw new Error(`隔离冷库不可用：${dependencies.startupError instanceof Error ? dependencies.startupError.message : '未定位到 @furongjun1999/dsh-memory。'}`)
-      }
-      return TemporaryLingshuClient.create({
-        storeRoot: record.directory,
-        lingshuPackageRoot: dependencies.lingshuPackageRoot,
-        sessionId: record.sessionId,
-      })
-    },
+    createClient: async (record) => localClientFactoryFor(record.sessionId).createClient(),
   })
 
   async function persist(record) {
@@ -544,6 +576,8 @@ export async function apply(ctx, config) {
     } catch (error) {
       closeError = error
     }
+    try { v1ClientFactories.get(record.sessionId)?.dispose?.() } catch { /* best-effort release */ }
+    v1ClientFactories.delete(record.sessionId)
     try { record.suppressionLease?.release?.() } catch { /* best-effort unpatch */ }
     record.client = null
     record.suppressionLease = null
@@ -685,10 +719,8 @@ export async function apply(ctx, config) {
     }
   }
 
-  const v2SemanticBackend = createLingshuBackendProvider({
-    lingshuPackageRoot: dependencies.lingshuPackageRoot,
-    logger: ctx.logger,
-  })
+  // 检索后端提供者已在引擎装配前创建（retrievalBackend）：v1/v2 共用同一提供者，
+  // 保证「模型主动读」与「自动回注」走同一条多路检索。
 
   const v2 = createV2Runtime({
     labRoot,
@@ -703,12 +735,12 @@ export async function apply(ctx, config) {
     onPlanFirstToggle: (agent, value) => (value ? planFirst.enterIfFresh(agent) : null),
     coordinator: dependencies.coordinator,
     // 同步取用：检索热路径不会隐式起子进程（只在 /memory-lab2 index 时启动）。
-    semanticBackendFor: ({ sessionId, storeRoot }) => v2SemanticBackend.backendFor({ sessionId, storeRoot }),
-    semanticBackendEnsure: ({ sessionId, storeRoot, signal }) => v2SemanticBackend.ensureBackend({ sessionId, storeRoot, signal }),
-    semanticBackendClose: ({ sessionId }) => v2SemanticBackend.close(sessionId),
-    semanticBackendStatus: () => v2SemanticBackend.describe(),
-    semanticBackendFailure: ({ sessionId }) => v2SemanticBackend.failureReason(sessionId),
-    semanticBackendCloseAll: () => v2SemanticBackend.closeAll(),
+    semanticBackendFor: ({ sessionId, storeRoot }) => retrievalBackend.backendFor({ sessionId, storeRoot }),
+    semanticBackendEnsure: ({ sessionId, storeRoot, signal }) => retrievalBackend.ensureBackend({ sessionId, storeRoot, signal }),
+    semanticBackendClose: ({ sessionId }) => retrievalBackend.close(sessionId),
+    semanticBackendStatus: () => retrievalBackend.describe(),
+    semanticBackendFailure: ({ sessionId }) => retrievalBackend.failureReason({ sessionId }),
+    semanticBackendCloseAll: () => retrievalBackend.closeAll(),
   })
 
   async function v2CommandHandler(invocation) {
@@ -805,11 +837,14 @@ export async function apply(ctx, config) {
       const planNote = readProjectionPlanFirst(invocation.agent.session)
         ? planFirst.enterIfFresh(invocation.agent)
         : null
-      // Enabling never touches the cold store, so a missing or incompatible
-      // dsh-memory must not block it. The degradation is reported here and
-      // again by any archive attempt, which is where it actually matters.
+      // 独立运行（设计文档 v1.2）：dsh-memory 缺席只损失可选增强（灵枢词法/结构
+      // 检索），冷库与检索由本地实现承担——告警措辞必须与实际能力一致，
+      // 不得再把「归档与回注会失败关闭」挂在独立模式下（那是旧绑定期的真话）。
       const degraded = dependencies.startupError
-        ? `\n\n注意：隔离冷库当前不可用（${dependencies.startupError instanceof Error ? dependencies.startupError.message : String(dependencies.startupError)}）。设置与状态照常工作，但归档与回注会在尝试时失败关闭，不会改写任何会话内容。`
+        ? `
+
+注意：未检测到 dsh-memory（${dependencies.startupError instanceof Error ? dependencies.startupError.message : String(dependencies.startupError)}），本插件以独立模式运行——本地冷库与词法检索照常工作；灵枢词法/结构检索增强不可用，不会回退到正式灵枢根。
+        `
         : ''
       return { kind: 'success', text: `已在本会话启用上下文降温。\n\n${engine.formatStatus(record)}${planNote ? `\n${planNote.text}` : ''}${degraded}` }
     }
@@ -854,7 +889,11 @@ export async function apply(ctx, config) {
           )
         } else {
           if (outcome.restored > 0) lines.push(`已恢复 ${outcome.restored} 个操作的原文。`)
-          if (outcome.skipped > 0) lines.push(`有 ${outcome.skipped} 个未能恢复（回执已变化或冷节点不可读），它们仍依赖冷库。`)
+          if (outcome.skipped > 0) {
+            lines.push(outcome.removed
+              ? `有 ${outcome.skipped} 个未能恢复（回执已变化或冷节点不可读），其原文不可找回，已随冷库一并清除。`
+              : `有 ${outcome.skipped} 个未能恢复（回执已变化或冷节点不可读），它们仍依赖冷库。`)
+          }
         }
         if (outcome.removed) {
           lines.push('已停用降温，并清除了本会话的插件隔离数据（冷库节点、状态与令牌文件）。DSH 的会话日志与命令审计不由插件改写。')
