@@ -759,11 +759,17 @@ export function recallProtectionEntries({
   return entries
 }
 
-/** 冷库依赖：仍被回执引用的冷记录不可被清理守卫释放。 */
+/**
+ * 冷库依赖：仍被回执引用的冷记录不可被清理守卫释放。
+ *
+ * `verify-failed` 必须一并计入。这种行的替换已经提交到活动面、原文已被回执遮蔽，
+ * 冷库里的分块是原文唯一的副本；只认 `applied` 会把它当普通冷节点，让清理守卫
+ * 释放掉唯一副本。它和 `applied` 的差别只在「替换后的活动面是否通过校验」。
+ */
 export function coldDependencyEntries({ archiveRows = [], operationEpoch = 0 }) {
   const entries = []
   for (const row of archiveRows) {
-    if (!row || row.status !== 'applied') continue
+    if (!row || (row.status !== 'applied' && row.status !== 'verify-failed')) continue
     entries.push(makeEntry({
       source: PROTECTION_SOURCE.COLD_DEPENDENCY,
       strength: PROTECTION_STRENGTH.HARD,

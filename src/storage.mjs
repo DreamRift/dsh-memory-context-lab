@@ -296,7 +296,6 @@ export async function removeSessionDirectory(labRoot, directory) {
   await rm(directory, { recursive: true, force: false, maxRetries: 3, retryDelay: 200 })
 }
 
-/** List every session state this plugin owns, newest directory first is not guaranteed. */
 /**
  * List every session state this plugin owns.
  *
@@ -304,6 +303,12 @@ export async function removeSessionDirectory(labRoot, directory) {
  * being skipped. Skipping it silently is how it disappears from every status
  * view while its receipts are still on the surface -- the user sees one row
  * fewer and has no way to learn that a session needs attention.
+ *
+ * 并发删除：目录可能在 `readdir` 与逐项检查之间被删掉（`/memory-lab clean`、
+ * 另一个会话的清理、用户手动删）。这不是损坏，也不该掀掉整次扫描——否则一个
+ * 正在被清理的会话会让整个状态视图报错。目录类型优先取 `readdir` 的 dirent
+ * 快照（同一次扫描的结果，不存在这个窗口）；只有在文件系统不返回类型
+ * （DT_UNKNOWN）时才回落 `lstat`，并单独容忍 ENOENT。
  *
  * @returns { rows, damaged }; damaged rows carry the reason.
  * @throws {Error} with code 'EDAMAGED' when the root marker is damaged.
@@ -324,8 +329,33 @@ export async function listSessionStates(labRoot) {
   for (const entry of entries) {
     if (!isSessionDirectoryName(entry.name)) continue
     const directory = path.join(sessionsRootFor(root), entry.name)
-    const stat = await lstat(directory)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+    let isDirectory = entry.isDirectory()
+    let isSymbolicLink = entry.isSymbolicLink()
+    if (!isDirectory && !isSymbolicLink && !entry.isFile()) {
+      // dirent 没有给出类型：回落 lstat，并容忍目录已被并发删除。
+      try {
+        const stat = await lstat(directory)
+        isDirectory = stat.isDirectory()
+        isSymbolicLink = stat.isSymbolicLink()
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        throw error
+      }
+    }
+    if (isSymbolicLink) continue
+    // A directory can disappear after lstat (DT_UNKNOWN fallback) or on a file
+    // system whose dirent type is unreliable. `readJsonStrict` maps ENOENT to
+    // null, but a directory path produces ENOTDIR for the state file instead;
+    // that is the same concurrent-removal race, not damaged state.
+    if (!isDirectory) {
+      try {
+        const stat = await lstat(directory)
+        if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        throw error
+      }
+    }
     let state
     try {
       state = await readJsonStrict(path.join(directory, STATE_FILE))
@@ -336,6 +366,7 @@ export async function listSessionStates(labRoot) {
       }
       throw error
     }
+    // 目录在这里被删掉时 `readJsonStrict` 返回 null（ENOENT 不是损坏），跳过。
     if (state === null) continue
     if (!isSessionState(state)) {
       damaged.push({ directory, reason: 'invalid-state' })

@@ -2,9 +2,9 @@
 
 本文件记录 `dsh-memory-context-lab` 面向用户的版本变化。格式按「版本 + 日期 + 分类条目」组织，只写行为与契约层面的变化，不复制内部调研。
 
-## 未发布 — 可靠性修复
+## 0.9.0-rc.3 — 2026-10-15
 
-本版修复 13 处数据可靠性与声明缺陷（另 1 处经核验不成立，见文末）。每条修复都带回归断言与变异验证。
+本版合入社区 PR 的 13 处数据可靠性与声明修复，并补齐合并审查发现的遗留缺口：`verify-failed`（替换已提交、原文已被遮蔽、仅提交后校验未通过）此前在恢复、保护、导入与展示路径上仍被当作「未归档」，一段只剩冷库副本的原文可能因此永久丢失。
 
 ### 修复
 
@@ -22,9 +22,22 @@
 - **`@deepseek-ai/cosmokit` 列入声明**：`index.mjs` 一直按可选依赖加载它，但 `package.json` 未声明。现补入 `peerDependencies` + `peerDependenciesMeta.optional` 与 devDependency。
 - **`config-contract` 套件不再以缺包失败**：两个可选 peer 缺失时显式说明缺哪个包并跳过，不再以 `ERR_MODULE_NOT_FOUND` 报成插件缺陷。
 
+### 合并审查补齐
+
+- **verify-failed 的回执重建元数据随行落盘**：`commitSurfaceRun` 此前只在 `applied` 分支携带 `chunkCount`/`chunkIds`/`shadowedTokenCount`/`surfaceGeneration`/`hostVersion` 与批次 `receiptFormat`/`batchSize`，校验未通过的行恢复时会按另一形态重建回执正文而被「回执正文已变化」拒绝。现在这些字段描述的是已提交的替换，与校验结果无关、无条件随行；只有 `state` 与 `reason` 分叉。
+- **遗留目录回收与删除确认统一走 `pendingReceipts`**：`off` 的遗留回收与 `clean` 的待恢复计数此前各自数 `status === 'applied'`，verify-failed 行既挡不住误删，又会被当成「无依赖」清掉隔离目录（销毁原文唯一副本）。两处统一改用恢复路径的同一判定。
+- **冷库依赖保护计入 verify-failed**：清理守卫此前只认 `applied`，verify-failed 引用的冷分块会被当作普通冷节点释放掉唯一副本。
+- **v1→v2 导入接受 verify-failed**：拒收它等于让一段只能从冷库恢复的原文无法导入 v2；其余字段（含 `chunkCount`）的严格校验不变。
+- **账本分列 verify-failed**：v2 账本与 v1 `status` 把它并进「已归档」会虚报成功段数；现在单列并提示原文只在冷库、可 restore 取回。
+- **停用拒绝文案不再重复计回执**：恢复超窗的拒绝理由此前把已在装配内的回执 token 当增量重算了一遍，把拒绝理由说得比实际更吓人。
+- **`listSessionStates` 容忍并发删除**：目录在扫描中途被删（清理命令、另一会话、用户手动）不再掀掉整次状态视图；目录类型优先取 `readdir` 的 dirent 快照，仅在文件系统不返回类型时回落 `lstat` 并容忍 ENOENT。
+- **批次计数契约显式化**：`releasedTokens`/`applied`/`recordsWritten` 只认 `applied`、归档行只认 `applied + verify-failed`、`failed` 两者都不进——四处判定以注释钉住，防回归。
+- **重复 JSDoc 清理**：`core.mjs`/`apply-engine.mjs`/`storage.mjs` 中与实现分离或互相重复的文档注释合并归位。
+
 ### 测试
 
 - 新增 `test/reliability.test.mjs`（22 项断言）并入 `npm test` 链；`pendingReceipts` 提升为 `apply-engine.mjs` 的模块级导出以便直接断言，`restoreGrowth` 抽到 `core.mjs` 作为纯函数。
+- 合并审查补齐 7 项回归：`writeJsonAtomic` 的 fsync 次序与无残留覆写、并发删除终态不入损坏桶、verify-failed 批次/单单元的字段完整性与恢复成功、批次提交后复测与活动面对齐、冷库创建失败只记一次不逐边界重试。总计 29 项。
 
 ### 经核验不成立
 

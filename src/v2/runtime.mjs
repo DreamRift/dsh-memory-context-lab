@@ -157,6 +157,9 @@ function formatRange(range) {  if (!range || typeof range !== 'object') return '
 function renderV2Status(record, extra = {}) {
   const settings = record.state.settings ?? {}
   const applied = record.state.archive.filter((row) => row.status === 'applied').length
+  // 单列 `verify-failed`：它和 `applied` 一样遮蔽了原文（原文只在冷库），
+  // 但替换后的活动面没通过校验。并进 `applied` 会虚报已归档段数。
+  const verifyFailed = record.state.archive.filter((row) => row.status === 'verify-failed').length
   const restored = record.state.archive.filter((row) => row.status === 'restored').length
   const lines = [
     `v2 引擎：${record.state.enabled ? '已启用' : '已停用'}${record.state.fullHistory === true ? '（全历史记忆上下文）' : ''}`,
@@ -164,7 +167,8 @@ function renderV2Status(record, extra = {}) {
     `隔离根：${record.directory}`,
     `设置：auto=${settings.auto ? 'on' : 'off'} recall=${settings.autoRecall ? 'on' : 'off'} `
       + `batch=${settings.archiveBatchSize} retain=${record.state.fullHistory === true ? `${settings.retainOperations}（全历史模式下失效）` : settings.retainOperations}`,
-    `账本：已归档 ${applied} 段，已恢复 ${restored} 段`,
+    `账本：已归档 ${applied} 段，已恢复 ${restored} 段`
+      + (verifyFailed ? `，校验未通过 ${verifyFailed} 段（原文只在冷库，可 restore 取回）` : ''),
   ]
   if (record.state.lastMeasurement) {
     const m = record.state.lastMeasurement

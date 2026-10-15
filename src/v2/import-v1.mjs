@@ -39,7 +39,12 @@ export function validateV1ArchiveEntry(entry) {
     if (!(key in entry)) problems.push(`缺少 ${key}`)
   }
   if (problems.length) return problems.join('；')
-  if (entry.status !== 'applied') problems.push(`status 必须是 applied，实际 ${JSON.stringify(entry.status)}`)
+  // `verify-failed` 与 `applied` 一样把原文遮蔽了：替换事件已提交，冷分块已写入，
+  // 差别只在提交后的校验结果。拒收它等于让一段只能从冷库恢复的原文无法导入 v2。
+  // 其余字段（含 chunkCount）的严格校验不变——恢复路径仍要按它重建回执正文。
+  if (entry.status !== 'applied' && entry.status !== 'verify-failed') {
+    problems.push(`status 必须是 applied 或 verify-failed，实际 ${JSON.stringify(entry.status)}`)
+  }
   if (!isSafeInt(entry.rangeStart, { min: 1 })) problems.push('rangeStart 非法')
   if (!isSafeInt(entry.rangeEnd, { min: 1 })) problems.push('rangeEnd 非法')
   if (isSafeInt(entry.rangeStart, { min: 1 }) && isSafeInt(entry.rangeEnd, { min: 1 })

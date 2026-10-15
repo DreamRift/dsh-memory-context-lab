@@ -1115,26 +1115,29 @@ function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER,
   } catch (error) {
     problems.push(`活动面无法构建下一次请求：${messageOf(error)}`)
   }
+  // 这些字段描述的是「已经提交到活动面的那次替换」，与校验是否通过无关：
+  // 原文已经被回执遮蔽，冷库里的分块是它唯一的副本。恢复路径（`restoreReceipts`
+  // 的批次分组、`restoreLegacyReceipt` 重建回执正文）必须能读到与实际写入一致
+  // 的 `receiptFormat`/`chunkCount`/`chunkIds`，否则 `verify-failed` 行会被重建
+  // 成另一种格式而比对失败（「回执正文已变化，拒绝覆盖」），原文永久不可恢复。
+  // 只有 `state` 与 `reason` 随校验结果分叉。
   return {
     outcomes: run.map(({ unit, chunkIds }) => ({
       ...unitBaseOf(unit),
+      replacementSeq: replacement.seq,
+      /** Cold nodes this operation occupies; restore reads them back in order. */
+      chunkCount: chunkIds.length,
+      chunkIds: [...chunkIds],
+      /** Same number that went into `compaction/prune`; carried for P0-2 对账. */
+      shadowedTokenCount: perUnitTokens.get(unit.nodeId) ?? 0,
+      surfaceGeneration: session.surface.replaceGeneration,
+      hostVersion: hostVersion ?? 'unknown',
+      ...(run.length > 1
+        ? { receiptFormat: RECEIPT_FORMAT_BATCH, batchSize: run.length }
+        : {}),
       ...(problems.length
-        ? { replacementSeq: replacement.seq, state: 'verify-failed', reason: problems.join('；') }
-        : {
-            replacementSeq: replacement.seq,
-            state: 'applied',
-            reason: '',
-            /** Cold nodes this operation occupies; restore reads them back in order. */
-            chunkCount: chunkIds.length,
-            chunkIds: [...chunkIds],
-            /** Same number that went into `compaction/prune`; carried for P0-2 对账. */
-            shadowedTokenCount: perUnitTokens.get(unit.nodeId) ?? 0,
-            surfaceGeneration: session.surface.replaceGeneration,
-            hostVersion: hostVersion ?? 'unknown',
-            ...(run.length > 1
-              ? { receiptFormat: RECEIPT_FORMAT_BATCH, batchSize: run.length }
-              : {}),
-          }),
+        ? { state: 'verify-failed', reason: problems.join('；') }
+        : { state: 'applied', reason: '' }),
     })),
   }
 }
@@ -1200,6 +1203,9 @@ export function tokenAccountingOf(rows) {
   let prune = 0
   let compared = 0
   for (const row of rows ?? []) {
+    // Applied-only on purpose: this compares the receipt figure against
+    // `compaction/prune.shadowedTokenCount`, and a verify-failed row never wrote
+    // that prune event, so including it would invent a mismatch.
     if (row?.status !== 'applied') continue
     const r = Number(row.originalTokens)
     const p = Number(row.shadowedTokenCount)
@@ -1360,9 +1366,20 @@ export function occupancyLines(occupancy) {
 /** Report one batch: what landed, what did not, and why. */
 export function formatBatchReport(result) {
   const lines = [`已归档 ${result.applied} 个操作，释放 ≈${result.releasedTokens} token（估算）。`]
+  // `verify-failed` 不等于「未归档」：回执已经提交、原文已被遮蔽，只是替换后的
+  // 活动面没通过校验。把它说成「未归档」会让用户以为原文还在表层而错过恢复，
+  // 因此单独措辞，并在汇总里提示原文只在冷库。
+  const verifyFailed = result.outcomes.filter((outcome) => outcome.state === 'verify-failed').length
   for (const outcome of result.outcomes) {
-    const label = outcome.state === 'applied' ? '成功' : `未归档(${outcome.state})`
+    const label = outcome.state === 'applied'
+      ? '成功'
+      : outcome.state === 'verify-failed'
+        ? '已归档但校验未通过(verify-failed)'
+        : `未归档(${outcome.state})`
     lines.push(`- seq ${outcome.rangeStart}–${outcome.rangeEnd} / ${outcome.tools.join('、')}：${label}${outcome.reason ? ` — ${outcome.reason}` : ''}`)
+  }
+  if (verifyFailed) {
+    lines.push(`本批有 ${verifyFailed} 个单元的原文已被回执遮蔽但校验未通过；原文只在冷库，请用 /memory-lab restore 取回。`)
   }
   if (result.failed.length) lines.push('失败或跳过的单元保留了原文；已归档单元的回执仍然有效。')
   if (result.releaseCapped) lines.push('本批释放达到单批上限，其余候选留到下一批。')

@@ -244,11 +244,6 @@ export function makeOrdinalAllocator(record) {
 }
 
 /**
- * Durable per-range cold-node claims.
- *
- * See `nodeClaimOf`.
- */
-/**
  * Receipts still shadowing the active surface.
  *
  * A verify-failed row counts. The replacement WAS appended -- that is why the
@@ -761,6 +756,12 @@ export function createEngine(dependencies) {
         await persist(record)
       },
     })
+    // 下面四处计数**故意只认 `applied`**，与上面的 `failed` 相反：`verify-failed`
+    // 的冷节点写进去了，但替换后的活动面没通过校验，不能算作「本批净释放」。
+    // 把它的 token 计入 releasedTokens 会虚报收益，计入 applied/recordsWritten 会
+    // 让账本与「冷库写入 N 条」对不上——而它又不该进 failed 的孤儿清理与重试账。
+    // 四处判定必须分开写：`applied` 独占（releasedTokens / applied / batchReplacements /
+    // recordsWritten）、`verify-failed` 独占（归档行 + 恢复路径）、两者都不进（failed）。
     const releasedTokens = outcomes.reduce((sum, outcome) => sum + (outcome.state === 'applied' ? outcome.netReleaseTokens : 0), 0)
     const applied = outcomes.filter((outcome) => outcome.state === 'applied').length
     // C3/O3：本批实际替换段数回填进 usage 观测的基线（status 展示「这批之后
@@ -1243,7 +1244,8 @@ export function createEngine(dependencies) {
   function formatStatus(record) {
     if (!record) return '当前会话未启用上下文降温。使用 /memory-lab on 启用。'
     const settings = settingsOf(record)
-    const pending = pendingReceipts(record).length
+    const pending = pendingReceipts(record)
+    const verifyFailed = pending.filter((row) => row.status === 'verify-failed').length
     const restored = record.state.archive.filter((row) => row.status === 'restored').length
     const suppression = record.suppressionLease?.stats?.() ?? { write: 0, read: 0 }
     const lines = [
@@ -1251,7 +1253,9 @@ export function createEngine(dependencies) {
       `保留最近操作：${settings.retainOperations} 个（唯一触发线，一直生效）`,
       `归档节奏：保留窗口外攒够 ${settings.archiveBatchSize} 个操作提交一批`,
       `自动降温：${settings.auto ? '开' : '关'}；自动回注：${settings.autoRecall ? '开' : '关'}`,
-      `已归档操作：${pending} 个；已恢复：${restored} 个`,
+      // verify-failed 单列：它与 applied 一样遮蔽了原文（原文只在冷库），
+      // 并进「已归档操作」会把校验未通过的段数虚报成成功归档。
+      `已归档操作：${pending.length - verifyFailed} 个${verifyFailed ? `；校验未通过 ${verifyFailed} 个（原文只在冷库，可 restore 取回）` : ''}；已恢复：${restored} 个`,
       `真实灵枢抑制：本会话已拦截自动 ${suppression.write} 写 / ${suppression.read} 读调用。`,
       '工具集不变：插件从不增删模型可见的工具，因此不会因工具变化作废前缀缓存。',
     ]

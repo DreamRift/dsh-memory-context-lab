@@ -797,8 +797,12 @@ export async function apply(ctx, config) {
         // A directory can outlive the enable (an earlier run, or a resume in a new
         // process). Reclaim it when nothing depends on it, so `off` is idempotent
         // and never leaves plugin data behind.
+        // "Nothing depends on it" is exactly `pendingReceipts`, not a local
+        // `status === 'applied'` test: a verify-failed row shadowed an original
+        // just as firmly, so purging the directory here would destroy the only
+        // copy of that text.
         const leftover = await readSessionState(labRoot, sessionId)
-        if (leftover && !leftover.state.archive.some((row) => row.status === 'applied')) {
+        if (leftover && engine.pendingReceipts(leftover).length === 0) {
           try {
             await removeSessionDirectory(labRoot, leftover.directory)
             return { kind: 'success', text: '当前会话未启用上下文降温；已清除遗留的插件隔离数据。' }
@@ -814,8 +818,11 @@ export async function apply(ctx, config) {
         const outcome = await runMaintenance(invocation, (signal) => normalizeAndStop(record, signal, { guardWindow: true }))
         const lines = []
         if (outcome.refused) {
+          // 真正会涨上去的是 `total - heldByReceipts`：回执本身已经在组装输入里，
+          // 拿 `total` 当增量会把它们重复计一遍，把拒绝理由说得比实际更吓人。
+          const growth = outcome.refused.total - (outcome.refused.heldByReceipts ?? 0)
           lines.push(
-            `已停用降温。但恢复会让组装输入超出模型窗口（当前约 ${outcome.refused.assembled} + 待恢复约 ${outcome.refused.total} > 窗口 ${outcome.refused.window}），`,
+            `已停用降温。但恢复会让组装输入超出模型窗口（当前约 ${outcome.refused.assembled} + 待恢复约 ${growth} > 窗口 ${outcome.refused.window}），`,
             '因此**没有**恢复，原文仍在冷库里。要回到正常会话，请先缩小上下文，或直接丢弃冷库：',
             '  /memory-lab clean confirm delete-session',
           )
@@ -1084,7 +1091,10 @@ export async function apply(ctx, config) {
           // delete that orphans a receipt.
           const found = await readSessionState(labRoot, sessionId)
           const rows = found?.state.archive ?? live?.state.archive ?? []
-          const pending = rows.filter((row) => row.status === 'applied').length
+          // Count what `restore` can actually get back, via the same predicate
+          // the restore path uses: a verify-failed row is restorable, so it must
+          // still gate the delete confirmation.
+          const pending = engine.pendingReceipts({ state: { archive: rows } }).length
           const decision = cleanDecision({ pendingReceipts: pending, confirmDelete })
           if (decision.refuse) return { refused: true, pending: decision.pending }
           if (!found) {

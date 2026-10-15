@@ -1033,14 +1033,6 @@ export function normalizeRecallPayload(payload, maxHits = MAX_RECALL_HITS) {
 }
 
 /**
- * Truncate to a budget counted in CODE POINTS, not UTF-16 units.
- *
- * String.prototype.slice counts UTF-16 code units, so a cut that lands inside a
- * surrogate pair leaves a lone high surrogate: it renders as a replacement
- * character and, once written into a message, is a permanently broken sequence.
- * Counting with Array.from keeps emoji and any astral-plane character whole.
- */
-/**
  * Tokens a restore would ADD to the surface, and whether that overflows.
  *
  * Restoring swaps each receipt for the original it replaced, so the growth is
@@ -1064,6 +1056,14 @@ export function restoreGrowth(pending, { assembledTokens, contextWindow }) {
   }
 }
 
+/**
+ * Truncate to a budget counted in CODE POINTS, not UTF-16 units.
+ *
+ * String.prototype.slice counts UTF-16 code units, so a cut that lands inside a
+ * surrogate pair leaves a lone high surrogate: it renders as a replacement
+ * character and, once written into a message, is a permanently broken sequence.
+ * Counting with Array.from keeps emoji and any astral-plane character whole.
+ */
 export function truncateCodePoints(text, limit) {
   const value = String(text ?? '')
   if (value.length <= limit) return value

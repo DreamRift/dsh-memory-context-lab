@@ -2,7 +2,7 @@
 // they cost a user their archive. Each test names the behaviour, not the patch.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -11,7 +11,10 @@ import {
   LAB_ROOT_MARKER_FILE,
   LAB_ROOT_MARKER_KIND,
   MAX_PREVIEW_CHARS,
+  MIN_OPERATION_CHARS,
   NUMERIC_SETTINGS,
+  RECEIPT_FORMAT_BATCH,
+  RECEIPT_FORMAT_VERSION,
   STATE_FILE,
   displayPreview,
   normalizeSettings,
@@ -25,9 +28,18 @@ import {
   listSessionStates,
   readSessionState,
   sessionDirectoryFor,
+  writeJsonAtomic,
 } from '../src/storage.mjs'
 import { createSuppressionCoordinator } from '../src/dsh-memory-suppression.mjs'
-import { pendingReceipts } from '../src/apply-engine.mjs'
+import { createEngine, pendingReceipts } from '../src/apply-engine.mjs'
+import {
+  applyOperations,
+  collectOperationCandidates,
+  openTurnOf,
+  planCooling,
+  restoreReceipts,
+} from '../src/apply.mjs'
+import { FakeColdStore, buildSession, fakeMeter } from './helpers/fake-host.mjs'
 
 async function withRoot(body) {
   const root = await mkdtemp(path.join(tmpdir(), 'ctxlab-reliability-'))
@@ -300,3 +312,262 @@ test('restoreGrowth treats a missing receipt count as zero', () => {
   assert.equal(growth.overflow, true)
   assert.equal(restoreGrowth([], { assembledTokens: 0, contextWindow: 0 }).overflow, false)
 })
+
+// --- atomic state writes: the bytes must survive a crash -----------------
+// B1：writeJsonAtomic 的持久化次序与落盘卫生。崩溃落在 rename 之后、盘刷之前
+// 会留下空文件或半截文件，而旧状态已经没了——这是回执账本不可重建的损失。
+
+test('writeJsonAtomic fsyncs the temp file before the rename takes over', async () => {
+  const source = await readFile(new URL('../src/storage.mjs', import.meta.url), 'utf8')
+  const start = source.indexOf('export async function writeJsonAtomic')
+  const end = source.indexOf('async function readLabRootMarker', start)
+  assert.ok(start >= 0 && end > start, 'the source layout this contract pins has changed')
+  const body = source.slice(start, end)
+  assert.ok(body.includes('handle.sync()'), 'the temp file must be flushed while it is still the temp name')
+  assert.ok(
+    body.indexOf('handle.sync()') < body.indexOf('await rename('),
+    'the flush must happen BEFORE the rename: after it, a crash lands on the final name',
+  )
+})
+
+test('writeJsonAtomic leaves no temp residue and fully replaces prior content', async () => {
+  await withRoot(async (root) => {
+    const file = path.join(root, 'nested', 'state.json')
+    await writeJsonAtomic(file, { v: 1 })
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { v: 1 })
+    let names = await readdir(path.dirname(file))
+    assert.equal(names.some((name) => name.endsWith('.tmp')), false, 'a completed write leaves no .tmp behind')
+    await writeJsonAtomic(file, { v: 2 })
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { v: 2 }, 'prior content must be fully replaced')
+    names = await readdir(path.dirname(file))
+    assert.deepEqual(names, ['state.json'], 'the directory holds exactly the one state file')
+  })
+})
+
+// --- listing: a session that vanishes mid-scan is not damage -------------
+// B2/C7：并发清理（`/memory-lab clean`、另一会话、用户手动删）会让目录消失在
+// `readdir` 与逐项检查之间。那不是损坏，不该掀掉整次扫描。窗口本身无法确定性
+// 复现，所以行为侧断言同一终态（状态文件已消失的会话目录被跳过、不算损坏），
+// 源码侧钉住 ENOENT 容忍分支确实存在。
+
+test('listSessionStates skips a vanished session instead of reporting damage', async () => {
+  const source = await readFile(new URL('../src/storage.mjs', import.meta.url), 'utf8')
+  const start = source.indexOf('export async function listSessionStates')
+  const body = source.slice(start, source.indexOf('\nexport ', start + 10) === -1 ? undefined : source.indexOf('\nexport ', start + 10))
+  assert.ok(start >= 0, 'the source layout this contract pins has changed')
+  assert.equal((body.match(/'ENOENT'/g) || []).length >= 2, true,
+    'listSessionStates must tolerate ENOENT from the lstat fallbacks (the concurrent-removal race)')
+
+  await withRoot(async (root) => {
+    await ensureLabRoot(root)
+    // 终态一：目录还在、状态文件已被并发清掉（readJsonStrict → null → 跳过）。
+    const directory = sessionDirectoryFor(root, 'session-vanish')
+    await mkdir(directory, { recursive: true })
+    // 终态二：目录被同名普通文件顶替（ENOTDIR 同源竞态）。
+    await writeFile(path.join(root, 'sessions', 'a'.repeat(24)), 'not a session', 'utf8')
+    const result = await listSessionStates(root)
+    assert.equal(result.rows.length, 0)
+    assert.equal(result.damaged.length, 0, 'a vanished session is a race, not damage')
+  })
+})
+
+// --- verify-failed: the shadowed original must stay restorable -----------
+// B3/B6/C1：替换已提交、原文已被回执遮蔽之后校验才失败。此时冷库分块是原文
+// 唯一的副本，归档行必须带着与实际写入一致的回执重建元数据——否则 restore
+// 会按另一种格式重建正文而被「回执正文已变化」拒绝，原文永久不可恢复。
+
+function planFor(session, { retainOperations = 0, batchSize = 1, receiptMarker } = {}) {
+  const measured = fakeMeter.measure(session)
+  const view = collectOperationCandidates({
+    surfaceNodes: session.surface.nodes,
+    eventAt: (seq) => session.eventAt(seq),
+    measuredNodes: measured.nodes,
+    retainOperations,
+    openTurn: openTurnOf(session),
+    archivedRanges: [],
+    minimumChars: MIN_OPERATION_CHARS,
+  })
+  const plan = planCooling({
+    candidates: view.candidates,
+    meter: fakeMeter,
+    nodeIdFor: (candidate) => `node-${candidate.rangeStart}`,
+    retainOperations,
+    batchSize,
+    maxOperations: 64,
+    minNetReleaseTokens: 128,
+    ...(receiptMarker ? { receiptMarker } : {}),
+  })
+  return { view, plan }
+}
+
+function archiveRowFromOutcome(outcome) {
+  return {
+    rangeStart: outcome.rangeStart,
+    rangeEnd: outcome.rangeEnd,
+    callIds: outcome.callIds,
+    tools: outcome.tools,
+    nodeId: outcome.nodeId,
+    hash: outcome.hash,
+    chars: outcome.chars,
+    originalTokens: outcome.originalTokens,
+    replacementSeq: outcome.replacementSeq,
+    locators: outcome.locators ?? [],
+    statuses: outcome.statuses ?? [],
+    receiptFormat: outcome.receiptFormat,
+    batchSize: outcome.batchSize,
+    chunkCount: outcome.chunkCount ?? 1,
+  }
+}
+
+test('a verify-failed batch keeps full receipt metadata and restores every original', async () => {
+  const session = buildSession({ operations: 4, resultChars: 4000 })
+  const { plan } = planFor(session, { retainOperations: 0, batchSize: 4, receiptMarker: 'V2-RECEIPT' })
+  const store = new FakeColdStore()
+  // 让提交后的校验失败：此刻冷节点已写入、替换已提交（deriveMessages 只在
+  // commitSurfaceRun 的校验段被调用）。
+  session.deriveMessages = () => { throw new Error('fake surface assembly failed') }
+
+  const outcomes = await applyOperations({
+    session, client: store, units: plan.units, meter: fakeMeter, hostVersion: 'test', receiptMarker: 'V2-RECEIPT',
+  })
+  assert.equal(outcomes.length, 4)
+  for (const outcome of outcomes) {
+    assert.equal(outcome.state, 'verify-failed', outcome.reason)
+    assert.ok(outcome.reason.includes('fake surface assembly failed'))
+    // C1：这些字段描述的是已提交的替换，与校验结果无关，restore 靠它们重建。
+    assert.equal(typeof outcome.replacementSeq, 'number')
+    assert.equal(outcome.chunkCount, outcome.chunkIds.length)
+    assert.ok(outcome.chunkIds.length >= 1)
+    assert.equal(typeof outcome.shadowedTokenCount, 'number')
+    assert.equal(typeof outcome.surfaceGeneration, 'number')
+    assert.equal(outcome.hostVersion, 'test')
+    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_BATCH)
+    assert.equal(outcome.batchSize, 4)
+    for (const seq of [outcome.rangeStart, outcome.rangeEnd]) {
+      assert.equal(session.surface.nodes.includes(seq), false, `seq ${seq} is shadowed even though verification failed`)
+    }
+  }
+
+  const rows = outcomes.map(archiveRowFromOutcome)
+  const restored = await restoreReceipts({ session, client: store, receipts: rows, receiptMarker: 'V2-RECEIPT' })
+  assert.equal(
+    restored.filter((outcome) => outcome.state === 'restored').length,
+    4,
+    `every verify-failed row must restore: ${JSON.stringify(restored.map((o) => [o.state, o.reason]))}`,
+  )
+})
+
+test('a verify-failed single-unit commit keeps the legacy receipt rebuildable', async () => {
+  const session = buildSession({ operations: 3, resultChars: 60000 })
+  const { plan } = planFor(session, { retainOperations: 0, batchSize: 3 })
+  assert.equal(plan.units.length, 3, 'the fixture needs all three units planned')
+  // 跳过中间单元：0 与 2 的宿主 seq 不相邻 → 断成两个单单元 run，各自保持
+  // 逐条（legacy）回执——这正是 0.9.0-rc.2 之前的字节形态。
+  const units = [plan.units[0], plan.units[2]]
+  const store = new FakeColdStore()
+  session.deriveMessages = () => { throw new Error('fake surface assembly failed') }
+
+  const outcomes = await applyOperations({
+    session, client: store, units, meter: fakeMeter, hostVersion: 'test',
+  })
+  assert.equal(outcomes.length, 2)
+  assert.ok(outcomes.some((outcome) => outcome.chunkCount > 1), 'the fixture must include a multi-chunk unit — that is the shape the old bug corrupted')
+  for (const outcome of outcomes) {
+    assert.equal(outcome.state, 'verify-failed', outcome.reason)
+    assert.equal(outcome.chunkCount, outcome.chunkIds.length)
+    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_VERSION, 'a single-unit run keeps the per-unit (format-2) receipt')
+    assert.equal(outcome.batchSize, undefined)
+  }
+
+  const restored = await restoreReceipts({ session, client: store, receipts: outcomes.map(archiveRowFromOutcome) })
+  assert.equal(
+    restored.filter((outcome) => outcome.state === 'restored').length,
+    2,
+    `both verify-failed rows must restore via the legacy rebuild: ${JSON.stringify(restored.map((o) => [o.state, o.reason]))}`,
+  )
+})
+
+// --- engine: measurement and cold-store lifecycle -------------------------
+
+function makeEngineRecord(session) {
+  return {
+    agent: { session },
+    state: {
+      enabled: true,
+      settings: { auto: true, autoRecall: true, retainOperations: 1, archiveBatchSize: 1 },
+      archive: [],
+      lastMeasurement: null,
+      lastFailures: [],
+    },
+    lastAction: null,
+    occupancy: null,
+    occupancyError: null,
+    client: null,
+    clientError: null,
+    cost: null,
+  }
+}
+
+// B4：批次提交后的占用率必须重新测量。批前快照描述的活动面已经不存在——
+// 原文被回执替换了；把旧数落盘，status 会报一个用户再也看不到的占用量。
+test('a committed batch re-measures occupancy so the stored figure matches the new surface', async () => {
+  const engine = createEngine({
+    persist: async () => {},
+    nodeIdFor: (record, ordinal) => `reliability-node-${ordinal}`,
+    hostVersion: 'reliability-test',
+    services: {
+      get(name) {
+        if (name === 'tokenMeter') return fakeMeter
+        if (name === 'llm') return { resolveModelInfo: async () => ({ context: { contextWindow: 100000 }, defaultMaxTokens: 4096 }) }
+        return undefined
+      },
+    },
+    logger: { info() {}, warn() {}, error() {} },
+    createClient: async () => new FakeColdStore(),
+  })
+  const session = buildSession({ operations: 2, resultChars: 4000 })
+  const record = makeEngineRecord(session)
+  const before = fakeMeter.measure(session).totalTokens
+
+  // 复测发生在 runAutoCooling 的批次成功路径上（runOnce 是手动入口，不落测量）。
+  const outcome = await engine.runAutoCooling(record, new AbortController().signal)
+  assert.equal(outcome.action, 'applied', `the batch must really commit: ${JSON.stringify(outcome)}`)
+  assert.equal(
+    record.state.archive.filter((row) => row.status === 'applied').length,
+    1,
+    'exactly the one out-of-window operation must be archived',
+  )
+  const after = fakeMeter.measure(session).totalTokens
+  assert.ok(after < before, 'the committed batch must shrink the surface')
+  assert.equal(record.state.lastMeasurement.kind, 'applied')
+  assert.equal(
+    record.state.lastMeasurement.assembledTokens,
+    after,
+    'the stored measurement must equal the POST-batch surface, not the stale pre-batch snapshot',
+  )
+})
+
+// B5：冷库创建失败要被记住、只失败一次——每个 pre-step 边界都重试一次工厂
+// 会让一个坏掉的冷库把会话的每一步都拖进失败循环。
+test('a cold-store creation failure is remembered instead of retried at every boundary', async () => {
+  let attempts = 0
+  const engine = createEngine({
+    persist: async () => {},
+    nodeIdFor: (record, ordinal) => `reliability-node-${ordinal}`,
+    hostVersion: 'reliability-test',
+    services: { get: () => undefined },
+    logger: { info() {}, warn() {}, error() {} },
+    createClient: async () => {
+      attempts += 1
+      throw new Error('cold store unavailable')
+    },
+  })
+  const record = makeEngineRecord(buildSession({ operations: 1 }))
+
+  await assert.rejects(() => engine.ensureClient(record), /cold store unavailable/)
+  await assert.rejects(() => engine.ensureClient(record), /cold store unavailable/)
+  assert.equal(attempts, 1, 'the factory must run exactly once; later calls rethrow the cached failure')
+  assert.ok(record.clientError, 'the failure must be remembered on the record')
+  assert.equal(record.client, null, 'no half-built client may be cached')
+})
+
