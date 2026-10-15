@@ -183,7 +183,49 @@ export function createPlanFirst({ services, logger = null }) {
     return { outcome: 'unavailable', text: '宿主未提供计划模式（无 dsh-plan-mode 服务且读不到 plan 投影），计划先行不生效' }
   }
 
-  return { planStateOf, coolingSuspensionFor, sessionIsFresh, sessionIsFreshForAutoEnter, enterIfFresh, enterViaLog }
+  /**
+   * 用户关闭 planfirst 时的联动退出：计划模式 active 或 pending 就 `set(false)`。
+   *
+   * 与 `enterIfFresh` 对称：服务可用走服务（含 pending 取消语义），服务抛错或
+   * 缺失回退落账路径（append `plan/mode {active:false}`，与宿主 set() 的
+   * committed 等价）；连状态都读不到时不动并如实说明——未知状态下落一个
+   * `active:false` 与宿主投影可能冲突，交给用户手动 /plan off。
+   *
+   * 这是用户显式开关动作的组成部分，不是插件替用户决定计划；文本如实报告结果。
+   */
+  function exitIfActive(agent) {
+    const state = planStateOf(agent)
+    if (!state) {
+      return { outcome: 'unavailable', text: '读不到计划模式状态，未联动退出；可手动 /plan off' }
+    }
+    if (!state.active && !state.pending) return { outcome: 'inactive', text: '' }
+    const ctl = controller()
+    if (ctl) {
+      try {
+        const outcome = ctl.set(agent, false)
+        const text = outcome === 'committed'
+          ? '已退出计划模式'
+          : outcome === 'queued'
+            ? '计划模式将在下一轮退出（当前轮次进行中）'
+            : outcome === 'cancelled'
+              ? '已取消排队的计划模式切换'
+              : '会话已不在计划模式'
+        return { outcome, text }
+      } catch (error) {
+        warn(logger, 'planMode.set(false) 失败，尝试落账路径', error)
+        // fall through 到落账路径：服务抛错不代表会话日志不可写。
+      }
+    }
+    try {
+      agent?.session?.append?.('plan/mode', { active: false })
+      return { outcome: 'committed', text: '已退出计划模式（经会话日志落账）' }
+    } catch (error) {
+      warn(logger, 'plan/mode 落账失败（退出）', error)
+      return { outcome: 'error', text: `退出计划模式失败：${String(error?.message ?? error).slice(0, 200)}；可手动 /plan off` }
+    }
+  }
+
+  return { planStateOf, coolingSuspensionFor, sessionIsFresh, sessionIsFreshForAutoEnter, enterIfFresh, enterViaLog, exitIfActive }
 }
 
 /**

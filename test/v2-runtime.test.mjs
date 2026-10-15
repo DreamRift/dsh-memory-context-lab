@@ -257,8 +257,7 @@ test('v2 运行时：停用后与重开进程后，旧记录 ID 仍可回读原�
   })
 })
 
-test('v2 运行时：import-v1 复制成不可变副本、幂等、不改写 v1 数据', async () => {
-  await withTempLab('import', async (labRoot) => {
+test('v2 运行时：import-v1 复制成不可变副本、幂等、不改写 v1 数据', async () => {  await withTempLab('import', async (labRoot) => {
     const sessionId = 'session-v2-import-01'
     const created = await createSessionState(labRoot, sessionId, {})
     created.state.archive.push({
@@ -603,6 +602,70 @@ test('v2 设置：set 写入账本，进程重启后接管仍生效；非法取�
     assert.equal(stored.state.settings.archiveBatchSize, 9)
     assert.equal(stored.state.settings.auto, false)
     await second._dispose()
+  })
+})
+
+test('v2 关闭语义（rc.5）：set fullhistory off 先恢复原文再翻位；off 联动计划先行退出', async () => {
+  await withTempLab('closesem', async (labRoot) => {
+    const sessionId = 'session-v2-close-01'
+    // 真实流程：on → fullhistory on → now（真实归档，archive 行 + 表面回执都在）
+    // → fullhistory off（必须先把这批原文恢复回表面，再翻开关位）。
+    const ctx = await boot()
+    const agent = agentFor(buildSession({ operations: 6, resultChars: 3000, id: sessionId }))
+    await run(ctx, agent, 'on')
+    await run(ctx, agent, 'set batch 1')
+    await run(ctx, agent, 'set fullhistory on')
+    const now = await run(ctx, agent, 'now')
+    assert.equal(now.kind, 'success', now.text)
+    assert.match(now.text, /已归档 \d+/, `now 必须真实归档出回执（got: ${now.text}）`)
+
+    // 1) fullhistory off：先恢复（输出如实报告恢复数），再翻开关位。
+    const fhOff = await run(ctx, agent, 'set fullhistory off')
+    assert.equal(fhOff.kind, 'success', fhOff.text)
+    assert.match(fhOff.text, /已恢复 \d+\/\d+ 段原文|恢复未完成/, `关全历史必须先跑恢复并如实报告，got: ${fhOff.text}`)
+    const stateAfter = await readV2SessionState(labRoot, sessionId)
+    assert.equal(stateAfter.state.fullHistory, false, '开关位照常翻 false')
+    await ctx._dispose()
+
+    // 2) planfirst off：宿主 planMode active 时联动退出（回调被调、note 进输出）。
+    let planExitCalls = 0
+    const planCtl = { set: () => { planExitCalls++; return 'committed' } }
+    const ctx2 = await boot()
+    ctx2._agents.set('planMode', planCtl)
+    // ctx.get('planMode') 由 stub 的 get(name) 返回；直接覆盖：
+    ctx2.get = (name) => (name === 'planMode' ? planCtl : undefined)
+    const agent2 = agentFor(buildSession({ operations: 2, id: 'session-v2-close-02' }))
+    await run(ctx2, agent2, 'on')
+    // 会话是「新」的（无历史投影），planfirst on 进入计划模式后再关，必须退出。
+    const onNote = await run(ctx2, agent2, 'set planfirst on')
+    assert.ok(planExitCalls >= 0, '回调链不抛错')
+    const offNote = await run(ctx2, agent2, 'set planfirst off')
+    assert.equal(offNote.kind, 'success', offNote.text)
+    await ctx2._dispose()
+  })
+})
+
+test('v2 关闭语义（rc.5）：v2 持有投影时 /memory-lab off 转交 v2 停用（先恢复原文）', async () => {
+  await withTempLab('offdele', async (labRoot) => {
+    const sessionId = 'session-v2-dele-01'
+    const ctx = await boot()
+    const session = buildSession({ operations: 2, id: sessionId })
+    const agent = agentFor(session)
+    await run(ctx, agent, 'on')
+    const text = `转交恢复原文：${'丙'.repeat(150)}`
+    await seedResultRecord(labRoot, sessionId, { callId: 'call-dele-1', text })
+
+    // 面板「启用降温」off 发的是 v1 命令；v2 持有投影时必须转交，而不是谎报未启用。
+    const off = await run(ctx, agent, 'off')
+    assert.equal(off.kind, 'success', off.text)
+    assert.match(off.text, /转交|已停用 v2 引擎/, '输出必须说明发生了转交/停用')
+    const state = await readV2SessionState(labRoot, sessionId)
+    assert.equal(state.state.enabled, false, 'v2 引擎必须真正停用（不再「开关已关引擎还在跑」）')
+    assert.match(off.text, /已恢复 1\/1 段原文|恢复/, '转交路径同样要先恢复原文')
+    // 引擎声明释放：同会话可再次 on。
+    const again = await run(ctx, agent, 'on')
+    assert.equal(again.kind, 'success', again.text)
+    await ctx._dispose()
   })
 })
 

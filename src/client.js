@@ -86,7 +86,7 @@ window.__ModuleLoader__.load({
       'action.clean': '清理',
       'action.cleanConfirm': '确认清理',
 
-      'output.title': '最近一次命令输出',
+      'output.title': '状态与最近一次命令输出',
       'output.empty': '暂无输出',
 
       'error.noSession': '当前会话不可用，无法执行命令',
@@ -136,7 +136,7 @@ window.__ModuleLoader__.load({
       'action.clean': 'Clean up',
       'action.cleanConfirm': 'Confirm cleanup',
 
-      'output.title': 'Last command output',
+      'output.title': 'Status and last command output',
       'output.empty': 'No output yet',
 
       'error.noSession': 'No usable session for this command',
@@ -248,10 +248,11 @@ window.__ModuleLoader__.load({
       // 外点关闭走 veil：全屏透明层压在弹层之下（z-index 39 < 40），点在弹层
       // 之外的任何位置都落在 veil 上并收起；客户端不注册 window/document 事件。
       + '.mcl-veil{position:fixed;inset:0;z-index:39;background:transparent;border:0;padding:0;}'
-      + '.mcl-pop{position:absolute;bottom:calc(100% + 8px);left:0;z-index:40;box-sizing:border-box;width:320px;max-height:min(420px,60vh);overflow-y:auto;border:0.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:var(--dsw-radius-lg);padding:12px;display:flex;flex-direction:column;gap:8px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}'
-      + '.mcl-row{display:flex;align-items:center;gap:8px;min-height:28px}'
-      + '.mcl-label{flex:1;min-width:0;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}'
-      + '.mcl-status{flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
+      + '.mcl-pop{position:absolute;bottom:calc(100% + 8px);left:0;z-index:40;box-sizing:border-box;width:320px;max-height:min(420px,60vh);overflow-y:auto;overflow-x:hidden;border:0.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:var(--dsw-radius-lg);padding:12px;display:flex;flex-direction:column;gap:8px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}'
+      + '.mcl-row{display:flex;align-items:center;gap:8px;min-height:28px;min-width:0}'
+      // rc.5：label 永不竖排——长文本收缩到省略号（title 提示保留全文），
+      // 不再把行 min-content 撑破弹层宽度把「启用降温」挤成一字一行。
+      + '.mcl-label{flex:1;min-width:0;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
       + '.mcl-field{flex:none;display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}'
       + '.mcl-input{box-sizing:border-box;width:72px;height:28px;padding:0 8px;border:0.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;text-align:right}'
       + '.mcl-input:disabled{cursor:not-allowed;opacity:.5}'
@@ -784,6 +785,16 @@ window.__ModuleLoader__.load({
           + (planActive ? ' · ' + t('panel.status.planActive') : '')
         : t('panel.status.off');
 
+      // rc.5：状态信息从开关后移到底部输出框（原「暂无输出」位）。
+      // 摘要恒显：降温状态行 + 全历史行 + 计划先行行；最近一次命令输出追加其下。
+      var statusSummary = [
+        statusText,
+        (fullHistory ? t('panel.status.on') : t('panel.status.off')) + ' · ' + t('field.fullHistory'),
+        planFirst
+          ? (planActive ? t('panel.status.planActive') : t('panel.status.on')) + ' · ' + t('field.planFirst')
+          : t('panel.status.off') + ' · ' + t('field.planFirst')
+      ].join('\n');
+
       // 当前会话生效的预设：投影折叠出 preset.id/label；没选过或全局默认 → 「全局预设」。
       var presetId = view != null && typeof view.preset === 'object' && view.preset != null
         ? String(view.preset.id || '')
@@ -823,8 +834,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'mcl-label' }, t('panel.enable')),
         switchNode(enabled, t('panel.enable'), busy, function (next) {
           run(next ? '/memory-lab on' : '/memory-lab off');
-        }),
-        h('span', { className: 'mcl-status', title: statusText }, statusText)));
+        })));
 
       rows.push(h('div', { className: 'mcl-row', key: 'retain' },
         h('span', { className: 'mcl-label', title: fullHistory ? t('field.retainDisabled') : t('field.retain') }, t('field.retain')),
@@ -865,11 +875,7 @@ window.__ModuleLoader__.load({
           } else {
             run('/memory-lab2 set fullhistory off');
           }
-        }),
-        h('span', {
-          className: 'mcl-status',
-          title: t('field.fullHistoryHint')
-        }, fullHistory ? t('panel.status.on') : t('panel.status.off'))));
+        })));
 
       // 新会话计划先行：插件级开关（从会话日志折叠，两个引擎通用）。
       // 「on」由宿主侧联动进入计划模式（仅全新会话；非全新会话由命令输出提示）。
@@ -877,13 +883,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'mcl-label', title: t('field.planFirstHint') }, t('field.planFirst')),
         switchNode(planFirst, t('field.planFirst'), busy, function (next) {
           run('/memory-lab set planfirst ' + (next ? 'on' : 'off'));
-        }),
-        h('span', {
-          className: 'mcl-status',
-          title: t('field.planFirstHint')
-        }, planFirst
-          ? (planActive ? t('panel.status.planActive') : t('panel.status.on'))
-          : t('panel.status.off'))));
+        })));
 
       rows.push(h('div', { className: 'mcl-row', key: 'batch' },
         h('span', { className: 'mcl-label' }, t('field.batch')),
@@ -949,7 +949,7 @@ window.__ModuleLoader__.load({
         'aria-label': t('output.title'),
         title: t('output.title'),
         key: 'output'
-      }, store.status != null ? store.status : t('output.empty')));
+      }, statusSummary + (store.status != null ? '\n\n' + store.status : '')));
 
       return h('div', { className: 'mcl-pop', key: 'pop' }, rows);
     }

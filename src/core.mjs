@@ -1090,3 +1090,4 @@ export function isStrictDescendant(base, candidate, pathApi = path) {
 export function isSessionDirectoryName(name) {
   return typeof name === 'string' && /^[0-9a-f]{24}$/.test(name)
 }
+

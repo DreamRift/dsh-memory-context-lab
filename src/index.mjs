@@ -700,7 +700,9 @@ export async function apply(ctx, config) {
     defaultSettings: resolveDefaultsSettings,
     defaultFullHistory: () => resolveFullHistoryDefault(config),
     onEnabled: (agent) => (readProjectionPlanFirst(agent.session) ? planFirst.enterIfFresh(agent) : null),
-    onPlanFirstToggle: (agent, value) => (value ? planFirst.enterIfFresh(agent) : null),
+    // off 联动退出计划模式（rc.5）：关「新会话计划先行」时若计划模式仍处于
+    // active/pending，同步退出——这是用户显式开关动作的一部分，不是插件自作主张。
+    onPlanFirstToggle: (agent, value) => (value ? planFirst.enterIfFresh(agent) : planFirst.exitIfActive(agent)),
     coordinator: dependencies.coordinator,
     // 同步取用：检索热路径不会隐式起子进程（只在 /memory-lab2 index 时启动）。
     semanticBackendFor: ({ sessionId, storeRoot }) => v2SemanticBackend.backendFor({ sessionId, storeRoot }),
@@ -820,6 +822,24 @@ export async function apply(ctx, config) {
       if (!record) {
         const notice = damagedNotice(sessionId)
         if (notice) return notice
+        // rc.5：关闭按钮与引擎解耦。v2 引擎仍持有本会话投影时，/memory-lab off
+        // 不再报「未启用」（那只会让面板显示已关、v2 引擎继续每步归档，形成
+        // 「关不掉」的失同步，见会话 c250b0cf），而是转交 v2 的同一停用语义：
+        // 先恢复原文、再停用、清引擎声明。
+        try {
+          if (getEngineRegistry(labRoot, sessionId).holder === 'v2') {
+            const outcome = await v2.disable(invocation, 'memory-lab off 转交')
+            return {
+              kind: 'success',
+              text: `本会话投影由 v2 引擎持有：/memory-lab off 已按同一停用语义转交。\n${outcome.text}`,
+            }
+          }
+        } catch (error) {
+          return {
+            kind: 'error',
+            text: `v2 转交停用失败：${error instanceof Error ? error.message : String(error)}`,
+          }
+        }
         // A directory can outlive the enable (an earlier run, or a resume in a new
         // process). Reclaim it when nothing depends on it, so `off` is idempotent
         // and never leaves plugin data behind.
@@ -896,14 +916,15 @@ export async function apply(ctx, config) {
         if (rawValue !== 'on' && rawValue !== 'off') {
           return { kind: 'error', text: '计划先行只能是 on 或 off。' }
         }
-        const note = rawValue === 'on' ? planFirst.enterIfFresh(invocation.agent) : null
+        // rc.5：off 时若计划模式仍 active/pending，联动退出并如实报告。
+        const note = rawValue === 'on' ? planFirst.enterIfFresh(invocation.agent) : planFirst.exitIfActive(invocation.agent)
         const recordForPlan = records.get(sessionId)
         if (recordForPlan) {
           recordForPlan.state.planFirst = rawValue === 'on'
           await persist(recordForPlan).catch(() => {})
         }
         const lines = [`新会话计划先行已设为 ${rawValue === 'on' ? '开' : '关'}。`]
-        if (note) lines.push(note.text)
+        if (note?.text) lines.push(note.text)
         if (!records.get(sessionId)) lines.push('（本会话尚未启用降温；开关位置已记下，随会话日志折叠生效。）')
         return { kind: 'success', text: lines.join('\n') }
       }

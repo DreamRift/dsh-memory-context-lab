@@ -26,6 +26,7 @@ import {
   escapePromptBraces,
   normalizeSettings,
   renderRecallBlock,
+  restoreGrowth,
   V2_RECEIPT_MARKER,
 } from '../core.mjs'
 import { createEngine } from '../apply-engine.mjs'
@@ -664,16 +665,50 @@ export function createV2Runtime(dependencies) {
     const lines = []
     let restored = 0
     let before = 0
+    let windowGuardRefusal = null
 
     if (record) {
+      // 0) 窗口守卫（rc.5，与 v1 normalizeAndStop 同口径）：恢复会让组装输入
+      // 超出模型窗口时跳过恢复、照常停用，原文留在冷库并如实给出路。
+      // 「无测量不设闸」——测量不可用时照常恢复（与 v1 一致），不静默扣留。
+      const pendingCount = engine.pendingReceipts(record).length
+      if (pendingCount > 0 && engine.settingsOf(record).autoRestore) {
+        try {
+          const occupancy = await engine.measureOccupancy(record, undefined)
+          const growth = restoreGrowth(engine.pendingReceipts(record), {
+            assembledTokens: occupancy.host.assembledTokens,
+            contextWindow: occupancy.host.contextWindow,
+          })
+          if (growth.overflow) {
+            windowGuardRefusal = {
+              total: growth.total,
+              heldByReceipts: growth.heldByReceipts,
+              assembled: occupancy.host.assembledTokens,
+              window: occupancy.host.contextWindow,
+            }
+          }
+        } catch (error) {
+          ctx.logger.warn(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
       // 1) 先恢复所有已替换区间：投影回到原文，再停用。
-      try {
-        const outcome = await engine.runRestore(record)
-        restored = outcome?.restored ?? 0
-        before = outcome?.before ?? 0
-      } catch (error) {
-        // 恢复失败不静默：仍继续停用，但把失败写进回执文本，且不宣称已恢复。
-        lines.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}`)
+      if (!windowGuardRefusal) {
+        try {
+          const outcome = await engine.runRestore(record)
+          restored = outcome?.restored ?? 0
+          before = outcome?.before ?? 0
+        } catch (error) {
+          // 恢复失败不静默：仍继续停用，但把失败写进回执文本，且不宣称已恢复。
+          lines.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}`)
+        }
+      } else {
+        const growth = windowGuardRefusal.total - (windowGuardRefusal.heldByReceipts ?? 0)
+        lines.push(
+          `停用了降温，但恢复会让组装输入超出模型窗口（当前约 ${windowGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${windowGuardRefusal.window}），`,
+          '因此**没有**恢复，原文仍在冷库里。要取回原文，请先缩小上下文，或直接丢弃冷库：',
+          '  /memory-lab2 clean confirm delete-session',
+        )
       }
       const disabledState = disabledV2State(record.state, reason)
       await writeV2SessionState(record.directory, disabledState)
@@ -689,8 +724,10 @@ export function createV2Runtime(dependencies) {
     if (outcome.warnings?.length) lines.push(...outcome.warnings)
 
     lines.unshift(
-      `已停用 v2 引擎。恢复 ${restored}/${before} 段原文；`
-      + '历史与载荷按只读保留，旧记录 ID 仍可回读。',
+      windowGuardRefusal
+        ? `已停用 v2 引擎，未恢复原文（窗口守卫拒绝，见下）。历史与载荷按只读保留，旧记录 ID 仍可回读。`
+        : `已停用 v2 引擎。恢复 ${restored}/${before} 段原文；`
+          + '历史与载荷按只读保留，旧记录 ID 仍可回读。',
     )
     return { kind: 'success', text: lines.join('\n'), restored, before }
   }
@@ -1790,10 +1827,61 @@ export function createV2Runtime(dependencies) {
       if (rawValue !== 'on' && rawValue !== 'off') {
         return { kind: 'error', text: '用法：`/memory-lab2 set fullhistory on|off`' }
       }
+      // rc.5：off 先恢复原文再翻开关位——已归档的操作不能以回执形态留在投影里
+      // 却宣称「全历史已关」。恢复失败不阻断关闭（与 v2 off 同语义），如实逐条报告。
+      // 窗口守卫与停用同口径：overflow 则跳过恢复但开关照翻，如实给出路。
+      const restoreNotes = []
+      let fullHistoryGuardRefusal = null
+      if (rawValue === 'off' && record.state.fullHistory === true) {
+        const pendingCount = engine.pendingReceipts(record).length
+        if (pendingCount > 0) {
+          try {
+            const occupancy = await engine.measureOccupancy(record, undefined)
+            const growth = restoreGrowth(engine.pendingReceipts(record), {
+              assembledTokens: occupancy.host.assembledTokens,
+              contextWindow: occupancy.host.contextWindow,
+            })
+            if (growth.overflow) {
+              fullHistoryGuardRefusal = {
+                total: growth.total,
+                heldByReceipts: growth.heldByReceipts,
+                assembled: occupancy.host.assembledTokens,
+                window: occupancy.host.contextWindow,
+              }
+            }
+          } catch (error) {
+            ctx.logger.warn(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
+        if (fullHistoryGuardRefusal) {
+          const growth = fullHistoryGuardRefusal.total - (fullHistoryGuardRefusal.heldByReceipts ?? 0)
+          restoreNotes.push(
+            `已关闭全历史，但恢复会让组装输入超出模型窗口（当前约 ${fullHistoryGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${fullHistoryGuardRefusal.window}），`,
+            '因此**没有**恢复，原文仍在冷库里。要取回原文，请先缩小上下文后再 /memory-lab2 restore，或直接丢弃冷库：',
+            '  /memory-lab2 clean confirm delete-session',
+          )
+        } else {
+          try {
+            const outcome = await engine.runRestore(record)
+            const restored = outcome?.restored ?? 0
+            const before = outcome?.before ?? 0
+            if (before > 0) restoreNotes.push(`已恢复 ${restored}/${before} 段原文。`)
+          } catch (error) {
+            restoreNotes.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}；` +
+              '可稍后用 /memory-lab2 restore 重试（历史按只读保留，旧记录 ID 仍可回读）。')
+          }
+        }
+      }
       record.state.fullHistory = rawValue === 'on'
       if (record.state.fullHistory) {
         settings.retainOperations = normalizeSettings(settings).retainOperations
       }
+      record.state.settings = normalizeSettings(settings)
+      // 设置必须落盘：只改内存会让「设置成功」在重启后失效，而 v1 的 set 是持久的。
+      await writeV2SessionState(record.directory, record.state)
+      const lines = [`全历史记忆上下文已设为 ${rawValue === 'on' ? '开' : '关'}（写入 v2 账本）。`]
+      lines.push(...restoreNotes)
+      return { kind: 'success', text: lines.join('\n') }
     } else if (key === 'planfirst') {
       // 插件级开关（与 /memory-lab set planfirst 同义）：v2 账本只记位置，
       // 联动动作由注入的回调执行（服务缺失时回调返回提示，不阻断）。
@@ -1801,7 +1889,11 @@ export function createV2Runtime(dependencies) {
         return { kind: 'error', text: '用法：`/memory-lab2 set planfirst on|off`' }
       }
       record.state.planFirst = rawValue === 'on'
-      const note = (await onPlanFirstToggle?.(invocation.agent, rawValue === 'on')?.catch(() => null)) ?? null
+      // 回调可能返回 Promise 或普通对象（v1 的 enter/exitIfFresh 是 async，但不在
+      // 手里兜底），统一经 Promise.resolve 吞错——退出失败不阻断开关位落账。
+      const note = onPlanFirstToggle
+        ? (await Promise.resolve(onPlanFirstToggle(invocation.agent, rawValue === 'on')).catch(() => null))
+        : null
       record.state.settings = normalizeSettings(settings)
       await writeV2SessionState(record.directory, record.state)
       const lines = [`新会话计划先行已设为 ${rawValue === 'on' ? '开' : '关'}（写入 v2 账本）。`]
