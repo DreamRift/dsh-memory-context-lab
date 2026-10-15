@@ -29,7 +29,8 @@
 ### 测试
 
 - 新增 `test/v2-local-lexical.test.mjs`（本地词法后端：词条化、AND 语义、持久化、增量幂等、词条上限如实报、崩溃重建）与 `test/v2-local-client.test.mjs`（本地冷库客户端）。
-- D1/D2 各补守卫断言：未启动灵枢时复合 `describe` 报本地后端；旧 mdcg 冷库在场时 `status`/`on`/`restore` 附注升级出路。
+- D1/D2 各补守卫断言：未启动灵枢时复合 `describe` 报本地后端（`test/v2-retrieval-provider.test.mjs`，含 backendFor 兜底与 close 语义）；旧 mdcg 冷库在场时 `status`/`on`/`restore` 附注升级出路（`test/session.test.mjs`）。
+- 0.9.0-rc.6 全量：29 套、407 项断言（402 通过 / 5 环境性跳过——lingshu 可选化后的真实集成项，受限会话如实 SKIP），失败 0（2026-10-15，Node v24.19.0）。
 
 ## 0.9.0-rc.5 — 2026-10-15
 
