@@ -546,6 +546,37 @@ test('D6：v2 持有投影时 v1 的 set 明确指路，不再谎报「on 后生
   })
 })
 
+test('B2：v2 持有投影时 v1 的 restore/now 不再误报「未启用」，而是指路 v2', async () => {
+  await withTempLab('b2restore', async () => {
+    const ctx = await boot()
+    try {
+      const session = buildSession({ operations: 1, id: 'session-v2-b2-01' })
+      const agent = agentFor(session)
+      const enabled = await run(ctx, agent, 'on')
+      assert.equal(enabled.kind, 'success')
+
+      // c896f803 现场：v2 账本 1845 段完好，面板「恢复原文」却走 v1 入口报
+      // 「请先使用 /memory-lab on」。v1 的 restore/now/dry-run 在 v2 持有投影时
+      // 必须如实指路 v2 的等价入口。
+      for (const op of ['restore', 'now', 'dry-run']) {
+        const outcome = await command(ctx, 'memory-lab').handler(invocationFor(agent, op))
+        assert.equal(outcome.kind, 'error', `${op} 应明确报错，实际 ${JSON.stringify(outcome.text)}`)
+        assert.match(outcome.text, /v2 引擎（\/memory-lab2）持有投影/, `${op} 必须指明 v2 持有投影`)
+        assert.match(outcome.text, /\/memory-lab2 (restore|now|dry-run|read)/, `${op} 必须指路 v2 入口`)
+      }
+
+      // 防误杀：两引擎都不持有的会话里，v1 restore 维持原文案。
+      const other = buildSession({ operations: 1, id: 'session-v2-b2-02' })
+      const otherAgent = agentFor(other)
+      const plain = await command(ctx, 'memory-lab').handler(invocationFor(otherAgent, 'restore'))
+      assert.equal(plain.kind, 'error')
+      assert.match(plain.text, /请先使用 \/memory-lab on/)
+    } finally {
+      await ctx._dispose()
+    }
+  })
+})
+
 test('v2 设置：set 写入账本，进程重启后接管仍生效；非法取值显式拒绝', async () => {
   await withTempLab('set', async (labRoot) => {
     const session = buildSession({ operations: 2, id: 'session-v2-set-01' })

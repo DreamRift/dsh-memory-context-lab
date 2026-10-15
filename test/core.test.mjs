@@ -307,6 +307,41 @@ test('the projection folds settings from command/run records', () => {
   assert.equal(view.preset.modified, false)
 })
 
+test('B1: memory-lab2 off folds away the full-history bit and the engine stays in sync', () => {
+  // B1（session-3e4bad47 实测时间线）：`set fullhistory on` 之后 `/memory-lab2 off`
+  // 停用引擎，fullHistory 折叠若残留 true，面板开关仍显示「已启用」而关闭分支
+  // 按 enabled/engine 分流一条命令都发不出。v2 停用即全历史模式失效：off 折叠
+  // 必须同时清掉残留位，投影 enabled/engine 与引擎实际状态保持一致。
+  let state = initProjectionState()
+  const run2 = (args) => { state = applyEvent(state, { type: 'command/run', seq: state.revision + 300, data: { name: 'memory-lab2', args } }) }
+
+  run2('on')
+  run2('set fullhistory on')
+  let view = viewOf(state)
+  assert.equal(view.enabled, true)
+  assert.equal(view.engine, 'v2')
+  assert.equal(view.fullHistory, true)
+
+  run2('off')
+  view = viewOf(state)
+  assert.equal(view.enabled, false, 'off folds the engine as not enabled')
+  assert.equal(view.engine, '', 'off folds the engine slot back to empty')
+  assert.equal(view.fullHistory, false, 'v2 off must clear the stale full-history bit')
+
+  // v1 的 off 不动 fullHistory 位：v1 停用与 v2 的全历史开关无关（v1 off 在
+  // v2 持投影时会被运行时拒绝，但 command/run 仍落账、折叠仍会读它）。
+  state = initProjectionState()
+  const run1 = (args) => { state = applyEvent(state, { type: 'command/run', seq: state.revision + 400, data: { name: 'memory-lab', args } }) }
+  run1('on')
+  run2('on')
+  run2('set fullhistory on')
+  run1('off')
+  view = viewOf(state)
+  assert.equal(view.enabled, false)
+  assert.equal(view.engine, '')
+  assert.equal(view.fullHistory, true, 'a v1 off leaves the v2 full-history bit alone')
+})
+
 test('the projection folds preset commands and flags manual adjustments', () => {
   const presets = [
     { id: 'eco', name: 'GLM 5.3 Flash 省流', settings: { retainOperations: 5, archiveBatchSize: 3, auto: true, autoRecall: true, autoRestore: true } },

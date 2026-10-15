@@ -111,7 +111,14 @@ export function applyEvent(state, event, context = null) {
     const engineAfter = operation === 'on' ? engine : operation === 'off' ? '' : null
     const engineChanged = engineAfter !== null && (next.engine ?? '') !== engineAfter
     if (engineChanged) next.engine = engineAfter
-    if (!foldCommandIntoState(next, args, context) && !engineChanged) return state
+    // B1 修复：v2 停用即全历史模式失效。`memory-lab2 off` 的折叠同时清掉
+    // fullHistory 残留位，否则 v2 停用后面板开关仍显示「已启用」，而关闭分支
+    // 按 enabled/engine 分流一条命令都发不出（投影停在
+    // {enabled:false, engine:'', fullHistory:true} 的实测形态）。v1 的 off 不动
+    // 该位：v1 停用与 v2 的全历史开关无关。
+    const fullHistoryCleared = engine === 'v2' && operation === 'off' && next.fullHistory === true
+    if (fullHistoryCleared) next.fullHistory = false
+    if (!foldCommandIntoState(next, args, context) && !engineChanged && !fullHistoryCleared) return state
     next.revision = (state.revision ?? 0) + 1
     return next
   }

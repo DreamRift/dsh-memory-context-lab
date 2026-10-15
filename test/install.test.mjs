@@ -142,9 +142,13 @@ test('the lookup searches the DSH home, not only this plugin\'s own tree', async
 })
 
 test('a missing package fails with an actionable message, not a silent skip', async () => {
-  const requireFromPlugin = (await import('node:module')).createRequire(import.meta.url)
+  // B4：本用例测「包不存在时的报错」，前提必须由测试自己钉死。真实
+  // `requireFromPlugin` 的 Node 解析路径会命中原机已装的 peer（按 README 装好
+  // dsh-memory 的环境），让「未找到」这条断言红。传一个没有解析路径的 stub
+  // 显式屏蔽 Node 段，只剩不存在的 dshHome 可查——两种环境同一结果。
+  const noNodePaths = { resolve: { paths: () => [] } }
   await assert.rejects(
-    locatePinnedDshMemory(requireFromPlugin, { dshHome: 'C:/definitely-not-a-real-dsh-home', listProfiles: async () => [] }),
+    locatePinnedDshMemory(noNodePaths, { dshHome: 'C:/definitely-not-a-real-dsh-home', listProfiles: async () => [] }),
     /未找到已安装的 @furongjun1999\/dsh-memory/,
   )
 })

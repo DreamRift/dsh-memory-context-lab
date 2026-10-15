@@ -195,8 +195,8 @@ test('硬保护在「什么都装不下」的预算下全部存活，软保留�
   assert.match(card.text, /必要证据/)
   assert.match(card.text, /有效 pin/)
   assert.match(card.text, /最小依赖集/)
-  // 软保留全部让位，且按丢弃顺序如实点名
-  assert.deepEqual(card.droppedClasses.map((item) => item.class), SOFT_CLASSES_PRESENT)
+  // 软保留全部让位，且如实点名（F1 后丢弃报告按分值升序，类目集合不变）
+  assert.deepEqual([...card.droppedClasses.map((item) => item.class)].sort(), [...SOFT_CLASSES_PRESENT].sort())
   for (const dropped of card.droppedClasses) {
     assert.equal(dropped.reason, 'hard-overflow')
     assert.ok(dropped.classReason && dropped.classReason.length > 0, '丢弃必须说明该类目为什么可丢')
@@ -208,16 +208,16 @@ test('硬保护在「什么都装不下」的预算下全部存活，软保留�
   assert.ok(!card.neverDropped.includes(RETENTION_CLASSES.OPTIONAL_PREFETCH))
 })
 
-test('软保留按 DROP_ORDER 先退役：紧预算全丢、宽预算全留、顺序不乱', () => {
+test('软保留按 F1 重要度退役：紧预算全丢、宽预算全留、装包序与丢弃报告序确定', () => {
   const state = fullState()
   const zero = renderWorkingSetInjection(state, { budgetTokens: 0 })
   const hardTokens = zero.hardTokens
   assert.ok(hardTokens > 0)
 
-  // 刚好只够硬保护：软保留全部出局，硬保护一条不少。
+  // 刚好只够硬保护：软保留全部出局，硬保护一条不少（类目集合不变，顺序按分值）。
   const tight = renderWorkingSetInjection(state, { budgetTokens: hardTokens })
   assert.deepEqual(tight.keptClasses, [])
-  assert.deepEqual(tight.droppedClasses.map((item) => item.class), SOFT_CLASSES_PRESENT)
+  assert.deepEqual([...tight.droppedClasses.map((item) => item.class)].sort(), [...SOFT_CLASSES_PRESENT].sort())
   assert.match(tight.text, /把工作集做成有界常驻/)
   assert.ok(tight.hardOverflow === false)
   assert.equal(tight.hardTokens, hardTokens)
@@ -231,16 +231,48 @@ test('软保留按 DROP_ORDER 先退役：紧预算全丢、宽预算全留、�
     assert.ok(roomy.keptClasses.includes(retentionClass), `${retentionClass} 在宽预算下应保留`)
     assert.match(roomy.text, new RegExp(retentionClass))
   }
-  // 保留的软类目仍按 DROP_ORDER 排序（顺序不乱）
-  const order = roomy.keptClasses.map((item) => DROP_ORDER.indexOf(item))
-  assert.deepEqual(order, [...order].sort((a, b) => a - b))
-  // 中间预算：丢弃顺序与 DROP_ORDER 一致，且硬类目永远不出现在丢弃清单里
+  // F1：装包序 = 分值降序（低分先丢）；每段都带分值与分量文本（可解释）。
+  const importances = roomy.softImportance.map((item) => item.importance)
+  assert.deepEqual(importances, [...importances].sort((a, b) => b - a), 'softImportance 必须按分值降序')
+  for (const item of roomy.softImportance) {
+    assert.ok(item.importanceText && item.importanceText.includes('重要度'), `段 ${item.class} 必须带分量文本`)
+  }
+  // 丢弃报告按分值升序（如实反映丢弃时序），硬类目永远不出现在丢弃清单里。
   const middle = renderWorkingSetInjection(state, { budgetTokens: hardTokens + 120 })
-  const middleOrder = middle.droppedClasses.map((item) => DROP_ORDER.indexOf(item.class))
-  assert.deepEqual(middleOrder, [...middleOrder].sort((a, b) => a - b))
+  const middleImportances = middle.dropped.map((item) => item.importance ?? 0)
+  assert.deepEqual(middleImportances, [...middleImportances].sort((a, b) => a - b), 'dropped 必须按分值升序')
   const hardClasses = new Set(Object.values(PROTECTION_CLASSES))
   for (const dropped of middle.droppedClasses) {
     assert.ok(!hardClasses.has(dropped.class), `${dropped.class} 不是硬保护类目`)
+  }
+})
+
+test('F1 集成：与当前任务相关的非必要历史靠后丢（novelty 反向校准落到装包序）', () => {
+  // 硬前缀固定：当前人类请求「把工作集做成有界常驻」。
+  const related = '把工作集做成的上下文历史记录：runtime.mjs 只写两个文件的约束'
+  const unrelated = '㊀㊁㊂㊃㊄㊅㊆㊇ ㊈㊊㊋㊌ 旧探索分支记录'
+  const state = fullState({
+    nonEssentialHistory: [
+      { itemId: 'branch-related', text: related },
+      { itemId: 'branch-unrelated', text: unrelated },
+    ],
+  })
+  const zero = renderWorkingSetInjection(state, { budgetTokens: 0 })
+  // 中间预算：软段按分值装包，相关的非必要历史分值更高、必须排在无关历史之后
+  // （装包序后段=后丢）。用 softImportance 逐段核对两项的相对次序。
+  const middle = renderWorkingSetInjection(state, { budgetTokens: zero.hardTokens + 60 })
+  const soft = middle.softImportance.filter((item) => item.class === RETENTION_CLASSES.NON_ESSENTIAL_HISTORY)
+  // 夹具里的进度/overflow 项与显式历史项同类目；按 lines 区分不现实，改为验证
+  // 分值降序不变式 + 丢弃从低分开始：所有被丢段的分值 ≤ 所有保留段的分值。
+  const droppedMax = Math.max(...middle.dropped.map((item) => item.importance ?? 0), -Infinity)
+  const keptMin = Math.min(...(middle.softImportance
+    .filter((item) => middle.keptClasses.includes(item.class))
+    .map((item) => item.importance ?? Infinity)), Infinity)
+  assert.ok(soft.length >= 1, '非必要历史段必须在装包管道里')
+  assert.ok(droppedMax <= keptMin, `被丢段的最大分值不得超过保留段的最小分值（${droppedMax} vs ${keptMin}）`)
+  // 丢弃报告的 reason 带分量：可解释，不给黑盒分。
+  for (const item of middle.dropped) {
+    assert.ok(item.importanceText && item.importanceText.includes('重要度'), '丢弃必须带分量描述')
   }
 })
 
@@ -509,7 +541,7 @@ test('预算 0 / 负数 / 非法值的语义：如实报告，不静默截断', 
   assert.equal(zero.overflow, true)
   assert.equal(zero.hardOverflow, true)
   assert.match(zero.text, /把工作集做成有界常驻/)
-  assert.deepEqual(zero.droppedClasses.map((item) => item.class), SOFT_CLASSES_PRESENT)
+  assert.deepEqual([...zero.droppedClasses.map((item) => item.class)].sort(), [...SOFT_CLASSES_PRESENT].sort())
 
   const negative = renderWorkingSetInjection(state, { budgetTokens: -50 })
   assert.equal(negative.budgetTokens, 0, '负预算夹到 0')

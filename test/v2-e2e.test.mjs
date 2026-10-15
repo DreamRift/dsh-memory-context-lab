@@ -480,3 +480,52 @@ test('C3/O3：批提交前后各取一次 usage，差额记 observedInvalidation
     await ctx._dispose()
   })
 })
+
+test('B2 端到端：v2 会话的 restore 恢复回执原文且不停用引擎', async () => {
+  await withTempLab('restore', async (labRoot) => {
+    const ctx = createStubContext()
+    await applyPlugin(ctx)
+    const session = buildRealLayoutSession({ operations: 3, resultChars: 3000 })
+    const agent = agentFor(session)
+    await enableAndNarrow(ctx, agent)
+
+    const first = await run(ctx, agent, 'now')
+    assert.equal(first.kind, 'success', `归档必须成功：${first.text}`)
+    const archived = visibleText(session)
+    assert.ok(archived.includes('已归档操作'), '归档后表层必须出现回执')
+    // 归档后仍有部分原文在热面上（retain 窗口），只记录哪些标记被退热。
+    const archivedMarks = new Set([...archived.matchAll(/标记-(\d+):/g)].map((match) => Number(match[1])))
+    assert.ok(archivedMarks.size >= 2, `3 个操作 retain=1 至少退出 2 段，实际 ${[...archivedMarks]}`)
+
+    // B2 核心：restore 恢复全部可恢复回执，引擎保持启用（与 off 的唯一区别）。
+    const restored = await run(ctx, agent, 'restore')
+    assert.equal(restored.kind, 'success', `v2 restore 必须成功：${restored.text}`)
+    assert.match(restored.text, /引擎保持启用/)
+    assert.ok(Number(restored.restored) >= 1, `必须如实报告恢复段数：${restored.restored}`)
+    const afterRestore = visibleText(session)
+    assert.ok(!afterRestore.includes('已归档操作'), 'restore 后回执必须退出表层')
+    const backMarks = new Set([...afterRestore.matchAll(/标记-(\d+):/g)].map((match) => Number(match[1])))
+    assert.ok(backMarks.size > archivedMarks.size, `被归档的原文必须回到表层：${[...backMarks]} vs ${[...archivedMarks]}`)
+
+    // 引擎未停用：状态仍启用、账本 enabled。
+    const status = await run(ctx, agent, 'status')
+    assert.match(status.text, /v2 引擎：已启用/, `restore 不得停用引擎：${status.text}`)
+    const stored = await readV2SessionState(labRoot, SESSION_ID)
+    assert.equal(stored?.state?.enabled, true, 'restore 不得停用 v2 账本')
+    await ctx._dispose()
+  })
+})
+
+test('B2：未启用会话的 v2 restore 如实报告，不冒用 v1 的「请先启用」文案', async () => {
+  await withTempLab('restore-absent', async () => {
+    const ctx = createStubContext()
+    await applyPlugin(ctx)
+    const session = buildRealLayoutSession({ operations: 1, resultChars: 3000, id: 'e2e-no-v2-01' })
+    const agent = agentFor(session)
+    const outcome = await run(ctx, agent, 'restore')
+    assert.equal(outcome.kind, 'error', `未启用时必须是 error：${outcome.text}`)
+    assert.match(outcome.text, /v2 引擎在本会话未启用/)
+    assert.ok(!outcome.text.includes('请先使用 /memory-lab on'), '不得冒用 v1 的「未启用」文案')
+    await ctx._dispose()
+  })
+})

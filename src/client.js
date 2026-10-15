@@ -847,7 +847,10 @@ window.__ModuleLoader__.load({
       // 全历史记忆上下文（v2 引擎专属模式）。开启路径按当前引擎分流：
       // - v1 启用中：先停 v1（恢复原文），再启 v2，最后写入开关；
       // - v2 启用中 / 未启用任何引擎：直接「启用 v2 + 写开关」（set 需要 v2 账本在场）。
-      // 关闭路径只在 v2 启用中写回 off；其余情形开关本来就是投影默认 false，不发命令。
+      // 关闭路径无条件发 `set fullhistory off`（B1 修复）：投影折叠可能停在 v2
+      // 停用后的残留态（enabled=false、engine 为空而 fullHistory 仍为 true），
+      // 按引擎条件分流会让「关闭」一条命令都不发、开关永远关不掉。v2 未启用时
+      // 该命令返回「v2 引擎未启用」，属可接受的空操作。
       rows.push(h('div', { className: 'mcl-row', key: 'fullHistory' },
         h('span', { className: 'mcl-label', title: t('field.fullHistoryHint') }, t('field.fullHistory')),
         switchNode(fullHistory, t('field.fullHistory'), busy, function (next) {
@@ -859,7 +862,7 @@ window.__ModuleLoader__.load({
             } else {
               runSequence(['/memory-lab2 on', '/memory-lab2 set fullhistory on']);
             }
-          } else if (enabled && engine === 'v2') {
+          } else {
             run('/memory-lab2 set fullhistory off');
           }
         }),
@@ -918,10 +921,14 @@ window.__ModuleLoader__.load({
           run('/memory-lab set autorestore ' + (next ? 'on' : 'off'));
         })));
 
+      // B2：维护动作按当前引擎分流。v2 会话改发 v2 同名命令（now/dry-run/restore
+      // 在 v2 侧等价存在），不再硬编码 v1——否则 v2 会话点「恢复原文」会走 v1 入口
+      // 被误报「未启用」（会话 c896f803）。「清理」保持 v1 入口：v2 停用后数据按
+      // 只读保留，没有 v2 等价的删除面，v1 入口自会按引擎说明实际状态。
       rows.push(h('div', { className: 'mcl-actions', key: 'actions' },
-        secondaryButton(t('action.now'), busy, false, function () { run('/memory-lab now'); }),
-        secondaryButton(t('action.dryRun'), busy, false, function () { run('/memory-lab dry-run'); }),
-        secondaryButton(t('action.restore'), busy, false, function () { run('/memory-lab restore'); }),
+        secondaryButton(t('action.now'), busy, false, function () { run(engine === 'v2' ? '/memory-lab2 now' : '/memory-lab now'); }),
+        secondaryButton(t('action.dryRun'), busy, false, function () { run(engine === 'v2' ? '/memory-lab2 dry-run' : '/memory-lab dry-run'); }),
+        secondaryButton(t('action.restore'), busy, false, function () { run(engine === 'v2' ? '/memory-lab2 restore' : '/memory-lab restore'); }),
         secondaryButton(cleanArmed ? t('action.cleanConfirm') : t('action.clean'), busy, cleanArmed, function () {
           // 二次确认：第一次点击只是把按钮变成「确认清理」。
           if (!cleanArmed) {

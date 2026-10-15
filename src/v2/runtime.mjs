@@ -89,6 +89,7 @@ export const V2_HELP = [
   '',
   '/memory-lab2 on                 启用 v2：本会话历史进入 v2 隔离库，已完成操作可退出热上下文',
   '/memory-lab2 off [原因]         停用 v2：恢复所有已替换区间，历史转只读保留',
+  '/memory-lab2 restore            恢复全部可恢复的回执原文，引擎保持启用（不停用）',
   '/memory-lab2 status             当前引擎、记录数、在途配对、最近一次动作',
   '/memory-lab2 now                立刻执行一次降温（不等自动触发线）',
   '/memory-lab2 dry-run            只规划不落库：报告会降温哪些范围、被门禁拦下哪些',
@@ -718,6 +719,35 @@ export function createV2Runtime(dependencies) {
     const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : null
     if (!agent) return null
     return adopt(agent)
+  }
+
+  /**
+   * `/memory-lab2 restore`（B2）：不停用引擎，把全部可恢复的回执恢复回原文。
+   *
+   * 与 `off` 的区别只在「不停用」：恢复管线复用同一套 `engine.runRestore`
+   * （逐回执校验冷节点与表层一致性，失败行如实逐条说明并保持可按 ID 回读）。
+   * 面板的「恢复原文」在 v2 会话改发本命令，不再硬编码 v1 的 `/memory-lab restore`
+   * （后者在 v1 adopt 为 null 时会误报「未启用」，见会话 c896f803 的排查）。
+   */
+  async function restoreOnly(invocation) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    if (!sessionId) throw new EngineV2Error('无法确定会话 ID，拒绝恢复。', { code: 'EINVAL' })
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
+    if (!record) {
+      return {
+        kind: 'error',
+        text: 'v2 引擎在本会话未启用，没有可整批恢复的 v2 回执。\n'
+          + '若此前启用过又停用：回执仍在会话日志里，单段原文可用 /memory-lab2 read <ID> 回读（停用后旧 ID 仍可解析）；'
+          + 'v1 降温的恢复请用 /memory-lab restore。',
+      }
+    }
+    const outcome = await engine.runRestore(record)
+    return {
+      kind: 'success',
+      text: `${outcome.text}\n引擎保持启用（本次不停用）；单段回读用 /memory-lab2 read <ID>，整批恢复并停用用 /memory-lab2 off。`,
+      restored: outcome.restored,
+      before: outcome.before,
+    }
   }
 
   // ── 只读操作 ─────────────────────────────────────────────────────────────
@@ -1793,6 +1823,7 @@ export function createV2Runtime(dependencies) {
     switch (parsed.operation) {
       case 'on': return runExclusive(sessionIdOf(invocation.agent.session), () => enable(invocation))
       case 'off': return runExclusive(sessionIdOf(invocation.agent.session), () => disable(invocation, parsed.rest))
+      case 'restore': return runExclusive(sessionIdOf(invocation.agent.session), () => restoreOnly(invocation))
       case 'status': return status(invocation)
       case 'card': return cardCommand(invocation, parsed.args)
       case 'cost': return costCommand(invocation)
@@ -1948,6 +1979,7 @@ export function createV2Runtime(dependencies) {
     enable,
     disable,
     disableById,
+    restoreOnly,
     status,
     read,
     history,

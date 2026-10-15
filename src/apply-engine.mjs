@@ -256,6 +256,22 @@ export function pendingReceipts(record) {
   return archive.filter((row) => row.status === 'applied' || row.status === 'verify-failed')
 }
 
+/**
+ * Receipts whose originals are still only in the cold store after a failed
+ * restore attempt (`restore-skipped: <reason>`).
+ *
+ * `restoreAll` rewrites a failed row away from `applied`/`verify-failed`, so it
+ * leaves `pendingReceipts` even though the original text never came back (the
+ * receipt body changed, the cold node is unreadable, and so on). Any decision
+ * that asks "does anything still depend on the cold store?" -- the `off` purge
+ * and the `clean` confirmation gate -- must count these rows too, or it will
+ * delete the only copy of that text (B3, GitHub issue #2).
+ */
+export function restoreSkippedReceipts(record) {
+  const archive = Array.isArray(record?.state?.archive) ? record.state.archive : []
+  return archive.filter((row) => typeof row?.status === 'string' && row.status.startsWith('restore-skipped'))
+}
+
 export function createEngine(dependencies) {
   const { persist, nodeIdFor, hostVersion, services, logger } = dependencies
 

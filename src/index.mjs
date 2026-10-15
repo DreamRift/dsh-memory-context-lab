@@ -30,7 +30,7 @@ import {
   SettingsError,
 } from './core.mjs'
 import { cleanDecision, recallQueryFrom } from './apply.mjs'
-import { createEngine } from './apply-engine.mjs'
+import { createEngine, restoreSkippedReceipts } from './apply-engine.mjs'
 import { createMemoryContextLabProjection } from './projection.mjs'
 import { TemporaryLingshuClient } from './lingshu-lab-client.mjs'
 import { assertV2AllowsV1, getEngineRegistry } from './v2/engine.mjs'
@@ -602,7 +602,12 @@ export async function apply(ctx, config) {
     }
 
     const restored = record.state.archive.filter((row) => row.status === 'restored').length - restoredBefore
-    const remaining = engine.pendingReceipts(record).length
+    // B3：冷依赖 = pending（applied/verify-failed，原文只在冷库）+ restore-skipped
+    // （restore 尝试失败、原文**仍只在冷库**的行）。restoreAll 把失败行改写为
+    // `restore-skipped: <原因>` 后就脱离 pendingReceipts，若只看 pending 会把
+    // 「remaining=0」误判成「无回执依赖冷库」而删掉原文唯一副本（issue #2）。
+    const pending = engine.pendingReceipts(record).length
+    const remaining = pending + restoreSkippedReceipts(record).length
     record.state.enabled = false
     await persist(record)
     await disposeRecord(record)
@@ -620,7 +625,9 @@ export async function apply(ctx, config) {
         ctx.logger.warn(`memory-context-lab: purge after stop failed: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
-    return { before, restored, skipped: before - restored - remaining, remaining, removed, refused }
+    // `skipped` 仍是「本轮 off 尝试恢复但没成功」的行数（文案用）；它与
+    // `remaining` 的分工：skipped 讲为什么没恢复，remaining 讲冷库为什么不能删。
+    return { before, restored, skipped: before - restored - pending, remaining, removed, refused }
   }
 
   async function runMaintenance(invocation, action) {
@@ -744,6 +751,25 @@ export async function apply(ctx, config) {
     return record
   }
 
+  /**
+   * B2：v1 维护入口的引擎感知。v1 的 adopt 为 null 时，若 v2 引擎仍持有本会话
+   * 投影（engine.json 激活中，读引擎声明而不是猜），如实指路 v2 的等价入口，
+   * 不再误报「请先启用」（会话 c896f803：v2 账本 1845 段完好，面板却报未启用）。
+   * 返回 null 表示 v2 未持有，调用方维持原文案。
+   */
+  function v2HeldNotice(sessionId) {
+    try {
+      if (getEngineRegistry(labRoot, sessionId).holder !== 'v2') return null
+    } catch {
+      return null
+    }
+    return {
+      kind: 'error',
+      text: '本会话由 v2 引擎（/memory-lab2）持有投影：恢复原文请用面板「恢复原文」按钮或 /memory-lab2 restore；'
+        + '单段回读用 /memory-lab2 read <ID>；立即归档/预演用 /memory-lab2 now / dry-run；停用并整批恢复用 /memory-lab2 off。',
+    }
+  }
+
   async function commandHandler(invocation) {
     const { operation, remainder } = parseOperation(invocation.rawInput)
     const sessionId = sessionIdOf(invocation.agent.session)
@@ -797,12 +823,12 @@ export async function apply(ctx, config) {
         // A directory can outlive the enable (an earlier run, or a resume in a new
         // process). Reclaim it when nothing depends on it, so `off` is idempotent
         // and never leaves plugin data behind.
-        // "Nothing depends on it" is exactly `pendingReceipts`, not a local
-        // `status === 'applied'` test: a verify-failed row shadowed an original
-        // just as firmly, so purging the directory here would destroy the only
-        // copy of that text.
+        // "Nothing depends on it" is exactly `pendingReceipts` plus the
+        // restore-skipped rows (B3: those originals are also only in the cold
+        // store): a verify-failed row shadowed an original just as firmly, and a
+        // restore-skipped row never got its original back.
         const leftover = await readSessionState(labRoot, sessionId)
-        if (leftover && engine.pendingReceipts(leftover).length === 0) {
+        if (leftover && engine.pendingReceipts(leftover).length === 0 && restoreSkippedReceipts(leftover).length === 0) {
           try {
             await removeSessionDirectory(labRoot, leftover.directory)
             return { kind: 'success', text: '当前会话未启用上下文降温；已清除遗留的插件隔离数据。' }
@@ -987,6 +1013,8 @@ export async function apply(ctx, config) {
       if (!record) {
         const notice = damagedNotice(sessionId)
         if (notice) return notice
+        const v2Notice = v2HeldNotice(sessionId)
+        if (v2Notice) return v2Notice
         return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
       }
       try {
@@ -1043,6 +1071,8 @@ export async function apply(ctx, config) {
       if (!record) {
         const notice = damagedNotice(sessionId)
         if (notice) return notice
+        const v2Notice = v2HeldNotice(sessionId)
+        if (v2Notice) return v2Notice
         return { kind: 'error', text: '请先使用 /memory-lab on 在当前会话启用降温。' }
       }
       if (remainder) return { kind: 'error', text: '用法：/memory-lab restore' }
@@ -1093,8 +1123,10 @@ export async function apply(ctx, config) {
           const rows = found?.state.archive ?? live?.state.archive ?? []
           // Count what `restore` can actually get back, via the same predicate
           // the restore path uses: a verify-failed row is restorable, so it must
-          // still gate the delete confirmation.
-          const pending = engine.pendingReceipts({ state: { archive: rows } }).length
+          // still gate the delete confirmation; a restore-skipped row never got
+          // its original back (B3), so it gates the delete just as firmly.
+          const rowsRecord = { state: { archive: rows } }
+          const pending = engine.pendingReceipts(rowsRecord).length + restoreSkippedReceipts(rowsRecord).length
           const decision = cleanDecision({ pendingReceipts: pending, confirmDelete })
           if (decision.refuse) return { refused: true, pending: decision.pending }
           if (!found) {
@@ -1533,7 +1565,7 @@ export async function apply(ctx, config) {
       definitionId: 'dsh-memory-context-lab/control-v2',
       name: V2_COMMAND_NAME,
       description: 'Full-history on-demand memory (v2): structured records with bounded working state',
-      input: { hint: 'on | off | status | now | dry-run | read <ID...> | history [页大小] | working-set [预算] | recall [查询|id <ID...>] | index [status|sync] | relations | cost | import-v1 | fork <子会话ID> | fork-status | fork-reset <子会话ID> | set auto|recall|batch|retain <value> | help' },
+      input: { hint: 'on | off | restore | status | now | dry-run | read <ID...> | history [页大小] | working-set [预算] | recall [查询|id <ID...>] | index [status|sync] | relations | cost | import-v1 | fork <子会话ID> | fork-status | fork-reset <子会话ID> | set auto|recall|batch|retain <value> | help' },
       handler: (invocation) => v2CommandHandler(invocation),
     })
     // 固定注册的只读召回工具：完整模式的一部分，不随 v2 的 on/off 增删 schema。

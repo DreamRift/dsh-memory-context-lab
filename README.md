@@ -1,6 +1,6 @@
 # dsh-memory-context-lab
 
-按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2 模式）与**计划先行**。当前版本 **0.9.0-rc.3**，变化见 [CHANGELOG.md](CHANGELOG.md)。
+按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2 模式）与**计划先行**。当前版本 **0.9.0-rc.4**，变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 > 适用对象：[DeepSeek Harness (DSH)](https://github.com/DeepSeek-ai/DeepSeek-Harness) 桌面端插件体系。
 
@@ -42,6 +42,7 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），固定
 
 ```text
 /memory-lab2 on | off                启用 / 停用（停用保留冷库，释放投影所有权）
+/memory-lab2 restore                 恢复全部可恢复回执的原文，引擎保持启用（不停用）
 /memory-lab2 status                  引擎状态、记录数、最近动作、成本账本
 /memory-lab2 set auto|recall|batch|retain|fullhistory <值>   与 v1 同名同义，写入 v2 账本
 /memory-lab2 now | dry-run           走一次「测量 → 门禁 → 提交 → 表层替换」；dry-run 零副作用
@@ -69,7 +70,7 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），固定
 
 图形入口与设置：composer 工具行权限控件右侧的「降温」触发器（同一套设置与动作，含全历史/计划先行两个新开关）；全局默认与预设在 设置 → 组件 → 「记忆上下文」行。
 
-**停用或归档都会把会话送回正常。** `/memory-lab2 off` 先恢复原文、再解除真实灵枢抑制、最后删隔离目录（顺序不能颠倒）；仍有未恢复回执时不删，给两条出路（`restore` 后重试，或 `clean confirm delete-session` 明确丢弃）。插件只清理自己在 `$DSH_HOME/.memory-context-lab` 下的隔离数据，**从不写真实灵枢**，也不改写 DSH 会话日志与命令审计。
+**停用或归档都会把会话送回正常。** `/memory-lab2 off` 先恢复原文、再解除真实灵枢抑制、最后删隔离目录（顺序不能颠倒）；仍有未恢复回执（含 restore 失败的行，原文仍只在冷库）时不删，给两条出路（先 `/memory-lab2 restore` 恢复后重试，或 `clean confirm delete-session` 明确丢弃）。**只想恢复原文、不想停用**时用 `/memory-lab2 restore`（面板「恢复原文」按钮在 v2 会话自动改发它）。插件只清理自己在 `$DSH_HOME/.memory-context-lab` 下的隔离数据，**从不写真实灵枢**，也不改写 DSH 会话日志与命令审计。
 
 ### 单一触发线怎么算
 

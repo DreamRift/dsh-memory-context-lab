@@ -524,6 +524,82 @@ test('the stop-time restore switch is exposed, reflects the view, and sends its 
   assert.equal(offNode.props['aria-checked'], false, 'an explicit false must not read as the default')
 })
 
+test('B1: the full-history switch sends its off command unconditionally', async () => {
+  const { entry, shim } = await loadClient()
+  const sent = []
+  const { context, slots } = createClientContext()
+  entry.exports.apply(context)
+  const chip = slots[0]
+  const run = async (line) => { sent.push(line); return { ok: true, text: 'ok' } }
+  const labels = ['全历史记忆上下文', 'Full-history memory context']
+  const base = { targetOccupancy: 0.6, retainOperations: 10, releaseMarginRatio: 0.05, auto: true, autoRecall: true, archived: 0, restored: 0, revision: 1 }
+
+  // B1 失同步形态（session-3e4bad47 实测）：`/memory-lab2 off` 停用 v2 后
+  // fullHistory 折叠残留 true —— enabled=false、engine 为空而开关仍显示
+  // 「已启用」。此时点「关」必须仍然发出命令，否则开关永远关不掉。
+  const staleView = { ...base, enabled: false, engine: '', fullHistory: true }
+  chipButton(shim.mount(chip.component, chipProps(staleView, { run }))).props.onClick({ preventDefault() {}, stopPropagation() {} })
+  let opened = shim.mount(chip.component, chipProps(staleView, { run }))
+  const staleSwitch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
+  assert.ok(staleSwitch, 'the panel must expose the full-history switch')
+  assert.equal(staleSwitch.props['aria-checked'], true, 'the stale fold still reads as enabled')
+  staleSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.ok(
+    sent.includes('/memory-lab2 set fullhistory off'),
+    `turning off from the stale fold must still send the command, sent: ${JSON.stringify(sent)}`,
+  )
+
+  // 正常形态（v2 启用中）同样发这一条命令：关闭路径不按投影分流。弹层在
+  // shim 里保持打开（hook 状态跨 mount 保留），直接换投影重渲即可。
+  sent.length = 0
+  const v2View = { ...base, enabled: true, engine: 'v2', fullHistory: true }
+  opened = shim.mount(chip.component, chipProps(v2View, { run }))
+  const v2Switch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
+  v2Switch.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.ok(
+    sent.includes('/memory-lab2 set fullhistory off'),
+    `turning off while v2 owns the projection sends the same command, sent: ${JSON.stringify(sent)}`,
+  )
+})
+
+test('B2: maintenance actions route to the v2 engine when it owns the projection', async () => {
+  const { entry, shim } = await loadClient()
+  const sent = []
+  const { context, slots } = createClientContext()
+  entry.exports.apply(context)
+  const chip = slots[0]
+  const run = async (line) => { sent.push(line); return { ok: true, text: 'ok' } }
+  const base = { targetOccupancy: 0.6, retainOperations: 10, releaseMarginRatio: 0.05, auto: true, autoRecall: true, archived: 3, restored: 0, revision: 2 }
+
+  // v2 会话：恢复/立即归档/预演改发 v2 同名命令，不再硬编码 v1（B2，c896f803）。
+  const v2View = { ...base, enabled: true, engine: 'v2', fullHistory: true }
+  chipButton(shim.mount(chip.component, chipProps(v2View, { run }))).props.onClick({ preventDefault() {}, stopPropagation() {} })
+  const opened = shim.mount(chip.component, chipProps(v2View, { run }))
+  // The action buttons carry no aria-label (only switches do); match by text.
+  const byText = (labels) => collect(opened, (row) => row.type === 'button' && labels.includes(textOf(row)))[0]
+  const restoreLabels = ['恢复原文', 'Restore text']
+  const nowLabels = ['立即降温', 'Cool now']
+  const dryRunLabels = ['预演', 'Dry run']
+  for (const [labels, line] of [[restoreLabels, '/memory-lab2 restore'], [nowLabels, '/memory-lab2 now'], [dryRunLabels, '/memory-lab2 dry-run']]) {
+    const node = byText(labels)
+    assert.ok(node, `the panel must expose ${labels[0]}`)
+    node.props.onClick({ preventDefault() {}, stopPropagation() {} })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.ok(sent.includes(line), `${labels[0]} in a v2 session must send ${line}, sent: ${JSON.stringify(sent)}`)
+  }
+
+  // v1 会话照旧发 v1 命令（防误杀对照）。
+  sent.length = 0
+  const v1View = { ...base, enabled: true, engine: 'v1', fullHistory: false }
+  const reopened = shim.mount(chip.component, chipProps(v1View, { run }))
+  const restoreNode = collect(reopened, (row) => row.type === 'button' && restoreLabels.includes(textOf(row)))[0]
+  restoreNode.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.ok(sent.includes('/memory-lab restore'), `a v1 session keeps the v1 command, sent: ${JSON.stringify(sent)}`)
+})
+
 test('the popover closes via the veil, not on inner focus loss or busy controls', async () => {
   const { entry, shim } = await loadClient()
   const { context, slots } = createClientContext()

@@ -30,6 +30,7 @@
 import { createHash } from 'node:crypto'
 import { isHumanAuthoredMessage } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
+import { formatImportanceReason, scoreSoftRetention } from './importance.mjs'
 
 export const WORKING_STATE_SCHEMA_VERSION = 3
 
@@ -44,8 +45,11 @@ export const WORKING_STATE_SCHEMA_VERSION = 3
  * 只取硬前缀时，软保留区的进度行每步都在变、键却不变，进度更新被去重吞掉；
  * 同时注入形态引入增量卡（`workingStateCardDelta`），注入语义整体变化，
  * 旧键必须全部失效。
+ *
+ * v4（2026-10-15，F1）：软保留按灵枢重要度分值装包（每项一段，分值降序、
+ * 低分先丢；丢弃报告带分量）。软段的次序与结构语义变化，旧键全部失效。
  */
-export const CARD_SEMANTIC_VERSION = 3
+export const CARD_SEMANTIC_VERSION = 4
 
 /** 每个会话最多记住多少个已注入的语义键：有界集合，防会话内无限增长。 */
 export const WORKING_SET_DEDUP_HISTORY_LIMIT = 32
@@ -1627,7 +1631,8 @@ const VOLATILE_SEQ_PATTERNS = Object.freeze([
 
 /** 软段头与页脚：语义键只取硬前缀，必须把这几段从整卡文本里切掉。 */
 const CARD_SOFT_HEADER_PREFIX = '■ 软保留'
-const CARD_DROP_FOOTER_PREFIX = '因预算丢弃（按丢弃顺序）：'
+/** 页脚文案随 F1 改成「按重要度分值升序」，切分按公共前缀匹配，两边不耦合。 */
+const CARD_DROP_FOOTER_PREFIX = '因预算丢弃'
 const CARD_HARD_OVERFLOW_PREFIX = '⚠ 硬保护内容'
 
 /** 把每步都会变的 seq 引用归一化成 `seq:#`；其余文本逐字保留。 */
@@ -1729,22 +1734,56 @@ function hardSectionsOf(state) {
   return sections
 }
 
-/** 按 DROP_ORDER 把软保留归组，产出软段（顺序即丢弃顺序）。 */
-function softSectionsOf(state) {
-  const retention = state.retention ?? {}
-  const sections = []
+/**
+ * 按 F1 重要度把软保留装成**每项一段**：装包顺序 = 分值降序（高分先装、
+ * 等价于低分先丢），同分维持 DROP_ORDER 类目次序与项原次序（确定性兜底）。
+ *
+ * 打分在装包前完成（scoreSoftRetention，纯函数；分量见 importance.mjs 的
+ * 权重与出处注释）。相关性的查询文本就是**硬前缀**——它天然包含「当前人类
+ * 请求」与「最小工作状态」段，即「当前工作状态卡硬前缀 + 当前人类请求」的
+ * 统一口径。`retrievalHits` 由调用方注入（当前 v2 无 per-record 回读记账，
+ * 如实传空，见 importance.mjs 的诚实边界）。
+ *
+ * 每段的 `importanceText` 带分量描述：丢弃报告据此如实写
+ * 「因重要度分值 X（分量…）被丢弃」，不给黑盒分。
+ */
+function softSectionsOf(state, { hardPrefixText = '', retrievalHits = null } = {}) {
+  const retention = state?.retention ?? {}
+  const context = {
+    hardPrefixText: typeof hardPrefixText === 'string' ? hardPrefixText : '',
+    currentRequestText: '',
+    retrievalHits: retrievalHits && typeof retrievalHits === 'object' ? retrievalHits : {},
+  }
+  const scored = []
   for (const retentionClass of DROP_ORDER) {
     const items = Array.isArray(retention[retentionClass]) ? retention[retentionClass] : []
-    if (items.length === 0) continue
-    const lines = []
-    for (const item of items) lines.push(...item.lines)
-    sections.push(section(
-      `■ ${RETENTION_TITLES[retentionClass]}（soft/${retentionClass}）`,
-      lines,
-      { retentionClass, strength: PROTECTION_STRENGTH.SOFT },
-    ))
+    for (const item of items) {
+      const result = scoreSoftRetention({
+        lines: item.lines,
+        source: item.source,
+        retentionClass,
+        evidenceStatus: retentionClass === RETENTION_CLASSES.STALE_EVIDENCE
+          ? EVIDENCE_STATUS.STALE
+          : retentionClass === RETENTION_CLASSES.UNVERIFIED_EVIDENCE
+            ? EVIDENCE_STATUS.UNVERIFIED
+            : null,
+        recordId: item.sourceRef,
+      }, context)
+      scored.push({
+        score: result.score,
+        importanceText: formatImportanceReason(result),
+        section: section(
+          `■ ${RETENTION_TITLES[retentionClass]}（soft/${retentionClass}）`,
+          [...item.lines],
+          { retentionClass, strength: PROTECTION_STRENGTH.SOFT, importance: result.score, importanceText: formatImportanceReason(result) },
+        ),
+      })
+    }
   }
-  return sections
+  // 稳定排序：先按 DROP_ORDER 生成（同分兜底序），再按分值降序——
+  // Array#sort 在本模块支持的 Node 版本（>=22）里保证稳定。
+  scored.sort((a, b) => b.score - a.score)
+  return scored.map((entry) => entry.section)
 }
 
 /**
@@ -1762,6 +1801,8 @@ function softSectionsOf(state) {
 export function renderWorkingStateCard(state, {
   budgetTokens = WORKING_SET_DEFAULTS.cardTokens,
   previousPrefixHash = null,
+  /** F1：软保留打分的回读记账（`{ recordId: 次数 }`），调用方注入、只读。 */
+  retrievalHits = null,
 } = {}) {
   const input = state ?? {}
   const rawBudget = Number(budgetTokens)
@@ -1770,8 +1811,10 @@ export function renderWorkingStateCard(state, {
   const budget = budgetInvalid ? WORKING_SET_DEFAULTS.cardTokens : Math.max(0, Math.floor(rawBudget))
 
   const hardSections = hardSectionsOf(input)
-  const softSections = softSectionsOf(input)
   const hardText = [CARD_HEADER, CARD_AUTHORITY_LINE, renderSections(hardSections)].filter((line) => line !== '').join('\n')
+  // F1：先渲染硬前缀、再对软保留打分——相关性的查询文本就是硬前缀（含当前
+  // 人类请求与最小工作状态段），分值决定装包顺序（低分先丢，见 softSectionsOf）。
+  const softSections = softSectionsOf(input, { hardPrefixText: hardText, retrievalHits })
   // estimateTokensOf 收的是**文本**、返回 token；这里绝不传 byteLength，
   // 否则预算会按 4 倍口径失真（budget.mjs 的 4 字节≈1 token 只在内层用一次）。
   const hardTokens = estimateTokensOf(hardText)
@@ -1794,7 +1837,7 @@ export function renderWorkingStateCard(state, {
 
   const dropped = []
   const kept = []
-  const softHeader = '■ 软保留（丢弃顺序：可选预取 → 冗余卡片 → 非必要历史 → stale/未验证证据 → 过期 pin → 已否决选项 → 未决问题）'
+  const softHeader = '■ 软保留（按 F1 重要度分值装包：分值降序，低分先丢；同分按类目兜底次序 可选预取 → 冗余卡片 → 非必要历史 → stale/未验证证据 → 过期 pin → 已否决选项 → 未决问题）'
 
   const composeSoft = (sections) => {
     if (sections.length === 0) return ''
@@ -1810,13 +1853,15 @@ export function renderWorkingStateCard(state, {
         const entry = grouped.get(key) ?? { class: key, sections: 0, lines: 0, reasons: new Set() }
         entry.sections += 1
         entry.lines += item.lines
-        entry.reasons.add(item.reason)
+        // 戒律：丢弃报告如实带分量——「因重要度分值 X（分量…）被丢弃」，
+        // 不给黑盒分；无分量（如 hard-overflow）时只写原因。
+        entry.reasons.add(item.importanceText ? `${item.reason}｜${item.importanceText}` : item.reason)
         grouped.set(key, entry)
       }
       const described = [...grouped.values()]
         .map((entry) => `${entry.class}×${entry.sections}段/${entry.lines}行（${[...entry.reasons].join('、')}）`)
         .join('；')
-      lines.push(`因预算丢弃（按丢弃顺序）：${described}。丢弃不等于不存在，可按记录 ID 回读。`)
+      lines.push(`因预算丢弃（按重要度分值升序）：${described}。丢弃不等于不存在，可按记录 ID 回读。`)
     }
     if (hardOverflow) {
       lines.push(`⚠ 硬保护内容 ≈${hardTokens} token 已超过预算 ${budget} token（缺口 ≈${hardTokens - budget}）：`
@@ -1837,6 +1882,8 @@ export function renderWorkingStateCard(state, {
         lines: item.lines.length,
         reason: 'hard-overflow',
         classReason: RETENTION_RULES[item.retentionClass]?.reason ?? null,
+        importance: item.importance ?? null,
+        importanceText: item.importanceText ?? null,
         reReadable: true,
         readbackHint: '按记录 ID 回读',
       })
@@ -1855,6 +1902,8 @@ export function renderWorkingStateCard(state, {
           lines: item.lines.length,
           reason: 'budget',
           classReason: RETENTION_RULES[item.retentionClass]?.reason ?? null,
+          importance: item.importance ?? null,
+          importanceText: item.importanceText ?? null,
           reReadable: true,
           readbackHint: '按记录 ID 回读',
         })
@@ -1880,6 +1929,8 @@ export function renderWorkingStateCard(state, {
         lines: removed.lines.length,
         reason: 'budget',
         classReason: RETENTION_RULES[removed.retentionClass]?.reason ?? null,
+        importance: removed.importance ?? null,
+        importanceText: removed.importanceText ?? null,
         reReadable: true,
         readbackHint: '按记录 ID 回读',
       })
@@ -1890,7 +1941,13 @@ export function renderWorkingStateCard(state, {
   // 软保留区的进度行每步都在真实变化，键必须跟着变，否则进度更新被去重吞掉。
   prefix.dedupKey = workingSetDedupKeyOf(text)
 
-  dropped.sort((a, b) => DROP_ORDER.indexOf(a.class) - DROP_ORDER.indexOf(b.class))
+  // 丢弃报告按真实丢弃时序排：分值升序（低分先丢），同分维持类目次序。
+  dropped.sort((a, b) => {
+    const left = a.importance ?? 0
+    const right = b.importance ?? 0
+    if (left !== right) return left - right
+    return DROP_ORDER.indexOf(a.class) - DROP_ORDER.indexOf(b.class)
+  })
   const droppedClasses = []
   for (const item of dropped) {
     const entry = droppedClasses.find((candidate) => candidate.class === item.class)
@@ -1941,6 +1998,13 @@ export function renderWorkingStateCard(state, {
     })),
     hardSections: hardSections.map((item) => item.title),
     softSections: softSections.map((item) => item.title),
+    /** F1：软段装包序（分值降序=低分先丢）与各段分值，机器可读、供审计与测试。 */
+    softImportance: softSections.map((item) => ({
+      class: item.retentionClass,
+      importance: item.importance ?? null,
+      importanceText: item.importanceText ?? null,
+      lines: item.lines.length,
+    })),
   }
 }
 

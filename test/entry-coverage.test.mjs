@@ -19,12 +19,21 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.join(here, '..')
 
-/** `node test/x.test.mjs` 形式的条目；容忍 `&&` 分隔与多余空白。 */
+/**
+ * `node [flags] test/x.test.mjs` 形式的条目；容忍 `&&` 分隔、node 标志
+ * （如 B5 的 `--test-force-exit`）与多余空白。标志必须是 `--` 开头的裸 token，
+ * 文件名仍以 `.test.mjs` 收尾——除此之外的形态不认，防止入口悄悄变成别的跑法。
+ */
+function testEntryOf(part) {
+  const match = part.trim().match(/^node\s+(?:--\S+\s+)*(\S+\.test\.mjs)$/)
+  return match ? match[1].replaceAll('\\', '/') : null
+}
+
 function testEntriesOf(script) {
   const entries = new Set()
   for (const part of String(script).split('&&')) {
-    const match = part.trim().match(/^node\s+(\S+\.test\.mjs)$/)
-    if (match) entries.add(match[1].replaceAll('\\', '/'))
+    const entry = testEntryOf(part)
+    if (entry) entries.add(entry)
   }
   return entries
 }
@@ -53,8 +62,7 @@ test('入口顺序稳定且不重复（同一文件只跑一次）', async () =>
   const manifest = JSON.parse(await readFile(path.join(pluginRoot, 'package.json'), 'utf8'))
   const raw = String(manifest.scripts.test)
     .split('&&')
-    .map((part) => part.trim().match(/^node\s+(\S+\.test\.mjs)$/)?.[1])
+    .map(testEntryOf)
     .filter(Boolean)
-    .map((entry) => entry.replaceAll('\\', '/'))
   assert.equal(new Set(raw).size, raw.length, '同一个测试文件不得在入口里出现两次')
 })

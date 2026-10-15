@@ -679,9 +679,9 @@ test('F2 失败关闭：只有 seq 倒排（多记录）、无 callId 映射时�
 // D1 升级（c896f803 循环根因 #1）：增量注入
 // ---------------------------------------------------------------------------
 
-test('语义版本升级到 v3：去重键口径改为整卡归一化，键里编 v3', () => {
-  assert.equal(CARD_SEMANTIC_VERSION, 3, '整卡去重口径 + 增量注入是渲染语义变化，必须 +1 让旧键全部失效')
-  assert.match(workingSetDedupKeyOf('任意文本'), /^ws-card:v3:/, '键前缀必须携带 v3')
+test('语义版本升级到 v4：F1 软保留按重要度分值装包，键里编 v4', () => {
+  assert.equal(CARD_SEMANTIC_VERSION, 4, 'F1 改变软段结构与次序（每项一段、按分值降序装包），是渲染语义变化，必须 +1 让旧键全部失效')
+  assert.match(workingSetDedupKeyOf('任意文本'), /^ws-card:v4:/, '键前缀必须携带 v4')
 })
 
 test('形态裁决：首张全量、每 N 张再锚定、重启回落全量', () => {
