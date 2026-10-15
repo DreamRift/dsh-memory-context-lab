@@ -32,12 +32,16 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
 
   function describe() {
     const lingshuDescribe = lingshu?.describe?.() ?? null
-    const lingshuAvailable = lingshuDescribe?.available === true
+    // D1（0.9.0-rc.6）：顶层 name/capabilities 必须报「当前实际生效」的后端。
+    // 灵枢 root 在场（available）≠ 已为某会话启动（sessions>0）：backendFor 只在
+    // 灵枢为该会话启动过时才返回 T2，其余会话与未启用期都实际走 T1。用
+    // available 当判据会在未启动时虚报灵枢生效（诚实边界）。
+    const lingshuActive = (lingshuDescribe?.sessions ?? 0) > 0
     return {
       available: true,
       // 状态面照抄当前生效后端；本地后端始终可用，所以 available 恒为 true。
-      name: lingshuAvailable ? lingshuDescribe.name : LOCAL_LEXICAL_BACKEND_NAME,
-      capabilities: lingshuAvailable ? lingshuDescribe.capabilities : LOCAL_LEXICAL_CAPABILITIES,
+      name: lingshuActive ? lingshuDescribe.name : LOCAL_LEXICAL_BACKEND_NAME,
+      capabilities: lingshuActive ? lingshuDescribe.capabilities : LOCAL_LEXICAL_CAPABILITIES,
       defaultBackend: LOCAL_LEXICAL_BACKEND_NAME,
       lingshu: lingshuDescribe,
       local: { name: LOCAL_LEXICAL_BACKEND_NAME, capabilities: LOCAL_LEXICAL_CAPABILITIES, sessions: localEntries.size },

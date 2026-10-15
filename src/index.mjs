@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
   archiveNodeId,
@@ -447,6 +447,26 @@ export async function apply(ctx, config) {
     createClient: async (record) => localClientFactoryFor(record.sessionId).createClient(),
   })
 
+  /**
+   * 旧冷库如实提示（0.9.0-rc.6，PR #3 复核补充）：
+   * 0.9.0-rc.6 之前由灵枢子进程归档的 v1 冷库（`sessions/<键>/mdcg/`）是灵枢
+   * contextual 节点格式；本地冷库客户端（v2 store）读不了这种节点。它在场且会话
+   * 还有待恢复/已跳过回执时，`on`/`status`/`restore` 的输出必须指出：旧回执原文
+   * 已读不回、数据不会被删除、回收磁盘走 `clean confirm delete-session`。否则
+   * 等于让用户在不知情的情况下以为旧回执仍可恢复（诚实边界）。无需提示时返回 null。
+   */
+  function legacyColdStoreNote(record) {
+    if (!record || !record.directory) return null
+    try {
+      if (!existsSync(join(record.directory, 'mdcg'))) return null
+      if (engine.pendingReceipts(record).length === 0 && restoreSkippedReceipts(record).length === 0) return null
+    } catch {
+      return null
+    }
+    return '注意：本会话隔离根内存在旧版灵枢格式冷库（mdcg/）：若其中有旧回执仍未恢复，其原文已读不回（恢复会如实报「冷节点不可读」）。'
+      + '这些数据仍在磁盘上、不会被删除；确认不再需要后，可用 /memory-lab clean confirm delete-session 放弃并回收。'
+  }
+
   async function persist(record) {
     await writeSessionState(record.directory, record.state)
   }
@@ -819,12 +839,17 @@ export async function apply(ctx, config) {
         const notice = damagedNotice(sessionId)
         if (notice) return notice
       }
-      return { kind: 'success', text: engine.formatStatus(record) }
+      const legacyNote = legacyColdStoreNote(record)
+      return { kind: 'success', text: engine.formatStatus(record) + (legacyNote ? `\n\n${legacyNote}` : '') }
     }
 
     if (operation === 'on') {
       if (remainder) return { kind: 'error', text: '用法：/memory-lab on' }
-      if (records.get(sessionId)) return { kind: 'success', text: engine.formatStatus(records.get(sessionId)) }
+      if (records.get(sessionId)) {
+        const existing = records.get(sessionId)
+        const legacyNote = legacyColdStoreNote(existing)
+        return { kind: 'success', text: engine.formatStatus(existing) + (legacyNote ? `\n\n${legacyNote}` : '') }
+      }
       let record
       try {
         record = await enableV1(invocation.agent, invocation.signal)
@@ -848,7 +873,8 @@ export async function apply(ctx, config) {
 注意：未检测到 dsh-memory（${dependencies.startupError instanceof Error ? dependencies.startupError.message : String(dependencies.startupError)}），本插件以独立模式运行——本地冷库与词法检索照常工作；灵枢词法/结构检索增强不可用，不会回退到正式灵枢根。
         `
         : ''
-      return { kind: 'success', text: `已在本会话启用上下文降温。\n\n${engine.formatStatus(record)}${planNote ? `\n${planNote.text}` : ''}${degraded}` }
+      const legacyNote = legacyColdStoreNote(record)
+      return { kind: 'success', text: `已在本会话启用上下文降温。\n\n${engine.formatStatus(record)}${planNote ? `\n${planNote.text}` : ''}${degraded}${legacyNote ? `\n\n${legacyNote}` : ''}` }
     }
 
     if (operation === 'off') {
@@ -1137,7 +1163,12 @@ export async function apply(ctx, config) {
       }
       if (remainder) return { kind: 'error', text: '用法：/memory-lab restore' }
       try {
-        return await runMaintenance(invocation, () => engine.runRestore(record))
+        const outcome = await runMaintenance(invocation, () => engine.runRestore(record))
+        const legacyNote = legacyColdStoreNote(record)
+        if (legacyNote && outcome?.kind === 'success') {
+          return { ...outcome, text: `${outcome.text}\n\n${legacyNote}` }
+        }
+        return outcome
       } catch (error) {
         return { kind: 'error', text: `恢复失败（未覆盖任何新事件）：${error instanceof Error ? error.message : String(error)}` }
       }

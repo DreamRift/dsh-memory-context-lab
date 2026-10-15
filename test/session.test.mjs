@@ -9,7 +9,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -647,6 +647,50 @@ test('B3: a restore-skipped row also gates the clean confirmation', async () => 
     assert.equal(clean.kind, 'error', `clean must refuse while the store still holds originals: ${clean.text}`)
     assert.ok(clean.text.includes('依赖隔离冷库'), `clean must explain the refusal, got: ${clean.text}`)
     assert.ok(await readSessionState(labRoot, sessionId), 'the store must survive the refusal')
+    await second._dispose()
+  })
+})
+
+test('D2: status surfaces the legacy lingshu-format cold library behind pending receipts', async () => {
+  await withTempLab('d2legacy', async (labRoot) => {
+    const sessionId = 'session-d2-legacy-01'
+    const controlSessionId = 'session-d2-control-01'
+    const first = await harness({ labRoot })
+
+    // 会话一：0.6.2 及更早的 Python 冷节点写进 sessions/<key>/mdcg，升级后本地
+    // 客户端读不了它；恰好还有一条待恢复回执。状态面必须把这一层如实报出来
+    // （指路 clean confirm），不能静默当成「回执可恢复」。
+    const session = buildSession({ operations: 1, id: sessionId })
+    const { agent } = agentFor(session)
+    await run(first, agent, 'on')
+    const found = await readSessionState(labRoot, sessionId)
+    found.state.archive.push(receipt('applied'))
+    await writeSessionState(found.directory, found.state)
+    await mkdir(path.join(found.directory, 'mdcg'), { recursive: true })
+
+    // 对照会话：mdcg 目录同样存在，但没有待恢复/已跳过的回执——没有依赖就
+    // 不该提示（状态面不制造噪声）。
+    const controlSession = buildSession({ operations: 1, id: controlSessionId })
+    const controlAgent = agentFor(controlSession).agent
+    await run(first, controlAgent, 'on')
+    const control = await readSessionState(labRoot, controlSessionId)
+    await mkdir(path.join(control.directory, 'mdcg'), { recursive: true })
+    await writeSessionState(control.directory, control.state)
+    await first._dispose()
+
+    const second = await harness({ labRoot })
+    const status = await run(second, agent, 'status')
+    assert.equal(status.kind, 'success', status.text)
+    assert.ok(status.text.includes('旧版灵枢格式冷库'), `status must surface the legacy store, got: ${status.text}`)
+    assert.ok(status.text.includes('/memory-lab clean confirm delete-session'), 'status must hand back the reclaim path')
+    assert.ok(status.text.includes('冷节点不可读'), 'status must tell the restore outcome honestly')
+
+    const controlStatus = await run(second, controlAgent, 'status')
+    assert.equal(controlStatus.kind, 'success', controlStatus.text)
+    assert.equal(
+      controlStatus.text.includes('旧版灵枢格式冷库'), false,
+      `the note must stay silent when nothing points into the legacy store, got: ${controlStatus.text}`,
+    )
     await second._dispose()
   })
 })
