@@ -2,6 +2,15 @@
 
 **版本** 1.0　**基于** 架构方案 v3.0　**约定** 只定义功能和接口，不写实现。项目自行填充。
 
+> **0.9.0 状态注记**（2026-10-15 核验）：本文件为 PR #4 原文，接口约定与 0.9.0 实现的对应关系如下——
+> 端口一七方法、端口二契约（`assertBackendContract`、T1 名 `local-lexical-v1`、ping/dispose）、「装配期决定、运行期不换」选择规则：**与实现一致**。
+> 端口三「需补一个方法 getNode」：**rc.6 起已具备**（`v2/client-adapter.mjs`，含三态回读），本文写作时为过时表述。
+> 「检索后端显式指定」：**0.9.0 已实现**（Config `defaults.retrievalBackend`：`auto` / `local-lexical-v1` / `lingshu-mdcg-receipt`）。
+> 「新增模块：验证跟踪」：**0.9.0 已实现**（`v2/verification.mjs`；口径与本文有一处修正——`check` 为三态 `valid` / `stale` / `unverified`，无指纹或文件不可读时如实报 `unverified`，不二值猜测；指纹在**归档事务提交后**采集，回答「记录引用的文件现在与归档时是否一致」，不承诺「与工具当初读取时一致」）。
+> 错误码 `EBACKENDUNAVAILABLE` / `EBACKENDPINGFAIL` / `EVERIFICATIONSTALE`：**0.9.0 已实现**（前两者为启动/握手失败关闭；`EVERIFICATIONSTALE` 标注 `check` 的 stale 分支结果，stale 是合法答案不是异常）。
+> `v2/lingshu-backend.mjs`「改动态加载」：**0.9.0 已实现**（`index.mjs` 装配期 `await import`，失败走 `startupError` 失败关闭路径）。
+> `working-state.mjs` 实际 2025 行（本文写作时 1961 行为快照漂移）。
+
 ---
 
 ## 总图：四个端口

@@ -75,3 +75,52 @@ test('close releases the local entry but not lingshu sessions', async () => {
   assert.equal(described.local.sessions, 0, 'the closed session must leave the local map')
   assert.equal(described.name, LINGSHU_NAME, 'the still-active lingshu session keeps the top-level name')
 })
+
+// ── 显式指定（PR #4 端口二，retrievalBackend 配置）─────────────────────────
+
+test('forced lingshu with no lingshu present: precheck fails closed with EBACKENDUNAVAILABLE', () => {
+  const provider = createCompositeRetrievalBackendProvider({ lingshu: null, forcedMode: 'lingshu-mdcg-receipt' })
+  const pre = provider.precheck()
+  assert.equal(pre.ok, false)
+  assert.equal(pre.code, 'EBACKENDUNAVAILABLE')
+  // 未启动期检索失败关闭：不隐式起 T1 兜底。
+  assert.equal(provider.backendFor({ sessionId: 's4', storeRoot: 'D:\\tmp\\store' }), null)
+})
+
+test('forced lingshu with lingshu present: precheck passes; handshake failure is EBACKENDPINGFAIL, no fallback', async () => {
+  const provider = createCompositeRetrievalBackendProvider({
+    lingshu: stubLingshu({ ensure: { ok: false, reason: 'tools/list 握手失败' } }),
+    forcedMode: 'lingshu-mdcg-receipt',
+  })
+  assert.equal(provider.precheck().ok, true)
+  const outcome = await provider.ensureBackend({ sessionId: 's5', storeRoot: 'D:\\tmp\\store' })
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'EBACKENDPINGFAIL')
+  assert.ok(outcome.reason.includes('握手失败'), 'the lingshu failure reason must be carried through verbatim')
+})
+
+test('forced local-lexical-v1: never tries T2, describe marks the forced mode', async () => {
+  let ensureCalls = 0
+  const provider = createCompositeRetrievalBackendProvider({
+    lingshu: {
+      ...stubLingshu(),
+      async ensureBackend() { ensureCalls += 1; return { ok: true, backend: {} } },
+    },
+    forcedMode: 'local-lexical-v1',
+  })
+  const outcome = await provider.ensureBackend({ sessionId: 's6', storeRoot: 'D:\\tmp\\store' })
+  assert.equal(ensureCalls, 0, 'the forced local mode must not attempt T2')
+  assert.equal(outcome.ok, true)
+  assert.equal(provider.describe().forcedMode, 'local-lexical-v1')
+  assert.equal(provider.precheck().ok, true)
+})
+
+test('auto mode keeps the existing degradation semantics (guard against regressions)', async () => {
+  const provider = createCompositeRetrievalBackendProvider({
+    lingshu: stubLingshu({ ensure: { ok: false, reason: 'root 不在场' } }),
+  })
+  const outcome = await provider.ensureBackend({ sessionId: 's7', storeRoot: 'D:\\tmp\\store' })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.fallback, LOCAL_LEXICAL_BACKEND_NAME)
+  assert.equal(provider.precheck().ok, true, 'auto must not fail the precheck even when lingshu is absent')
+})

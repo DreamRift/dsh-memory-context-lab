@@ -35,7 +35,6 @@ import { createMemoryContextLabProjection } from './projection.mjs'
 import { assertV2AllowsV1, getEngineRegistry } from './v2/engine.mjs'
 import { EngineV2Error } from './v2/errors.mjs'
 import { createV2Runtime, V2_COMMAND_NAME } from './v2/runtime.mjs'
-import { createLingshuBackendProvider } from './v2/lingshu-backend.mjs'
 import { createV2ClientFactory } from './v2/client-adapter.mjs'
 import { v2SessionDirectoryFor } from './v2/store.mjs'
 import { createCompositeRetrievalBackendProvider } from './v2/retrieval-backend-provider.mjs'
@@ -178,6 +177,16 @@ function buildConfigSchema() {
         .i18n({ 'zh-CN': '全历史记忆上下文（v2）', en: 'Full-history memory context (v2)' }),
       planFirst: SCHEMAS.boolean().default(false)
         .i18n({ 'zh-CN': '新会话计划先行', en: 'Plan first in new sessions' }),
+      // 检索后端显式指定（PR #4 接口设计 §端口二）：auto = 现状自动梯队（T2 优先、
+      // 失败降级 T1 带原因）；local-lexical-v1 = 不尝试 T2；lingshu-mdcg-receipt =
+      // 强制 T2，不可用即失败关闭（EBACKENDUNAVAILABLE/EBACKENDPINGFAIL），不静默降级。
+      // schemastery 没有 .enum()，字符串枚举用 union(const(...))。
+      retrievalBackend: SCHEMAS.union([
+        SCHEMAS.const('auto'),
+        SCHEMAS.const('local-lexical-v1'),
+        SCHEMAS.const('lingshu-mdcg-receipt'),
+      ]).default('auto')
+        .i18n({ 'zh-CN': '检索后端选择', en: 'Retrieval backend' }),
     })
       // Volatile fields never leave the root config object; the host stores a
       // detached reference instead of inlining rows, so preset rows are not
@@ -399,17 +408,33 @@ export async function apply(ctx, config) {
   /** Optional host-service lookup: never a hard dependency, so a missing one degrades instead of failing the load. */
   const services = { get: (service) => ctx.get(service) }
 
-  // ── 检索后端提供者（设计文档 v1.2 §4）─────────────────────────────────
-  // T2 灵枢（可选，dsh-memory 在位且 mcp_server 握手成功）优先；
-  // T1 本地词法（默认，无外部进程）兜底。独立运行的关键：缺 dsh-memory 时
-  // 插件照常启用，检索如实降级到 T1，状态面写明 T2 不可用原因。
-  const lingshuBackend = createLingshuBackendProvider({
-    lingshuPackageRoot: dependencies.lingshuPackageRoot,
-    logger: ctx.logger,
-  })
+  // ── 检索后端提供者（设计文档 v1.2 §4；PR #4 后端显式指定）─────────────
+  // retrievalBackend 配置：'auto'（默认）保持既有梯队——T2 灵枢（可选，
+  // dsh-memory 在位且 mcp_server 握手成功）优先、失败降级 T1 本地词法；
+  // 'local-lexical-v1' 不尝试 T2；'lingshu-mdcg-receipt' 强制 T2，
+  // 显式指定不可用即失败关闭（EBACKENDUNAVAILABLE / EBACKENDPINGFAIL），
+  // 绝不静默降级。独立运行的关键不变：缺 dsh-memory 时 auto 插件照常启用。
+  const retrievalBackendMode = (() => {
+    const raw = unwrapVolatile(ctx.config?.defaults)?.retrievalBackend
+    return raw === 'local-lexical-v1' || raw === 'lingshu-mdcg-receipt' ? raw : 'auto'
+  })()
+  // lingshu-backend 动态加载（PR #4 依赖图约定）：主装配路径与 T2 实现解耦，
+  // 模块加载失败走 startupError 失败关闭路径，不拖垮插件加载。
+  let lingshuBackend = null
+  try {
+    const { createLingshuBackendProvider } = await import('./v2/lingshu-backend.mjs')
+    lingshuBackend = createLingshuBackendProvider({
+      lingshuPackageRoot: dependencies.lingshuPackageRoot,
+      logger: ctx.logger,
+    })
+  } catch (error) {
+    ctx.logger.warn(`memory-context-lab: lingshu-backend 动态加载失败：${error instanceof Error ? error.message : String(error)}`)
+    lingshuBackend = null
+  }
   const retrievalBackend = createCompositeRetrievalBackendProvider({
     lingshu: lingshuBackend,
     logger: ctx.logger,
+    forcedMode: retrievalBackendMode,
   })
 
   /**
@@ -761,6 +786,10 @@ export async function apply(ctx, config) {
     semanticBackendEnsure: ({ sessionId, storeRoot, signal }) => retrievalBackend.ensureBackend({ sessionId, storeRoot, signal }),
     semanticBackendClose: ({ sessionId }) => retrievalBackend.close(sessionId),
     semanticBackendStatus: () => retrievalBackend.describe(),
+    // PR #4 端口二：显式 lingshu 模式的启用预检（EBACKENDUNAVAILABLE 失败关闭）。
+    backendPrecheck: () => (retrievalBackendMode === 'lingshu-mdcg-receipt'
+      ? retrievalBackend.precheck()
+      : { ok: true }),
     semanticBackendFailure: ({ sessionId }) => retrievalBackend.failureReason({ sessionId }),
     semanticBackendCloseAll: () => retrievalBackend.closeAll(),
   })

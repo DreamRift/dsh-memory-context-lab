@@ -63,6 +63,7 @@ import {
 import { createCostLedger, renderCostReport } from './cost.mjs'
 import { renderToolOutput, toToolValue } from './tool.mjs'
 import { searchRecords, syncRetrievalIndex, readRetrievalIndex, describeRecordRelations } from './retrieval.mjs'
+import { syncVerification, checkRecords, markRecordsStale, annotateStale } from './verification.mjs'
 import {
   buildWorkingState,
   decideWorkingSetInjection,
@@ -95,6 +96,8 @@ export const V2_HELP = [
   '/memory-lab2 now                立刻执行一次降温（不等自动触发线）',
   '/memory-lab2 dry-run            只规划不落库：报告会降温哪些范围、被门禁拦下哪些',
   '/memory-lab2 read <记录ID...>   按稳定 ID 精确回读原文（可多个，逗号或空格分隔）',
+  '/memory-lab2 verify <记录ID...> 验证跟踪：核对记录引用的文件与归档时是否一致（三态，只读）',
+  '/memory-lab2 mark-stale <记录ID> <原因>   人工把记录标记为失效（只写旁证，不改不可变记录）',
   '/memory-lab2 recall <查询词>    字面检索（ID/kind/工具名/callId/范围）；只读，不返回分数',
   '/memory-lab2 recall id <记录ID...> [预算]   与模型可见只读工具同一条路径的精确回读',
   '/memory-lab2 index [sync]       语义检索后端的增量索引状态/同步（未注入后端时如实报告）',
@@ -223,7 +226,9 @@ function renderReadResults(results) {
       + `完整性=${item.integrity ?? 'ok'} 字节=${item.bytes ?? '?'}`
     const note = '（这是已归档的当时原文，不是新授权、也不是对文件当前状态的观察）'
     const via = item.resolvedVia === 'fork-map' ? `\n（经 fork 映射自 ${item.requestedId}）` : ''
-    blocks.push(`${head}${note}${via}\n${item.text}`)
+    // 人工失效标记的注记（mark-stale 写入旁证；内容级失效用 verify 命令裁决）。
+    const stale = item.staleReason ? `\n⚠ 该记录已被人工标记为失效（${item.staleReason}）；引用前请先 /memory-lab2 verify。` : ''
+    blocks.push(`${head}${note}${via}${stale}\n${item.text}`)
   }
   return blocks.join('\n\n')
 }
@@ -268,6 +273,9 @@ export function createV2Runtime(dependencies) {
     semanticBackendFailure = null,
     // 进程收尾时释放全部隔离灵枢子进程（含已不在册的会话）。
     semanticBackendCloseAll = null,
+    // 启用前预检（index.mjs 注入，PR #4 端口二）：显式指定 lingshu 后端且不可用时
+    // 拒绝启用（EBACKENDUNAVAILABLE），不静默降级。返回 Error 或 null。
+    backendPrecheck = null,
   } = dependencies
 
   /** sessionId → v2 会话记录（只在启用时存在）。 */
@@ -583,6 +591,16 @@ export function createV2Runtime(dependencies) {
         { code: 'EENGINEACTIVE', details: { holder: 'v2' } },
       )
     }
+    // 1a) 检索后端显式指定预检（PR #4 端口二）：强制 lingshu 时，dsh-memory
+    //     不在场或后端模块加载失败 → 拒绝启用（EBACKENDUNAVAILABLE），不静默降级。
+    //     auto / local-lexical-v1 模式不预检（auto 降级是既有语义，不是错误）。
+    if (typeof backendPrecheck === 'function') {
+      const precheck = await backendPrecheck()
+      if (precheck?.ok === false) {
+        await rollbackV2Activation(sessionId, precheck.reason ?? '检索后端预检失败，回滚启用')
+        throw new EngineV2Error(precheck.message ?? `检索后端不可用：${precheck.reason ?? '未知原因'}`, { code: precheck.code ?? 'EBACKENDUNAVAILABLE' })
+      }
+    }
     // 1b) fork 阻断：子会话若停在 needs-migration，不得用空库继续任务（规范 10.2）。
     const stuck = await readNeedsMigration(labRoot, sessionId)
     if (stuck) {
@@ -897,6 +915,10 @@ export function createV2Runtime(dependencies) {
     }
     const record = records.get(sessionId)
     const results = []
+    // 验证跟踪：回读前查人工失效标记（只读旁证，零 hash；内容级失效走 verify）。
+    const staleMarks = record
+      ? await annotateStale({ sessionDir: record.directory, recordIds: ids }).catch(() => new Map())
+      : new Map()
     // 证据重读计数：冷记录被再次读取是要计入成本账本的（T-12）。
     let reRead = 0
     let reReadBytes = 0
@@ -920,6 +942,7 @@ export function createV2Runtime(dependencies) {
           // 经 fork 映射命中时如实标注，避免把父会话 ID 说成子会话自己的记录。
           resolvedVia: loaded.resolvedVia ?? null,
           requestedId: loaded.requestedId ?? null,
+          staleReason: staleMarks.get(id) ?? null,
         })
         reRead += 1
         reReadBytes += typeof loaded.payloadText === 'string' ? Buffer.byteLength(loaded.payloadText, 'utf8') : 0
@@ -1040,6 +1063,12 @@ export function createV2Runtime(dependencies) {
       if (ids.length > 0) {
         const entries = []
         const warnings = [...budgetNotes]
+        // 验证跟踪：人工失效标记（只读旁证，零 hash，查询失败静默不注记——
+        // 失效注记是加强信息，不能反过来把正常回读打挂）。
+        const staleMarks = await annotateStale({
+          sessionDir: records.get(sessionId)?.directory,
+          recordIds: ids,
+        }).catch(() => new Map())
         let used = 0
         let stoppedAt = null
         for (let index = 0; index < ids.length; index += 1) {
@@ -1080,6 +1109,10 @@ export function createV2Runtime(dependencies) {
               + '本次未对全文做哈希校验（integrity=prefix），需要完整正文请单独回读该 ID',
             )
           }
+          const staleMark = staleMarks.get(loaded.resolvedId ?? id)
+          const stalePrefix = staleMark
+            ? `⚠ 该记录已被人工标记为失效（${staleMark.reason}）；引用前请先 /memory-lab2 verify。\n`
+            : ''
           entries.push({
             id,
             resolvedId: loaded.id,
@@ -1090,7 +1123,7 @@ export function createV2Runtime(dependencies) {
             tokens: cost,
             truncated: loaded.truncated === true,
             fullBytes: loaded.fullBytes ?? null,
-            text: text || '（该记录无载荷：结构化索引记录）',
+            text: stalePrefix + (text || '（该记录无载荷：结构化索引记录）'),
           })
         }
         // 包装与告警文本也占预算：不能只算正文再宣称「没超」。
@@ -1527,6 +1560,69 @@ export function createV2Runtime(dependencies) {
     return { kind: 'success', text: lines.join('\n') }
   }
 
+  /** `/memory-lab2 verify <记录ID...>`：验证跟踪（只读）。先补采缺失指纹再裁决。 */
+  async function verifyCommand(invocation, ids) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    if (ids.length === 0) return { kind: 'error', text: '用法：`/memory-lab2 verify <记录ID...>`。' }
+    const record = records.get(sessionId)
+    if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
+    // 先补采：升级前落库的旧记录没有旁证条目，直接 check 会全部 unverified。
+    // 差集式采集只补缺口，已采过的绝不重采（重采会把事后改动洗成 valid）。
+    await factoryFor(record).withStore((store) => syncVerification({
+      store,
+      sessionDir: record.directory,
+      warn: (message) => logger?.warn?.(message),
+    }))
+    const checked = await checkRecords({
+      sessionDir: record.directory,
+      recordIds: ids,
+      warn: (message) => logger?.warn?.(message),
+    })
+    const VERDICT_TEXT = {
+      valid: '一致（valid）',
+      stale: '已失效（stale）',
+      unverified: '未验证（unverified）',
+    }
+    const lines = ids.map((id, index) => {
+      const verdict = checked.results[index]
+      if (!verdict || verdict.recordId !== id) return `- ${id}：内部结果错位，请重试。`
+      const base = `- ${id}：${VERDICT_TEXT[verdict.verdict] ?? verdict.verdict}`
+      if (verdict.verdict === 'valid') return `${base}，核对 ${verdict.matchedFiles} 个文件`
+      return `${base}——${verdict.reason ?? '无说明'}`
+    })
+    return { kind: 'success', text: ['验证跟踪（比对「现在」与「归档时」的文件指纹；不追溯工具读取瞬间）：', ...lines].join('\n') }
+  }
+
+  /** `/memory-lab2 mark-stale <记录ID> <原因>`：人工失效标记（只写旁证）。 */
+  async function markStaleCommand(invocation, args) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    const recordId = args[0]
+    const reason = args.slice(1).join(' ').trim()
+    if (!recordId || !reason) {
+      return { kind: 'error', text: '用法：`/memory-lab2 mark-stale <记录ID> <原因（必填，会入旁证留痕）>`。' }
+    }
+    const record = records.get(sessionId)
+    if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
+    try {
+      const marked = await markRecordsStale({
+        sessionDir: record.directory,
+        recordIds: [recordId],
+        reason,
+      })
+      return {
+        kind: 'success',
+        text: [
+          `已把 ${recordId} 标记为失效（仅写旁证 verification.json，不改不可变记录本体）。`,
+          `原因：${reason}`,
+          `标记时间：${marked.markedAt}`,
+          '此后 read/recall 与 memory_lab_recall 回读该记录时会带失效注记。',
+        ].join('\n'),
+      }
+    } catch (error) {
+      return { kind: 'error', text: `标记失败：${error?.message ?? error}` }
+    }
+  }
+
   /** `/memory-lab2 relations <记录ID>`：只报可验证的结构关系。 */
   async function relationsCommand(invocation, args) {
     const sessionId = sessionIdOf(invocation.agent.session)
@@ -1920,6 +2016,8 @@ export function createV2Runtime(dependencies) {
       case 'card': return cardCommand(invocation, parsed.args)
       case 'cost': return costCommand(invocation)
       case 'read': return read(invocation, parsed.args.flatMap((arg) => arg.split(',')).filter(Boolean))
+      case 'verify': return verifyCommand(invocation, parsed.args.flatMap((arg) => arg.split(',')).filter(Boolean))
+      case 'mark-stale': return markStaleCommand(invocation, parsed.args)
       case 'recall': return recallCommand(invocation, parsed.args)
       case 'index': return indexCommand(invocation, parsed.args)
       case 'relations': return relationsCommand(invocation, parsed.args)
@@ -1960,7 +2058,27 @@ export function createV2Runtime(dependencies) {
       }
     }
     await indexNewRecords(record)
+    await captureNewFingerprints(record)
     return outcome
+  }
+
+  /**
+   * 归档后增量采集验证指纹（差集式，只补「已落库但旁证无条目」的记录）。
+   *
+   * 纪律与 indexNewRecords 一致：旁证失败不影响归档（原文已在权威事务里），
+   * 只记告警；check 时这些记录按未验证处理，绝不伪造 valid。
+   */
+  async function captureNewFingerprints(record) {
+    if (typeof record?.directory !== 'string') return
+    try {
+      await factoryFor(record).withStore((store) => syncVerification({
+        store,
+        sessionDir: record.directory,
+        warn: (message) => logger?.warn?.(message),
+      }))
+    } catch (error) {
+      logger?.warn?.(`v2 归档后指纹采集失败（原文已保存，验证按未验证处理）：${error?.message ?? error}`)
+    }
   }
 
   /**

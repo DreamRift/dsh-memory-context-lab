@@ -62,6 +62,20 @@ test('explicit user config passes through as volatile refs with user values', { 
   assert.equal(defaults?.auto, false)
 })
 
+test('retrievalBackend 枚举：默认 auto，三个合法值放行，非法值被拒', { skip: skipReason }, () => {
+  const fresh = Config['~standard'].validate({})
+  assert.equal(fresh.value.defaults.get()?.retrievalBackend, 'auto')
+
+  for (const value of ['local-lexical-v1', 'lingshu-mdcg-receipt']) {
+    const resolved = Config['~standard'].validate({ defaults: { retrievalBackend: value } })
+    assert.equal(resolved.issues, undefined, `${value} must be accepted`)
+    assert.equal(resolved.value.defaults.get()?.retrievalBackend, value)
+  }
+
+  const rejected = Config['~standard'].validate({ defaults: { retrievalBackend: 'lunar-index' } })
+  assert.ok(Array.isArray(rejected.issues) && rejected.issues.length > 0, 'an unknown backend name must be rejected by the schema')
+})
+
 test('默认值单一真源：schema default、投影兜底、客户端 fallback 与 core 的 DEFAULT_SETTINGS 一致', { skip: skipReason }, async () => {
   const { readFileSync } = await import('node:fs')
   const { fileURLToPath } = await import('node:url')

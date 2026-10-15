@@ -111,7 +111,8 @@ async function writeFileAtomic(file, data) {
   }
 }
 
-async function writeJsonFileAtomic(file, value) {
+// 导出给 verification.mjs 复用同一套「temp + rename + 兜底删除」原子写纪律（V2CHANGE-05）。
+export async function writeJsonFileAtomic(file, value) {
   await writeFileAtomic(file, Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8'))
 }
 

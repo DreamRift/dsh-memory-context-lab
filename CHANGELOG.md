@@ -2,6 +2,36 @@
 
 本文件记录 `dsh-memory-context-lab` 面向用户的版本变化。格式按「版本 + 日期 + 分类条目」组织，只写行为与契约层面的变化，不复制内部调研。
 
+## 0.9.0 — 2026-10-15
+
+首个正式版。本版合入社区 PR #4（灵枢作者提交的《四端口接口设计》《独立架构方案》两份设计文档，已按 0.9.0 现状核对并加状态注记），并实现设计中除归并固化、主动遗忘外的全部能力缺口（两项按用户决定列为 0.10.0 候选）。
+
+### 新增
+
+- **验证跟踪**（`v2/verification.mjs`，PR #4 设计）：v2 归档事务提交后，对 `operation.call` 记录按白名单字段（`file_path`/`path`/`workdir`，仅绝对路径）采集文件 sha256 指纹，写入会话目录旁证文件 `verification.json`（原子写、幂等差集）。新命令 `/memory-lab2 verify <记录ID...>`（三态核对：valid / stale / unverified，只读）与 `/memory-lab2 mark-stale <记录ID> <原因>`（人工失效标记，只写旁证，不改不可变记录）。口径如实声明：指纹回答「文件现在与归档时是否一致」，不承诺「与工具当初读取时一致」；无指纹或文件不可读报 unverified，不猜测；旁证文件损坏时失败关闭（全部 unverified + 告警，绝不伪造 valid）；v1 引擎不接（如实标注）。
+- **检索后端显式指定**（配置 `retrievalBackend`，PR #4 端口二）：`auto`（默认，行为零变化）/ `local-lexical-v1`（不尝试 T2）/ `lingshu-mdcg-receipt`（强制灵枢）。显式指定灵枢而不可用时**失败关闭**：启用预检失败拒启用（`EBACKENDUNAVAILABLE`）、握手失败不降级（`EBACKENDPINGFAIL`）——不静默降级到本地后端。
+- 错误码 `EBACKENDUNAVAILABLE` / `EBACKENDPINGFAIL` / `EVERIFICATIONSTALE` 随上述行为落地（`EVERIFICATIONSTALE` 标注 verify 的 stale 分支结果，stale 是合法答案不是异常）。
+- `read`/`recall` 命令与 `memory_lab_recall` 工具回读已人工标记失效的记录时附失效注记（工具 input schema 不变，工具集恒定红线不破）。
+
+### 变更
+
+- `v2/lingshu-backend.mjs` 改为装配期动态 `import`（PR #4 依赖图约定）：主装配路径与 T2 实现解耦；加载失败走既有 `startupError` 失败关闭路径（auto 模式如实降级本地后端并留痕）。实际收益是装配解耦，该模块本就只依赖 node 内置，不宣称性能收益。
+- 发布包 `files` 增加 `docs`（PR #4 两份设计文档随包分发）与 `CHANGELOG.md`。
+
+### 修复（文档）
+
+- PR #4 两份文档三处过时表述以状态注记修正（不重写原文）：`getNode`「需补一个方法」实际已具备；「解绑灵枢」第一步实际 rc.6 已完成；`working-state.mjs` 行数快照漂移（1961 → 2025）。
+
+### 文档
+
+- `release/docs/` 新增 `interface-design.md`（四端口接口契约、验证跟踪、错误码）与 `architecture-design.md`（独立架构方案、实施计划与 0.10.0 候选注记），头部附 0.9.0 状态注记（2026-10-15 核验）。
+- 工作文档 `docs/演进路线.md` 登记 0.10.0 候选：**归并固化（层级压缩）**与**主动遗忘（精确遗忘）**——摘要主体、墓碑机制、不可变不变量的让位范围均需先出设计再动工。
+
+### 测试
+
+- 新增 `test/v2-verification.test.mjs`（5 项：白名单字段提取与绝对路径过滤宁少勿错；capture→check 三态往返；markStale 只写旁证不改本体；旁证损坏失败关闭；syncVerification 差集防「事后改动洗白」）。扩展 `test/v2-retrieval-provider.test.mjs`（预检失败关闭、握手失败不降级、强制 local 不试 T2、auto 语义不变防回归）与 `test/config-contract.test.mjs`（retrievalBackend 枚举校验）。
+- 0.9.0 全量：31 套、417 项断言（417 通过 / 0 失败 / 0 跳过，2026-10-15，Node v24.19.0；rc.6 基线为 29 套 407 项、5 项环境性跳过）。
+
 ## 0.9.0-rc.6 — 2026-10-15
 
 本版合入社区 PR #3（独立运行——本地冷库客户端与本地词法检索后端），并补上合并复核发现的两处缺口（D1/D2）。

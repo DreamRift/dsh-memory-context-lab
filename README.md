@@ -1,6 +1,6 @@
 # dsh-memory-context-lab
 
-按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2 模式）与**计划先行**。当前版本 **0.9.0-rc.6**，变化见 [CHANGELOG.md](CHANGELOG.md)。
+按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2 模式）与**计划先行**。当前版本 **0.9.0**（首个正式版），变化见 [CHANGELOG.md](CHANGELOG.md)；设计文档见 [docs/](docs/)。
 
 > 适用对象：[DeepSeek Harness (DSH)](https://github.com/DeepSeek-ai/DeepSeek-Harness) 桌面端插件体系。
 
@@ -58,7 +58,7 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），固定
 
 **模型可见工具只有一个**：`memory_lab_recall`（`record_ids` / `query` / `budget_tokens` / `cursor`），只读；`budget_tokens` 非正整数返回结构化错误（本次未执行），超上限夹到上限并标注，**不静默换值**。
 
-**检索如实分级**：`query` 与自动回注共用一条三级检索——**T0** 内置字面索引（记录 ID、种类、工具名、callId、seq 等元数据，恒在）；**T1** 本地词法索引（默认，纯 Node：CJK 二元组 + ASCII 词元倒排，无外部进程，词条上限 20 万、超限如实标注）；**T2** 可选隔离灵枢后端（装 `dsh-memory` 时由 `/memory-lab2 index sync` 启动，全历史模式自动启动）。T2 不可用时**如实降级到 T1**并说明原因，绝不读正式灵枢根；三级都只返回记录 ID，正文一律回本会话冷库读。
+**检索如实分级**：`query` 与自动回注共用一条三级检索——**T0** 内置字面索引（记录 ID、种类、工具名、callId、seq 等元数据，恒在）；**T1** 本地词法索引（纯 Node，CJK 二元组 + ASCII 词元倒排，词条上限 20 万）；**T2** 可选隔离灵枢后端（装 `dsh-memory` 时由 `/memory-lab2 index sync` 启动，全历史模式自动启动）。T2 不可用时**如实降级到 T1**并说明原因，绝不读正式灵枢根；三级都只返回记录 ID，正文一律回本会话冷库读。
 
 ### 全历史记忆上下文（v2 模式开关）
 
@@ -68,7 +68,7 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），固定
 
 打开后，在**全新对话**第一条消息发出前自动进入 DSH 计划模式（服务可用走服务，否则落账 `plan/mode`）：AI 先产出计划，**用户批准的瞬间自动启用 v1 降温**（免敲 `/memory-lab on`）。计划生成与评审期间降温/回注/工作状态卡注入全部挂起（手动命令仍可用）；**计划全文（`exit_plan_mode` 调用与结果）终生保留**，v1/v2 都不可退热，常驻上下文作指引。已有历史的会话不自动进入（提示 `/plan`）；缺投影时如实报错。插件级默认在插件配置 `planFirst: true` 设置，可按会话覆盖。
 
-**关闭即退出（rc.5）**：`set planfirst off` 会把本会话仍处 active/pending 的计划模式一并退出，输出如实报告；读不到状态时降级为提示 `/plan off`。
+**关闭即退出（rc.5）**：`set planfirst off` 把本会话 active/pending 的计划模式一并退出；读不到状态时降级为提示 `/plan off`。
 
 图形入口：composer 工具行权限控件右侧的「降温」触发器（同一套设置与动作，含全历史/计划先行开关）；**降温状态、全历史、计划先行三行摘要与最近一次命令输出**显示在弹层底部输出框。全局默认与预设在 设置 → 组件 → 「记忆上下文」行。
 
@@ -98,7 +98,7 @@ dsh plugin --profile <name> add <本仓目录>
 ## 验证
 
 ```text
-npm test              # 29 套测试（维护版 6 套 + v2 全套 + plan-first / fullhistory + 独立运行三套），失败 0
+npm test              # 31 套测试（v1 六套 + v2 全套 + plan-first / fullhistory / 验证跟踪 / 独立运行三套），失败 0
 npm run probe:host    # 用宿主真实 JSON Schema 校验器核验工具 schema（需 DSH_ASAR，无参数时 SKIP）
 npm run probe:revert  # 20 个回退场景，确认对应测试确实会失败
 ```
