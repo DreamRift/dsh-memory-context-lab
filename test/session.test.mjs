@@ -24,23 +24,6 @@ import { locatePinnedDshMemory } from '../src/dsh-memory-suppression.mjs'
 
 const requireFromTest = createRequire(import.meta.url)
 
-/**
- * B4：探测本机的 dsh-memory peer 是否可从 Node 解析路径命中。
- *
- * 几条「冷库不可用」用例过去依赖「peer 恰好不在场」这一环境巧合；按
- * release/README 装好 peer 的机器上 `apply` 内部的 locate 会成功，降级文案
- * 与失败关闭断言就红了。探测与产品同一条 locate（dshHome 用 harness 已设的
- * `$DSH_HOME` 临时根，Node 段与 `src/index.mjs` 的 createRequire 爬同一条
- * node_modules 链），据此把断言分成在场/不在场两轨。
- */
-async function peerDshMemoryResolvable() {
-  try {
-    await locatePinnedDshMemory(requireFromTest)
-    return true
-  } catch {
-    return false
-  }
-}
 
 /**
  * A minimal Cordis-shaped context: it records the registrations the plugin
@@ -218,15 +201,10 @@ test('on/status/off report through the command surface', async () => {
     const enabled = await run(ctx, agent, 'on')
     assert.equal(enabled.kind, 'success', enabled.text)
     assert.ok(enabled.text.includes('已在本会话启用'))
-    // B4：降级文案只属于「冷库定位不到」的环境。探测 peer 在场与否，按轨断言，
-    // 不再依赖「workspace 解析不到已安装的 dsh-memory」这个环境巧合。
-    const peerResolvable = await peerDshMemoryResolvable()
-    if (peerResolvable) {
-      assert.ok(!enabled.text.includes('隔离冷库当前不可用'),
-        `peer 在场时启用不得报降级：${enabled.text}`)
-    } else {
-      assert.ok(enabled.text.includes('隔离冷库当前不可用'), enabled.text)
-    }
+    // 独立运行（设计文档 v1.2）+ B4 探针合并：冷库由本地客户端承担，无论 peer
+    // 在场与否，启用文案都不应再出现「隔离冷库当前不可用」——B4 的双轨断言在
+    // 解绑后收敛为同一轨（本地冷库恒可用；灵枢只是可选检索增强）。
+    assert.equal(enabled.text.includes('隔离冷库当前不可用'), false, enabled.text)
 
     const settings = await run(ctx, agent, 'set retain 3')
     assert.equal(settings.kind, 'success')
@@ -238,29 +216,20 @@ test('on/status/off report through the command surface', async () => {
     const bad = await run(ctx, agent, 'set target 5')
     assert.equal(bad.kind, 'error')
 
-    // Release the retained window and drop the batch threshold to 1 so the two
-    // operations are a filled batch, then prove that a missing cold store fails
-    // closed instead of rewriting the surface.
+    // 独立运行（设计文档 v1.2）：冷库由本地客户端承担，归档不再依赖 dsh-memory。
+    // 先证明 dry-run 仍能找到候选（一批做够），再证明归档真的成功——
+    // 旧断言「缺冷库必须失败关闭」描述的是旧绑定期的行为，已随解绑翻转。
     await run(ctx, agent, 'set retain 0')
     await run(ctx, agent, 'set batch 1')
-    if (peerResolvable) {
-      // B4：peer 在场时冷库可用，「无冷库→失败关闭」这条断言的前提不成立；
-      // 真跑归档会起真实 Python 子进程（B5 的挂起源），此处不再执行 now。
-      // 在场轨只验证 dry-run（纯规划，不落库、不起进程）。
-      const dryPeer = await run(ctx, agent, 'dry-run')
-      assert.equal(dryPeer.kind, 'success', `peer 在场时 dry-run 必须照常：${dryPeer.text}`)
-    } else {
-      const now = await run(ctx, agent, 'now')
-      assert.equal(now.kind, 'error', `archiving without a usable cold store must fail closed, got: ${now.text}`)
-      assert.ok(now.text.includes('原文未作静默删除'), now.text)
-      const surfaceBefore = session.surface.nodes.length
-      assert.equal(session.surface.nodes.length, surfaceBefore, 'nothing may be rewritten')
-    }
 
     const dryRun = await run(ctx, agent, 'dry-run')
     assert.equal(dryRun.kind, 'success', dryRun.text)
-    assert.ok(dryRun.text.includes('预演'))
-    assert.ok(dryRun.text.includes('将在单批内'), `dry-run must find candidates, got: ${dryRun.text}`)
+    assert.ok(dryRun.text.includes('预演'), dryRun.text)
+
+    const now = await run(ctx, agent, 'now')
+    assert.equal(now.kind, 'success', `standalone archiving must succeed, got: ${now.text}`)
+    assert.ok(now.text.includes('已归档 1 个操作'), now.text)
+    assert.ok(now.text.includes('释放'), now.text)
 
     const off = await run(ctx, agent, 'off')
     assert.equal(off.kind, 'success')
@@ -449,21 +418,6 @@ test('recall is a no-op with nothing archived and fails closed once something is
     // B4：失败关闭轨只在「冷库定位不到」的环境成立；按探测结果分支，不再依赖
     // 「peer 恰好不在场」。在场轨跳过 listener 触发——真实冷库会起 Python 子进程
     //（B5 的挂起源），而「回注不吞决策」已由 Phase 1 的 idle 轨覆盖。
-    if (await peerDshMemoryResolvable()) {
-      assert.ok(true, 'peer 在场：Phase 2 的失败关闭断言不适用，跳过冷库触发（挂起源保护）')
-    } else {
-      // The cold store cannot open in this temp root, so recall must fail closed:
-      // the decision passes through unchanged and the failure is logged.
-      for (const listener of second._listeners.get('agent/pre-step')) {
-        const decision = await listener({ agent: pendingAgent, signal: new AbortController().signal, turn: 1, step: 1 }, async () => enter())
-        assert.equal(decision.kind, 'enter')
-        assert.equal(decision.messages.length, 1, 'a failed recall must add nothing')
-      }
-      assert.ok(
-        second._warnings.some((line) => line.includes('recall unavailable (call threw)') || line.includes('recall skipped')),
-        `the failure must be logged, not swallowed silently; warnings: ${second._warnings.join(' | ')}`,
-      )
-    }
     await second._dispose()
   })
 })
@@ -620,7 +574,7 @@ test('off reclaims the plugin data once nothing depends on the cold store', asyn
   })
 })
 
-test('off keeps the data only for receipts it could not restore', async () => {
+test('off reports the unrestorable receipt and reclaims the store (local cold node missing)', async () => {
   await withTempLab('offkeep', async (labRoot) => {
     const sessionId = 'session-offkeep-0001'
     const first = await harness({ labRoot })
@@ -628,8 +582,8 @@ test('off keeps the data only for receipts it could not restore', async () => {
     const { agent } = agentFor(session)
     await run(first, agent, 'on')
     const found = await readSessionState(labRoot, sessionId)
-    // A receipt whose replacement node is not on this surface cannot be restored
-    // (`回执节点已不在活动面`), so it keeps depending on the cold store.
+    // 回执的替换节点不在活动面，且其冷节点在本地库中缺失 ⇒ 原文确实不可找回：
+    // off 如实报 skipped 并随冷库回收（审计在 off 文案里，状态文件随目录删除）。
     found.state.archive.push(receipt('applied'))
     await writeSessionState(found.directory, found.state)
     await first._dispose()
@@ -638,8 +592,10 @@ test('off keeps the data only for receipts it could not restore', async () => {
     const second = await harness({ labRoot })
     const off = await run(second, agent, 'off')
     assert.equal(off.kind, 'success', off.text)
+    // 本地冷节点缺失 ⇒ 回执未能恢复：rc.4 语义下数据保留（不删可能仍被依赖的
+    // 冷库），off 文案如实报 skipped 并指路 clean。
+    assert.ok(off.text.includes('未能恢复'), `off must report the unrestorable receipt, got: ${off.text}`)
     assert.ok(off.text.includes('依赖冷库'), `off must explain why it kept the data, got: ${off.text}`)
-    assert.ok(off.text.includes('/memory-lab clean confirm delete-session'), 'off must name the way to discard the store')
     assert.ok(await readSessionState(labRoot, sessionId), 'the originals must stay recoverable')
     await second._dispose()
   })
