@@ -17,6 +17,7 @@ import path from 'node:path'
 import { EngineV2Error } from './errors.mjs'
 import { RECEIPT_MARKER, V2_RECEIPT_MARKER } from '../core.mjs'
 import { CARD_HEADER } from './working-state.mjs'
+import { tokenizeForLexicalIndex } from './local-lexical-backend.mjs'
 
 /** 命中来源：内置索引（确定性）与语义后端（灵枢）。 */
 export const RETRIEVAL_SOURCES = Object.freeze({
@@ -274,37 +275,91 @@ export async function searchRecords({ store, backend = null, text, limit = 20, l
     if (isPluginAuthoredEntry(entry)) continue
     if (literalMatcher(entry, needle)) push(entry.id, RETRIEVAL_SOURCES.INDEX)
   }
-  let semanticUsed = false
-  let semanticError = null
-  if (backend) {
+  // 降级时最多查询多少个词元：每个词元一次后端调用，必须有上界，
+  // 否则一条 800 字符的长消息会变成几百次进程间往返。
+  const DEGRADE_TERM_BUDGET = 8
+  let reverse = null
+
+  /**
+   * 跑一次后端精确查询，把外部 ID 换回本会话记录 ID。
+   *
+   * 账本反向映射只构造一次（`reverse`），降级路径逐词查询时不重复读索引文件。
+   * 换不回来的 ID 一律丢弃 —— 不猜。
+   */
+  const queryBackend = async (queryText) => {
     assertBackendContract(backend)
-    try {
-      const hits = await backend.query(needle, { limit })
-      // 只有查询真的成功返回才把这一路记成「用过」：抛错时标 true 会让上层
-      // 把一次失败的语义调用渲染成 `literal+semantic`，等于给降级结果贴上语义标签。
-      semanticUsed = true
-      // backend 返回外部 ID 时用记账表换回本会话记录 ID；换不回来的丢弃（不猜）。
+    const hits = await backend.query(queryText, { limit })
+    if (reverse === null) {
       const index = await readRetrievalIndex(store.directory)
-      const reverse = new Map()
+      reverse = new Map()
       if (index && index.backend === backend.name) {
         for (const [recordId, externalId] of Object.entries(index.indexed)) {
           reverse.set(externalId, recordId)
         }
       }
-      for (const hit of Array.isArray(hits) ? hits : []) {
-        const externalId = typeof hit === 'string' ? hit : hit?.id
-        if (typeof externalId !== 'string') continue
-        const recordId = store.getEntry(externalId) ? externalId : reverse.get(externalId)
-        if (!recordId || !store.getEntry(recordId)) continue
-        push(recordId, RETRIEVAL_SOURCES.SEMANTIC)
-      }
+    }
+    const ids = []
+    for (const hit of Array.isArray(hits) ? hits : []) {
+      const externalId = typeof hit === 'string' ? hit : hit?.id
+      if (typeof externalId !== 'string') continue
+      const recordId = store.getEntry(externalId) ? externalId : reverse.get(externalId)
+      if (!recordId || !store.getEntry(recordId)) continue
+      ids.push(recordId)
+    }
+    return ids
+  }
+
+  let semanticUsed = false
+  let semanticError = null
+  let degraded = false
+  let degradedTermsMatched = 0
+  /** 记录 ID → 命中的**不同**降级词元数，只用于部分匹配内的排序。 */
+  const termHits = new Map()
+  if (backend) {
+    try {
+      const exact = await queryBackend(needle)
+      // 只有查询真的成功返回才把这一路记成「用过」：抛错时标 true 会让上层
+      // 把一次失败的语义调用渲染成 `literal+semantic`，等于给降级结果贴上语义标签。
+      semanticUsed = true
+      for (const id of exact) push(id, RETRIEVAL_SOURCES.SEMANTIC)
     } catch (error) {
       // 语义后端失败不拖垮检索：如实降级到内置索引，并把原因带出去。
       semanticUsed = false
       semanticError = error instanceof Error ? error.message : String(error)
     }
+    // 精确路径**完全无命中**时，才尝试部分匹配降级。见 degradeQueryTerms 的注释：
+    // 整条人类消息对多词 AND 后端恒不可满足，不退这一步回注就永久退化成「最近 N 条」。
+    if (semanticUsed && byId.size === 0) {
+      const terms = degradeQueryTerms(queryTermsOf(needle))
+      if (terms) {
+        for (const term of terms.slice(0, DEGRADE_TERM_BUDGET)) {
+          let ids
+          try {
+            ids = await queryBackend(term)
+          } catch {
+            // 降级是尽力而为：单个词元查询失败就停止降级，已获得的命中照常返回。
+            break
+          }
+          if (ids.length === 0) continue
+          degradedTermsMatched += 1
+          for (const id of ids) {
+            push(id, RETRIEVAL_SOURCES.SEMANTIC)
+            termHits.set(id, (termHits.get(id) ?? 0) + 1)
+          }
+        }
+        // 只标注「真的靠部分匹配拿到了东西」。一个词都没命中 ⇒ 不算降级命中，
+        // 上层照常走既有语义（回退最近 N 条），不把空结果包装成降级成功。
+        degraded = termHits.size > 0
+      }
+    }
   }
-  const records = [...byId.values()].slice(0, Math.max(1, limit)).map((hit, order) => ({
+  const found = [...byId.values()]
+  if (degraded) {
+    // 部分匹配内部按「命中的不同查询词数」降序：重合越多越可能相关。
+    // 注意这是**排序**，不是置信度，也不透出给调用方（与既有契约一致）。
+    found.sort((left, right) => (termHits.get(right.id) ?? 0) - (termHits.get(left.id) ?? 0))
+  }
+  const records = found.slice(0, Math.max(1, limit)).map((hit, order) => ({
     ...hit,
     order,
     entry: store.getEntry(hit.id),
@@ -316,8 +371,57 @@ export async function searchRecords({ store, backend = null, text, limit = 20, l
     truncated: byId.size > records.length,
     semanticUsed,
     semanticError,
+    // 降级必须自报家门：调用方据此把回注块标注成「部分匹配」，不得冒充精确命中。
+    degraded,
+    degradedTermsMatched,
     sources: [...new Set(records.flatMap((record) => record.sources))],
   }
+}
+
+/**
+ * 部分匹配降级（`degradeQueryTerms` 的判定阈值）。
+ *
+ * 为什么需要降级：自动回注把**整条人类消息**当查询词送进来（apply.mjs 的
+ * `recallQueryFrom`，slice 到 800 字符）。后端（灵枢词法阶梯 / T1 本地词法）
+ * 对多词查询是 **AND** 语义 —— 每个词都必须命中同一篇文档。整条消息里必然
+ * 带着「你能」「是不是」「顺便看看」这类只存在于提问、不存在于任何历史记录
+ * 的措辞，于是 AND 恒不可满足，检索恒 0 命中，回注永久退化为「按时间倒序
+ * 取最近 N 条」。实测（2026-10-15 真实会话）：12/12 次回注只命中查询记录
+ * 自身，而生产场景下当前人类消息尚未归档、其自身记录不存在 ⇒ 恒 0 命中，
+ * 用户看到的是连续数十次「本次检索没有任何记录匹配该问题」。
+ *
+ * 契约边界（不越界的地方）：
+ * - **不改后端**：T1 的 AND 语义被 `v2-local-lexical.test.mjs` 锁为契约，
+ *   灵枢阶梯同理，本降级只作用于**查询路径**；
+ * - **不冒充精确命中**：降级结果带 `degraded: true`，调用方必须如实标注；
+ * - **只在完全无命中时触发**：精确路径有命中就原样返回，短关键词行为不变；
+ * - **不硬凑**：部分匹配同样 0 命中时如实返回空，不返回「随便几条」。
+ */
+export const DEGRADE_MIN_TERMS = 4
+
+/** 查询词元化：与索引侧同一套词元化，保证「怎么索引就怎么查」。 */
+export function queryTermsOf(text) {
+  const seen = new Set()
+  const out = []
+  for (const term of tokenizeForLexicalIndex(text)) {
+    if (term.length === 0 || seen.has(term)) continue
+    seen.add(term)
+    out.push(term)
+  }
+  return out
+}
+
+/**
+ * 把一条查询拆成「用于部分匹配的词元」。
+ *
+ * 返回 null 表示不值得降级（词元太少，AND 本就该满足；降级只会引入噪声）。
+ * 只在词元数达到 {@link DEGRADE_MIN_TERMS} 时才降级 —— 短查询（关键词、
+ * 记录 ID、工具名）保持精确语义不变。
+ */
+export function degradeQueryTerms(terms) {
+  const list = Array.isArray(terms) ? terms.filter((term) => typeof term === 'string' && term.length > 0) : []
+  if (list.length < DEGRADE_MIN_TERMS) return null
+  return list
 }
 
 /**

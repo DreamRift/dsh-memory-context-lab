@@ -297,6 +297,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           let matched = []
           let matchedBy = 'recency'
           let semanticError = null
+          let partialMatch = null
           if (needle.length > 0) {
             const found = await searchRecords({
               store,
@@ -307,6 +308,13 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
             })
             matchedBy = found.semanticUsed ? 'literal+semantic' : 'literal'
             semanticError = found.semanticError ?? null
+            // 部分匹配降级：精确命中为空、检索层退到逐词 OR 并拿到了结果。这不是
+            // 「与问题相关」的强声明，也不能和精确命中长得一样，所以单独记一份，
+            // 由下面的块首声明如实区分。见 retrieval.mjs 的 degradeQueryTerms。
+            if (found.degraded === true) {
+              matchedBy = 'literal+semantic-partial'
+              partialMatch = { termsMatched: found.degradedTermsMatched ?? 0 }
+            }
             // 只自动回注归档跨度：普通历史段的原文由模型按 ID 主动读取。
             matched = found.records.map((hit) => byId.get(hit.id)).filter(Boolean)
           }
@@ -324,7 +332,9 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           // 逐条正文里不重复自报（那是每条的噪声）；块首声明一次即可。检索口径必须
           // 出现在注入文本里，而不是只留在返回值字段里：模型看到的就是这段文本。
           const basisNote = !fellBack
-            ? `（以下为与问题「${needle}」的检索命中，来源：${matchedBy === 'literal+semantic' ? '字面索引 + 语义后端' : '内置字面索引'}。）`
+            ? (partialMatch
+              ? `（以下为与问题「${needle}」的**部分匹配**命中（查询整条消息对多词 AND 检索不可满足，已退到逐词 OR 并按重合度排序，共 ${partialMatch.termsMatched} 个词元命中）；来源：字面索引 + 语义后端。命中只代表词汇重合，不构成「与当前任务相关」的判定。）`
+              : `（以下为与问题「${needle}」的检索命中，来源：${matchedBy === 'literal+semantic' ? '字面索引 + 语义后端' : '内置字面索引'}。）`)
             : (needle.length > 0
               ? `（以下为最近归档记录，**不是**与问题「${needle}」的相关命中：本次检索没有任何记录匹配该问题，故按时间倒序退回最近 ${Math.min(bounded, spans.length)} 条。${semanticError ? `语义检索后端不可用：${semanticError}。` : ''}）`
               : '（以下为最近归档记录，按时间倒序列出；本次没有查询词，未做相关性检索。）')
