@@ -4,9 +4,12 @@
  * 定位：灵枢后端（lingshu-mdcg-receipt）不可用时的**默认**检索实现。能力自述与
  * 灵枢后端同级（lexical-structural，无向量语义）——不冒充语义召回。
  *
- * 索引结构：CJK 连续段二元组 + ASCII 词元的倒排表，按记录 ID 记账；持久化在
- * 会话目录 lexical-index.json（tmp+rename 原子写）。文件缺失或半截 ⇒ 从空索引
- * 重建，与 retrieval-index.json 的记账语义一致，不引入第三种恢复路径。
+ * 索引结构：CJK 连续段二元组 + ASCII 词元的倒排表，按记录 ID 记账。持久化分两文件：
+ * - lexical-index.json = base 快照（tmp+rename 原子写，schema 与旧单文件完全一致），
+ *   只在 compaction 时写；缺失/半截 ⇒ 该层视为空（旧格式单文件是同一 schema，直接命中）；
+ * - lexical-index.log = 追加式 JSONL delta，每次 index 有增量时只 append 一行，
+ *   不再每次全量重写数 MB 索引（旧的 JSON.stringify 同步阻塞事件循环）。
+ * 读取时 base + 日志逐行重放合并；日志里损坏/半截的行跳过，只影响该行。
  *
  * 边界（capabilities.note 原样交给状态面，不夸大）：
  * - 只做词法命中：不做语义向量、模糊匹配、拼音、跨会话；
@@ -14,7 +17,7 @@
  * - 词条总量有上限（默认 200k，对应常用上下文量级）：超限后停止增量并**如实报
  *   skipped**——绝不让记账把「没索引」当成「已索引」（盲区 61 的工程回应之一）。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { EngineV2Error } from './errors.mjs'
 
@@ -23,6 +26,11 @@ export const LOCAL_LEXICAL_INDEX_FILE = 'lexical-index.json'
 export const LOCAL_LEXICAL_INDEX_KIND = 'dsh-memory-context-lab/v2/lexical-index'
 export const LOCAL_LEXICAL_SCHEMA_VERSION = 1
 export const DEFAULT_LEXICAL_MAX_TERMS = 200000
+
+// 内部常量（不新增导出面）：增量日志文件名、compaction 阈值。
+const LOCAL_LEXICAL_LOG_FILE = 'lexical-index.log'
+const DEFAULT_COMPACTION_LOG_BYTES = 1000000
+const DEFAULT_COMPACTION_NEW_DOCS = 512
 
 export const LOCAL_LEXICAL_CAPABILITIES = Object.freeze({
   kind: 'lexical-structural',
@@ -54,33 +62,121 @@ function emptyState() {
   return { docs: new Map(), postings: new Map(), limitReached: false }
 }
 
-export function createLocalLexicalBackend({ directory, logger = null, maxTerms = DEFAULT_LEXICAL_MAX_TERMS } = {}) {
+/**
+ * 重放一行日志 delta 到内存状态。语义与 index() 的去重/合并规则一致：
+ * - docs：已存在的 id 跳过（同一记录不重复记账）；
+ * - postings：同一 term 跨多个 delta 出现时合并（d 追加、f 追加），绝不覆盖；只补该
+ *   delta 真实新增的 id——base 已含该 id 时（compaction 写 base 与截断日志之间的崩溃
+ *   窗口会重放旧行）不会把词频重复计一次；
+ * - limitReached：只置真，不回滚。
+ * 返回本行真实新增的 docs 数。损坏/半截行由调用方在 JSON.parse 处跳过。
+ */
+function applyDelta(target, delta) {
+  const added = new Set()
+  const docs = delta.docs
+  if (docs && typeof docs === 'object') {
+    for (const [id, meta] of Object.entries(docs)) {
+      if (target.docs.has(id)) continue
+      target.docs.set(id, meta)
+      added.add(id)
+    }
+  }
+  const postings = delta.postings
+  if (added.size > 0 && postings && typeof postings === 'object') {
+    for (const [term, pairs] of Object.entries(postings)) {
+      if (!Array.isArray(pairs) || pairs.length === 0) continue
+      let posting = target.postings.get(term)
+      if (!posting) {
+        posting = { d: [], f: [] }
+        target.postings.set(term, posting)
+      }
+      for (const pair of pairs) {
+        if (!Array.isArray(pair) || typeof pair[0] !== 'string' || !added.has(pair[0])) continue
+        posting.d.push(pair[0])
+        posting.f.push(pair[1])
+      }
+    }
+  }
+  if (delta.limitReached === true) target.limitReached = true
+  return added.size
+}
+
+export function createLocalLexicalBackend({
+  directory,
+  logger = null,
+  maxTerms = DEFAULT_LEXICAL_MAX_TERMS,
+  // 可选注入（默认即规格阈值，仅调优/测试用；不改变既有导出与返回接口）。
+  compactionBytes = DEFAULT_COMPACTION_LOG_BYTES,
+  compactionDocs = DEFAULT_COMPACTION_NEW_DOCS,
+} = {}) {
   if (typeof directory !== 'string' || directory.length === 0) {
     throw new EngineV2Error('本地词法后端需要会话目录。', { code: 'EINVAL' })
   }
   if (!Number.isInteger(maxTerms) || maxTerms <= 0) {
     throw new EngineV2Error('本地词法后端的词条上限必须是正整数。', { code: 'EINVAL' })
   }
+  const compactionLogBytes = Number.isFinite(compactionBytes) && compactionBytes > 0 ? compactionBytes : DEFAULT_COMPACTION_LOG_BYTES
+  const compactionNewDocs = Number.isInteger(compactionDocs) && compactionDocs > 0 ? compactionDocs : DEFAULT_COMPACTION_NEW_DOCS
   const indexFile = path.join(directory, LOCAL_LEXICAL_INDEX_FILE)
+  const logFile = path.join(directory, LOCAL_LEXICAL_LOG_FILE)
   let state = null
+  // 增量记账：自上次写 base 起的日志字节数与新增 docs 数（compaction 判据）、日志末尾
+  // 是否为半截行（下次 append 前补一个换行，避免新行与残行粘成一行）。
+  let logBytes = 0
+  let docsSinceBase = 0
+  let logNeedsNewline = false
+  let storeInitialized = false
+  let writeChain = Promise.resolve()
+
+  /** 串行化「append 日志 / compaction」尾段：避免 append 与截断交错。 */
+  function enqueue(task) {
+    const next = writeChain.then(task, task)
+    writeChain = next.then(() => {}, () => {})
+    return next
+  }
 
   async function load() {
     if (state) return state
+    const fresh = emptyState()
+    let baseExists = false
     try {
       const raw = JSON.parse(await readFile(indexFile, 'utf8'))
       if (raw && raw.kind === LOCAL_LEXICAL_INDEX_KIND && raw.schemaVersion === LOCAL_LEXICAL_SCHEMA_VERSION) {
-        state = {
-          docs: new Map(Object.entries(raw.docs ?? {})),
-          postings: new Map(Object.entries(raw.postings ?? {}).map(([term, posting]) => [term, { d: posting.d ?? [], f: posting.f ?? [] }])),
-          limitReached: raw.limitReached === true,
-        }
-        return state
+        fresh.docs = new Map(Object.entries(raw.docs ?? {}))
+        fresh.postings = new Map(Object.entries(raw.postings ?? {}).map(([term, posting]) => [term, { d: posting.d ?? [], f: posting.f ?? [] }]))
+        fresh.limitReached = raw.limitReached === true
+        baseExists = true
       }
     } catch {
-      // 文件缺失/半截：从零重建。记账（retrieval-index.json）由调用方管理，
-      // 这里只保证自己的状态要么完整要么为空。
+      // base 缺失/半截：该层视为空（旧格式单文件是同一 schema，直接走上面分支，
+      // 无需单独兼容路径）。base 坏了不影响日志层——两文件彼此独立。
     }
-    state = emptyState()
+    let logText = ''
+    let logExists = false
+    try {
+      logText = await readFile(logFile, 'utf8')
+      logExists = true
+    } catch {
+      logText = ''
+    }
+    let loggedDocs = 0
+    for (const line of logText.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      let delta = null
+      try {
+        delta = JSON.parse(trimmed)
+      } catch {
+        continue // 半截/损坏行：只丢这一行，base 与其他行照常生效
+      }
+      if (!delta || typeof delta !== 'object') continue
+      loggedDocs += applyDelta(fresh, delta)
+    }
+    logBytes = Buffer.byteLength(logText, 'utf8')
+    docsSinceBase = loggedDocs
+    logNeedsNewline = logText.length > 0 && !logText.endsWith('\n')
+    storeInitialized = baseExists || logExists
+    state = fresh
     return state
   }
 
@@ -100,6 +196,17 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
     await rename(temporary, indexFile)
   }
 
+  /** compaction：全量写 base（tmp+rename 原子写），随后原子清空日志。 */
+  async function compact(current) {
+    await persist(current)
+    const temporary = path.join(directory, LOCAL_LEXICAL_LOG_FILE + '.tmp-' + process.pid + '-' + Date.now())
+    await writeFile(temporary, '', 'utf8')
+    await rename(temporary, logFile)
+    logBytes = 0
+    docsSinceBase = 0
+    logNeedsNewline = false
+  }
+
   return {
     name: LOCAL_LEXICAL_BACKEND_NAME,
     capabilities: LOCAL_LEXICAL_CAPABILITIES,
@@ -114,7 +221,10 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       const externalIds = {}
       const skipped = []
       const conflicts = []
-      let dirty = false
+      // 本批的增量 delta（null 原型：避免把 __proto__ 之类的词元/记录 ID 当原型赋值）。
+      const deltaDocs = Object.create(null)
+      const deltaPostings = Object.create(null)
+      let addedDocs = 0
       for (const record of Array.isArray(records) ? records : []) {
         const id = typeof record?.id === 'string' ? record.id : null
         if (!id) {
@@ -155,12 +265,35 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
           }
           posting.d.push(id)
           posting.f.push(count)
+          if (!deltaPostings[term]) deltaPostings[term] = []
+          deltaPostings[term].push([id, count])
         }
-        current.docs.set(id, { seq: record.seq ?? null, kind: record.kind ?? null, bytes: Buffer.byteLength(record.text, 'utf8') })
+        const meta = { seq: record.seq ?? null, kind: record.kind ?? null, bytes: Buffer.byteLength(record.text, 'utf8') }
+        current.docs.set(id, meta)
+        deltaDocs[id] = meta
         externalIds[id] = id
-        dirty = true
+        addedDocs += 1
       }
-      if (dirty) await persist(current)
+      if (addedDocs > 0) {
+        const payload = JSON.stringify({ docs: deltaDocs, postings: deltaPostings, limitReached: current.limitReached }) + '\n'
+        await enqueue(async () => {
+          await mkdir(directory, { recursive: true })
+          if (!storeInitialized) {
+            // 首批（base 与日志都不存在）：直接建立 base 快照，不建日志。这样既保住
+            // 旧有的「index 过后 lexical-index.json 必存在」语义（既有测试「崩溃/文件
+            // 缺失」要求删掉 base 后查不到东西），也不留下一个空 base。
+            await persist(current)
+            storeInitialized = true
+            return
+          }
+          const prefix = logNeedsNewline ? '\n' : '' // 残行结尾：先补换行，别把新行粘上去
+          await appendFile(logFile, prefix + payload, 'utf8')
+          logNeedsNewline = false
+          logBytes += Buffer.byteLength(prefix + payload, 'utf8')
+          docsSinceBase += addedDocs
+          if (logBytes >= compactionLogBytes || docsSinceBase >= compactionNewDocs) await compact(current)
+        })
+      }
       return { externalIds, skipped, conflicts }
     },
 
@@ -202,7 +335,17 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       return true
     },
 
-    /** 无需刷新：每次 index 后已原子落盘。保留挂点与契约对齐。 */
-    async dispose() {},
+    /**
+     * 正常停机：把日志并入 base 并清空日志（磁盘不留悬空日志），随后清空内存 state。
+     * 无悬空日志时不写盘（避免无谓的全量重写），重复调用不抛。仍返回 Promise。
+     */
+    async dispose() {
+      try {
+        const current = state ?? (await load())
+        await enqueue(() => (logBytes > 0 || docsSinceBase > 0 ? compact(current) : undefined))
+      } finally {
+        state = null
+      }
+    },
   }
 }
