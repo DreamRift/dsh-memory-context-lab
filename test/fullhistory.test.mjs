@@ -111,6 +111,56 @@ test('fullHistory：v1 命令回执（[已归档操作]）同样按凭证保护'
   assert.equal(skip[2], 'protected-receipt-voucher')
 })
 
+test('fullHistory：扁平形状（data.content）的真实回执写入形态同样按凭证保护（审计 P0-1）', () => {
+  // 回归 0.10.0 审计 P0-1：apply.mjs 的 commitSurfaceRun 写回执用的是扁平形状
+  // （content 直接挂在 data 上，见 session.append('user/message', { content, ... })），
+  // 而收集器只读 data.message.content 时这类回执取不到正文 → 凭证判定恒 false →
+  // 回执落到普通候选里被再退热。两种标记各验一遍。
+  const flatReceipt = (text, form = 'archive-receipt') => ({
+    type: 'user/message',
+    surfaceOp: 'append',
+    data: { id: `flat-${Math.random().toString(36).slice(2, 8)}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user', form } },
+  })
+  const events = [
+    systemHead(), // 1
+    flatReceipt(`${V2_RECEIPT_MARKER} 工具 read，冷记录 cold-3，hash abc`), // 2
+    flatReceipt(`${RECEIPT_MARKER} 工具 read，冷记录 cold-4，hash def`), // 3
+  ]
+  const view = { ...numbered(events), retainOperations: 0, fullHistory: true, minimumChars: 0, lastAssistantSeq: null }
+  const result = collectHistoryCandidates(view)
+  const skip = skippedOf(result)
+  assert.equal(skip[2], 'protected-receipt-voucher', '扁平形状 v2 回执必须按凭证保护')
+  assert.equal(skip[3], 'protected-receipt-voucher', '扁平形状 v1 回执必须按凭证保护')
+  assert.equal(result.candidates.length, 0, '凭证不得进入候选')
+})
+
+test('计划工件：扁平形状 assistant 消息里的 exit_plan_mode 调用同样受保护（审计 P0-1）', () => {
+  // 计划工件判定同样吃 contentBlocksOf：只读 data.message.content 时扁平形状的
+  // 助手消息取不到调用块，计划调用头会失去「全程保留」保护。
+  const events = [
+    systemHead(), // 1
+    humanUser('开始'), // 2
+    {
+      type: 'assistant/message',
+      surfaceOp: 'append',
+      data: {
+        turn: 1,
+        step: 1,
+        id: 'm-plan-flat',
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '计划如下' },
+          { type: 'tool-call', id: 'call-plan-flat', name: 'exit_plan_mode', arguments: JSON.stringify({ plan: '# 计划\n全文' }) },
+        ],
+        source: { kind: 'model', provider: 'fake', model: 'fake-model' },
+      },
+    }, // 3
+  ]
+  const view = { ...numbered(events), retainOperations: 0, fullHistory: true, minimumChars: 0, lastAssistantSeq: null }
+  const skip = skippedOf(collectHistoryCandidates(view))
+  assert.equal(skip[3], 'protected-plan-artifact', '扁平形状计划调用头必须受保护')
+})
+
 test('计划工件：exit_plan_mode 调用头在任何模式下都不可退热', () => {
   for (const fullHistory of [false, true]) {
     const events = [

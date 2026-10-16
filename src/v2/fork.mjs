@@ -13,6 +13,7 @@
  */
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { registerProvenanceEdge } from './provenance-index.mjs'
 import path from 'node:path'
 
 import { EngineV2Error } from './errors.mjs'
@@ -241,6 +242,24 @@ export async function executeForkClosure({ labRoot, parentSessionId, childSessio
       }, null, 2)}\n`,
       'utf8',
     )
+    // P2-8：软遗忘与来源图随闭包整份迁移。子记录 ID 与父逐字相同，账本键
+    // 仍是权威可见性键，整份复制即闭包等价；fork 之后父子账本各自独立演进。
+    const parentDir = v2SessionDirectoryFor(labRoot, parentSessionId)
+    const childDir = v2SessionDirectoryFor(labRoot, childSessionId)
+    for (const sidecar of ['disposition.jsonl', 'provenance.jsonl', 'forget-plans.json']) {
+      try {
+        const raw = await readFile(path.join(parentDir, sidecar), 'utf8')
+        await writeFile(path.join(childDir, sidecar), raw, 'utf8')
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+    }
+    await registerProvenanceEdge({
+      sessionDir: childDir,
+      derivedId: 'fork-map',
+      derivedKind: 'fork-map',
+      sourceIds: ['session:' + parentSessionId],
+    })
     // 子库建成 ≠ 子会话已启用 v2。`init` 建的 engine.json 默认是「已持有投影」，
     // 而这里只是把冷库搬过来，子会话还没有声明过所有权；若照原样留着，
     // 子会话里 `/memory-lab2 on` 会撞 EENGINEACTIVE（明明没启用却说已激活），

@@ -91,7 +91,7 @@ test('write-once：同 nodeId 不同 contentHash 拒收，失败关闭', async (
   )
 })
 
-test('recall：索引同步后走 T1 命中并如实标注来源；未命中退回最近且自报家门', async (t) => {
+test('recall：索引同步后走 T1 命中并如实标注来源；未命中零正文（P1-8）', async (t) => {
   const labRoot = await mkdtemp(path.join(tmpdir(), 'mcl-local-client-'))
   tmpRoots.push(labRoot)
   const sessionId = 'sess-' + path.basename(labRoot).slice(-12)
@@ -116,10 +116,27 @@ test('recall：索引同步后走 T1 命中并如实标注来源；未命中退�
   assert.equal(hit.matchedBy, 'literal+semantic')
   assert.ok(hit.hits.some((entry) => entry.content.includes('厨房')))
 
+  // P1-8（2026-10-16 拍板）：no-match 一律零正文——不再按时间倒序兜底注入。
   const miss = await client.recall('完全无关的查询词', null, 5)
-  assert.equal(miss.matchedBy, 'recency-fallback')
-  assert.ok(
-    miss.hits.some((entry) => entry.content.includes('最近归档记录') && entry.content.includes('不是')),
-    '退回说明应出现在注入文本中',
-  )
+  assert.equal(miss.matchedBy, 'no-match')
+  assert.equal(miss.hits.length, 0, '无关查询不得再注入最近记录正文')
+})
+
+test('P1-6 状态区分：not-ready / all-filtered 不冒充 no-match', async (t) => {
+  const labRoot = await mkdtemp(path.join(tmpdir(), 'mlab-notready-'))
+  tmpRoots.push(labRoot)
+  const sessionId = 'sess-' + path.basename(labRoot).slice(-12)
+  const directory = v2SessionDirectoryFor(labRoot, sessionId)
+  const backend = createLocalLexicalBackend({ directory })
+  const factory = createV2ClientFactory({ labRoot, sessionId, logger: null, backendFor: () => backend })
+  const client = await factory.createClient()
+  t.after(async () => {
+    await client.close()
+    await rm(labRoot, { recursive: true, force: true })
+  })
+
+  // 冷库还没有任何归档：检索面未就绪，不是「无关」。
+  const empty = await client.recall('任何词', null, 5)
+  assert.equal(empty.matchedBy, 'not-ready')
+  assert.equal(empty.hits.length, 0)
 })

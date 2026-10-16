@@ -22,6 +22,7 @@ import {
   MAX_RECALL_QUERY_CHARS,
   PACKAGE_NAME,
   buildReceipt,
+  buildForgetTombstone,
   buildSpanReceipt,
   escapePromptBraces,
   normalizeSettings,
@@ -38,6 +39,16 @@ import {
   releaseV2Engine,
 } from './engine.mjs'
 import { createV2ClientFactory } from './client-adapter.mjs'
+import {
+  COMPRESS_SUBCOMMANDS,
+  compressPreview,
+  compressRun,
+  compressStatus,
+  describeHierarchyError,
+  expandVoucher,
+  reconcileVouchers,
+} from './hierarchy-coordinator.mjs'
+import { AGG_VOUCHER_MARKER } from './agg-voucher.mjs'
 import {
   createV2SessionState,
   disabledV2State,
@@ -63,6 +74,21 @@ import {
 import { createCostLedger, renderCostReport } from './cost.mjs'
 import { renderToolOutput, toToolValue } from './tool.mjs'
 import { searchRecords, syncRetrievalIndex, readRetrievalIndex, describeRecordRelations } from './retrieval.mjs'
+import { planQuery } from './query-plan.mjs'
+import {
+  DispositionError,
+  applyForget,
+  applyUndo,
+  buildForgetPreview,
+  describeForgetStatus,
+  getForgetIndex,
+  getForgetPlan,
+  isForgotten,
+  nodeUnitBase,
+  resolveForgetTargets,
+  saveForgetPlan,
+} from './disposition.mjs'
+import { invalidateProvenance, registerProvenanceEdge } from './provenance-index.mjs'
 import { syncVerification, checkRecords, markRecordsStale, annotateStale } from './verification.mjs'
 import {
   buildWorkingState,
@@ -98,6 +124,16 @@ export const V2_HELP = [
   '/memory-lab2 read <记录ID...>   按稳定 ID 精确回读原文（可多个，逗号或空格分隔）',
   '/memory-lab2 verify <记录ID...> 验证跟踪：核对记录引用的文件与归档时是否一致（三态，只读）',
   '/memory-lab2 mark-stale <记录ID> <原因>   人工把记录标记为失效（只写旁证，不改不可变记录）',
+  '/memory-lab2 forget preview <目标…> 预览主动遗忘：目标=记录ID|nodeId|callId|kind=片段|before=<记录ID>',
+  '                                  宽条件必须先预览拿计划ID；硬保护目标会被拦截并列出',
+  '/memory-lab2 forget apply <计划ID|目标…> 提交软遗忘（回执换墓碑、读面不再泄漏、可 undo）',
+  '/memory-lab2 forget undo <操作ID>   撤销一次遗忘：只恢复可见性，原文回注仍需显式 restore',
+  '/memory-lab2 forget status [操作ID] 账本与收口状态：操作清单、待收口条目、隔离灵枢残留披露',
+  '/memory-lab2 compress preview   预览层级压缩：连续回执组 → 聚合凭证候选与 no-safe-gain 报告',
+  '                                  （层级压缩默认关，preview 只读不改任何状态）',
+  '/memory-lab2 compress run       按事务序提交压缩：凭证替换、层级账本落盘、可重复收口',
+  '/memory-lab2 compress status    层级账本状态：L0–L3 与凭证清单（只读，未启用也能查）',
+  '/memory-lab2 expand <凭证ID> [页] 分页展开聚合凭证成员原文（恒定只读面，不替换任何投影）',
   '/memory-lab2 recall <查询词>    字面检索（ID/kind/工具名/callId/范围）；只读，不返回分数',
   '/memory-lab2 recall id <记录ID...> [预算]   与模型可见只读工具同一条路径的精确回读',
   '/memory-lab2 index [sync]       语义检索后端的增量索引状态/同步（未注入后端时如实报告）',
@@ -251,6 +287,13 @@ export function createV2Runtime(dependencies) {
     // 设置页的全局默认（全历史记忆上下文）。缺省 false：v2 启用时若无旧账本值，
     // 按这里播种；返回真值时引擎直接以全历史模式运行。
     defaultFullHistory = () => false,
+    // 层级压缩模型模式的全局默认（设置页）。缺省 false：旧账本无该字段时
+    // 播种为关；只在值缺失时补，绝不覆盖用户在本会话写下的选择。
+    defaultCompressModel = () => false,
+    // 模型相位解析点（P4）：(sessionId, { signal }) => { stream, model, timeoutMs,
+    // cacheLookup, cacheSave, onUsage } | null。宿主无已核验 LLM 契约时注入方
+    // 直接返回 null，全链路按程序档工作；不在此直连宿主内部。
+    modelPhaseResolver = null,
     // 计划先行联动（index.mjs 注入）：v2 启用成功后回调，返回提示文本对象或 null。
     onEnabled = null,
     // 计划先行开关切换回调（agent, value) => note|null）：on 时尝试进入计划模式。
@@ -296,6 +339,18 @@ export function createV2Runtime(dependencies) {
     // v2 的回执标记与 v1 不同：日志里能直接看出哪套引擎替换了这段历史。
     receiptMarker: V2_RECEIPT_MARKER,
     createClient: async (record) => factoryFor(record).createClient(),
+    // P2 软遗忘：恢复守卫按行级 nodeId 对账 disposition 账本（权威）。
+    // 账本按记录 ID 键控；行是 node 基名粒度，因此先经 store 条目把遗忘
+    // 记录映射回 node 基名，再判定该行。账本已提交、行状态尚未收口的
+    // 崩溃窗口同样拦得住；v1 不注入此依赖。
+    isForgottenRow: async (record, row) => {
+      if (!row?.nodeId) return false
+      const forgetIndex = await getForgetIndex(record.directory)
+      if (!forgetIndex.forgotten || forgetIndex.forgotten.size === 0) return false
+      const entries = await collectForgetEntries(record)
+      const bases = forgetNodeBasesOf(entries, [...forgetIndex.forgotten.keys()])
+      return bases.has(nodeUnitBase(row.nodeId))
+    },
     // 候选门禁：在租用节点 ID 之前判定，被拦下的候选不留下任何 claim。
     guardUnit: (record, candidate) => guardCandidate(record, candidate),
     // v2 的候选收集器与 v1 不同：v2 要覆盖**全历史**（普通 user/assistant 正文、
@@ -467,6 +522,48 @@ export function createV2Runtime(dependencies) {
     }
   }
 
+  /**
+   * 崩溃窗口对账：账本已提交、表面撤回/行状态未收口的残差，在下次 adopt 时收敛。
+   *
+   * 判定完全确定性：受影响回执组的期望墓碑文本逐字节重建后与当前比对——
+   * 只有「当前就是原回执」才替换（已撤过、或用户已手工改写过的都不动，如实计数）。
+   * 行状态只补标缺失的 forgotten 标记，不重放任何工具副作用。失败时下一次
+   * adopt 仍会重试（缓存只在成功后写入）。
+   */
+  const reconciledAt = new Map()
+
+  async function reconcileForgetState(record) {
+    if (!record?.directory) return null
+    let forgetIndex
+    try {
+      forgetIndex = await getForgetIndex(record.directory)
+    } catch {
+      return null // 账本不可读：读面自带告警，这里不再放大。
+    }
+    const revision = forgetIndex?.revision ?? 0
+    if (reconciledAt.get(record.sessionId) === revision) return null
+    const targetIds = [...(forgetIndex?.forgotten?.keys() ?? [])]
+    if (targetIds.length === 0) {
+      reconciledAt.set(record.sessionId, revision)
+      return null
+    }
+    const plan = await planWithdrawals(
+      record,
+      forgetNodeBasesOf(await collectForgetEntries(record), targetIds),
+      targetIds,
+    )
+    const outcome = await withdrawForgottenSurfaces(
+      record,
+      { entry: { operationId: null }, targetIds },
+      plan,
+    )
+    reconciledAt.set(record.sessionId, revision)
+    if (outcome.withdrawn > 0 || outcome.reconciledRows > 0) {
+      logger?.info?.(`memory-lab2: 遗忘对账收敛（撤回 ${outcome.withdrawn}，补标 ${outcome.reconciledRows}）`)
+    }
+    return outcome
+  }
+
   /** 取会话记录：只有 v2 状态存在且 enabled 才返回（绝不自动启用）。 */
   async function adopt(agent) {
     const sessionId = sessionIdOf(agent.session)
@@ -483,6 +580,10 @@ export function createV2Runtime(dependencies) {
     if (!loaded || loaded.state.enabled !== true) return null
     const record = makeRecord({ agent, sessionId, directory: loaded.directory, state: loaded.state })
     records.set(sessionId, record)
+    // P2：账本已提交但表面未收口的崩溃窗口，在此收敛（失败不阻塞命令主路径）。
+    reconcileForgetState(record).catch(() => {})
+    // P3：凭证计划已保存但替换未落表面的崩溃窗口，同路收敛（不阻塞 adopt）。
+    reconcileVouchers(await compressDepsOf(record)).catch(() => {})
     return record
   }
 
@@ -633,6 +734,11 @@ export function createV2Runtime(dependencies) {
       record.state.fullHistory = defaultFullHistory() === true
       await writeV2SessionState(record.directory, record.state).catch(() => {})
     }
+    // 模型模式默认值播种：口径同上（只在缺失时补）。
+    if (record.state.compressModel === undefined) {
+      record.state.compressModel = defaultCompressModel() === true
+      await writeV2SessionState(record.directory, record.state).catch(() => {})
+    }
     records.set(sessionId, record)
     const warnings = [...(claim.warnings ?? [])]
 
@@ -689,11 +795,13 @@ export function createV2Runtime(dependencies) {
       // 0) 窗口守卫（rc.5，与 v1 normalizeAndStop 同口径）：恢复会让组装输入
       // 超出模型窗口时跳过恢复、照常停用，原文留在冷库并如实给出路。
       // 「无测量不设闸」——测量不可用时照常恢复（与 v1 一致），不静默扣留。
-      const pendingCount = engine.pendingReceipts(record).length
+      // P0-2：restore-skipped 的行同样「原文只在冷库」，停用前同样要走窗口守卫，
+      // 否则跳过行在恢复时突然全部回来会击穿模型窗口。
+      const pendingCount = engine.pendingReceipts(record).length + engine.restoreSkippedReceipts(record).length
       if (pendingCount > 0 && engine.settingsOf(record).autoRestore) {
         try {
           const occupancy = await engine.measureOccupancy(record, undefined)
-          const growth = restoreGrowth(engine.pendingReceipts(record), {
+          const growth = restoreGrowth([...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)], {
             assembledTokens: occupancy.host.assembledTokens,
             contextWindow: occupancy.host.contextWindow,
           })
@@ -716,6 +824,18 @@ export function createV2Runtime(dependencies) {
           const outcome = await engine.runRestore(record)
           restored = outcome?.restored ?? 0
           before = outcome?.before ?? 0
+          // P0-2：停用回执必须如实报告仍未恢复的行——它们的原文只在冷库，
+          // 停用后冷库按只读保留，旧记录 ID 仍可回读，但不能宣称「全部恢复」。
+          const stillSkipped = outcome?.stillSkipped ?? 0
+          if (stillSkipped > 0) {
+            lines.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过，原因见上）：它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
+          }
+          // P2：软遗忘的行不会随 off 恢复（可见性由 disposition 账本持有，
+          // 与引擎开关解耦）；停用回执必须如实披露这段「不在恢复范围内」。
+          const forgottenCount = outcome?.forgotten ?? 0
+          if (forgottenCount > 0) {
+            lines.push(`另有 ${forgottenCount} 段已软遗忘未恢复：off 只停用引擎，不改变遗忘状态；如需恢复可见性，先重新启用后用 /memory-lab2 forget undo <操作ID>。`)
+          }
         } catch (error) {
           // 恢复失败不静默：仍继续停用，但把失败写进回执文本，且不宣称已恢复。
           lines.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}`)
@@ -970,7 +1090,13 @@ export function createV2Runtime(dependencies) {
     }))
     if (!page) return { kind: 'error', text: '本会话没有 v2 库（从未启用）。' }
     if (page.entries.length === 0) {
-      return { kind: 'success', text: '（没有更多记录）' }
+      const hidden = page.forgottenCount ?? 0
+      return {
+        kind: 'success',
+        text: hidden > 0
+          ? '（没有更多记录；另有 ' + hidden + ' 条已软遗忘记录被隐藏，用 forget undo 恢复可见性）'
+          : '（没有更多记录）',
+      }
     }
     const lines = page.entries.map((entry) => {
       const inline = entry.inline ?? {}
@@ -1150,7 +1276,10 @@ export function createV2Runtime(dependencies) {
       }
 
       if (literal !== null) {
-        const needle = literal.toLowerCase()
+        // P1-1 查询规划：ID/路径/调用标识与引号短语走精确通道，自然语言部分
+        // 留给 OR 召回 + 相关门槛；与自动回注同一条规划逻辑，避免两端口径漂移。
+        const plan = planQuery(literal)
+        const needle = plan.text.toLowerCase()
         // 多路检索：内置字面索引为主，语义后端（灵枢）作为可注入的附加路。
         // 命中只带来源，不带分数；后端失败如实降级并带出原因。
         // 后端按会话取用：只有该会话的隔离灵枢已经启动时才拿到它，
@@ -1159,12 +1288,21 @@ export function createV2Runtime(dependencies) {
           store,
           backend: backendForSession(sessionId),
           text: needle,
+          exact: plan.exact.map((token) => token.toLowerCase()),
           limit: RECALL_MAX_QUERY_HITS,
           literalMatcher: entryMatchesLiteral,
+          // P2 软遗忘：查询路径的权威过滤在复验处（searchRecords 内部按账本
+          // 剔除 forgotten 命中并计数）；T2 服务端残留如实披露，不假装已清除。
+          forgetIndex: await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId)),
         })
         const warnings = [...budgetNotes]
         if (found.truncated) {
           warnings.push(`命中 ${found.totalMatched} 条，只返回前 ${found.records.length} 条；用 record_ids 精确回读全文`)
+        }
+        // P2：遗忘剔除如实披露——命中为 0 且全是遗忘记录时，明确「不是库里没有」。
+        if (found.forgottenFiltered > 0) {
+          const zeroNote = found.totalMatched === 0 ? '（本次候选全部为遗忘记录，非库中无历史）' : ''
+          warnings.push(`已软遗忘记录 ${found.forgottenFiltered} 条被剔除、不参与命中${zeroNote}；恢复可见性用 /memory-lab2 forget undo`)
         }
         if (found.semanticError) {
           warnings.push(`语义检索后端不可用，已降级为内置字面索引：${found.semanticError}`)
@@ -1233,7 +1371,8 @@ export function createV2Runtime(dependencies) {
         }
       }
 
-      const card = cardFromStore(store, sessionId, Math.min(budget, WORKING_SET_DEFAULTS.cardTokens), session)
+      const card = cardFromStore(store, sessionId, Math.min(budget, WORKING_SET_DEFAULTS.cardTokens), session,
+        await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId)))
       const wrapperTokens = estimateTokensOf([...budgetNotes, ...(card.dropped?.length ? [`因预算丢弃 ${card.dropped.length} 段`] : [])].join('\n'))
       return {
         mode: 'working-set',
@@ -1299,10 +1438,14 @@ export function createV2Runtime(dependencies) {
    * 与 `buildCard` 的区别：不需要活动记录，因而也不需要占用率与成本账本——
    * 只读召回不该有副作用，这里一个计数器都不动。
    */
-  function cardFromStore(store, sessionId, budgetTokens, session) {
+  function cardFromStore(store, sessionId, budgetTokens, session, forgetIndex = null) {
     // 配对账本取一次（Map 复制），卡片构建期按 callId 闭包查询：并行调用共享
     // 宿主 seq，seq 侧倒排无法与调用序列对位（错位句柄会误导模型回读别人正文）。
     const pairing = store.pairingLedger()
+    // P2 软遗忘：卡片是读面之一，被遗忘记录的 ID 不再印进热上下文——模型拿
+    // 到句柄就会去回读，印出去等于绕过遗忘。过滤在 idsBySeq 之后、状态构建
+    // 之前，配对账本同理会剔除遗忘的调用/结果记录。
+    const visibleIds = (ids) => (forgetIndex ? ids.filter((id) => !isForgotten(forgetIndex, id)) : ids)
     const state = buildWorkingState({
       sessionId,
       surfaceNodes: session?.surface?.nodes ?? [],
@@ -1311,11 +1454,18 @@ export function createV2Runtime(dependencies) {
       lastAssistantSeq: lastAssistantSeqOf(session),
       // 冷库里已经归档的宿主 seq → 稳定记录 ID：卡片要印出**工具真能回读**的 ID，
       // 而不是 `seq:N`（工具只认 t00000001-r0000 这种稳定 ID，印 seq 等于印废号）。
-      recordIdsForSeq: (seq) => store.idsBySeq(seq),
+      recordIdsForSeq: (seq) => visibleIds(store.idsBySeq(seq)),
       // callId → 调用/结果记录 ID 的精确对位：共享同一 seq 的并行调用各拿各的记录。
       recordIdsForCallId: (callId) => {
         const entry = pairing.get(callId)
-        return entry ? { callRecordId: entry.callRecordId ?? null, resultRecordId: entry.resultRecordId ?? null } : null
+        if (!entry) return null
+        const callRecordId = entry.callRecordId ?? null
+        const resultRecordId = entry.resultRecordId ?? null
+        if (forgetIndex) {
+          if (callRecordId && isForgotten(forgetIndex, callRecordId)) return null
+          if (resultRecordId && isForgotten(forgetIndex, resultRecordId)) return null
+        }
+        return { callRecordId, resultRecordId }
       },
     })
     return renderWorkingSetInjection(state, { budgetTokens })
@@ -1400,22 +1550,32 @@ export function createV2Runtime(dependencies) {
    */
   async function buildCard(record, { budgetTokens = WORKING_SET_DEFAULTS.cardTokens, countDrops = true } = {}) {
     const session = record.agent?.session
+    // P2 软遗忘：卡片构建前先取一次账本快照（进程缓存），同 `cardFromStore`。
+    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, record.sessionId))
     // 与 `cardFromStore` 同源：卡片里出现的宿主 seq 必须换成**工具真能回读**的稳定
     // 记录 ID。这里曾经漏传 `recordIdsForSeq`，于是注入路径的卡片只印 `seq:609`
     // 并自报 `readable:false`——模型照着抄，工具一律不认（审计 P2-5）。
     const state = await factoryFor(record).withStore((store) => {
       // 同 `cardFromStore`：配对账本一次取齐，按 callId 精确对位（并行调用共享 seq）。
       const pairing = store.pairingLedger()
+      const visibleIds = (ids) => (forgetIndex ? ids.filter((id) => !isForgotten(forgetIndex, id)) : ids)
       return buildWorkingState({
         sessionId: record.sessionId,
         surfaceNodes: session?.surface?.nodes ?? [],
         eventAt: (seq) => (typeof session?.eventAt === 'function' ? session.eventAt(seq) : null),
         openCalls: store.openCalls(),
         lastAssistantSeq: lastAssistantSeqOf(session),
-        recordIdsForSeq: (seq) => store.idsBySeq(seq),
+        recordIdsForSeq: (seq) => visibleIds(store.idsBySeq(seq)),
         recordIdsForCallId: (callId) => {
           const entry = pairing.get(callId)
-          return entry ? { callRecordId: entry.callRecordId ?? null, resultRecordId: entry.resultRecordId ?? null } : null
+          if (!entry) return null
+          const callRecordId = entry.callRecordId ?? null
+          const resultRecordId = entry.resultRecordId ?? null
+          if (forgetIndex) {
+            if (callRecordId && isForgotten(forgetIndex, callRecordId)) return null
+            if (resultRecordId && isForgotten(forgetIndex, resultRecordId)) return null
+          }
+          return { callRecordId, resultRecordId }
         },
       })
     })
@@ -1540,10 +1700,13 @@ export function createV2Runtime(dependencies) {
           : `${capabilityLine}\n索引记账：无（尚未同步）`,
       }
     }
-    const synced = await factoryFor(record).withStore((store) => syncRetrievalIndex({
+    const synced = await factoryFor(record).withStore(async (store) => syncRetrievalIndex({
       directory: record.directory,
       backend,
       store,
+      // P2：同步侧把软遗忘记录当 pluginAuthored 同款差集——已索引的遗忘记录
+      // 不再留在索引记账里，T1 文档同时确定性清除；旧索引读到未知代际照常握手。
+      forgetIndex: await getForgetIndex(record.directory),
     }))
     const lines = [
       capabilityLine,
@@ -1698,7 +1861,8 @@ export function createV2Runtime(dependencies) {
     const record = await adopt(agent)
     if (!record) return null
     if (record.state.settings?.workingSet === false) return null
-    if (engine.pendingReceipts(record).length === 0) return null
+    // P0-2：跳过行未恢复时，保护卡与软保留仍以冷库依赖为事实来源继续注入。
+    if (engine.pendingReceipts(record).length === 0 && engine.restoreSkippedReceipts(record).length === 0) return null
     const { card } = await buildCard(record)
     if (!card.text) return null
 
@@ -1929,11 +2093,14 @@ export function createV2Runtime(dependencies) {
       const restoreNotes = []
       let fullHistoryGuardRefusal = null
       if (rawValue === 'off' && record.state.fullHistory === true) {
-        const pendingCount = engine.pendingReceipts(record).length
+        // P0-2：待恢复行与跳过行合并计数——两者恢复到活动面的增量同源，
+        // 窗口守卫只看总量，不看上次尝试的成败。
+        const restoreRows = [...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)]
+        const pendingCount = restoreRows.length
         if (pendingCount > 0) {
           try {
             const occupancy = await engine.measureOccupancy(record, undefined)
-            const growth = restoreGrowth(engine.pendingReceipts(record), {
+            const growth = restoreGrowth(restoreRows, {
               assembledTokens: occupancy.host.assembledTokens,
               contextWindow: occupancy.host.contextWindow,
             })
@@ -1962,6 +2129,8 @@ export function createV2Runtime(dependencies) {
             const restored = outcome?.restored ?? 0
             const before = outcome?.before ?? 0
             if (before > 0) restoreNotes.push(`已恢复 ${restored}/${before} 段原文。`)
+            const stillSkipped = outcome?.stillSkipped ?? 0
+            if (stillSkipped > 0) restoreNotes.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过，原因见逐条结局）：它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
           } catch (error) {
             restoreNotes.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}；` +
               '可稍后用 /memory-lab2 restore 重试（历史按只读保留，旧记录 ID 仍可回读）。')
@@ -1978,6 +2147,27 @@ export function createV2Runtime(dependencies) {
       const lines = [`全历史记忆上下文已设为 ${rawValue === 'on' ? '开' : '关'}（写入 v2 账本）。`]
       lines.push(...restoreNotes)
       return { kind: 'success', text: lines.join('\n') }
+    } else if (key === 'compress') {
+      // 层级压缩开关（P3）：默认关；开启后自动降温收尾会尝试对连续已完成回执组
+      // 做聚合凭证替换（preview 不受开关影响，任何时候都可只读预览）。
+      if (rawValue !== 'on' && rawValue !== 'off') {
+        return { kind: 'error', text: '用法：`/memory-lab2 set compress on|off`' }
+      }
+      record.state.hierarchyCompress = rawValue === 'on'
+      await writeV2SessionState(record.directory, record.state)
+      return { kind: 'success', text: `层级压缩已设为 ${rawValue === 'on' ? '开' : '关'}（默认关；可用 /memory-lab2 compress preview 先行预览）。` }
+    } else if (key === 'compressmodel') {
+      // 层级压缩模型模式开关（P4）：只在 compress 已开时有实效；模型不可用或
+      // 产出不合格时自动落回程序摘要（失败关闭），这里只记偏好位。
+      if (rawValue !== 'on' && rawValue !== 'off') {
+        return { kind: 'error', text: '用法：`/memory-lab2 set compressmodel on|off`' }
+      }
+      record.state.compressModel = rawValue === 'on'
+      await writeV2SessionState(record.directory, record.state)
+      const note = record.state.compressModel
+        ? '已设为开：聚合摘要将先经模型改写（注入的 stream 契约），失败或校验不过时自动落回程序摘要。'
+        : '已设为关：聚合摘要直接用程序版本。'
+      return { kind: 'success', text: `层级压缩模型模式已设为 ${rawValue === 'on' ? '开' : '关'}。${note}` }
     } else if (key === 'planfirst') {
       // 插件级开关（与 /memory-lab set planfirst 同义）：v2 账本只记位置，
       // 联动动作由注入的回调执行（服务缺失时回调返回提示，不阻断）。
@@ -1996,7 +2186,7 @@ export function createV2Runtime(dependencies) {
       if (note) lines.push(note.text)
       return { kind: 'success', text: lines.join('\n') }
     } else {
-      return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|fullhistory|planfirst。` }
+return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|fullhistory|planfirst|compress|compressmodel。` }
     }
     record.state.settings = normalizeSettings(settings)
     // 设置必须落盘：只改内存会让「设置成功」在重启后失效，而 v1 的 set 是持久的。
@@ -2018,6 +2208,9 @@ export function createV2Runtime(dependencies) {
       case 'read': return read(invocation, parsed.args.flatMap((arg) => arg.split(',')).filter(Boolean))
       case 'verify': return verifyCommand(invocation, parsed.args.flatMap((arg) => arg.split(',')).filter(Boolean))
       case 'mark-stale': return markStaleCommand(invocation, parsed.args)
+      case 'forget': return runExclusive(sessionIdOf(invocation.agent.session), () => forgetCommand(invocation, parsed.args))
+      case 'compress': return runExclusive(sessionIdOf(invocation.agent.session), () => compressCommand(invocation, parsed.args))
+      case 'expand': return runExclusive(sessionIdOf(invocation.agent.session), () => expandCommand(invocation, parsed.args))
       case 'recall': return recallCommand(invocation, parsed.args)
       case 'index': return indexCommand(invocation, parsed.args)
       case 'relations': return relationsCommand(invocation, parsed.args)
@@ -2031,6 +2224,491 @@ export function createV2Runtime(dependencies) {
       case 'dry-run': return runNow(invocation, { dryRun: true })
       case 'set': return setSetting(invocation, parsed.args)
       default: return { kind: 'success', text: V2_HELP }
+    }
+  }
+
+  // ── P2 主动遗忘：命令面、表面撤回与重启对账 ──────────────────────────────
+  //
+  // 权威顺序（计划 §5 P2-5）：disposition 账本先提交，读面立即过滤；随后收口
+  // 表面回执（换墓碑）、行状态（status='forgotten'，脱离 restore 待办与 off 清
+  // 理判定）、T1 记忆索引文档、provenance 失效标记。收口步骤幂等可重放：任一
+  // 步失败只挂进 forget status 的待收口清单并如实报告，绝不回滚账本。undo 只
+  // 恢复可见性并按撤回快照重建可见回执；原文回注仍走显式 restore。
+
+  const FORGET_TOMBSTONE_TAG = '本段已按用户指令软遗忘'
+
+  async function collectForgetEntries(record) {
+    return factoryFor(record).withStore((store) => {
+      const entries = []
+      let afterId = null
+      for (;;) {
+        const page = store.listEntries({ afterId, limit: 500 })
+        if (page.entries.length === 0) break
+        entries.push(...page.entries)
+        if (!page.nextAfter) break
+        afterId = page.nextAfter
+      }
+      return entries
+    })
+  }
+
+  function forgetNodeBasesOf(entries, recordIds) {
+    const wanted = new Set(recordIds)
+    const bases = new Set()
+    for (const entry of entries) {
+      if (!wanted.has(entry.id)) continue
+      const nodeId = entry.inline?.nodeId
+      if (typeof nodeId === 'string' && nodeId) bases.add(nodeUnitBase(nodeId))
+    }
+    return bases
+  }
+
+  function isTombstoneText(text) {
+    return typeof text === 'string' && text.includes(FORGET_TOMBSTONE_TAG)
+  }
+
+  function appendSurfaceText(session, seq, text) {
+    return session.append(
+      'user/message',
+      {
+        id: `surface-${randomUUID()}`,
+        role: 'user',
+        content: [{ type: 'text', text }],
+        source: { kind: 'user', form: 'memory-lab2-surface' },
+      },
+      { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] },
+    )
+  }
+
+  /**
+   * 计算一次遗忘的表面撤回计划：行按 replacementSeq 分组（P1-5 批组共享同一
+   * 表面节点），组内任一行被遗忘则整组换墓碑；换墓碑前把当前表面文本快照进
+   * 账本的 withdrawals，undo 据此逐字节恢复。已经是墓碑或原文已变的节点不重
+   * 复快照，如实计入 pendingWithdrawals 交由对账重放。
+   */
+  async function planWithdrawals(record, forgetNodeIds, targetIds) {
+    const session = record.agent?.session
+    const rows = Array.isArray(record.state?.archive) ? record.state.archive : []
+    const bySeq = new Map()
+    for (const row of rows) {
+      if (!row?.replacementSeq || !row?.nodeId) continue
+      const list = bySeq.get(row.replacementSeq) ?? []
+      list.push(row)
+      bySeq.set(row.replacementSeq, list)
+    }
+    const withdrawals = []
+    const pendingWithdrawals = []
+    const touchedRows = []
+    for (const [seq, group] of bySeq) {
+      const affected = group.filter((row) => forgetNodeIds.has(nodeUnitBase(row.nodeId)))
+      if (affected.length === 0) continue
+      touchedRows.push(...affected)
+      const current = receiptTextOf(typeof session?.eventAt === 'function' ? session.eventAt(seq) : null)
+      if (current === null || isTombstoneText(current)) {
+        // 表面已经是墓碑（先前撤回过）或文本已不存在：不重复快照。
+        if (current === null) pendingWithdrawals.push({ nodeIds: [...new Set(group.map((row) => row.nodeId))], replacementSeq: seq, reason: 'surface-missing' })
+        continue
+      }
+      withdrawals.push({
+        nodeIds: [...new Set(group.map((row) => row.nodeId))].sort(),
+        recordIds: targetIds.slice().sort(),
+        replacementSeq: seq,
+        receiptText: current,
+      })
+    }
+    return { withdrawals, pendingWithdrawals, touchedRows }
+  }
+
+  async function withdrawForgottenSurfaces(record, result, precomputed = null) {
+    const session = record.agent?.session
+    const plan = precomputed
+      ?? await planWithdrawals(record, forgetNodeBasesOf(await collectForgetEntries(record), result.targetIds ?? []), result.targetIds ?? [])
+    const failures = []
+    for (const withdrawal of plan.withdrawals) {
+      try {
+        appendSurfaceText(session, withdrawal.replacementSeq, buildForgetTombstone({
+          range: { start: withdrawal.replacementSeq, end: withdrawal.replacementSeq },
+          nodeId: withdrawal.nodeIds[0] ?? '(unknown)',
+          hash: null,
+          reason: result.entry?.reason ?? null,
+        }))
+      } catch (error) {
+        failures.push({ replacementSeq: withdrawal.replacementSeq, message: error?.message ?? String(error) })
+      }
+    }
+    for (const row of plan.touchedRows) {
+      row.status = 'forgotten'
+      row.forgottenBy = result.entry?.operationId ?? null
+    }
+    if (plan.touchedRows.length > 0) await writeV2SessionState(record.directory, record.state)
+    return {
+      failures,
+      pendingWithdrawals: plan.pendingWithdrawals,
+      withdrawn: plan.withdrawals.length,
+      reconciledRows: plan.touchedRows.length,
+    }
+  }
+
+  /**
+   * undo 侧：账本已把可见性放回，这里按撤销条目携带的撤回快照恢复可见回执。
+   * 快照缺失或表面已再次变化时不动表面、如实报告（账本仍是权威）。
+   */
+  async function restoreForgottenSurfaces(record, undoResult) {
+    const session = record.agent?.session
+    const rows = Array.isArray(record.state?.archive) ? record.state.archive : []
+    const failures = []
+    let restoredSurfaces = 0
+    for (const withdrawal of undoResult.withdrawals ?? []) {
+      try {
+        const current = receiptTextOf(typeof session?.eventAt === 'function' ? session.eventAt(withdrawal.replacementSeq) : null)
+        if (current === null) {
+          failures.push({ replacementSeq: withdrawal.replacementSeq, message: 'surface-missing' })
+          continue
+        }
+        if (!isTombstoneText(current)) continue
+        appendSurfaceText(session, withdrawal.replacementSeq, withdrawal.receiptText)
+        restoredSurfaces += 1
+      } catch (error) {
+        failures.push({ replacementSeq: withdrawal.replacementSeq, message: error?.message ?? String(error) })
+      }
+    }
+    // 行状态跟随账本（权威）：forgotten 行的 node 基名若已不再遗忘，放回 applied。
+    const forgetIndex = await getForgetIndex(record.directory)
+    let changed = false
+    let bases = new Set()
+    if (forgetIndex.forgotten && forgetIndex.forgotten.size > 0) {
+      const entries = await collectForgetEntries(record)
+      bases = forgetNodeBasesOf(entries, [...forgetIndex.forgotten.keys()])
+    }
+    for (const row of rows) {
+      if (row?.status !== 'forgotten' || !row.nodeId) continue
+      if (!bases.has(nodeUnitBase(row.nodeId))) {
+        row.status = 'applied'
+        row.forgottenBy = null
+        changed = true
+      }
+    }
+    if (changed) await writeV2SessionState(record.directory, record.state)
+    return { failures, restoredSurfaces }
+  }
+
+  async function forgetCommand(invocation, args) {
+    const subcommand = (args[0] ?? '').toLowerCase()
+    const targets = args.slice(1)
+    const sessionId = sessionIdOf(invocation.agent.session)
+    const sessionDir = v2SessionDirectoryFor(labRoot, sessionId)
+    if (!['preview', 'apply', 'undo', 'status'].includes(subcommand)) {
+      return { kind: 'error', code: 'EFORGETUSAGE', message: '用法：/memory-lab2 forget preview|apply|undo|status <目标…>' }
+    }
+    if (subcommand === 'status') {
+      try {
+        const report = await describeForgetStatus(sessionDir)
+        const lines = ['账本状态 ' + report.state + '（revision ' + report.revision + '，当前遗忘 ' + report.forgottenCount + ' 条）。']
+        for (const op of report.operations.slice(-40).reverse()) {
+          if (op.kind === 'undo') {
+            lines.push(op.operationId + ' undo ' + op.undoOf + '（恢复 ' + op.restoredCount + '，保持 ' + op.keptCount + '）')
+          } else {
+            lines.push(op.operationId + ' forget ' + op.targetCount + ' 条（' + (op.reason || '无备注') + '）' + (op.undone ? ' — 已撤销' : ''))
+          }
+        }
+        if (report.operations.length > 40) lines.push('（仅显示最近 40 条操作，共 ' + report.operations.length + ' 条）')
+        if (report.repairedBytes > 0) lines.push('本次读取截断了 ' + report.repairedBytes + ' 字节的账本半行（崩溃残留，已修复）。')
+        // 诚实边界（计划 §8）：T2 派生索引在服务端，插件没有探针过的删除原语；
+        // 权威过滤在读面拦截，但残留计数要如实说，不假装已清除。
+        const statusBackend = backendForSession(sessionId)
+        if (statusBackend?.kind === 'lingshu' && report.forgottenCount > 0) {
+          lines.push('隔离灵枢侧派生索引仍可能残留已遗忘内容的命中（读面已拦截，服务端未清除）。')
+        }
+        return { kind: 'success', text: lines.join('\n') }
+      } catch (error) {
+        if (error instanceof DispositionError) {
+          return { kind: 'error', code: error.code, message: error.message }
+        }
+        throw error
+      }
+    }
+    if (subcommand === 'preview') {
+      if (targets.length === 0) {
+        return { kind: 'error', code: 'EFORGETUSAGE', message: 'preview 需要至少一个目标：记录ID | nodeId | callId | kind=<片段> | before=<记录ID>' }
+      }
+      const record = await adopt(invocation.agent)
+      const entries = await collectForgetEntries(record)
+      const reader = async (id) => {
+        const result = await factoryFor(record).withStore((store) => store.readRecord(id))
+        return { ok: result.ok, text: result.ok ? result.payloadText ?? null : null }
+      }
+      const preview = await buildForgetPreview({ sessionDir, targets, entries, readRecord: reader })
+      const lines = ['当前 revision ' + preview.revision + '。']
+      for (const expansion of preview.expansions) {
+        lines.push(expansion.from + ' → ' + expansion.to.length + ' 条记录（' + expansion.note + '）')
+      }
+      if (preview.unknown.length > 0) lines.push('未命中目标（不在本会话冷库）：' + preview.unknown.join('、'))
+      if (preview.blocked.length > 0) {
+        lines.push('硬保护拦截：' + preview.blocked.map((item) => item.id + '（' + item.rule + '）').join('、'))
+      }
+      if (preview.warnings.length > 0) {
+        lines.push('警告（显式目标已放行）：' + preview.warnings.map((item) => item.id + '（' + item.detail + '）').join('、'))
+      }
+      if (preview.already.length > 0) lines.push('已遗忘（幂等跳过）：' + preview.already.map((item) => item.id).join('、'))
+      lines.push('本次将遗忘 ' + preview.toForget.length + ' 条记录。')
+      if (preview.plan) {
+        await saveForgetPlan(sessionDir, preview.plan)
+        lines.push('宽条件目标已生成计划 ' + preview.plan.planId + '（revision ' + preview.plan.revision + '）；apply 用：/memory-lab2 forget apply ' + preview.plan.planId)
+      } else if (preview.wide) {
+        lines.push('宽条件无可遗忘集合，未生成计划。')
+      }
+      if (preview.repairedBytes > 0) lines.push('账本读取截断 ' + preview.repairedBytes + ' 字节半行（崩溃残留，已修复）。')
+      return { kind: 'success', text: lines.join('\n') }
+    }
+    if (subcommand === 'undo') {
+      const operationId = targets[0]
+      if (!operationId) {
+        return { kind: 'error', code: 'EFORGETUSAGE', message: 'undo 需要操作ID，先用 /memory-lab2 forget status 查看' }
+      }
+      const record = await adopt(invocation.agent)
+      // 账本权威：先提交 undo，再做表面回执重建（幂等、失败如实报告）。
+      let result
+      try {
+        result = await applyUndo({ sessionDir, operationId })
+      } catch (error) {
+        if (error instanceof DispositionError) {
+          return { kind: 'error', code: error.code, message: error.message }
+        }
+        throw error
+      }
+      const surface = await restoreForgottenSurfaces(record, result)
+      const lines = [
+        `已撤销遗忘操作 ${result.entry.operationId}（恢复可见 ${result.restoredIds.length} 条；其余 ${result.keptIds.length} 条保持遗忘——多原因命中，逐条列出剩余 cause）。`,
+        `可见性已由账本放回；被撤销对象里的表面回执恢复 ${surface.restoredSurfaces} 个。`,
+      ]
+      if (result.keptIds.length > 0) lines.push(`保持遗忘：${result.keptIds.join('、')}`)
+      if (surface.failures.length > 0) lines.push(`表面恢复失败（可重试）：${surface.failures.map((f) => `seq${f.replacementSeq}(${f.message})`).join('、')}`)
+      lines.push('原文回注（把内容重新注入热上下文）仍需显式 /memory-lab2 restore。')
+      return { kind: 'success', text: lines.join('\n') }
+    }
+    // apply
+    if (targets.length === 0) {
+      return { kind: 'error', code: 'EFORGETUSAGE', message: 'apply 需要 <计划ID>（宽条件）或显式记录ID列表' }
+    }
+    const record = await adopt(invocation.agent)
+    const entries = await collectForgetEntries(record)
+    let plan = null
+    let targetIds = null
+    let reason = null
+    if (targets.length === 1 && /^[0-9a-f]{16}$/.test(targets[0])) {
+      plan = await getForgetPlan(sessionDir, targets[0])
+      if (!plan) {
+        return { kind: 'error', code: 'EFORGETPLAN', message: `计划 ${targets[0]} 不存在或已被消费；请重新 /memory-lab2 forget preview` }
+      }
+      targetIds = plan.resolvedIds
+      reason = `plan:${plan.planId}`
+    } else {
+      // 显式目标也先解析再提交：别名（nodeId/callId/导入指针）按单元闭包展开；
+      // 宽条件（kind=/before=）拒绝直通——计划通道是宽条件的唯一提交路径；
+      // 未知目标如实报错，不把字符串当记录 ID 写进账本。
+      const resolved = await resolveForgetTargets({
+        targets,
+        entries,
+        readRecord: (id) => factoryFor(record).withStore((store) => {
+          try {
+            return store.readRecord(id, { verifyHash: false, maxBytes: 64 * 1024 })
+          } catch {
+            return { ok: false }
+          }
+        }),
+      })
+      if (resolved.wide) {
+        return { kind: 'error', code: 'EFORGETWIDE', message: '宽条件目标必须先 /memory-lab2 forget preview，再用计划 ID apply；apply 不接受宽条件直通' }
+      }
+      if (resolved.unknown.length > 0) {
+        return { kind: 'error', code: 'EFORGETTARGET', message: '未知目标：' + resolved.unknown.join('、') }
+      }
+      if (resolved.recordIds.length === 0) {
+        return { kind: 'error', code: 'EFORGETTARGET', message: '目标解析后为空集合' }
+      }
+      targetIds = resolved.recordIds
+      reason = 'explicit'
+    }
+    // 先快照再提交：账本条目携带 undo 所需的回执原文（崩溃窗口内不丢快照）。
+    const forgetNodeIds = forgetNodeBasesOf(entries, targetIds)
+    const withdrawalPlan = await planWithdrawals(record, forgetNodeIds, targetIds)
+    let result
+    try {
+      result = await applyForget({
+        sessionDir,
+        targetIds,
+        actor: 'user',
+        reason,
+        expectedRevision: plan ? plan.revision : null,
+        withdrawals: withdrawalPlan.withdrawals,
+      })
+    } catch (error) {
+      if (error instanceof DispositionError) {
+        return { kind: 'error', code: error.code, message: error.message }
+      }
+      throw error
+    }
+    if (!result.appended) {
+      return { kind: 'success', text: '目标已全部处于遗忘状态（幂等，未追加条目）；当前 revision ' + result.revision + '。' }
+    }
+    const withdrawal = await withdrawForgottenSurfaces(record, result, withdrawalPlan)
+    // provenance：先注册「表面回执 ← 遗忘记录」来源边，再标记失效（undo 后复验
+    // 有结构可查）。注册/失效都失败不阻断遗忘本体——账本才是权威，status 披露。
+    for (const withdrawalItem of withdrawalPlan.withdrawals) {
+      try {
+        await registerProvenanceEdge({
+          sessionDir,
+          derivedId: 'surface:' + withdrawalItem.replacementSeq,
+          derivedKind: 'surface-receipt',
+          sourceIds: withdrawalItem.recordIds,
+        })
+      } catch { /* 已注册或只读时跳过 */ }
+      try {
+        await invalidateProvenance({ sessionDir, derivedId: 'surface:' + withdrawalItem.replacementSeq, cause: result.entry.operationId })
+      } catch { /* 失效标记失败不阻断遗忘 */ }
+    }
+    const lines = [
+      '软遗忘已生效（操作 ' + result.entry.operationId + '）：新增 ' + result.entry.targetIds.length + ' 条，已遗忘 ' + result.alreadyForgotten.length + ' 条幂等跳过。',
+      '表面回执撤回 ' + withdrawal.withdrawn + ' 个节点' + (withdrawal.failures.length ? '，失败 ' + withdrawal.failures.length + ' 个（forget status 待收口清单可重放）' : '') + '。',
+    ]
+    if (withdrawal.pendingWithdrawals.length > 0) {
+      lines.push('表面缺失待对账 ' + withdrawal.pendingWithdrawals.length + ' 组（下次 adopt 时收敛）。')
+    }
+    lines.push('冷库原文与审计日志保留；撤销用 /memory-lab2 forget undo ' + result.entry.operationId + '。')
+    return { kind: 'success', text: lines.join('\n') }
+  }
+
+  /**
+   * P3 层级压缩命令面：/memory-lab2 compress preview|run|status。
+   * 两段式与 forget 一致：preview 不改任何状态；run 按事务序提交并可重复收口。
+   */
+  async function compressCommand(invocation, args) {
+    const subcommand = (args[0] ?? '').toLowerCase()
+    const sessionId = sessionIdOf(invocation.agent.session)
+    if (!COMPRESS_SUBCOMMANDS.includes(subcommand)) {
+      return { kind: 'error', code: 'ECOMPRESSUSAGE', message: '用法：/memory-lab2 compress preview|run|status' }
+    }
+    if (subcommand === 'status') {
+      try {
+        const report = await compressStatus(await lightHierarchyDepsOf(invocation))
+        return { kind: 'success', text: report.text }
+      } catch (error) {
+        return { kind: 'error', code: 'ECOMPRESSSTATE', message: describeHierarchyError(error) }
+      }
+    }
+    const record = await adopt(invocation.agent)
+    if (!record) return { kind: 'error', code: 'ENOTENABLED', message: '本会话尚未启用记忆上下文（/memory-lab2 on）。' }
+    const deps = await compressDepsOf(record)
+    try {
+      const outcome = subcommand === 'preview' ? await compressPreview(deps) : await compressRun(deps)
+      return { kind: 'success', text: outcome.text }
+    } catch (error) {
+      return { kind: 'error', code: 'ECOMPRESSRUN', message: describeHierarchyError(error) }
+    }
+  }
+
+  /** P3 凭证展开：/memory-lab2 expand <凭证ID> [页码]（恒定只读面，分页回读原文）。 */
+  async function expandCommand(invocation, args) {
+    const voucherId = args[0]
+    if (!voucherId) {
+      return { kind: 'error', code: 'EEXPANDUSAGE', message: '用法：/memory-lab2 expand <凭证ID> [页码]（凭证ID 见 /memory-lab2 compress status）' }
+    }
+    try {
+      const outcome = await expandVoucher(await lightHierarchyDepsOf(invocation), voucherId, args[1])
+      return { kind: 'success', text: outcome.text }
+    } catch (error) {
+      return { kind: 'error', code: 'EEXPANDVOUCHER', message: describeHierarchyError(error) }
+    }
+  }
+
+  /**
+   * hierarchy-coordinator 依赖注入：表面与冷库都从已启用会话取（与 forget 相同的
+   * adopt + factory 通道）。getRecordBody 走 withStore 事务读，isRecordVisible 用
+   * 遗忘账本做同步过滤（展开页如实标注已遗忘成员）。
+   */
+  async function compressDepsOf(record) {
+    const sessionId = record.sessionId
+    const sessionDir = record.directory
+    const session = record.agent?.session
+    const forgetIndex = await getForgetIndex(record.directory).catch(() => null)
+    const forgotten = forgetIndex?.forgotten instanceof Map ? forgetIndex.forgotten : new Map()
+    const kindById = new Map()
+    return {
+      sessionDir,
+      eventAt: (seq) => (typeof session?.eventAt === 'function' ? session.eventAt(seq) : null),
+      surfaceNodes: () => (Array.isArray(session?.surface?.nodes) ? [...session.surface.nodes] : []),
+      surfaceVoucherNodes: surfaceVoucherNodesOf(session),
+      getRecordBody: async (recordId) => {
+        const result = await factoryFor(record).withStore((store) => store.readRecord(recordId))
+        if (!result?.ok) return null
+        kindById.set(recordId, result.record?.kind ?? result.entry?.kind ?? null)
+        return result.payloadText
+      },
+      getRecordKind: (recordId) => {
+        // kind 只用于渲染标签；读不到就按 tool-output 呈现，不猜。
+        return kindById.get(recordId) ?? 'tool-output'
+      },
+      isRecordVisible: (recordId) => !forgotten.has(recordId),
+      // 模型相位（P4 依赖注入解析点）：所有宿主 LLM 契约风险收敛在
+      // modelPhaseResolver 一个回调里。会话偏好未开或解析不出 stream 时返回
+      // null → 协调器整体走程序档；解析失败同样按程序档处理（失败关闭）。
+      modelPhase: await (async () => {
+        if (record.state.compressModel !== true) return null
+        try {
+          const resolved = modelPhaseResolver
+            ? await Promise.resolve(modelPhaseResolver(sessionId, { signal: record.abortSignal }))
+            : null
+          if (!resolved || typeof resolved.stream !== 'function') return null
+          return resolved
+        } catch {
+          return null
+        }
+      })(),
+      appendVoucherMessage: async ({ startSeq, endSeq, memberSeqs, sourceEventSeqs, text }) => {
+        // 协调器显式给了来源事件就用之；否则按成员 seq 推导（仍是本段范围内的）。
+        const given = (sourceEventSeqs ?? memberSeqs ?? []).filter((s) => Number.isSafeInteger(s) && s >= 0)
+        const shadowed = given.length > 0 ? given : [startSeq]
+        const event = session.append('user/message', { content: [{ type: 'text', text }] }, {
+          surfaceOp: { op: 'replace', startSeq, endSeq },
+          sourceEventSeqs: shadowed,
+          source: { kind: 'user', form: 'memory-lab2-surface' },
+        })
+        return { seq: event?.seq }
+      },
+    }
+  }
+
+  /** 表面聚合凭证节点视图：[{ seq, text }]，供 coordinator 直接消费。 */
+  function surfaceVoucherNodesOf(session) {
+    const nodes = session?.surface?.nodes
+    if (!Array.isArray(nodes)) return []
+    const found = []
+    for (const seq of nodes) {
+      const event = typeof session?.eventAt === 'function' ? session.eventAt(seq) : null
+      if (event?.type !== 'user/message') continue
+      const content = event.data?.content
+      if (!Array.isArray(content)) continue
+      const first = content.find((part) => part?.type === 'text')
+      if (typeof first?.text === 'string' && first.text.startsWith(AGG_VOUCHER_MARKER)) {
+        found.push({ seq, text: first.text })
+      }
+    }
+    return found
+  }
+
+  /**
+   * 只读轻依赖：compress status 与 expand 不需要 adopt（会话未启用也能查已有
+   * 账本与凭证），只装 sessionDir、表面凭证视图与遗忘过滤。
+   */
+  async function lightHierarchyDepsOf(invocation) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    const sessionDir = v2SessionDirectoryFor(labRoot, sessionId)
+    const forgetIndex = await getForgetIndex(sessionDir).catch(() => null)
+    const forgotten = forgetIndex?.forgotten instanceof Map ? forgetIndex.forgotten : new Map()
+    return {
+      sessionDir,
+      surfaceVoucherNodes: surfaceVoucherNodesOf(invocation.agent.session),
+      isRecordVisible: (recordId) => !forgotten.has(recordId),
     }
   }
 
@@ -2059,6 +2737,18 @@ export function createV2Runtime(dependencies) {
     }
     await indexNewRecords(record)
     await captureNewFingerprints(record)
+    // P3：层级压缩默认关；显式开启后，本批归档结束时尝试对连续已完成回执组做
+    // 聚合凭证替换。失败只记告警、不破坏归档结果（失败不破坏原状态）。
+    if (record.state.hierarchyCompress === true && Number(outcome.applied) > 0) {
+      try {
+        const compressOutcome = await maybeStageCompress(await compressDepsOf(record), { enabled: true })
+        if (compressOutcome?.triggered && Number(compressOutcome.applied) > 0) {
+          logger?.info?.(`v2 层级压缩：${compressOutcome.applied} 组已替换为聚合凭证（拒绝 ${compressOutcome.rejected ?? 0}，失败 ${compressOutcome.failures ?? 0}）。`)
+        }
+      } catch (error) {
+        logger?.warn?.(`v2 层级压缩尝试失败（原回执保持原样）：${error?.message ?? error}`)
+      }
+    }
     return outcome
   }
 
@@ -2095,10 +2785,12 @@ export function createV2Runtime(dependencies) {
     const backend = backendForSession(record?.sessionId ?? null)
     if (!backend || typeof record?.directory !== 'string') return
     try {
-      const synced = await factoryFor(record).withStore((store) => syncRetrievalIndex({
+      const synced = await factoryFor(record).withStore(async (store) => syncRetrievalIndex({
         directory: record.directory,
         backend,
         store,
+        // 同 sync 命令面：归档后增量同步排除软遗忘记录。
+        forgetIndex: await getForgetIndex(record.directory),
       }))
       if (synced.indexedTotal < synced.total) {
         logger?.warn?.(`v2 索引未覆盖全部记录（${synced.indexedTotal}/${synced.total}），`
@@ -2130,7 +2822,9 @@ export function createV2Runtime(dependencies) {
   async function buildRecall(agent, decision, signal) {
     const record = await adopt(agent)
     if (!record || !engine.settingsOf(record).autoRecall) return decision
-    if (engine.pendingReceipts(record).length === 0) return decision
+    // P0-2：restore-skipped 行的原件仍在冷库且回执在活动面上，回注与工作卡
+    // 一样以「是否有冷库依赖」为闸门，跳过行同样算依赖。
+    if (engine.pendingReceipts(record).length === 0 && engine.restoreSkippedReceipts(record).length === 0) return decision
     const query = recallQueryFrom(decision.messages)
     if (!query || record.recallQueryId === query.id) return decision
     record.recallQueryId = query.id

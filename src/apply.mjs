@@ -1390,10 +1390,30 @@ export function formatBatchReport(result) {
 export function formatRestoreReport(result) {
   const lines = [`已恢复 ${result.restored} 个操作的原文。`]
   for (const outcome of result.outcomes) {
+    if (outcome.state === 'forgotten') {
+      lines.push(`- seq ${outcome.rangeStart}：未恢复(软遗忘)${outcome.reason ? ` — ${outcome.reason}` : ''}`)
+      continue
+    }
     const label = outcome.state === 'restored' ? '已恢复' : `跳过(${outcome.state})`
     lines.push(`- seq ${outcome.rangeStart}：${label}${outcome.reason ? ` — ${outcome.reason}` : ''}`)
   }
   if (result.restored) lines.push('恢复以一条 user 消息承载原文正文，内容完整但不还原原来的节点结构。')
+  // P2：被软遗忘拦下的行要单独给出可见结局——「没恢复」与「被遗忘拦下」
+  // 不能看起来一样，且必须指路 undo 而不是让用户反复重试 restore。
+  const forgotten = Number(result.forgotten ?? 0)
+  if (forgotten > 0) {
+    lines.push(`${forgotten} 个回执因软遗忘未恢复：先用 /memory-lab2 forget undo 撤销遗忘，再运行 restore。`)
+  }
+  // P0-2：重试的跳过行必须有可见的结局——「重试后仍跳过」与「从未跳过」不能
+  // 看起来一样。仍跳过的行原文依旧只在冷库（依赖未解除），不能让成功计数
+  // 把这一点盖掉。
+  const retried = Number(result.retriedSkipped ?? 0)
+  const still = Number(result.stillSkipped ?? 0)
+  if (retried > 0 && still > 0) {
+    lines.push(`本次重试了 ${retried} 个上次跳过的回执，其中 ${still} 个仍无法恢复：它们的原文仍只在冷库，回执保持跳过状态，下一次 restore 会再次尝试。`)
+  } else if (retried > 0) {
+    lines.push(`本次重试了 ${retried} 个上次跳过的回执，全部取回。`)
+  }
   return lines.join('\n')
 }
 
@@ -1776,6 +1796,11 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
 export async function recallDigest({ client, query, signal, limit = 5 }) {
   const payload = await client.recall(query, signal, limit)
   const normalized = normalizeRecallPayload(payload, limit)
+  // P1-8（v1 收窄）：服务端自报 recency 兜底时零正文注入——与 v2 的 no-match
+  // 语义一致（双引擎语义一致，2026-10-16 拍板）。
+  if (normalized.status === RECALL_STATUS.NO_MATCH) {
+    return { status: RECALL_STATUS.NO_MATCH, text: '', reason: normalized.reason ?? '', entries: [] }
+  }
   if (normalized.status !== RECALL_STATUS.OK) {
     return { status: normalized.status, text: '', reason: normalized.reason ?? '', entries: [] }
   }

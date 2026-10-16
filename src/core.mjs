@@ -242,6 +242,9 @@ export const BOOLEAN_SETTINGS = Object.freeze({
   // 折叠状态里随命令记录，供面板在引擎切换时还原开关位置）。
   fullhistory: { key: 'fullHistory', label: '全历史记忆上下文（v2）' },
   planfirst: { key: 'planFirst', label: '新会话计划先行' },
+  // v2 层级压缩（P3）与其模型模式（P4）：折叠进投影状态供面板显示开关位置。
+  compress: { key: 'hierarchyCompress', label: '层级压缩（v2）' },
+  compressmodel: { key: 'compressModel', label: '层级压缩模型模式（v2）' },
 })
 
 /** Split a slash-command's unparsed input into an operation and its literal remainder. */
@@ -527,6 +530,9 @@ export function initialProjectionState() {
     // 在无命令记录时叠加显示）。
     fullHistory: false,
     planFirst: false,
+    // v2 层级压缩与模型模式：同上，折叠位初始恒 false（层级压缩默认关是拍板决策）。
+    hierarchyCompress: false,
+    compressModel: false,
     presetId: '',
     presetLabel: GLOBAL_PRESET_LABEL,
     presetBaseline: null,
@@ -878,6 +884,33 @@ function formatStatusLine(tools, callIds, statuses) {
  * 正文、旧回执、旧状态卡、旧召回包根本没有工具调用，套用操作回执等于对模型谎称
  * 那里发生过一次工具操作。格式仍是稳定 ID 的纯函数，不含时间戳与动态统计。
  */
+/**
+ * Soft-forget tombstone receipt（0.10.0 P2）。
+ *
+ * 主动遗忘把表面上的原回执替换成这块墓碑：seq 范围与冷记录指针保留（审计与
+ * undo 的结构依据），但正文指针被明确宣告「已软遗忘、不再回注」。以
+ * V2_RECEIPT_MARKER 开头，全历史模式的凭证收集器因此天然把它计入不可压缩
+ * 凭证——遗忘不是删除，冷库原文与 append-only 日志都在。
+ *
+ * 逐字节确定：同样入参永远得到同样文本，供对账与「重建后比对再替换」的
+ * 撤回/恢复路径使用。
+ */
+export function buildForgetTombstone({ range, nodeId, hash, reason = null }) {
+  const lines = [
+    V2_RECEIPT_MARKER,
+    '本段已按用户指令软遗忘（在本插件记忆中停用）。',
+    `来源：seq ${range.start}–${range.end}`,
+    `冷记录：${nodeId}`,
+  ]
+  if (reason) lines.push(`缘由：${reason}`)
+  lines.push(
+    '撤销遗忘：/memory-lab2 forget undo <操作ID>；恢复原文回注仍需显式 restore。',
+    '冷库原文与审计日志保留（软遗忘不是物理删除）；隔离灵枢检索侧可能仍有残留，见 /memory-lab2 forget status。',
+    `hash：${String(hash ?? '').slice(0, 12)}`,
+  )
+  return lines.join('\n')
+}
+
 export function buildSpanReceipt({ label, range, nodeId, hash, chars, tokens, chunks = 1, marker = RECEIPT_MARKER }) {
   const lines = [
     marker,
@@ -981,6 +1014,11 @@ export const RECALL_STATUS = Object.freeze({
   OK: 'ok',
   UNSUPPORTED: 'unsupported',
   UNAVAILABLE: 'unavailable',
+  // P1-6 状态区分（0.10.0 计划）：零命中不再混作一种「未命中」。
+  NO_MATCH: 'no-match', // 检索面就绪且确实无关，零注入
+  NOT_READY: 'not-ready', // 冷库还没有任何可检索归档
+  ALL_FILTERED: 'all-filtered', // 命中全是插件自产物，按策略不回注
+  BACKEND_ERROR: 'backend-error', // 语义后端失败且字面无命中，不能宣称 no-match
 })
 
 /**
@@ -1019,6 +1057,12 @@ export function normalizeRecallPayload(payload, maxHits = MAX_RECALL_HITS) {
   }
   if (!Array.isArray(rows)) {
     return { status: RECALL_STATUS.UNSUPPORTED, summaries: [], reason: 'store returned no result envelope' }
+  }
+  // P1-8（v1 收窄，2026-10-16 拍板）：服务端如果声明这是 recency 兜底而非
+  // 相关命中（fallback/matched 标记），按 no-match 处理——零正文，不把「退回最近」
+  // 冒充检索命中注入。旧版服务端不带标记时行为不变（命中照常回注）。
+  if (outer.fallback === true || outer.matched === false) {
+    return { status: RECALL_STATUS.NO_MATCH, summaries: [], reason: 'server fell back to recency' }
   }
   const summaries = rows.slice(0, maxHits).map((raw, index) => {
     const item = raw && typeof raw === 'object' ? raw : {}

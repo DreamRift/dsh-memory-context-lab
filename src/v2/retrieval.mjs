@@ -15,6 +15,8 @@ import { readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { EngineV2Error } from './errors.mjs'
+import { isForgotten } from './disposition.mjs'
+import { registerProvenanceEdges } from './provenance-index.mjs'
 import { RECEIPT_MARKER, V2_RECEIPT_MARKER } from '../core.mjs'
 import { CARD_HEADER } from './working-state.mjs'
 
@@ -109,13 +111,21 @@ export async function readRetrievalIndex(directory) {
  * 下次读只会被当作「未索引」从头重建——记账白丢。先写临时文件再 rename，
  * 保证读到的要么是旧版本、要么是新版本。
  */
-export async function writeRetrievalIndex(directory, { backend, indexed }) {
+export async function writeRetrievalIndex(directory, { backend, indexed, generation = 1, watermark = null, visibilityRevision = null }) {
   const payload = {
     kind: RETRIEVAL_INDEX_KIND,
     schemaVersion: RETRIEVAL_INDEX_SCHEMA_VERSION,
     backend,
     updatedAt: new Date().toISOString(),
     indexed,
+    // P1-4 索引代际：generation 单调递增标识一次完整同步；watermark 是本次同步
+    // 时点 store 里最大记录 seq。读面据此判断「索引落后于库」并如实报 lag，
+    // 而不是把索引建成时点当成现在。
+    generation,
+    watermark,
+    // P2：本次同步时点的软遗忘账本 revision（null = 旧格式/未知）。它只是
+    // 观测值：权威过滤在命中侧（searchRecords 的 push 闸门），不依赖它。
+    visibilityRevision,
   }
   const target = indexFileFor(directory)
   const temporary = `${target}.tmp-${process.pid}-${Date.now()}`
@@ -142,12 +152,49 @@ export const INDEX_TEXT_MAX_BYTES = 8 * 1024
  * 会让后端无内容可索引，于是「语义检索」永远搜不到库里真实存在的正文词，却仍报告
  * `semanticUsed: true` —— 那是把空索引冒充成语义召回。
  */
-export async function syncRetrievalIndex({ directory, backend, store, batchSize = 200, textMaxBytes = INDEX_TEXT_MAX_BYTES }) {
+export async function syncRetrievalIndex({ directory, backend, store, batchSize = 200, textMaxBytes = INDEX_TEXT_MAX_BYTES, maxChunks = 4, forgetIndex = null }) {
   assertBackendContract(backend)
   const previous = await readRetrievalIndex(directory)
   const indexed = previous && previous.backend === backend.name ? { ...previous.indexed } : {}
   const entries = store.listEntries({ limit: Number.MAX_SAFE_INTEGER }).entries
-  const pending = entries.filter((entry) => typeof indexed[entry.id] !== 'string')
+  const candidates = entries.filter((entry) => typeof indexed[entry.id] !== 'string')
+  // P2：软遗忘在同步侧的差集——待索引条目先剔除遗忘记录（与插件来源排除同款：
+  // 不进索引、也不记成「已索引」）；已记进 indexed 的遗忘条目除名，T1（索引在
+  // 文件里）还要物理清除（removeDocs），否则词法命中仍会回来。T2 没有主动清除
+  // 原语（服务端语义未探针），如实报 unsupported，命中侧闸门照常拦截，换后端
+  // 重建时账面除名兜底。
+  const excludedForgottenIds = []
+  let purgeReport = null
+  if (forgetIndex) {
+    for (const entry of candidates) {
+      if (isForgotten(forgetIndex, entry.id)) excludedForgottenIds.push(entry.id)
+    }
+    const staleForgotten = []
+    for (const id of Object.keys(indexed)) {
+      if (isForgotten(forgetIndex, id)) {
+        staleForgotten.push(id)
+        delete indexed[id]
+      }
+    }
+    if (staleForgotten.length > 0) {
+      if (typeof backend.removeDocs === 'function') {
+        try {
+          const purge = await backend.removeDocs(staleForgotten)
+          purgeReport = {
+            removed: Array.isArray(purge?.removed) ? purge.removed : [],
+            absent: Array.isArray(purge?.absent) ? purge.absent : [],
+          }
+        } catch (error) {
+          purgeReport = { error: error instanceof Error ? error.message : String(error) }
+        }
+      } else {
+        purgeReport = { unsupported: true }
+      }
+    }
+  }
+  const pending = forgetIndex
+    ? candidates.filter((entry) => !isForgotten(forgetIndex, entry.id))
+    : candidates
   const indexedNow = []
   const skippedNow = []
   // D4：插件来源记录（卡片/回注包/回执的 ingest 记录、插件卡片的归档 span）不进
@@ -177,6 +224,21 @@ export async function syncRetrievalIndex({ directory, backend, store, batchSize 
       // 那等于用空索引冒充语义召回，而且没有任何报错。
       const loaded = await store.readRecord(entry.id, { verifyHash: false, maxBytes: textMaxBytes })
       const text = loaded.ok === false || typeof loaded.payloadText !== 'string' ? null : loaded.payloadText
+      // P1-7 分块索引：正文超过单块上限时继续读后续块（有界：maxChunks 块）。
+      // 覆盖字节如实披露（textCoveredBytes / textFullBytes），超上限部分不算已索引。
+      let textParts = null
+      let coveredBytes = typeof text === 'string' ? Buffer.byteLength(text) : 0
+      const fullBytes = Number.isFinite(loaded.fullBytes) ? loaded.fullBytes : 0
+      if (loaded.truncated === true && text !== null) {
+        textParts = [text]
+        for (let chunk = 1; chunk < maxChunks && coveredBytes < fullBytes; chunk += 1) {
+          const more = await store.readRecord(entry.id, { verifyHash: false, maxBytes: textMaxBytes, offsetBytes: coveredBytes })
+          if (more.ok === false || typeof more.payloadText !== 'string' || more.payloadText.length === 0) break
+          textParts.push(more.payloadText)
+          coveredBytes += Buffer.byteLength(more.payloadText)
+          if (more.truncated !== true) break
+        }
+      }
       // 旧记录兜底：正文命中插件形态（回执/卡片/回注块前缀）的不索引。截断的前缀
       // 仍足以判定（这些标记都在首行）；`text: null`（读失败）时**不**据正文排除——
       // 判定不出就按原行为交给后端，由后端如实报拒收，不能静默扩大排除面。
@@ -194,11 +256,16 @@ export async function syncRetrievalIndex({ directory, backend, store, batchSize 
         refs: entry.refs ?? {},
         inline: entry.inline ?? {},
         payload: entry.payload ?? null,
-        // 派生索引用的有界正文。`textTruncated` 为 true 时后端必须知道它只拿到前缀。
+        // 派生索引用的有界正文。`textTruncated` 为 true 时后端必须知道它只拿到片段。
         text,
-        textTruncated: loaded.truncated === true,
+        textTruncated: loaded.truncated === true && coveredBytes < fullBytes,
         textIntegrity: loaded.ok === false ? loaded.error : loaded.integrity,
         textMaxBytes,
+        // P1-7：分块后的正文块列表（单块内为 null）；后端逐块分词计入同一文档。
+        textParts,
+        // 覆盖披露：索引实际看到了多少字节 / 全文多少字节。
+        textCoveredBytes: coveredBytes,
+        textFullBytes: fullBytes,
       })
     }
     const result = await backend.index(records)
@@ -225,7 +292,21 @@ export async function syncRetrievalIndex({ directory, backend, store, batchSize 
       indexedNow.push(entry.id)
     }
   }
-  const payload = await writeRetrievalIndex(directory, { backend: backend.name, indexed })
+  // P2：本批新进索引的派生文档登记来源边（derived ← 自身记录）。批量一次落盘，
+  // 注册失败不阻断索引同步（provenance 是审计旁证，记账权威在索引文件本身）。
+  if (indexedNow.length > 0 && typeof registerProvenanceEdges === 'function') {
+    try {
+      await registerProvenanceEdges({
+        sessionDir: directory,
+        edges: indexedNow.map((id) => ({ derivedId: 'index-doc:' + id, derivedKind: 'retrieval-index', sourceIds: [id] })),
+      })
+    } catch { /* 只读/损坏时跳过注册 */ }
+  }
+  // P1-4：水位取本次同步时点 store 的最大记录 seq（含被排除的插件来源记录——
+  // 它们也是 store 状态的一部分；水位是「看到了哪」，不是「索引了哪」）。
+  const watermark = entries.reduce((max, entry) => (Number.isFinite(entry?.seq) && entry.seq > max ? entry.seq : max), 0)
+  const generation = (Number.isFinite(previous?.generation) ? previous.generation : 0) + 1
+  const payload = await writeRetrievalIndex(directory, { backend: backend.name, indexed, generation, watermark, visibilityRevision: forgetIndex ? forgetIndex.revision : null })
   return {
     backend: backend.name,
     indexedNow: indexedNow.length,
@@ -236,6 +317,11 @@ export async function syncRetrievalIndex({ directory, backend, store, batchSize 
     // D4：因插件来源被排除出索引的记录数（inline 标记 + 旧记录正文前缀兜底）。
     excludedPluginAuthored: excludedPluginAuthored.length,
     excludedPluginAuthoredIds: excludedPluginAuthored,
+    // P2：因软遗忘被排除出索引的记录数 + T1/T2 的物理清除结果。
+    excludedForgotten: excludedForgottenIds.length,
+    excludedForgottenIds,
+    purgeReport,
+    visibilityRevision: forgetIndex ? forgetIndex.revision : null,
     // 换后端时如实报告重建，避免把「从零索引」说成「增量」。
     rebuilt: !(previous && previous.backend === backend.name),
     externalIds: indexed,
@@ -248,20 +334,35 @@ export async function syncRetrievalIndex({ directory, backend, store, batchSize 
  *
  * 返回的命中**不带分数**：只带 `source` 与 `order`。排序是排序，不是置信度。
  */
-export async function searchRecords({ store, backend = null, text, limit = 20, literalMatcher }) {
+export async function searchRecords({ store, backend = null, text, exact = [], limit = 20, literalMatcher, excluded = [], forgetIndex = null }) {
   const needle = String(text ?? '').trim()
-  if (needle.length === 0) {
+  const exactTokens = (Array.isArray(exact) ? exact : [])
+    .map((token) => (typeof token === 'string' ? token.trim() : ''))
+    .filter((token) => token.length > 0)
+  if (needle.length === 0 && exactTokens.length === 0) {
     throw new EngineV2Error('检索词不能为空。', { code: 'EINVAL' })
   }
   if (typeof literalMatcher !== 'function') {
     throw new EngineV2Error('内置字面检索需要 literalMatcher(entry, needle)。', { code: 'EINVAL' })
   }
   const byId = new Map()
+  // P1-3：排除集（遗忘/会话过滤）在字面与语义两路都生效。
+  const excludedIds = new Set((Array.isArray(excluded) ? excluded : []).filter((x) => typeof x === 'string'))
+  const forgottenHitIds = new Set()
   const push = (id, source) => {
     // D4：插件来源记录不进命中面（索引同步侧已排除新写入，这里再挡一次语义后端
     // 里残留的旧索引命中——「索引同步与命中两处都过滤」）。判定不出（无标记的
     // 旧记录）按原行为保留，不静默扩大过滤面。
     if (isPluginAuthoredEntry(store.getEntry(id))) return
+    // P1-3：排除集在 push 前生效（字面与语义两路共用此闸门）。
+    if (excludedIds.has(id)) return
+    // P2 遗忘复验：excluded 是调用方时点快照，这里再对账本查一次，拦下
+    // ①T1 旧索引/字面已拦但语义后端残留的命中 ②T2 服务端无过滤的原始
+    // 命中。拦下的命中按 id 计数披露（forgottenFiltered），不静默吞。
+    if (forgetIndex && isForgotten(forgetIndex, id)) {
+      forgottenHitIds.add(id)
+      return
+    }
     const existing = byId.get(id)
     if (existing) {
       if (!existing.sources.includes(source)) existing.sources.push(source)
@@ -270,21 +371,36 @@ export async function searchRecords({ store, backend = null, text, limit = 20, l
     byId.set(id, { id, sources: [source] })
   }
   const entries = store.listEntries({ limit: Number.MAX_SAFE_INTEGER }).entries
+  // 字面探针：自由词 + 精确标识符/引号短语各自探一次（query-plan 的两通道在
+  // 字面检索侧同样成立——标识符按字面全文命中，自由词按整句子串命中）。
+  const probes = [...new Set([needle, ...exactTokens])].filter((probe) => probe.length > 0)
   for (const entry of entries) {
     if (isPluginAuthoredEntry(entry)) continue
-    if (literalMatcher(entry, needle)) push(entry.id, RETRIEVAL_SOURCES.INDEX)
+    if (probes.some((probe) => literalMatcher(entry, probe))) push(entry.id, RETRIEVAL_SOURCES.INDEX)
   }
   let semanticUsed = false
   let semanticError = null
+  let staleDropped = 0
+  // P1-4 索引代际握手：读索引的 generation/watermark，对照当前 store 的最大 seq。
+  // 索引落后时如实报 lag（滞后多少条记录），不把同步时点冒充现在；旧格式索引
+  // 无水位（watermark 非Finite）时 lag 记 null——覆盖范围未知，不猜。
+  const index = backend ? await readRetrievalIndex(store.directory) : null
+  const indexGeneration = index && Number.isFinite(index.generation) ? index.generation : null
+  const indexWatermark = index && Number.isFinite(index.watermark) ? index.watermark : null
+  const laggedRecords = indexWatermark === null ? null : entries.reduce((count, entry) => (Number.isFinite(entry?.seq) && entry.seq > indexWatermark ? count + 1 : count), 0)
   if (backend) {
     assertBackendContract(backend)
     try {
-      const hits = await backend.query(needle, { limit })
+      // P1-3 过滤前移 + 有界补取：排除集（遗忘/会话过滤）在 top-k 前就传给后端，
+      // T1 直接跳过这些文档；T2 服务端过滤不了，就按 limit+补取量超量取回、
+      // 客户端复验后再截断。渲染前 push() 仍会逐条复验（不信任后端过滤）。
+      // P2：遗忘集合同样计入超量取回（T2 服务端不知道遗忘，只能客户端拦）。
+      const fetchLimit = Math.max(1, limit) + excludedIds.size + (forgetIndex ? forgetIndex.forgotten.size : 0)
+      const hits = await backend.query(needle, { limit: fetchLimit, exact: exactTokens, exclude: [...excludedIds] })
       // 只有查询真的成功返回才把这一路记成「用过」：抛错时标 true 会让上层
       // 把一次失败的语义调用渲染成 `literal+semantic`，等于给降级结果贴上语义标签。
       semanticUsed = true
       // backend 返回外部 ID 时用记账表换回本会话记录 ID；换不回来的丢弃（不猜）。
-      const index = await readRetrievalIndex(store.directory)
       const reverse = new Map()
       if (index && index.backend === backend.name) {
         for (const [recordId, externalId] of Object.entries(index.indexed)) {
@@ -304,11 +420,18 @@ export async function searchRecords({ store, backend = null, text, limit = 20, l
       semanticError = error instanceof Error ? error.message : String(error)
     }
   }
-  const records = [...byId.values()].slice(0, Math.max(1, limit)).map((hit, order) => ({
-    ...hit,
-    order,
-    entry: store.getEntry(hit.id),
-  }))
+  // P1-3 渲染前复验：命中的 id 在索引异步变更（遗忘、会话退出、并发同步）
+  // 后可能已不在 store 里。返回前逐条重取，取不到的如实丢弃并计数，
+  // 绝不把陈旧命中当有效结果渲染。
+  const ordered = [...byId.values()].slice(0, Math.max(1, limit))
+  const records = ordered.flatMap((hit, order) => {
+    const entry = store.getEntry(hit.id)
+    if (!entry) {
+      staleDropped += 1
+      return []
+    }
+    return [{ ...hit, order, entry }]
+  })
   return {
     query: needle,
     records,
@@ -316,6 +439,18 @@ export async function searchRecords({ store, backend = null, text, limit = 20, l
     truncated: byId.size > records.length,
     semanticUsed,
     semanticError,
+    // P1-3：复验时丢弃的陈旧命中数（渲染前从 store 取不到的 id）。
+    staleDropped,
+    // P1-4：索引代际观测——generation/watermark/lag（null = 旧格式索引无水位，覆盖未知）。
+    indexGeneration,
+    indexWatermark,
+    laggedRecords,
+    // P2：遗忘观测——push 闸门拦下的遗忘命中（0 = 无遗忘或遗忘集为空），
+    // 以及查询时点的账本 revision 与索引文件记录的 revision（旧格式无值）。
+    forgottenFiltered: forgottenHitIds.size,
+    forgottenFilteredIds: [...forgottenHitIds].sort(),
+    visibilityRevision: forgetIndex ? forgetIndex.revision : null,
+    indexVisibilityRevision: index && Number.isFinite(index.visibilityRevision) ? index.visibilityRevision : null,
     sources: [...new Set(records.flatMap((record) => record.sources))],
   }
 }

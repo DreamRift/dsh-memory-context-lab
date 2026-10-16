@@ -338,6 +338,10 @@ test('the projection rebuilds settings from the session log, not from plugin mem
     fullHistory: false,
     planFirst: false,
     planActive: false,
+    // P4：v2 层级压缩与模型模式折叠位。v1 会话恒为 false（字段固定存在，
+    // 避免 schema 随引擎切换漂移——与 fullHistory 同一口径）。
+    hierarchyCompress: false,
+    compressModel: false,
     archived: 0,
     restored: 0,
     revision: lines.length,
@@ -624,6 +628,34 @@ test('B3: a restore-skipped row keeps the cold store from being purged by off', 
     assert.ok(off.text.includes('/memory-lab clean confirm delete-session'), 'off must hand the delete path back (B3: it was stolen by `removed`)')
     assert.equal(off.text.includes('清除了本会话的插件隔离数据'), false, 'off must not claim the store was removed')
     assert.ok(await readSessionState(labRoot, sessionId), 'the only copy of the originals must survive the stop')
+    await second._dispose()
+  })
+})
+
+test('P0-2: restore retries restore-skipped rows and reports the final outcome honestly', async () => {
+  await withTempLab('p02retry', async (labRoot) => {
+    const sessionId = 'session-p02-retry-01'
+    const first = await harness({ labRoot })
+    const session = buildSession({ operations: 1, id: sessionId })
+    const { agent } = agentFor(session)
+    await run(first, agent, 'on')
+    // 上一次 restore 失败留下的持久化行（冷节点缺失是最常见故障）。P0-2 语义：
+    // restore-skipped 不是终态——再次执行 restore 必须重试，且重试的结局要写
+    // 进回执，不能把「重试后仍跳过」报告成「从没有回执」。
+    const found = await readSessionState(labRoot, sessionId)
+    found.state.archive.push(receipt('restore-skipped: 回执正文已变化'))
+    await writeSessionState(found.directory, found.state)
+    await first._dispose()
+
+    const second = await harness({ labRoot })
+    const restore = await run(second, agent, 'restore')
+    assert.equal(restore.kind, 'success', restore.text)
+    assert.ok(restore.text.includes('重试了 1 个上次跳过的回执'), `restore must report the retry, got: ${restore.text}`)
+    assert.ok(restore.text.includes('仍无法恢复'), `restore must report rows that stayed skipped, got: ${restore.text}`)
+    // 行没有消失也没有被降级为 unknown：跳过行保留为跳过（下一次 restore 还会重试）。
+    const after = await readSessionState(labRoot, sessionId)
+    const skippedRows = after.state.archive.filter((row) => typeof row?.status === 'string' && row.status.startsWith('restore-skipped'))
+    assert.equal(skippedRows.length, 1, `the skipped row must stay on disk, got: ${JSON.stringify(after.state.archive)}`)
     await second._dispose()
   })
 })

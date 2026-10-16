@@ -124,3 +124,40 @@ test('auto mode keeps the existing degradation semantics (guard against regressi
   assert.equal(outcome.fallback, LOCAL_LEXICAL_BACKEND_NAME)
   assert.equal(provider.precheck().ok, true, 'auto must not fail the precheck even when lingshu is absent')
 })
+
+test('P1-5 探测一次固定：同会话重复 ensure 不再重握手，close 后重新探测', async () => {
+  let ensureCalls = 0
+  const lingshuStub = {
+    describe: () => ({ name: 'lingshu-mdcg-receipt', sessions: 0 }),
+    backendFor: () => null,
+    failureReason: () => null,
+    async ensureBackend() { ensureCalls += 1; return { ok: false, reason: '瞬断' } },
+    async close() {},
+  }
+  const provider = createCompositeRetrievalBackendProvider({ lingshu: lingshuStub })
+  const first = await provider.ensureBackend({ sessionId: 's8', storeRoot: 'D:\tmp\store' })
+  const second = await provider.ensureBackend({ sessionId: 's8', storeRoot: 'D:\tmp\store' })
+  assert.equal(ensureCalls, 1, '同一会话第二次 ensure 不重复探测（缓存命中）')
+  assert.equal(first.ok, true)
+  assert.equal(second.fallback, LOCAL_LEXICAL_BACKEND_NAME)
+  await provider.close('s8')
+  await provider.ensureBackend({ sessionId: 's8', storeRoot: 'D:\tmp\store' })
+  assert.equal(ensureCalls, 2, 'close 清除缓存后允许重新探测')
+})
+
+test('P1-5 forced 模式同样缓存失败：重复 ensure 不反复握手', async () => {
+  let ensureCalls = 0
+  const lingshuStub = {
+    describe: () => ({ name: 'lingshu-mdcg-receipt', sessions: 0 }),
+    backendFor: () => null,
+    failureReason: () => null,
+    async ensureBackend() { ensureCalls += 1; return { ok: false, reason: '握手失败' } },
+    async close() {},
+  }
+  const provider = createCompositeRetrievalBackendProvider({ lingshu: lingshuStub, forcedMode: 'lingshu-mdcg-receipt' })
+  const forced = await provider.ensureBackend({ sessionId: 's9', storeRoot: 'D:\tmp\store' })
+  await provider.ensureBackend({ sessionId: 's9', storeRoot: 'D:\tmp\store' })
+  assert.equal(ensureCalls, 1)
+  assert.equal(forced.ok, false)
+  assert.equal(forced.code, 'EBACKENDPINGFAIL')
+})

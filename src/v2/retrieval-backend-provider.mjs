@@ -38,6 +38,27 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
     return entry.backend
   }
 
+  const probeCache = new Map()
+
+  async function resolveBackend({ sessionId, storeRoot, signal }) {
+    if (forceLingshu) {
+      if (!lingshu) {
+        return { ok: false, code: 'EBACKENDUNAVAILABLE', reason: '已显式指定 lingshu-mdcg-receipt，但灵枢后端不可用（dsh-memory 不在场或模块加载失败）' }
+      }
+      const attempted = await lingshu.ensureBackend({ sessionId, storeRoot, signal })
+      if (attempted.ok) return attempted
+      return { ok: false, code: 'EBACKENDPINGFAIL', reason: `已显式指定 lingshu-mdcg-receipt，灵枢后端握手失败：${attempted.reason ?? 'unknown'}` }
+    }
+    if (!forceLocal && lingshu) {
+      const attempted = await lingshu.ensureBackend({ sessionId, storeRoot, signal })
+      if (attempted.ok) return attempted
+      const backend = localBackendFor({ sessionId, storeRoot })
+      logger?.warn?.('检索后端降级：灵枢后端不可用（' + (attempted.reason ?? 'unknown') + '），改用本地词法索引。')
+      return { ok: true, backend, reason: attempted.reason ?? null, fallback: LOCAL_LEXICAL_BACKEND_NAME }
+    }
+    return { ok: true, backend: localBackendFor({ sessionId, storeRoot }), reason: forceLocal ? '已显式指定 local-lexical-v1，不尝试灵枢后端' : null }
+  }
+
   function describe() {
     const lingshuDescribe = lingshu?.describe?.() ?? null
     // D1（0.9.0-rc.6）：顶层 name/capabilities 必须报「当前实际生效」的后端。
@@ -72,24 +93,19 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
       return localBackendFor({ sessionId, storeRoot })
     },
 
-    /** 显式启动：auto 先试 T2、失败降级 T1；强制 T2 时握手失败返回 ok:false + EBACKENDPINGFAIL，不降级。 */
+    /** 显式启动：auto 先试 T2、失败降级 T1；强制 T2 时握手失败返回 ok:false + EBACKENDPINGFAIL，不降级。
+     *
+     * P1-5 探测一次固定：auto/forced 的探测结果（成功或失败）按会话缓存，
+     * 后续 ensure 不再重复起 T2 握手——失败每轮重试会让回注路径反复付握手
+     * 成本并打满日志。缓存随 close(sessionId) 失效；重启会话或重新 /memory-lab2
+     * index（close 后）即重新探测。代价是瞬断会被记住到会话结束，这在状态面
+     * 上有 failureReason 如实可见，不算静默。 */
     async ensureBackend({ sessionId, storeRoot, signal }) {
-      if (forceLingshu) {
-        if (!lingshu) {
-          return { ok: false, code: 'EBACKENDUNAVAILABLE', reason: '已显式指定 lingshu-mdcg-receipt，但灵枢后端不可用（dsh-memory 不在场或模块加载失败）' }
-        }
-        const attempted = await lingshu.ensureBackend({ sessionId, storeRoot, signal })
-        if (attempted.ok) return attempted
-        return { ok: false, code: 'EBACKENDPINGFAIL', reason: `已显式指定 lingshu-mdcg-receipt，灵枢后端握手失败：${attempted.reason ?? 'unknown'}` }
-      }
-      if (!forceLocal && lingshu) {
-        const attempted = await lingshu.ensureBackend({ sessionId, storeRoot, signal })
-        if (attempted.ok) return attempted
-        const backend = localBackendFor({ sessionId, storeRoot })
-        logger?.warn?.('检索后端降级：灵枢后端不可用（' + (attempted.reason ?? 'unknown') + '），改用本地词法索引。')
-        return { ok: true, backend, reason: attempted.reason ?? null, fallback: LOCAL_LEXICAL_BACKEND_NAME }
-      }
-      return { ok: true, backend: localBackendFor({ sessionId, storeRoot }), reason: forceLocal ? '已显式指定 local-lexical-v1，不尝试灵枢后端' : null }
+      const cached = probeCache.get(sessionId)
+      if (cached) return cached
+      const outcome = await resolveBackend({ sessionId, storeRoot, signal })
+      probeCache.set(sessionId, outcome)
+      return outcome
     },
 
     /** 只读：T2 的失败原因原样透出（T1 无失败态——构造即就绪）。 */
@@ -99,6 +115,7 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
 
     async close(sessionId) {
       localEntries.delete(sessionId)
+      probeCache.delete(sessionId)
       await lingshu?.close?.(sessionId)
     },
 

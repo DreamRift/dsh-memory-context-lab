@@ -13,10 +13,12 @@
  *   两条路径共用 `searchRecords`，因此后端形状、外部 ID 映射与降级语义完全一致 ——
  *   自动回注和模型主动读取不会出现「一边接了灵枢、另一边只做关键词」的分裂。
  */
-import { V2SessionStore } from './store.mjs'
+import { V2SessionStore, v2SessionDirectoryFor } from './store.mjs'
 import { RECORD_KINDS, draftRecord } from './records.mjs'
 import { SPAN_KINDS, spanLabelOf } from './history.mjs'
 import { INDEX_TEXT_MAX_BYTES, isPluginAuthoredEntry, pluginAuthoredBody, searchRecords } from './retrieval.mjs'
+import { planQuery } from './query-plan.mjs'
+import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { coldRecordContent } from '../core.mjs'
 
 const ARCHIVED_TAG = 'archived'
@@ -146,6 +148,15 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
     return sharedStore
   }
 
+  /** P2 软遗忘：读面统一按 disposition 账本过滤（账本 = 唯一权威）。getForgetIndex
+   * 自带按文件大小失效的进程缓存；账本损坏时返回带 damaged 标记的索引而不抛错
+   * —— 读面带告警继续，写面（forget/undo）才失败关闭。 */
+  const sessionDir = v2SessionDirectoryFor(labRoot, sessionId)
+
+  async function currentForgetIndex() {
+    return getForgetIndex(sessionDir)
+  }
+
   async function releaseStore() {
     if (sharedStore !== null) {
       const store = sharedStore
@@ -189,6 +200,13 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           // 同 nodeId 不同哈希按冷写冲突失败关闭，绝不覆盖。
           const existing = findSpanEntry(store, nodeId)
           if (existing) {
+            // P2：已遗忘的跨度不再复用——write-once 的「复用等于可读」会把已遗忘
+            // 内容的可读性声明写回表面；重写同一 nodeId 同样拒绝，undo 恢复可见性
+            // 后原有载荷原样可用，不需要新冷写。
+            const forgetIndex = await currentForgetIndex()
+            if (isForgotten(forgetIndex, existing.id)) {
+              throw new Error(`v2 冷写拒绝：node ${nodeId} 已被软遗忘（forget undo 后可恢复）`)
+            }
             if (existing.inline?.contentHash && contentHash && existing.inline.contentHash !== contentHash) {
               throw new Error(`v2 冷写冲突：node ${nodeId} 已持有不同内容（write-once 保护）`)
             }
@@ -245,6 +263,12 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           if (!match) {
             return { ok: false, error: 'not-found' }
           }
+          // P2：已遗忘的跨度不回正文——getNode 是冷库正文的唯一精确回源口，
+          // 恢复守卫在 runRestore，这里挡的是「按 nodeId 直接要原文」的旁路。
+          const forgetIndex = await currentForgetIndex()
+          if (isForgotten(forgetIndex, match.id)) {
+            return { ok: false, error: 'forgotten' }
+          }
           const loaded = await store.readRecord(match.id)
           if (!loaded.ok || typeof loaded.payloadText !== 'string') {
             return { ok: false, error: loaded.integrity ?? 'unreadable' }
@@ -273,8 +297,15 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           // 有界读取成本可控）。人类消息与工具操作的 span 照常参与。
           const spanEntries = []
           const excludedSpans = []
+          const forgottenSpans = []
+          const forgetIndex = await currentForgetIndex()
           for (const entry of entries) {
             if (!isArchivedSpan(entry)) continue
+            // P2：遗忘的 span 不进回注候选面（计数单列，不与插件来源混算）。
+            if (isForgotten(forgetIndex, entry.id)) {
+              forgottenSpans.push(entry.id)
+              continue
+            }
             if (isPluginAuthoredEntry(entry)) {
               excludedSpans.push(entry.id)
               continue
@@ -290,44 +321,70 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           const spans = spanEntries
           const byId = new Map(spans.map((entry) => [entry.id, entry]))
           const bounded = Math.max(1, limit)
-          const needle = typeof query === 'string' ? query.trim() : ''
+          const rawNeedle = typeof query === 'string' ? query.trim() : ''
+          // P1-1 查询规划：ID/路径/调用标识与引号短语走精确通道（AND、无门槛），
+          // 剩余自然语言作为自由词元走 OR 召回 + 相关门槛。
+          const plan = planQuery(rawNeedle)
+          const needle = plan.text
 
           // 有查询词时走与工具面**同一条**多路检索；无词时按时间倒序取最近。
           // 语义后端未启动时 `backendFor` 返回 null，这里如实退化为字面匹配。
           let matched = []
           let matchedBy = 'recency'
           let semanticError = null
-          if (needle.length > 0) {
+          let indexLag = null
+          let indexGeneration = null
+          if (needle.length > 0 || plan.exact.length > 0) {
             const found = await searchRecords({
               store,
               backend: typeof backendFor === 'function' ? backendFor() : null,
               text: needle,
+              exact: plan.exact,
               limit: bounded,
               literalMatcher: (entry, text) => spanHaystackOf(entry).includes(text.toLowerCase()),
+              // P2：检索通道同口径过滤遗忘记录（searchRecords 命中前剔除 + 计数）。
+              forgetIndex,
             })
             matchedBy = found.semanticUsed ? 'literal+semantic' : 'literal'
             semanticError = found.semanticError ?? null
+            // P1-4 索引滞后披露：检索结果可能落后于库（同步间隙），如实带出
+            // lag 计数供回注口径使用——命中不因滞后作废，但「没有更多信息」
+            // 不冒充「库里只有这些」。
+            indexLag = found.laggedRecords ?? null
+            indexGeneration = found.indexGeneration ?? null
             // 只自动回注归档跨度：普通历史段的原文由模型按 ID 主动读取。
             matched = found.records.map((hit) => byId.get(hit.id)).filter(Boolean)
           }
-          // 查询无命中时退回最近跨度，保证回注不空转（v1 recall 同语义）。但退回必须
-          // **如实自报家门**：命中为空是「没有相关记录」，最近 N 条是「时间上最近」，
-          // 两者在模型面前不能长得一样（审计 P2-5(b)：4 个回注块逐字节相同，而前缀却
-          // 宣称它们「与当前问题相关」）。所以退回结果带上非相关的固定说明，并回显本次
-          // 查询词——这样「没命中」这件事不会被冒充成「相关命中」，不同问题也不会得到
-          // 逐字节相同的块。
-          const fellBack = matched.length === 0 && spans.length > 0
-          if (fellBack) {
-            matched = spans.slice(-bounded)
-            matchedBy = needle.length > 0 ? 'recency-fallback' : 'recency'
+          if (needle.length === 0 && plan.exact.length === 0) {
+            // 无查询词：显式浏览语义，最近归档 span 倒序列出（插件卡已计入
+            // excludedSpans 并排除，此处只剩人类/工具侧 span）。
+            matched = spans.slice(-bounded).reverse()
+          }
+          // P1-8 no-match 零正文（用户拍板 2026-10-16）：有查询词而无命中时返回空
+          // 命中，不再按时间倒序退回最近记录——「退回最近」会把无关内容装成相关
+          // 证据注入活动面。无查询词的 recall 是显式浏览语义，保留最近列表。
+          if ((needle.length > 0 || plan.exact.length > 0) && matched.length === 0) {
+            // P1-6 状态区分：零命中先分清「为什么是零」，再报 matchedBy。
+            // 语义后端失败且字面也没命中时不能宣称 no-match（检索面不完整）。
+            const humanSpans = spans.length - excludedSpans.length
+            // P2：零命中区分第五种成因——候选只有遗忘记录（区别于「还没有任何
+            // 归档」与「全被插件来源过滤」）。混合场景仍报 no-match，由
+            // excludedForgotten 计数披露遗忘贡献，不冒充「库里没有」。
+            matchedBy = humanSpans === 0 && excludedSpans.length > 0
+              ? 'all-filtered'
+              : spans.length === 0 && forgottenSpans.length > 0
+                ? 'forgotten'
+                : spans.length === 0
+                  ? 'not-ready'
+                  : semanticError
+                    ? 'backend-error'
+                    : 'no-match'
           }
           // 逐条正文里不重复自报（那是每条的噪声）；块首声明一次即可。检索口径必须
           // 出现在注入文本里，而不是只留在返回值字段里：模型看到的就是这段文本。
-          const basisNote = !fellBack
-            ? `（以下为与问题「${needle}」的检索命中，来源：${matchedBy === 'literal+semantic' ? '字面索引 + 语义后端' : '内置字面索引'}。）`
-            : (needle.length > 0
-              ? `（以下为最近归档记录，**不是**与问题「${needle}」的相关命中：本次检索没有任何记录匹配该问题，故按时间倒序退回最近 ${Math.min(bounded, spans.length)} 条。${semanticError ? `语义检索后端不可用：${semanticError}。` : ''}）`
-              : '（以下为最近归档记录，按时间倒序列出；本次没有查询词，未做相关性检索。）')
+          const basisNote = needle.length === 0 && plan.exact.length === 0
+            ? '（以下为最近归档记录，按时间倒序列出；本次没有查询词，未做相关性检索。）'
+            : `（以下为与问题「${rawNeedle}」的检索命中，来源：${matchedBy === 'literal+semantic' ? '字面索引 + 语义后端' : '内置字面索引'}${indexLag && indexLag > 0 ? `；索引落后于库 ${indexLag} 条记录（第 ${indexGeneration} 代），未覆盖的记录不参与命中` : ''}。）`
           const hits = matched
             .slice(-bounded)
             .reverse()
@@ -364,7 +421,8 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           // matchedBy/semanticError 如实透出：调用方据此知道本次是字面命中还是
           // 语义命中、后端是否报错，而不是笼统地把两者都说成「检索到了」。
           // excludedPluginAuthored 同理：因插件来源被挡在回注面之外的 span 数（D4）。
-          return { hits, matchedBy, semanticError, excludedPluginAuthored: excludedSpans.length }
+          // excludedForgotten：被软遗忘挡在回注面之外的 span 数（P2 读面统一可见性）。
+          return { hits, matchedBy, semanticError, indexLag, indexGeneration, excludedPluginAuthored: excludedSpans.length, excludedForgotten: forgottenSpans.length }
         },
 
         async probeReceiptView() {

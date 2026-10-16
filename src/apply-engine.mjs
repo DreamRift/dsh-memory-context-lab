@@ -273,7 +273,7 @@ export function restoreSkippedReceipts(record) {
 }
 
 export function createEngine(dependencies) {
-  const { persist, nodeIdFor, hostVersion, services, logger } = dependencies
+  const { persist, nodeIdFor, hostVersion, services, logger, isForgottenRow } = dependencies
 
   /** The live settings for one record, normalized. */
   function settingsOf(record) {
@@ -929,26 +929,78 @@ export function createEngine(dependencies) {
     }
   }
 
-  /** Restore every receipt whose cold record and surface are still exact. */
+  /**
+   * Restore every receipt whose cold record and surface are still exact.
+   *
+   * P0-2（依赖状态与尝试状态分离）：一次失败的 restore 只改「尝试状态」——行变成
+   * `restore-skipped: <原因>`，不改「依赖状态」：回执仍遮着活动面、原文仍只在冷库。
+   * 因此本函数把**上次跳过的行**并入本次的行集合重试：故障解除（冷库进程恢复、
+   * 文件重新可读）后无需任何额外操作，下一次 restore 就能取回；永久性跳过原因
+   * （回执被改写等）会在重试里以同样原因再次跳过，无副作用。
+   */
   async function restoreAll(record) {
-    const rows = pendingReceipts(record)
-    if (!rows.length) return { outcomes: [], restored: 0 }
+    const retriedRows = restoreSkippedReceipts(record)
+    const rows = [...pendingReceipts(record), ...retriedRows]
+    // P2 报告口径：遗忘行已从 pendingReceipts 退役（不阻塞 off 清理），但
+    // restore 的报告仍要如实点名它们——「没有可恢复的回执」与「还有 N 段
+    // 被软遗忘拦着」是两个事实。这里按行状态投影计数，权威判定仍在 isForgottenRow。
+    const forgottenArchived = (Array.isArray(record?.state?.archive) ? record.state.archive : [])
+      .filter((row) => row.status === 'forgotten').length
+    if (!rows.length) return { outcomes: [], restored: 0, retriedSkipped: 0, stillSkipped: 0, forgotten: forgottenArchived }
+    // P2 软遗忘：遗忘行不进入恢复——可见性权威在 disposition 旁车账本，
+    // 行级状态只是投影（账本已提交、行状态尚未收口的崩溃窗口也拦得住）。
+    // 被拦下的行以 forgotten 结局如实披露，并指路 forget undo。
+    const forgottenOutcomes = []
+    const aliveRows = typeof isForgottenRow === 'function' ? [] : rows
+    if (typeof isForgottenRow === 'function') {
+      for (const row of rows) {
+        if (await isForgottenRow(record, row)) {
+          forgottenOutcomes.push({
+            rangeStart: row.rangeStart,
+            rangeEnd: row.rangeEnd,
+            nodeId: row.nodeId,
+            state: 'forgotten',
+            reason: '软遗忘生效中：先 /memory-lab2 forget undo 撤销遗忘，再 restore 回注原文',
+          })
+        } else {
+          aliveRows.push(row)
+        }
+      }
+    }
+    if (!aliveRows.length) {
+      return {
+        outcomes: forgottenOutcomes,
+        restored: 0,
+        retriedSkipped: retriedRows.length,
+        stillSkipped: 0,
+        forgotten: Math.max(forgottenOutcomes.length, forgottenArchived),
+      }
+    }
     const client = await ensureClient(record)
-    const outcomes = await restoreReceipts({
+    const outcomes = [...forgottenOutcomes, ...await restoreReceipts({
       session: record.agent.session,
       client,
-      receipts: rows,
+      receipts: aliveRows,
       receiptMarker: dependencies.receiptMarker ?? RECEIPT_MARKER,
-    })
+    })]
     for (const outcome of outcomes) {
+      if (outcome.state === 'forgotten') continue
       const stored = record.state.archive.find((row) => row.rangeStart === outcome.rangeStart
-        && (row.status === 'applied' || row.status === 'verify-failed'))
+        && (row.status === 'applied' || row.status === 'verify-failed' || row.status.startsWith('restore-skipped')))
       if (!stored) continue
       stored.status = outcome.state === 'restored' ? 'restored' : `restore-skipped: ${outcome.reason}`
       if (outcome.state === 'restored') stored.restoredSeq = outcome.restoredSeq
     }
     await persist(record)
-    return { outcomes, restored: outcomes.filter((outcome) => outcome.state === 'restored').length }
+    const stillSkippedSet = new Set(restoreSkippedReceipts(record).map((row) => row.rangeStart))
+    return {
+      outcomes,
+      restored: outcomes.filter((outcome) => outcome.state === 'restored').length,
+      retriedSkipped: retriedRows.length,
+      stillSkipped: restoreSkippedReceipts(record).length,
+      stillRetried: retriedRows.filter((row) => stillSkippedSet.has(row.rangeStart)).length,
+      forgotten: Math.max(forgottenOutcomes.length, forgottenArchived),
+    }
   }
 
   /**
@@ -1094,6 +1146,19 @@ export function createEngine(dependencies) {
     }
     const stillVisible = pruneRecallDeliveries(record)
     const fresh = normalized.summaries.filter((hit) => !stillVisible.has(hit.id))
+    // P1-6：零命中时区分「检索面就绪但无关」与「还没归档／全被过滤／后端失败」。
+    // 后端在 payload.matchedBy 上给出细分（v2 client-adapter），旧客户端无此字段
+    // 时按 v1 语义保守归为 no-match——不把未知伪装成已知。
+    if (normalized.summaries.length === 0) {
+      const detail = payload && typeof payload === 'object' && typeof payload.matchedBy === 'string' ? payload.matchedBy : ''
+      const zeroStatus = detail === RECALL_STATUS.NOT_READY || detail === RECALL_STATUS.ALL_FILTERED || detail === RECALL_STATUS.BACKEND_ERROR
+        ? detail
+        : RECALL_STATUS.NO_MATCH
+      const zeroReason = zeroStatus === RECALL_STATUS.BACKEND_ERROR
+        ? String(payload?.semanticError ?? 'semantic backend failed')
+        : ''
+      return { text: '', hits: [], status: zeroStatus, reason: zeroReason, skippedVisible: 0 }
+    }
     const digest = digestRecall(fresh)
     return {
       text: digest.text,
@@ -1214,9 +1279,22 @@ export function createEngine(dependencies) {
     }
   }
 
-  /** `/memory-lab restore`. */
+  /**
+   * `/memory-lab restore`.
+   *
+   * P0-2：冷库瞬断是 restore 失败的最常见原因，而 `ensureClient` 会把创建失败
+   * 缓存在 `record.clientError`——不重置它，同一进程内之后的每次 restore 都会永久
+   * 失败，故障解除也不会自愈。命令通道自动重试一次：重置缓存的创建失败后再跑一
+   * 遍；仍失败就把最终结局原样交给调用方报告，不吞错、不谎报成功。
+   */
   async function runRestore(record) {
-    const result = await restoreAll(record)
+    let result
+    try {
+      result = await restoreAll(record)
+    } catch (error) {
+      record.clientError = null
+      result = await restoreAll(record)
+    }
     return {
       kind: 'success',
       text: formatRestoreReport(result),
@@ -1224,6 +1302,11 @@ export function createEngine(dependencies) {
       // 不该去解析人类可读文本。
       restored: result.restored,
       before: result.outcomes.length,
+      // P0-2 观测：本次重试了多少个上次跳过的行、其中多少行仍跳过。
+      retriedSkipped: result.retriedSkipped ?? 0,
+      stillSkipped: result.stillSkipped ?? 0,
+      // P2 观测：因软遗忘被拦下、未进入恢复的行数（先 forget undo 才能回注）。
+      forgotten: result.forgotten ?? 0,
     }
   }
 
@@ -1253,7 +1336,17 @@ export function createEngine(dependencies) {
       if (!last.hits && !last.skippedVisible) parts.push('冷库正常应答但没有匹配记录（这是"未命中"，不是读取失败）')
       return [`${head}：${parts.join('；')}。`]
     }
-    const label = last.status === RECALL_STATUS.UNAVAILABLE ? '冷库不可用（调用失败）' : '冷库拒绝读取（不支持该视图）'
+    const label = last.status === RECALL_STATUS.UNAVAILABLE ? '冷库不可用（调用失败）'
+      : last.status === RECALL_STATUS.UNSUPPORTED ? '冷库拒绝读取（不支持该视图）'
+      : last.status === RECALL_STATUS.NOT_READY ? '冷库还没有可检索的归档（尚未归档，不是无关）'
+      : last.status === RECALL_STATUS.ALL_FILTERED ? '命中全部是插件自产物，按策略不回注'
+      : last.status === RECALL_STATUS.BACKEND_ERROR ? '语义后端失败且字面无命中，检索面不完整'
+      : '检索面就绪但没有匹配记录（无关查询，零注入）'
+    if (last.status === RECALL_STATUS.NO_MATCH || last.status === RECALL_STATUS.NOT_READY
+      || last.status === RECALL_STATUS.ALL_FILTERED || last.status === RECALL_STATUS.BACKEND_ERROR) {
+      const tail = last.reason ? `——${last.reason}` : ''
+      return [`${head}：${label}${tail}。`]
+    }
     return [`${head}：${label}——${last.reason || '原因未记录'}。这不等于"没有相关信息"。`]
   }
 
@@ -1372,6 +1465,7 @@ export function createEngine(dependencies) {
   return {
     settingsOf,
     pendingReceipts,
+    restoreSkippedReceipts,
     measureOccupancy,
     runBatch,
     runAutoCooling,

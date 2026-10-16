@@ -1,5 +1,6 @@
-import { V2SessionStore } from './store.mjs'
+import { V2SessionStore, v2SessionDirectoryFor } from './store.mjs'
 import { EngineV2Error } from './errors.mjs'
+import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { BYTES_PER_TOKEN } from './budget.mjs'
 import { readForkMap } from './fork.mjs'
 import { RECORD_KINDS } from './records.mjs'
@@ -38,6 +39,15 @@ function estimateTokens(bytes) {
 export async function readRecordById(labRoot, sessionId, id, { verifyHash = true, store: borrowed = null, maxBytes = null } = {}) {
   const store = borrowed ?? await V2SessionStore.open({ labRoot, sessionId, readOnly: true })
   try {
+    // 主动遗忘守卫：遗忘记录不再按 ID 回读正文。账本是唯一权威；损坏的账本
+    // 仍按已解析前缀过滤（读侧不因旁车损坏而硬失败），损坏披露由状态面负责。
+    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId))
+    if (isForgotten(forgetIndex, id)) {
+      throw new EngineV2Error(`记录 ${id} 已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
+        code: 'EFORGOTTEN',
+        details: { id },
+      })
+    }
     const loaded = await store.readRecord(id, { verifyHash, maxBytes })
     if (!loaded?.ok) {
       // fork 迁移后的旧 ID 回源：父 namespace 的 ID 通过 fork-map 解析到子 ID。
@@ -46,6 +56,12 @@ export async function readRecordById(labRoot, sessionId, id, { verifyHash = true
       if (mapped) {
         const retried = await store.readRecord(mapped, { verifyHash, maxBytes })
         if (retried?.ok) {
+          if (isForgotten(forgetIndex, mapped)) {
+            throw new EngineV2Error(`记录 ${id}（fork 解析为 ${mapped}）已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
+              code: 'EFORGOTTEN',
+              details: { id, mapped },
+            })
+          }
           assertIntegrityAcceptable(retried, { id: mapped, verifyHash })
           const verified = retried.integrity === 'no-payload' || (verifyHash && retried.integrity === 'ok')
           return { ...retried, verified, requestedId: id, resolvedVia: 'fork-map' }
@@ -100,10 +116,49 @@ export async function listRecordsPage(labRoot, sessionId, { pageSize = 200, afte
   const size = Math.min(Math.max(Number(pageSize) || 200, 1), 2000)
   const store = borrowed ?? await V2SessionStore.open({ labRoot, sessionId, readOnly: true })
   try {
-    const { entries, nextAfter, total } = store.listEntries({ afterId, limit: size, kinds })
-    // 装满一页才假定还有更多；短页/空页即终止。
-    const hasNextPage = entries.length === size && total > entries.length
-    return { entries, pageSize: size, nextAfter, hasNextPage, total }
+    // 遗忘记录不进列表：原始分页逐页拉取、过滤后补足一页可见条目；
+    // forgottenCount 只计本页补页过程中被过滤的条数（逐页累计，非全库总数）。
+    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId))
+    const visible = []
+    let cursor = afterId
+    let forgottenCount = 0
+    let rawTotal = null
+    let lastExamined = afterId
+    for (;;) {
+      const { entries, nextAfter, total } = store.listEntries({ afterId: cursor, limit: size, kinds })
+      // total 语义沿用单批契约：从起始 afterId 起的剩余总数（含隐藏）。只在
+      // 首个非空批次捕获——补页循环末尾的空批会把 total 报成 0，覆盖真实值。
+      if (rawTotal === null && entries.length > 0) rawTotal = total
+      if (entries.length === 0) {
+        // 空批＝目录翻完：nextAfter 归 null（hasNextPage false），与原分页契约一致。
+        cursor = null
+        break
+      }
+      let overflowAt = -1
+      for (let i = 0; i < entries.length; i += 1) {
+        if (visible.length >= size) {
+          overflowAt = i
+          break
+        }
+        const entry = entries[i]
+        lastExamined = entry.id
+        if (isForgotten(forgetIndex, entry.id)) {
+          forgottenCount += 1
+          continue
+        }
+        visible.push(entry)
+      }
+      // 游标停在已检视的最后一条；未检视者留给下一页，不跳过也不重复。
+      cursor = lastExamined
+      if (overflowAt !== -1) break
+      if (visible.length >= size) break
+      if (nextAfter === null) {
+        cursor = null
+        break
+      }
+      cursor = nextAfter
+    }
+    return { entries: visible, pageSize: size, nextAfter: cursor, hasNextPage: cursor !== null, total: rawTotal ?? 0, forgottenCount }
   } finally {
     if (!borrowed) store.close()
   }
@@ -132,9 +187,16 @@ export async function packWorkingSet(labRoot, sessionId, {
     const entries = []
     const claimed = new Set()
     let used = 0
+    let forgottenSkipped = 0
+    // 工作集不装遗忘记录：显式点名如实警告，头部扫描静默跳过并计数披露。
+    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId))
 
     // 显式指定的记录：缺失不静默。
     for (const id of explicitRecordIds) {
+      if (isForgotten(forgetIndex, id)) {
+        warnings.push(`explicit-forgotten:${id}`)
+        continue
+      }
       const loaded = await store.readRecord(id, { verifyHash: true })
       if (!loaded?.ok) {
         warnings.push(`explicit-missing:${id}:${loaded?.error ?? 'unknown'}`)
@@ -163,6 +225,10 @@ export async function packWorkingSet(labRoot, sessionId, {
     const { entries: all } = store.listEntries({ limit: Number.MAX_SAFE_INTEGER })
     for (const entry of [...all].reverse()) {
       if (claimed.has(entry.id)) continue
+      if (isForgotten(forgetIndex, entry.id)) {
+        forgottenSkipped += 1
+        continue
+      }
       if (used >= budgetTokens) break
       const headerTokens = estimateTokens(256) // 头部预算按常量估计（kind/seq/refs 的稳定上界）
       used += headerTokens
@@ -193,6 +259,7 @@ export async function packWorkingSet(labRoot, sessionId, {
       entries,
       openCalls: store.openCalls(),
       warnings,
+      forgottenSkipped,
     }
   } finally {
     if (!borrowed) store.close()

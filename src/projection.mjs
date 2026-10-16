@@ -80,6 +80,10 @@ export function viewOf(state) {
     fullHistory: state.fullHistory === true,
     planFirst: state.planFirst === true,
     planActive: state.planActive === true,
+    // v2 层级压缩与模型模式（P4）：面板开关位。v1 会话恒为 false（状态里没有
+    // 这两个键），面板也只在 v2 下渲染模型模式行。
+    hierarchyCompress: state.hierarchyCompress === true,
+    compressModel: state.compressModel === true,
     archived: Array.isArray(state.receiptSeqs) ? state.receiptSeqs.length : 0,
     restored: Number.isInteger(state.restored) && state.restored >= 0 ? state.restored : 0,
     revision: Number.isInteger(state.revision) && state.revision >= 0 ? state.revision : 0,

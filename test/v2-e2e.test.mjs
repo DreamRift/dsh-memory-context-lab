@@ -516,6 +516,51 @@ test('B2 端到端：v2 会话的 restore 恢复回执原文且不停用引擎',
   })
 })
 
+test('P0 验收：真实持久 writer 上「归档 → 回执 → 凭证保护 → 恢复」一次往返', async () => {
+  await withTempLab('p0-roundtrip', async (labRoot) => {
+    const ctx = createStubContext()
+    await applyPlugin(ctx)
+    const session = buildRealLayoutSession({ operations: 4, resultChars: 3000 })
+    const agent = agentFor(session)
+    await enableAndNarrow(ctx, agent)
+
+    // 1) 归档：真实入口真实布局下真的归档，冷库落盘（真实持久 writer）。
+    const first = await run(ctx, agent, 'now')
+    assert.equal(first.kind, 'success', `归档必须成功：${first.text}`)
+    const visibleAfterArchive = visibleText(session)
+    assert.ok(visibleAfterArchive.includes('已归档操作'), '归档后表层必须出现回执')
+    // 同一进程内目录独占句柄（EOPEN 契约）：必须先停 ctx 拿落盘事实，
+    // 读完后立刻关句柄，否则下面第二段生命周期的客户端会开不了第二把锁。
+    const store = await openStoreAfterShutdown(ctx, labRoot)
+    assert.ok(store.recordCount > 0, '冷库必须真的落盘（持久 writer），而不是内存假象')
+    store.close()
+
+    // 重新进入（同一会话、同一冷库）：验证冷库持久性跨 ctx 生命周期成立。
+    const ctx2 = createStubContext()
+    await applyPlugin(ctx2)
+    const agent2 = agentFor(session)
+
+    // 2) 回执已在表层（上面断言），凭证保护：全历史模式下回执本身不得再被退热。
+    const fh = await run(ctx2, agent2, 'set fullhistory on')
+    assert.equal(fh.kind, 'success', `开启全历史必须成功：${fh.text}`)
+    // fullHistory 模式只退热非必要历史，热面上的回执（凭证）必须保留。
+    const again = await run(ctx2, agent2, 'now')
+    assert.equal(again.kind, 'success', `全历史模式下 now 不得报错：${again.text}`)
+    const visibleAfterFull = visibleText(session)
+    assert.ok(visibleAfterFull.includes('已归档操作'), '凭证回执在全历史模式下必须保留（不可压缩）')
+
+    // 3) 恢复：restore 把原文放回表层，回执退出。
+    const restored = await run(ctx2, agent2, 'restore')
+    assert.equal(restored.kind, 'success', `restore 必须成功：${restored.text}`)
+    assert.ok(Number(restored.restored) >= 1, `必须如实报告恢复段数：${restored.restored}`)
+    const afterRestore = visibleText(session)
+    assert.ok(!afterRestore.includes('已归档操作'), 'restore 后回执必须退出表层')
+    const marks = [...afterRestore.matchAll(/标记-(\d+):/g)].map((match) => Number(match[1]))
+    assert.ok(marks.length >= 3, `restore 后原文必须回到表层：${marks}`)
+    await ctx2._dispose()
+  })
+})
+
 test('B2：未启用会话的 v2 restore 如实报告，不冒用 v1 的「请先启用」文案', async () => {
   await withTempLab('restore-absent', async () => {
     const ctx = createStubContext()

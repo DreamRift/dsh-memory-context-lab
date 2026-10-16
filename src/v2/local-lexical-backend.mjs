@@ -135,9 +135,15 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
           skipped.push({ id, reason: 'term-limit-reached' })
           continue
         }
+        // P1-7 分块：长正文按块送达（textParts），逐块分词、词频累加进同一文档。
+        const parts = Array.isArray(record.textParts) && record.textParts.length > 0
+          ? record.textParts.filter((part) => typeof part === 'string' && part.length > 0)
+          : [record.text]
         const unique = new Map()
-        for (const term of tokenizeForLexicalIndex(record.text)) {
-          unique.set(term, (unique.get(term) ?? 0) + 1)
+        for (const part of parts) {
+          for (const term of tokenizeForLexicalIndex(part)) {
+            unique.set(term, (unique.get(term) ?? 0) + 1)
+          }
         }
         const freshTerms = [...unique.keys()].filter((term) => !current.postings.has(term))
         if (current.postings.size + freshTerms.length > maxTerms) {
@@ -156,7 +162,14 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
           posting.d.push(id)
           posting.f.push(count)
         }
-        current.docs.set(id, { seq: record.seq ?? null, kind: record.kind ?? null, bytes: Buffer.byteLength(record.text, 'utf8') })
+        current.docs.set(id, {
+          seq: record.seq ?? null,
+          kind: record.kind ?? null,
+          bytes: Buffer.byteLength(record.text, 'utf8'),
+          // 覆盖披露（P1-7）：该文档词频来自多少字节的正文片段。
+          coveredBytes: Number.isFinite(record.textCoveredBytes) ? record.textCoveredBytes : null,
+          fullBytes: Number.isFinite(record.textFullBytes) ? record.textFullBytes : null,
+        })
         externalIds[id] = id
         dirty = true
       }
@@ -165,36 +178,146 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
     },
 
     /**
-     * 查询：多词 AND（全部词条都命中的记录才算命中），按 Σ词频排序、新近度破平，
-     * 截断到 limit。只返回记录 ID——正文回冷库，索引副本不当原文。
+     * P2 主动遗忘：确定性清除文档与倒排项。
+     *
+     * docs 里没有逐文档词表，删除按「反向过滤」做：扫全部 postings，把命中的
+     * id 从 d/f 平行数组里剔除，清空的词条整条删除。代价是 O(全部倒排项)——
+     * 会话索引有 maxTerms 上界，一次全扫可接受；换来的是**确定性**：不依赖
+     * 重建（重建会把未遗忘记录重新分词，词频可能有微差）。
+     * 未在 docs 里的 id 如实报 absent，不谎称已清除。
      */
-    async query(text, { limit = 20 } = {}) {
+    async removeDocs(ids) {
       const current = await load()
-      const terms = [...new Set(tokenizeForLexicalIndex(text))]
-      if (terms.length === 0) return []
-      let candidates = null
-      for (const term of terms) {
-        const posting = current.postings.get(term)
-        if (!posting || posting.d.length === 0) return []
-        const docs = new Set(posting.d)
-        candidates = candidates === null ? docs : new Set([...candidates].filter((id) => docs.has(id)))
-        if (candidates.size === 0) return []
-      }
-      const scores = new Map([...candidates].map((id) => [id, 0]))
-      for (const term of terms) {
-        const posting = current.postings.get(term)
-        for (let i = 0; i < posting.d.length; i += 1) {
-          if (!scores.has(posting.d[i])) continue
-          scores.set(posting.d[i], (scores.get(posting.d[i]) ?? 0) + posting.f[i])
+      const removeSet = new Set((Array.isArray(ids) ? ids : []).filter((x) => typeof x === 'string'))
+      if (removeSet.size === 0) return { removed: [], absent: [] }
+      const removed = []
+      const absent = []
+      for (const id of removeSet) {
+        if (current.docs.has(id)) {
+          current.docs.delete(id)
+          removed.push(id)
+        } else {
+          absent.push(id)
         }
       }
-      const ranked = [...scores.entries()].sort((a, b) => {
-        if (b[1] !== a[1]) return b[1] - a[1]
-        const seqA = current.docs.get(a[0])?.seq ?? 0
-        const seqB = current.docs.get(b[0])?.seq ?? 0
-        return seqB - seqA
-      })
-      return ranked.slice(0, Math.max(1, limit)).map(([id]) => id)
+      if (removed.length > 0) {
+        for (const [term, posting] of [...current.postings]) {
+          const keepIds = []
+          const keepFreqs = []
+          for (let i = 0; i < posting.d.length; i += 1) {
+            if (removeSet.has(posting.d[i])) continue
+            keepIds.push(posting.d[i])
+            keepFreqs.push(posting.f[i])
+          }
+          if (keepIds.length === 0) current.postings.delete(term)
+          else {
+            posting.d = keepIds
+            posting.f = keepFreqs
+          }
+        }
+        await persist(current)
+      }
+      return { removed, absent }
+    },
+
+    /**
+     * 查询（P1-2 重写）：OR 召回 + BM25 排序 + 最小相关门槛；精确标识符/引号
+     * 短语走 AND 显式通道（无门槛）。
+     *
+     * 选型理由（计划 §5 P1-2 的二选一，选 BM25 而非「IDF 加权 + 字段权重」）：
+     * postings 已带词频、docs 已带字节长度，BM25 的 tf 饱和与长度归一是词法排序
+     * 的标准解，无需另造字段权重。门槛不用 BM25 分数（其尺度随语料大小漂移，
+     * 校准后会悄悄失效），而用无量纲量：
+     *   rel(d) = Σ_{t∈命中词元} idf(t) / Σ_{t∈查询词元} idf(t)
+     * 即「查询的信息质量被该文档覆盖的比例」。放行规则见函数体内联注释
+     * （P1 dev 集校准，test/v2-local-lexical.test.mjs）：OR 放宽的是召回，
+     * 不是相关性——主题词全中而连接词未中的改写记录放行；只碰一两个通用
+     * 词元的无关记录按「无关」处理，零正文。
+     *
+     * 精确通道（options.exact，由 query-plan 产出）：这些词元全部必须命中
+     * （AND 语义），不设门槛；自由词元仍参与 BM25 排序。
+     */
+    async query(text, { limit = 20, exact = [], exclude = [] } = {}) {
+      const current = await load()
+      const requiredTerms = [...new Set(tokenizeForLexicalIndex(Array.isArray(exact) ? exact.join(' ') : ''))]
+      const freeTerms = [...new Set(tokenizeForLexicalIndex(text))].filter((term) => !requiredTerms.includes(term))
+      const terms = [...requiredTerms, ...freeTerms]
+      if (terms.length === 0) return []
+      // P1-3：排除集在 top-k 前生效（遗忘/会话过滤等命中面策略），
+      // 排除文档不进候选、不占 top-k 名额。
+      const excludedIds = new Set(Array.isArray(exclude) ? exclude.filter((x) => typeof x === 'string') : [])
+      const docCount = current.docs.size
+      if (docCount === 0) return []
+
+      // idf(t) = ln(1 + (N - df + 0.5)/(df + 0.5))，恒正；语料外词元 df=0 → 最大 idf。
+      const idfOf = new Map(terms.map((term) => {
+        const df = current.postings.get(term)?.d.length ?? 0
+        return [term, Math.log(1 + (docCount - df + 0.5) / (df + 0.5))]
+      }))
+      const totalIdf = [...idfOf.values()].reduce((sum, value) => sum + value, 0) || 1
+
+      // OR 召回：任一词元命中即入候选集（不再要求全部词元同时命中）。
+      const candidates = new Map() // id -> Map<term, tf>
+      for (const term of terms) {
+        const posting = current.postings.get(term)
+        if (!posting) continue
+        for (let i = 0; i < posting.d.length; i += 1) {
+          if (excludedIds.has(posting.d[i])) continue
+          let tfByTerm = candidates.get(posting.d[i])
+          if (!tfByTerm) {
+            tfByTerm = new Map()
+            candidates.set(posting.d[i], tfByTerm)
+          }
+          tfByTerm.set(term, posting.f[i])
+        }
+      }
+      // 精确通道闸门：required 词元任一缺失即出局。
+      if (requiredTerms.length > 0) {
+        for (const [id, tfByTerm] of [...candidates]) {
+          if (requiredTerms.some((term) => !tfByTerm.has(term))) candidates.delete(id)
+        }
+      }
+      if (candidates.size === 0) return []
+
+      // BM25 排序：k1=1.5、b=0.75（标准缺省）。文档长度用 bytes 近似——索引不存
+      // 词元总数，字节与词元数在同语料内近似线性，归一目的（长文不加权）达成即可。
+      const K1 = 1.5
+      const B = 0.75
+      let totalBytes = 0
+      // 文档长度按覆盖字节计：P1-7 分块索引后 doc.bytes 只是首块长度，
+      // 归一化用实际索引到的字节数才不自欺（超限未覆盖的部分本来就没进索引）。
+      for (const doc of current.docs.values()) totalBytes += doc?.coveredBytes ?? doc?.bytes ?? 0
+      const avgBytes = totalBytes / docCount || 1
+      // 门槛（P1 dev 集校准，见 test/v2-local-lexical.test.mjs）二选一放行：
+      // ① rel ≥ 0.5：过半 idf 质量——单词命中但那是查询的稀缺主题词（如「做饭」）
+      //    时成立，是 OR 召回放宽的本意（改写/换序仍可命中）；
+      // ② 命中 ≥2 词元且 rel ≥ 0.25：CJK 二元组查询里连接词（「复失」「试路」）
+      //    的 idf 常高于主题词，纯分数门槛会把「四个主题词全中、四个连接词未中」
+      //    的改写记录误杀；≥2 词元防单点误配，0.25 下限挡住只共享两个通用词的
+      //    无关记录（其低 idf 使 rel 远低于 0.25）。
+      const REL_FLOOR = 0.5
+      const MULTI_TERM_FLOOR = 0.25
+      const ranked = []
+      for (const [id, tfByTerm] of candidates) {
+        const len = current.docs.get(id)?.bytes ?? 0
+        const norm = K1 * (1 - B + (B * len) / avgBytes)
+        let bm25 = 0
+        let matchedIdf = 0
+        for (const [term, tf] of tfByTerm) {
+          const weight = idfOf.get(term) ?? 0
+          matchedIdf += weight
+          bm25 += weight * ((tf * (K1 + 1)) / (tf + norm))
+        }
+        if (requiredTerms.length === 0) {
+          const relevance = matchedIdf / totalIdf
+          const paraphrase = tfByTerm.size >= 2 && relevance + 1e-9 >= MULTI_TERM_FLOOR
+          if (relevance + 1e-9 < REL_FLOOR && !paraphrase) continue // 无关：不进候选
+        }
+        const seq = current.docs.get(id)?.seq ?? 0
+        ranked.push({ id, score: bm25, seq })
+      }
+      ranked.sort((a, b) => (b.score !== a.score ? b.score - a.score : b.seq - a.seq))
+      return ranked.slice(0, Math.max(1, limit)).map((entry) => entry.id)
     },
 
     /** 本后端无进程、无外部连接：就绪恒真（装配期选择不依赖它）。 */

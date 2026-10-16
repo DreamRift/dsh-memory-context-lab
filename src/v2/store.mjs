@@ -122,10 +122,17 @@ export async function writeJsonFileAtomic(file, value) {
  * 句柄一定关闭：读取失败时如果只抛错不关闭，一次坏载荷就能耗尽进程句柄。
  */
 async function readPrefix(file, maxBytes) {
+  return readRange(file, 0, maxBytes)
+}
+
+/**
+ * P1-7 分块索引：从 `offsetBytes` 起读一段有界区间（同 readPrefix 的句柄纪律）。
+ */
+async function readRange(file, offsetBytes, maxBytes) {
   const handle = await open(file, 'r')
   try {
     const buffer = Buffer.allocUnsafe(maxBytes)
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, offsetBytes)
     return buffer.subarray(0, bytesRead)
   } finally {
     await handle.close().catch(() => {})
@@ -1002,7 +1009,7 @@ export class V2SessionStore {
    * `truncated: true` 且 `integrity: 'prefix'`（明确表示本次没有对全文做哈希
    * 校验）。没有它时读全文并校验——预算受限的调用方不该被迫先把整篇读进内存。
    */
-  async readRecord(id, { verifyHash = true, maxBytes = null } = {}) {
+  async readRecord(id, { verifyHash = true, maxBytes = null, offsetBytes = 0 } = {}) {
     const parsed = parseRecordId(id)
     if (!parsed) throw new EngineV2Error(`非法记录 ID：${id}`, { code: 'EINVAL' })
     const entry = this.#catalog.get(id)
@@ -1025,7 +1032,7 @@ export class V2SessionStore {
     let truncated = false
     let fullBytes = record.payload?.size ?? 0
     if (record.payload) {
-      const loaded = await this.#readPayload(record.payload, { verifyHash, maxBytes })
+      const loaded = await this.#readPayload(record.payload, { verifyHash, maxBytes, offsetBytes })
       integrity = loaded.integrity
       payloadText = loaded.text
       truncated = loaded.truncated === true
@@ -1034,7 +1041,7 @@ export class V2SessionStore {
     return { ok: true, id, record, entry, payloadText, integrity, truncated, fullBytes }
   }
 
-  async #readPayload(payload, { verifyHash, maxBytes = null }) {
+  async #readPayload(payload, { verifyHash, maxBytes = null, offsetBytes = 0 }) {
     const hex = payload.hash.slice('sha256:'.length)
     const file = path.join(this.directory, PAYLOADS_DIRECTORY, hex.slice(0, 2), hex)
     const fullBytes = payload.size
@@ -1042,7 +1049,9 @@ export class V2SessionStore {
     let buffer
     try {
       if (bounded) {
-        buffer = await readPrefix(file, maxBytes)
+        // P1-7：offsetBytes>0 时读中段（分块索引）；chunk 起点越界时返回空段。
+        const start = Math.max(0, Number.isFinite(offsetBytes) ? offsetBytes : 0)
+        buffer = start >= fullBytes ? Buffer.alloc(0) : await readRange(file, start, maxBytes)
       } else {
         buffer = await readFile(file)
       }
@@ -1051,9 +1060,9 @@ export class V2SessionStore {
       return { integrity: 'payload-unreadable', text: null, fullBytes }
     }
     if (bounded) {
-      // 只读了前缀：不对全文做哈希断言，如实标 'prefix'（不是 'ok'）。
+      // 只读了片段：不对全文做哈希断言，如实标 'prefix'（不是 'ok'）。
       const text = payload.encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf8')
-      return { integrity: 'prefix', text, truncated: true, fullBytes, prefixBytes: buffer.byteLength }
+      return { integrity: 'prefix', text, truncated: fullBytes > (offsetBytes || 0) + buffer.byteLength, fullBytes, prefixBytes: (offsetBytes || 0) + buffer.byteLength }
     }
     if (buffer.byteLength !== fullBytes) {
       return { integrity: 'size-mismatch', text: null, fullBytes }

@@ -77,7 +77,7 @@ test('ASCII 词元大小写不敏感', async () => {
   assert.deepEqual(await backend.query('eacces', { limit: 5 }), ['r1'])
 })
 
-test('多词 AND：两词都在才命中', async () => {
+test('多词门槛（P1-2）：只碰一个通用词的记录按无关处理', async () => {
   const dir = await newDir()
   const backend = createLocalLexicalBackend({ directory: dir })
   await backend.index([record('r1', '厨房做饭洗碗', 1), record('r2', '厨房打扫', 2)])
@@ -139,6 +139,39 @@ test('新近度破平：同分时 seq 大者优先', async () => {
   const backend = createLocalLexicalBackend({ directory: dir })
   await backend.index([record('r1', '厨房记录', 1), record('r2', '厨房记录', 2)])
   assert.deepEqual(await backend.query('厨房', { limit: 5 }), ['r2', 'r1'])
+})
+
+test('P1-2 dev 集：OR 召回 + 覆盖率放行——改写记录可命中，无关主题零命中', async () => {
+  const dir = await newDir()
+  const backend = createLocalLexicalBackend({ directory: dir })
+  await backend.index([
+    record('a', '恢复失败的重试路径已在冷库留档，恢复与重试都可按记录 ID 回读', 1),
+    record('b', '厨房做饭洗碗，今天的午饭做了两菜一汤，味道不错', 2),
+    record('c', '失败之后重试：路径与恢复策略讨论，含恢复失败案例', 3),
+    record('d', '周报：本周完成了三件事，下周计划继续开发', 4),
+    record('e', '周报里的失败总结与 retrospective 无关内容', 5),
+  ])
+  // 主题词全中（a）与主题词多数中的改写记录（c）都能命中——旧 AND 只会返回 a。
+  assert.deepEqual(await backend.query('恢复失败的重试路径', { limit: 5 }), ['a', 'c'])
+  // 无关主题（厨房做饭）只返回自己的记录，开发/周报记录零正文。
+  assert.deepEqual(await backend.query('厨房 做饭', { limit: 5 }), ['b'])
+  // 只碰一个通用词（失败，且是低 idf 词）的记录 e：低于门槛，按无关处理。
+  assert.deepEqual(await backend.query('恢复 重试 冷库 留档 失败', { limit: 5 }), ['a', 'c'])
+})
+
+test('P1-2 精确通道：exact 词元全部命中才返回，与自由通道 AND 组合', async () => {
+  const dir = await newDir()
+  const backend = createLocalLexicalBackend({ directory: dir })
+  await backend.index([
+    record('a', '恢复失败的重试路径已在冷库留档，恢复与重试都可按记录 ID 回读', 1),
+    record('c', '失败之后重试：路径与恢复策略讨论，含恢复失败案例', 3),
+  ])
+  // exact 记录 ID 不在任何文档里：AND 关卡如实空手，不降级成 OR。
+  assert.deepEqual(await backend.query('冷库 留档', { limit: 5, exact: ['t00000037-r0000'] }), [])
+  // exact 命中 + 自由词命中：a 同时满足。
+  assert.deepEqual(await backend.query('冷库', { limit: 5, exact: ['留档'] }), ['a'])
+  // exact 命中但自由词不存在：exact 是硬闸门、自由词只参与排序，仍返回（按计划「精确通道不走 OR 阈值」）。
+  assert.deepEqual(await backend.query('洗碗', { limit: 5, exact: ['留档'] }), ['a'])
 })
 
 test('cleanup', async () => {

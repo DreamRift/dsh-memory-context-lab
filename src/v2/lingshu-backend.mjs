@@ -152,10 +152,19 @@ export function createLingshuSemanticBackend({ client, logger = null, name = LIN
       }
       return { externalIds, skipped, conflicts }
     },
-    async query(text, { limit = 20 } = {}) {
+    async query(text, { limit = 20, exact = [], exclude = [] } = {}) {
+      // exclude（P1-3）：灵枢服务端口径不接受本地排除集，客户端侧以
+      // 「limit + 排除数」超量取回后复验（见 retrieval.mjs searchRecords）。
+      // 精确通道（query-plan 产出）折叠回查询串：灵枢的词法检索在服务端整串
+      // 进行，标识符/引号短语原样并入与用户手工输入同一形态，不改变服务端口径。
+      const needleParts = [typeof text === 'string' ? text.trim() : '']
+      for (const token of Array.isArray(exact) ? exact : []) {
+        if (typeof token === 'string' && token.trim()) needleParts.push(token.trim())
+      }
+      const needle = needleParts.filter(Boolean).join(' ')
       const view = await client.callTool('cg', {
         op: 'read',
-        query: text,
+        query: needle,
         // 条数参数是 `k`：写成 `limit` 会静默失效（那是 goal/recent/edges 的条数）。
         k: Number.isInteger(limit) && limit > 0 ? limit : 5,
         session: client.sessionId,

@@ -281,6 +281,17 @@ test('recall summaries survive the common md_cg envelopes', () => {
 
   assert.equal(formatRecallDigest([]), '')
   assert.ok(formatRecallDigest(ok.summaries, 100).length <= 100)
+
+  // P1-8（v1 收窄，2026-10-16 拍板）：服务端自报 recency 兜底（fallback/matched
+  // 标记）时按 no-match 处理——零正文，不把「退回最近」冒充命中注入。
+  const fellBack = normalizeRecallPayload({ results: [{ id: 'r1', content: 'recent row' }], fallback: true })
+  assert.equal(fellBack.status, RECALL_STATUS.NO_MATCH)
+  assert.equal(fellBack.summaries.length, 0)
+  const unmatched = normalizeRecallPayload({ results: [{ id: 'r1', content: 'recent row' }], matched: false })
+  assert.equal(unmatched.status, RECALL_STATUS.NO_MATCH)
+  // 旧版服务端不带标记：行为不变，照常回注。
+  const legacy = normalizeRecallPayload({ results: [{ id: 'r1', content: 'real hit' }] })
+  assert.equal(legacy.status, RECALL_STATUS.OK)
 })
 
 test('archive node ids are stable and filesystem-safe', () => {

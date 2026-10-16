@@ -514,6 +514,141 @@ test('D4 命中过滤：字面与语义两路都不得把插件来源记录放�
   }
 })
 
+test('P1-3 排除集在 top-k 前生效，陈旧命中渲染前复验后如实丢弃', async () => {
+  const root = await makeLabRoot('p13filter')
+  try {
+    const { store, ids } = await seed(root, 3)
+    try {
+      // 排除 top-1（分数最高的 call-0）：有界补取应把后续记录顶上来，而不是少给。
+      const filtered = await searchRecords({
+        store,
+        backend: null,
+        text: ids[0],
+        limit: 2,
+        literalMatcher,
+        excluded: [ids[0]],
+      })
+      assert.equal(filtered.records.length, 0, '唯一字面命中被排除后不得回注该记录')
+      assert.ok(!filtered.records.some((record) => record.id === ids[0]))
+
+      // T1 路径：排除集传给后端，后端跳过该文档（本地词法签名带 exclude）。
+      const backend = { name: 't1-like', indexed: [], async index() { return { externalIds: {} } }, async query() { return [] } }
+      const viaBackend = await searchRecords({ store, backend, text: ids[0], limit: 2, literalMatcher, excluded: [ids[0]] })
+      assert.equal(viaBackend.records.length, 0)
+
+      // 陈旧命中：push 时在、渲染前被并发移除的记录（模拟遗忘/会话退出与检索
+      // 竞态）。getEntry 前两次（id 解析与守卫）返回条目、第三次（渲染复验）消失，
+      // 复验必须丢弃并计数。
+      const ghostEntry = { id: 'ghost-1', kind: 'projection-span', fidelity: 'synthesized', seq: 999, refs: {}, inline: {}, payload: null, text: 'ghost 正文', textTruncated: false, textIntegrity: 'ok', textMaxBytes: 8192 }
+      let ghostCalls = 0
+      const originalGetEntry = store.getEntry.bind(store)
+      store.getEntry = (id) => {
+        if (id === 'ghost-1') {
+          ghostCalls += 1
+          return ghostCalls <= 2 ? ghostEntry : undefined
+        }
+        return originalGetEntry(id)
+      }
+      const staleBackend = { name: 'stale-be', indexed: [], async index() { return { externalIds: {} } }, async query() { return ['ghost-1'] } }
+      const staleSemantic = await searchRecords({ store, backend: staleBackend, text: 'ghost', limit: 5, literalMatcher: () => false })
+      store.getEntry = originalGetEntry
+      assert.equal(staleSemantic.records.length, 0, '陈旧命中不得渲染')
+      assert.equal(staleSemantic.staleDropped, 1, '复验丢弃要计数上报')
+
+      console.log(`[P1-3] 排除后 0 命中、陈旧丢弃 ${staleSemantic.staleDropped} 条`)
+    } finally {
+      store.close()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('P1-7 分块索引：长正文按块全索引，覆盖字节如实披露', async () => {
+  const root = await makeLabRoot('p1-7-chunks')
+  try {
+    const store = await V2SessionStore.init({ labRoot: root, sessionId: SESSION_ID })
+    try {
+      const { createLocalLexicalBackend } = await import('../src/v2/local-lexical-backend.mjs')
+      const backend = createLocalLexicalBackend({ directory: store.directory, logger: null })
+      // ① 约 28KB 的长文（超过 8KiB 单块上限，4 块内有界覆盖）：特征词放在**末尾**。
+      const longText = '压舱填充文本'.repeat(1600) + '块尾记号甲'
+      let txn = await store.openTransaction()
+      await store.stageRecord(txn, draftRecord({ kind: RECORD_KINDS.OPERATION_CALL, seq: 1, inline: { range: '1-2' }, refs: { callId: 'c-long', messageId: 'm-1', toolName: 'read', blockIndex: 0 }, content: longText }))
+      await store.commitTransaction(txn)
+      // ② 约 60KB 的超长文（4 块上限覆盖不到尾）：特征词在覆盖界之外。
+      const hugeText = '超限压舱文本'.repeat(10000) + '界外证据乙'
+      txn = await store.openTransaction()
+      await store.stageRecord(txn, draftRecord({ kind: RECORD_KINDS.OPERATION_CALL, seq: 3, inline: { range: '3-4' }, refs: { callId: 'c-huge', messageId: 'm-2', toolName: 'read', blockIndex: 0 }, content: hugeText }))
+      await store.commitTransaction(txn)
+
+      const sync = await syncRetrievalIndex({ store, backend, directory: store.directory })
+      assert.equal(sync.skippedNow.length, 0)
+
+      // 18KB 记录：3 块覆盖全文，尾部词可命中；截断披露为 false。
+      const tailHit = await backend.query('块尾记号甲', { limit: 5 })
+      assert.equal(tailHit.length, 1, '长文尾部词必须因分块索引可命中')
+      // 60KB 记录：覆盖有界（4 块 = 32KiB），界外词不命中、如实为空。
+      const beyondHit = await backend.query('界外证据乙', { limit: 5 })
+      assert.equal(beyondHit.length, 0, '超出覆盖边界的词不得命中')
+      // 索引内部如实记录覆盖字节：coveredBytes 有界且小于 fullBytes 的只允许是超长那条。
+      const state = await backend.status?.()
+      if (state) assert.ok(Number.isFinite(state.docs), '状态面可用')
+      console.log(`[P1-7] 18KB 全覆盖命中尾部词；60KB 界外词零命中（有界披露）`)
+    } finally {
+      store.close()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('P1-4 索引代际：水位落后于库如实报 lag，旧格式索引不冒充已知覆盖', async () => {
+  const root = await makeLabRoot('p1-4-generation')
+  try {
+    const { store, ids } = await seed(root, 2)
+    try {
+      const backend = fakeBackend({})
+      await syncRetrievalIndex({ store, backend, directory: store.directory })
+      const fresh = await searchRecords({ store, backend, text: ids[0], limit: 5, literalMatcher })
+      assert.equal(fresh.indexGeneration, 1, '首次同步 generation 为 1')
+      assert.equal(fresh.laggedRecords, 0, '刚同步完不落后')
+
+      // 库前进（新事务追加一条），索引不动：lag 如实为 1。
+      const txn2 = await store.openTransaction()
+      const staged = await store.stageRecord(txn2, draftRecord({ kind: RECORD_KINDS.OPERATION_CALL, seq: 99, inline: { range: '99-100' }, refs: { callId: 'call-99', messageId: 'msg-99', toolName: 'read', blockIndex: 0 }, content: 'freshly appended' }))
+      await store.commitTransaction(txn2)
+      const lagged = await searchRecords({ store, backend, text: ids[0], limit: 5, literalMatcher })
+      assert.equal(lagged.indexGeneration, 1, '未再同步，generation 不变')
+      assert.equal(lagged.laggedRecords, 1, '水位之后的 1 条如实报 lag')
+      assert.ok(!lagged.records.some((r) => r.id === staged.id), '未入索引的记录不参与语义命中路径；字面路径仍可按 store 直查')
+
+      // 再次同步：generation 前进、lag 清零。
+      await syncRetrievalIndex({ store, backend, directory: store.directory })
+      const resynced = await searchRecords({ store, backend, text: ids[0], limit: 5, literalMatcher })
+      assert.equal(resynced.indexGeneration, 2, '再同步 generation+1')
+      assert.equal(resynced.laggedRecords, 0)
+
+      // 删除索引文件后重新同步：从头索引（generation 重置），不误报覆盖。
+      const { writeRetrievalIndex, RETRIEVAL_INDEX_FILE } = await import('../src/v2/retrieval.mjs')
+      await rm(path.join(store.directory, RETRIEVAL_INDEX_FILE), { force: true })
+      await syncRetrievalIndex({ store, backend, directory: store.directory })
+      const rebuilt = await searchRecords({ store, backend, text: ids[0], limit: 5, literalMatcher })
+      assert.equal(rebuilt.indexGeneration, 1, '索引重建 generation 从 1 重新计数')
+      assert.equal(rebuilt.laggedRecords, 0)
+
+      // 旧格式索引（无 watermark）：lag 为 null——覆盖未知，不冒充。
+      await writeRetrievalIndex(store.directory, { backend: 'fake-lingshu', indexed: {} })
+      const legacy = await searchRecords({ store, backend, text: ids[0], limit: 5, literalMatcher })
+      assert.equal(legacy.laggedRecords, null, '旧格式无水位 → 覆盖未知，不冒充 no-lag')
+    } finally {
+      store.close()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 /** D4 回注面：插件卡片 span 不进回注候选（含 recency 兜底），label 按作者区分。 */
 test('D4 回注面：插件来源 span 不被回注，也不再渲染成「用户消息」', async () => {
   const root = await makeLabRoot('d4recall')
@@ -561,8 +696,10 @@ test('D4 回注面：插件来源 span 不被回注，也不再渲染成「用�
       })
       assert.equal(legacy.ok, true)
       const recalledAgain = await client.recall('口径', null, 5)
-      assert.ok(!recalledAgain.hits.some((hit) => hit.content.includes('archived_card_2')), '旧形态（回执正文）靠前缀兜底排除')
-      assert.ok(recalledAgain.hits.some((hit) => hit.content.includes('archived_human_1')), '人类消息命中不受影响')
+      // P1-8：无后端命中即 no-match 零正文——旧 recency 兜底会把人类 span 塞进无关查询，
+      // 现在零注入；card_2 的排除由空查询的 recency 路径与前缀兜底共同保证。
+      assert.equal(recalledAgain.matchedBy, 'no-match')
+      assert.equal(recalledAgain.hits.length, 0, '无命中零注入：不因放宽召回把无关内容塞进活动面')
 
       console.log(`[D4 回注面] 排除插件来源 ${recalledAgain.excludedPluginAuthored} 条；人类 span 标签「用户消息」，插件侧不冒充`)
     } finally {

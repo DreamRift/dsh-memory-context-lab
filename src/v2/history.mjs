@@ -285,7 +285,10 @@ export function collectHistoryCandidates(view) {
   for (let index = 0; index < total; index += 1) {
     const event = eventOf(index)
     if (event?.type !== 'assistant/message') continue
-    if (contentHasPlanToolCall(event.data?.message?.content)) {
+    // 计划工件判定与凭证判定共用 contentBlocksOf 的双形状归一（审计 P0-1）：
+    // 只读 data.message.content 会让扁平形状（data.content，插件回执/注入的真实
+    // 写入形态）取到 undefined，计划调用头与退热凭证双双失去保护。
+    if (contentHasPlanToolCall(contentBlocksOf(event))) {
       protect(index, 'protected-plan-artifact')
     }
   }
@@ -298,7 +301,7 @@ export function collectHistoryCandidates(view) {
     for (let index = 0; index < total; index += 1) {
       const event = eventOf(index)
       if (event?.type !== 'user/message') continue
-      const blocks = event.data?.message?.content
+      const blocks = contentBlocksOf(event)
       const text = Array.isArray(blocks)
         ? blocks.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text).join('\n')
         : ''

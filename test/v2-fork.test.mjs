@@ -23,6 +23,8 @@ import {
   closureFingerprint,
   needsMigrationFileFor,
 } from '../src/v2/fork.mjs'
+import { applyForget, dispositionPath, getForgetIndex } from '../src/v2/disposition.mjs'
+import { provenancePath } from '../src/v2/provenance-index.mjs'
 
 const PARENT = 'aaaa1111bbbb2222cccc3333'
 const CHILD = 'dddd4444eeee5555ffff6666'
@@ -218,6 +220,40 @@ test('fork：子会话目录不存在时，plan 报告 exists=false 而不是抛
     const plan = await planForkClosure({ labRoot: root, parentSessionId: 'ffffffffffffffffffffffff' })
     assert.equal(plan.exists, false)
     assert.equal(plan.recordCount, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('fork：遗忘状态随闭包携带（父遗忘→子镜像）；子会话再遗忘不动父库', async () => {
+  const root = await makeLabRoot('sidecar')
+  try {
+    const parentIds = await seedParent(root, 2)
+    // 父会话先软遗忘第一条记录：账本在父目录里生效。
+    const parentDir = path.join(root, 'v2', 'sessions', sessionKeyFor(PARENT))
+    await applyForget({ sessionDir: parentDir, targetIds: [parentIds[0]], actor: 'user', reason: 'fork 前遗忘' })
+    const parentIndex = await getForgetIndex(parentDir)
+    assert.equal(parentIndex.forgotten.size, 1, '父会话账本应有一条遗忘')
+
+    const result = await executeForkClosure({ labRoot: root, parentSessionId: PARENT, childSessionId: CHILD })
+    assert.equal(result.recordCount, parentIds.length)
+
+    // 侧车逐文件复制到子目录；ID 原样保留，因此账本对子库同样成立。
+    const childDir = path.join(root, 'v2', 'sessions', sessionKeyFor(CHILD))
+    await assert.doesNotReject(readFile(dispositionPath(childDir), 'utf8'), '子会话必须带 disposition 侧车')
+    await assert.doesNotReject(readFile(provenancePath(childDir), 'utf8'), '子会话必须带 provenance 侧车')
+    const childIndex = await getForgetIndex(childDir)
+    assert.equal(childIndex.forgotten.size, 1, '子会话镜像父遗忘')
+    assert.ok(childIndex.forgotten.has(parentIds[0]), '遗忘目标 ID 原样携带')
+
+    // 子会话再遗忘第二条：只写子账本，父库可读性不受影响。
+    await applyForget({ sessionDir: childDir, targetIds: [parentIds[1]], actor: 'user', reason: '子会话追加遗忘' })
+    const childAfter = await getForgetIndex(childDir)
+    const parentAfter = await getForgetIndex(parentDir)
+    assert.equal(childAfter.forgotten.size, 2)
+    assert.equal(parentAfter.forgotten.size, 1, '父会话遗忘集合不被子会话改动')
+    await assert.doesNotReject(readRecordById(root, PARENT, parentIds[1]), '父会话未被遗忘的记录保持可读')
+    await assert.rejects(readRecordById(root, CHILD, parentIds[0]), (err) => err?.code === 'EFORGOTTEN', '子会话对镜像遗忘的父 ID 拒绝回读')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

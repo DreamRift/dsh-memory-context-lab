@@ -177,6 +177,11 @@ function buildConfigSchema() {
         .i18n({ 'zh-CN': '全历史记忆上下文（v2）', en: 'Full-history memory context (v2)' }),
       planFirst: SCHEMAS.boolean().default(false)
         .i18n({ 'zh-CN': '新会话计划先行', en: 'Plan first in new sessions' }),
+      // 层级压缩模型模式的全局默认（P4）：只影响 v2 新账本的播种值与面板初始
+      // 位置；已有账本的会话内开关以 /memory-lab2 set compressmodel 为准。
+      // 模型模式失败关闭：LLM 不可用或产出不合格时自动落回程序摘要。
+      compressModelDefault: SCHEMAS.boolean().default(false)
+        .i18n({ 'zh-CN': '层级压缩模型模式（默认关，失败自动落回程序摘要）', en: 'Hierarchy compression model mode (default off; falls back to program summaries)' }),
       // 检索后端显式指定（PR #4 接口设计 §端口二）：auto = 现状自动梯队（T2 优先、
       // 失败降级 T1 带原因）；local-lexical-v1 = 不尝试 T2；lingshu-mdcg-receipt =
       // 强制 T2，不可用即失败关闭（EBACKENDUNAVAILABLE/EBACKENDPINGFAIL），不静默降级。
@@ -648,13 +653,15 @@ export async function apply(ctx, config) {
    */
   async function normalizeAndStop(record, signal, { guardWindow }) {
     const settings = engine.settingsOf(record)
-    const before = engine.pendingReceipts(record).length
+    // P0-2：restore-skipped 行的原件仍在冷库，停用前同样要尝试恢复并走窗口
+    // 守卫；只看 pending 会漏掉「上次恢复失败、依赖仍未闭合」的行。
+    const before = engine.pendingReceipts(record).length + engine.restoreSkippedReceipts(record).length
     const restoredBefore = record.state.archive.filter((row) => row.status === 'restored').length
     let refused = null
 
     if (before > 0 && settings.autoRestore) {
       if (guardWindow) {
-        const pending = engine.pendingReceipts(record)
+        const pending = [...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)]
         try {
           const occupancy = await engine.measureOccupancy(record, signal)
           const growth = restoreGrowth(pending, {
@@ -780,6 +787,10 @@ export async function apply(ctx, config) {
     recallQueryFrom,
     defaultSettings: resolveDefaultsSettings,
     defaultFullHistory: () => resolveFullHistoryDefault(config),
+    defaultCompressModel: () => config?.compressModelDefault === true,
+    // P4 拍板：宿主没有已核验的插件侧 LLM 调用契约 → 解析点恒返回 null。
+    // 模型模式全链路按程序档工作（失败关闭）；未来接入宿主契约时只改这里。
+    modelPhaseResolver: () => null,
     onEnabled: (agent) => (readProjectionPlanFirst(agent.session) ? planFirst.enterIfFresh(agent) : null),
     // off 联动退出计划模式（rc.5）：关「新会话计划先行」时若计划模式仍处于
     // active/pending，同步退出——这是用户显式开关动作的一部分，不是插件自作主张。
@@ -1689,7 +1700,7 @@ export async function apply(ctx, config) {
       definitionId: 'dsh-memory-context-lab/control-v2',
       name: V2_COMMAND_NAME,
       description: 'Full-history on-demand memory (v2): structured records with bounded working state',
-      input: { hint: 'on | off | restore | status | now | dry-run | read <ID...> | history [页大小] | working-set [预算] | recall [查询|id <ID...>] | index [status|sync] | relations | cost | import-v1 | fork <子会话ID> | fork-status | fork-reset <子会话ID> | set auto|recall|batch|retain <value> | help' },
+      input: { hint: 'on | off | restore | status | now | dry-run | read <ID...> | history [页大小] | working-set [预算] | recall [查询|id <ID...>] | forget preview|apply|undo|status | mark-stale <ID...> [备注] | verify <ID...> | index [status|sync] | relations | cost | import-v1 | fork <子会话ID> | fork-status | fork-reset <子会话ID> | set auto|recall|batch|retain <value> | help' },
       handler: (invocation) => v2CommandHandler(invocation),
     })
     // 固定注册的只读召回工具：完整模式的一部分，不随 v2 的 on/off 增删 schema。
