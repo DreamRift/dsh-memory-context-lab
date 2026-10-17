@@ -2038,6 +2038,7 @@ export function createV2Runtime(dependencies) {
         forkMap,
         retrievalIndex,
         backendName: backendFor(record)?.name ?? null,
+        forgetIndex: await getForgetIndex(record.directory),
       })
       const lines = []
       if (described.relations.length === 0) {

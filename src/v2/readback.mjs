@@ -54,14 +54,16 @@ export async function readRecordById(labRoot, sessionId, id, { verifyHash = true
       // 这条路径只在本地未命中时走，且映射来自本会话自己的迁移记录，不跨目录乱读。
       const mapped = await resolveViaForkMap(labRoot, sessionId, id)
       if (mapped) {
+        // 墓碑判定先于任何磁盘读取（安全审计 2026-10-17）：先读后拒会让调用方
+        // 从「读取成功后才失败」的时序侧信道区分「已遗忘但物理存在」的冷记录。
+        if (isForgotten(forgetIndex, mapped)) {
+          throw new EngineV2Error(`记录 ${id}（fork 解析为 ${mapped}）已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
+            code: 'EFORGOTTEN',
+            details: { id, mapped },
+          })
+        }
         const retried = await store.readRecord(mapped, { verifyHash, maxBytes })
         if (retried?.ok) {
-          if (isForgotten(forgetIndex, mapped)) {
-            throw new EngineV2Error(`记录 ${id}（fork 解析为 ${mapped}）已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
-              code: 'EFORGOTTEN',
-              details: { id, mapped },
-            })
-          }
           assertIntegrityAcceptable(retried, { id: mapped, verifyHash })
           const verified = retried.integrity === 'no-payload' || (verifyHash && retried.integrity === 'ok')
           return { ...retried, verified, requestedId: id, resolvedVia: 'fork-map' }

@@ -151,6 +151,11 @@ async function memberViewOf(deps, plan) {
   }
   const members = []
   for (const recordId of plan.recordIds) {
+    // 遗忘成员绝不进蒸馏（安全审计 2026-10-17）：账本判不可见 → 整个候选组跳过
+    //（失败关闭）。展开页的同款过滤（isRecordVisible）只管渲染已产出的卡；
+    // 候选阶段不拦的话，被遗忘成员的冷库正文会经 getRecordBody 进入
+    // extractAtoms → 蒸馏卡与聚合凭证，把已遗忘内容重新带出来。
+    if (typeof deps.isRecordVisible === 'function' && !deps.isRecordVisible(recordId)) return null
     const receiptText = receiptByRecordId.get(recordId)
     if (receiptText === undefined) return null
     const body = await deps.getRecordBody(recordId)
