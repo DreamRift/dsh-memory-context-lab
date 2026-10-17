@@ -126,7 +126,8 @@ export async function loadHierarchy(sessionDir) {
   }
   const fold = foldHierarchy(parsed.entries)
   return {
-    state: parsed.entries.length === 0 && parsed.header === null ? 'absent' : parsed.damaged ? 'damaged' : 'ok',
+    // BUG-013：损坏优先于 absent（首行坏 JSON 时 entries=[]、header=null）。
+    state: parsed.damaged ? 'damaged' : (parsed.entries.length === 0 && parsed.header === null ? 'absent' : 'ok'),
     entries: parsed.entries,
     revision: parsed.entries.length,
     damaged: parsed.damaged,

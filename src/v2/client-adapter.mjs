@@ -334,6 +334,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           let semanticError = null
           let indexLag = null
           let indexGeneration = null
+          let weakHits = null
           if (needle.length > 0 || plan.exact.length > 0) {
             const found = await searchRecords({
               store,
@@ -380,14 +381,50 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
                     ? 'backend-error'
                     : 'no-match'
           }
+          // 0.10.1 弱候选导航（partial-match，pointerOnly）：强命中为零且检索面
+          // 就绪（no-match 口径）时，若后端提供 queryDetailed 诊断且有弱重合候选，
+          // 只给少量记录 ID 与词元重合说明——不注入正文、不凑 recent（PR #6 吸收
+          // 项；弱重合是 query 级信号，不写回读计数）。T2 无 queryDetailed 时如实
+          // 保持 no-match（能力缺口，不假造弱候选）。
+          if (matchedBy === 'no-match') {
+            const liveBackend = typeof backendFor === 'function' ? backendFor() : null
+            if (liveBackend && typeof liveBackend.queryDetailed === 'function') {
+              try {
+                const detail = await liveBackend.queryDetailed(needle, { exact: plan.exact, limit: bounded, weakLimit: 3 })
+                const weakSpans = (Array.isArray(detail?.weak) ? detail.weak : [])
+                  .map((w) => ({ weak: w, entry: byId.get(w.id) }))
+                  .filter((pair) => pair.entry)
+                if (weakSpans.length > 0) {
+                  matchedBy = 'partial-match'
+                  const weakNote = '（弱候选：以下记录与查询只有部分词元重合，不构成相关证据；仅提供 ID 供按需回读，本次未注入正文。）'
+                  weakHits = weakSpans.map((pair) => ({
+                    id: pair.weak.id,
+                    nodeId: pair.entry.inline?.nodeId,
+                    createdAt: pair.entry.createdAt,
+                    range: pair.entry.inline?.range ?? null,
+                    tools: pair.entry.inline?.tools ?? null,
+                    tags: [ARCHIVED_TAG],
+                    content: `弱候选 ${pair.weak.id}：词元重合 ${pair.weak.matchedTerms?.join('、') ?? '(unknown)'}（覆盖 ${pair.weak.coverage ?? '?'}）；原文需按 ID 显式回读。`,
+                  }))
+                  weakHits[0] = { ...weakHits[0], content: `${weakNote}\n${weakHits[0].content}` }
+                }
+              } catch { /* 诊断面失败保持 no-match（弱候选是加强信息，不反过来把回注打挂） */ }
+            }
+          }
           // 逐条正文里不重复自报（那是每条的噪声）；块首声明一次即可。检索口径必须
           // 出现在注入文本里，而不是只留在返回值字段里：模型看到的就是这段文本。
           const basisNote = needle.length === 0 && plan.exact.length === 0
             ? '（以下为最近归档记录，按时间倒序列出；本次没有查询词，未做相关性检索。）'
             : `（以下为与问题「${rawNeedle}」的检索命中，来源：${matchedBy === 'literal+semantic' ? '字面索引 + 语义后端' : '内置字面索引'}${indexLag && indexLag > 0 ? `；索引落后于库 ${indexLag} 条记录（第 ${indexGeneration} 代），未覆盖的记录不参与命中` : ''}。）`
-          const hits = matched
-            .slice(-bounded)
-            .reverse()
+          // 0.10.1 R1-F4a：检索命中保持 searchRecords 的相关性顺序（字面命中按
+          // 条目序、语义命中按后端排名，最相关在前），不再整体倒置——此前
+          // slice(-bounded).reverse() 把语义 top-k 倒序（best 排最后）且字面命中
+          // ≥limit 时把语义命中挤出窗口。无查询词的 recency 浏览分支保持倒序
+          // （最新在前，与 basisNote 的「按时间倒序」声明一致）。
+          const ordered = needle.length > 0 || plan.exact.length > 0
+            ? matched.slice(0, bounded)
+            : matched.slice(-bounded).reverse()
+          const hits = ordered
             .map((entry) => {
               // range 是 `{start,end}` 对象：直接插值会渲染成 [object Object]。
               const range = entry.inline.range
@@ -422,7 +459,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           // 语义命中、后端是否报错，而不是笼统地把两者都说成「检索到了」。
           // excludedPluginAuthored 同理：因插件来源被挡在回注面之外的 span 数（D4）。
           // excludedForgotten：被软遗忘挡在回注面之外的 span 数（P2 读面统一可见性）。
-          return { hits, matchedBy, semanticError, indexLag, indexGeneration, excludedPluginAuthored: excludedSpans.length, excludedForgotten: forgottenSpans.length }
+          return { hits: weakHits ?? hits, matchedBy, semanticError, indexLag, indexGeneration, excludedPluginAuthored: excludedSpans.length, excludedForgotten: forgottenSpans.length }
         },
 
         async probeReceiptView() {

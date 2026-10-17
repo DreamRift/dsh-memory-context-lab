@@ -390,6 +390,8 @@ let receiptSeq = 0
 function receiptText() {
   receiptSeq += 1
   const id = 'mcl2-def000000000000000000000-' + String(receiptSeq).padStart(6, '0')
+  // 正文行带成员序号：程序卡的证据块按内容去重，全部相同的模板行会让 8 个成员
+  // 折叠成 1 块，模型卡的「净省」比对场景就不成立（no-gain 恒真）。
   return [
     V2_RECEIPT_MARKER,
     '工具：run_code',
@@ -397,7 +399,7 @@ function receiptText() {
     '冷记录：' + id,
     'hash：' + id.slice(-10),
     '',
-    'run_code 以 exit 0 完成，版本 1.2.3，共 5 条输出。',
+    'run_code 以 exit 0 完成，版本 1.2.3，第 ' + receiptSeq + ' 轮共 5 条输出。',
   ].join('\n')
 }
 
@@ -461,23 +463,30 @@ async function seedRun(session, memberBodies, count) {
 
 test('接线：模型模式开启时，ready 候选相位卡换成校验过的模型卡，凭证正文不变', async () => {
   const { session, deps, memberBodies } = wiredDeps({ stream: async ({ messages }) => {
-    // 消息里应带程序选中的块行文（含可校验的数字）。
-    assert.ok(messages.some((m) => m.role === 'user' && m.content.includes('1.2.3')))
-    return { text: JSON.stringify({ lines: [{ text: 'run_code exit 0，版本 1.2.3，共 5 条。', refs: ['blk-1'] }] }), usage: { input: 7 } }
+    // 消息里应带程序选中的块行文（含可校验的数字）；refs 必须用清单里的真实块 ID
+    // （写死 'blk-1' 会因 invalid-ref 落回程序卡——0.10.1 修复时的实测教训）。
+    const user = messages.find((m) => m.role === 'user')
+    assert.ok(user && user.content.includes('1.2.3'))
+    const blockIdMatch = /\[([^\]]+)\] /.exec(user.content)
+    assert.ok(blockIdMatch, '事实清单必须带块 ID')
+    const blockId = blockIdMatch[1]
+    return { text: JSON.stringify({ lines: [{ text: 'run_code exit 0，版本 1.2.3，共 5 条。', refs: [blockId] }] }), usage: { input: 7 } }
   } })
-  await seedRun(session, memberBodies, 4)
+  // 8 成员：程序卡逐块行文（≥8 行）天然大于单行结论的模型卡——no-gain 判定
+  // 的比对场景必须让「模型卡更省」成立，否则接线测试实际测的是 no-gain 落回。
+  await seedRun(session, memberBodies, 8)
   const preview = await compressPreview(deps)
   assert.ok(preview.text.includes('模型'), '预览应标注模型模式：' + preview.text)
   const run = await compressRun(deps)
   assert.equal(run.applied.length, 1)
   const { loadHierarchy } = await import('../src/v2/hierarchy-store.mjs')
   const ledger = await loadHierarchy(deps.sessionDir)
-  const l2 = ledger.entries.find((e) => e.kind === 'l2')
+  const l2 = ledger.entries.find((e) => e.kind === 'hierarchy/l2-phase')
   assert.ok(l2, '应有 L2 相位卡条目')
   assert.ok(l2.text.includes('模型摘要模式'), 'L2 应是模型卡：' + l2.text)
   assert.ok(l2.text.includes('1.2.3'))
   // 凭证正文保持恒定渲染（不含模型卡脚注）。
-  const voucher = ledger.entries.find((e) => e.kind === 'voucher')
+  const voucher = ledger.entries.find((e) => e.kind === 'hierarchy/agg-voucher')
   assert.ok(!voucher.text.includes('模型摘要模式'))
   // 费用账本已落一行。
   const usageRows = await readModelUsageEntries(deps.sessionDir)
@@ -492,7 +501,7 @@ test('接线：模型失败（host-error）落回程序卡，run 照常提交', 
   assert.equal(run.applied.length, 1, '失败不阻断提交')
   const { loadHierarchy } = await import('../src/v2/hierarchy-store.mjs')
   const ledger = await loadHierarchy(deps.sessionDir)
-  const l2 = ledger.entries.find((e) => e.kind === 'l2')
+  const l2 = ledger.entries.find((e) => e.kind === 'hierarchy/l2-phase')
   assert.ok(!l2.text.includes('模型摘要模式'), '应是程序卡')
   // 失败也花了钱吗？没有 usage（抛错没有返回 usage），不落账。
   assert.equal((await readModelUsageEntries(deps.sessionDir)).length, 0)
@@ -513,7 +522,7 @@ test('接线：用户取消是任务撤销——run 即停、不借兜底提交�
   // 表面没有凭证消息（原回执保留）。
   const { loadHierarchy } = await import('../src/v2/hierarchy-store.mjs')
   const ledger = await loadHierarchy(deps.sessionDir)
-  assert.equal(ledger.entries.filter((e) => e.kind === 'voucher').length, 0)
+  assert.equal(ledger.entries.filter((e) => e.kind === 'hierarchy/agg-voucher').length, 0)
 })
 
 test('接线：模型模式未注入（modelPhase 缺失）全链路程序档可用', async () => {

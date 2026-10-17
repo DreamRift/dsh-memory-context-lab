@@ -120,8 +120,9 @@ test('renderExpansionPage：分页恒定、遗忘成员占位、末页如实标�
   const voucher = { voucherId: 'agg-1-4-abcdef', startSeq: 1, endSeq: 4, memberSeqs: [1, 2, 3, 4] }
   const texts = ['回执一', '回执二', '回执三', '回执四']
   const page1 = renderExpansionPage({ voucher, receiptTexts: texts, page: 1 })
-  // receiptTexts 是“当前页切片”：第 2 页只传该页成员的文本。
-  const page2 = renderExpansionPage({ voucher, receiptTexts: texts.slice(3), page: 2 })
+  // receiptTexts 是按成员 seq 平行的**全量**数组（隐藏槽位为 undefined）；
+  // 第 2 页由渲染器按页起点偏移取原文（BUG-006）。
+  const page2 = renderExpansionPage({ voucher, receiptTexts: texts, page: 2 })
   assert.ok(page1.includes('第 1/2 页'), 'pageSize=3，4 段共 2 页')
   assert.ok(page1.includes('回执三'))
   assert.ok(page1.includes('expand agg-1-4-abcdef 2'), '页脚带下一页提示')

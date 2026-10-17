@@ -116,6 +116,9 @@ function evaluateCandidate(plan, membersById) {
     reason: gainCheck.ok ? null : gainCheck.reason,
     gainCheck,
     members,
+    // BUG-007：L1 证据卡按成员自己的事实原子渲染。块（blocks）是预算选择后的
+    // 渲染单元，不带记录来源，拿它反查成员永远为空；事实列表才是权威映射。
+    factList: facts,
     facts: facts.length,
     groups: grouping.groups.length,
     blocks: summary.selected,
@@ -350,6 +353,7 @@ export async function compressRun(deps) {
   const failures = []
   // 模型相位统计（P4）：用户可见「几组走模型卡、几组落回程序卡」。
   const modelStats = { model: 0, fallback: 0 }
+  let modelNote = null
   for (const candidate of candidates) {
     if (candidate.status !== 'ready') {
       if (candidate.status === RUN_OUTCOME_NO_SAFE_GAIN) rejected.push(candidate.plan.voucherId)
@@ -360,7 +364,6 @@ export async function compressRun(deps) {
     // 机械校验的模型卡；失败关闭落程序卡；取消是任务撤销——停止本次 run，
     // 已完成的组保留，本组原状态保留，不借兜底继续。
     let l2CardText
-    let modelNote
     if (deps.modelPhase && typeof deps.modelPhase.stream === 'function') {
       const outcome = await modelPhaseOutcome(deps, candidate)
       if (outcome.cancelled) {
@@ -372,9 +375,9 @@ export async function compressRun(deps) {
         }
       }
       if (outcome.mode === 'model') {
-        l2CardText = outcome.cardText
+        l2CardText = outcome.card
         modelStats.model += 1
-      } else if (outcome.mode === 'fallback') {
+      } else if (outcome.mode === 'program') {
         modelStats.fallback += 1
         modelNote = outcome.reason
       }
@@ -464,8 +467,12 @@ function ledgerEntryBatch({ plan, evaluation, memberTexts, l2CardText, replaceme
   for (const member of evaluation.members) {
     const cardId = 'l1-' + member.recordId
     l1Ids.push(cardId)
-    const memberBlocks = evaluation.blocks.filter((b) => (b.sourceRecordIds ?? []).includes(member.recordId))
-    const evidenceAtoms = memberBlocks.map((b) => ({ entity: b.entity, attribute: b.attribute, value: b.value }))
+    // BUG-007：从该成员自己的事实原子取 entity/attribute/value（sourceRefs 的
+    // recordId 是来源映射的权威）。用 blocks 反查永远是空卡——buildBlocks 的
+    // 输出是「预算选择后的渲染块」，不是按记录索引。
+    const evidenceAtoms = (evaluation.factList ?? [])
+      .filter((fact) => (fact.sourceRefs ?? []).some((ref) => ref?.recordId === member.recordId))
+      .map((fact) => ({ entity: fact.entity, attribute: fact.attribute, value: fact.value }))
     const cardText = renderEvidenceCard({
       recordId: member.recordId,
       spanLabel: `seq ${plan.startSeq}-${plan.endSeq}`,

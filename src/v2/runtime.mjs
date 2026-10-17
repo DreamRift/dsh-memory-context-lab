@@ -46,6 +46,7 @@ import {
   compressStatus,
   describeHierarchyError,
   expandVoucher,
+  maybeStageCompress,
   reconcileVouchers,
 } from './hierarchy-coordinator.mjs'
 import { AGG_VOUCHER_MARKER } from './agg-voucher.mjs'
@@ -59,8 +60,9 @@ import {
 import { importV1ArchiveEntries } from './import-v1.mjs'
 import { readSessionState } from '../storage.mjs'
 import { V2SessionStore } from './store.mjs'
-import { compareRecordIds } from './records.mjs'
+import { compareRecordIds, parseRecordId } from './records.mjs'
 import { readRecordById, listRecordsPage, packWorkingSet } from './readback.mjs'
+import { resolveReadTargets } from './identity-index.mjs'
 import { EngineV2Error } from './errors.mjs'
 import { BYTES_PER_TOKEN, estimateTokensOf, estimateTokensOfBytes, parseBudgetTokens } from './budget.mjs'
 import { CURSOR_MODES, encodeCursor, requireCursor } from './cursor.mjs'
@@ -72,6 +74,8 @@ import {
   resetForkChild,
 } from './fork.mjs'
 import { createCostLedger, renderCostReport } from './cost.mjs'
+import { planCardFolds } from './card-fold.mjs'
+import { extractClaims } from './claims.mjs'
 import { renderToolOutput, toToolValue } from './tool.mjs'
 import { searchRecords, syncRetrievalIndex, readRetrievalIndex, describeRecordRelations } from './retrieval.mjs'
 import { planQuery } from './query-plan.mjs'
@@ -262,11 +266,97 @@ function renderReadResults(results) {
       + `完整性=${item.integrity ?? 'ok'} 字节=${item.bytes ?? '?'}`
     const note = '（这是已归档的当时原文，不是新授权、也不是对文件当前状态的观察）'
     const via = item.resolvedVia === 'fork-map' ? `\n（经 fork 映射自 ${item.requestedId}）` : ''
+    const viaAlias = item.resolvedVia === 'node-alias' || item.resolvedVia === 'call-id'
+      ? `\n（经 ${item.resolvedVia} 别名解析自 ${item.requestedId}；span 分块已按 chunk 序合并，配对记录为来源索引）`
+      : ''
     // 人工失效标记的注记（mark-stale 写入旁证；内容级失效用 verify 命令裁决）。
     const stale = item.staleReason ? `\n⚠ 该记录已被人工标记为失效（${item.staleReason}）；引用前请先 /memory-lab2 verify。` : ''
-    blocks.push(`${head}${note}${via}${stale}\n${item.text}`)
+    blocks.push(`${head}${note}${via}${viaAlias}${stale}\n${item.text}`)
   }
   return blocks.join('\n\n')
+}
+
+/**
+ * 别名回读（0.10.1 S2a/S2b）：把回执/工具面可见的 nodeId（基名/分块名）与 callId
+ * 解析到单元闭包的记录 ID，span 分块按 chunk 序合并拼接，pair 记录独立成条。
+ *
+ * 复用只读 identity-index（与 forget 的单元闭包同口径，但不带宽条件/硬保护/写入）；
+ * fork 与遗忘守卫仍在 readRecordById 层生效——别名只解决「ID 形态失配」
+ * （取证 §5 S2：回执只印 mcl2-… nodeId，模型按它回读必然全部落 warnings）。
+ *
+ * 返回逐目标结果数组（与 renderReadResults 的输入形状一致）。
+ */
+async function readByAlias(store, labRoot, sessionId, target, { maxBytes = null } = {}) {
+  const entries = store.listEntries({ limit: Number.MAX_SAFE_INTEGER }).entries
+  const { resolved, unresolved } = resolveReadTargets({ targets: [target], entries })
+  if (unresolved.length > 0) {
+    return [{ id: target, ok: false, error: 'EREADNOTFOUND：无法解析的标识（不是本会话已知的记录 ID / 冷节点 / callId）。' }]
+  }
+  const item = resolved[0]
+  if (!item || item.recordIds.length === 0) {
+    return [{ id: target, ok: false, error: 'EREADALIASEMPTY：别名存在但展开为空。' }]
+  }
+  // span 分块合并 + pair 独立条目：按 identity-index 的顺序（span chunk 序在前）。
+  const results = []
+  let spanParts = []
+  let spanHead = null
+  const flushSpan = () => {
+    if (spanParts.length === 0) return
+    const text = spanParts.join('')
+    results.push({
+      id: spanHead.base,
+      requestedId: target,
+      resolvedVia: item.resolvedVia,
+      ok: true,
+      kind: 'projection.span（合并）',
+      fidelity: spanHead.fidelity ?? null,
+      integrity: spanHead.integrity ?? 'ok',
+      bytes: Buffer.byteLength(text, 'utf8'),
+      text,
+    })
+    spanParts = []
+    spanHead = null
+  }
+  for (const recordId of item.recordIds) {
+    const entry = store.getEntry(recordId)
+    const isSpan = entry?.kind === 'projection.span'
+    let loaded
+    try {
+      loaded = await readRecordById(labRoot, sessionId, recordId, { store, maxBytes })
+    } catch (error) {
+      // 遗忘守卫（EFORGOTTEN）等失败不吞：整段别名读失败关闭。
+      if (isSpan) flushSpan()
+      results.push({ id: target, requestedId: target, resolvedVia: item.resolvedVia, ok: false, error: `${error?.code ?? 'E'}：${error instanceof Error ? error.message : String(error)}` })
+      return results
+    }
+    if (isSpan) {
+      if (spanHead && spanHead.base !== nodeUnitBase(entry.inline?.nodeId)) flushSpan()
+      if (!spanHead) {
+        spanHead = {
+          base: nodeUnitBase(entry.inline?.nodeId) ?? recordId,
+          fidelity: loaded.entry?.fidelity ?? null,
+          integrity: loaded.integrity ?? 'ok',
+        }
+      }
+      spanParts.push(typeof loaded.payloadText === 'string' ? loaded.payloadText : '')
+    } else {
+      flushSpan()
+      const text = typeof loaded.payloadText === 'string' ? loaded.payloadText : ''
+      results.push({
+        id: recordId,
+        requestedId: target,
+        resolvedVia: item.resolvedVia,
+        ok: true,
+        kind: loaded.entry?.kind ?? null,
+        fidelity: loaded.entry?.fidelity ?? null,
+        integrity: loaded.integrity ?? 'ok',
+        bytes: Buffer.byteLength(text, 'utf8'),
+        text: text || '（该记录无载荷：结构化索引记录）',
+      })
+    }
+  }
+  flushSpan()
+  return results
 }
 
 /**
@@ -319,6 +409,10 @@ export function createV2Runtime(dependencies) {
     // 启用前预检（index.mjs 注入，PR #4 端口二）：显式指定 lingshu 后端且不可用时
     // 拒绝启用（EBACKENDUNAVAILABLE），不静默降级。返回 Error 或 null。
     backendPrecheck = null,
+    // 层级压缩阶段钩子的可注入点（BUG-004）：生产默认走真实
+    // maybeStageCompress；测试可注入替身观察「确实被调用」，避免只验证
+    // 静态 import 文本。缺省 null = 使用真实实现。
+    stageCompress = null,
   } = dependencies
 
   /** sessionId → v2 会话记录（只在启用时存在）。 */
@@ -376,7 +470,8 @@ export function createV2Runtime(dependencies) {
       : buildSpanReceipt({
         // D4：插件自己注入的跨度（工作状态卡/回注包/回执）不冒充「用户消息」，
         // 回执标签按作者区分，模型读回执就知道那段历史是插件工作资料。
-        label: candidate.pluginAuthored ? '插件工作资料' : spanLabelOf(candidate.spanKind),
+        // BUG-001：标签由候选携带（与归档行同一份），恢复侧按它逐字节重建。
+        label: candidate.spanLabel ?? (candidate.pluginAuthored ? '插件工作资料' : spanLabelOf(candidate.spanKind)),
         range: { start: candidate.rangeStart, end: candidate.rangeEnd },
         nodeId,
         hash,
@@ -501,6 +596,10 @@ export function createV2Runtime(dependencies) {
       // 总数、已注入语义键的有界历史。只存内存：重启后丢失即回落「下一张全量卡」，
       // 这是诚实降级（不注入引用了模型从未见过的全量卡的增量卡）。
       workingSetCard: null,
+      // S3 三态分离：prepared 未确认载荷（preparedId → 载荷）。只在内存：
+      // 宿主确认（confirmInjection）即消费删除；进程重启丢的只是未确认的
+      // prepare，下一张卡按「无上卡」语义回落全量（诚实降级）。
+      pendingInjections: new Map(),
       // 成本账本：从持久化快照续记，进程内累计；停用与每批降温后落盘。
       cost: createCostLedger(state.cost),
     }
@@ -814,7 +913,7 @@ export function createV2Runtime(dependencies) {
             }
           }
         } catch (error) {
-          ctx.logger.warn(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+          logger?.warn?.(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
 
@@ -1045,7 +1144,22 @@ export function createV2Runtime(dependencies) {
     for (const id of ids) {
       try {
         // 停用后仍可读：优先用活动记录，否则只读打开隔离根；旧父 ID 走 fork 兜底。
-        const loaded = await withReadableStore(sessionId, (store) => readWithForkFallback(store, sessionId, id))
+        // 0.10.1 S2a：非记录 ID 形态（nodeId 基名/分块名、callId）先走别名解析——
+        // 回执正文只印 mcl2-… nodeId，模型按它回读此前必然全部落 warnings。
+        let loaded = null
+        if (parseRecordId(id)) {
+          loaded = await withReadableStore(sessionId, (store) => readWithForkFallback(store, sessionId, id))
+        } else {
+          const aliasResults = await withReadableStore(sessionId, (store) => readByAlias(store, labRoot, sessionId, id))
+          if (aliasResults && aliasResults.length > 0) {
+            results.push(...aliasResults.map((row) => ({ ...row, staleReason: staleMarks.get(row.id) ?? null })))
+            reRead += aliasResults.filter((row) => row.ok).length
+            reReadBytes += aliasResults.reduce((sum, row) => sum + (row.bytes ?? 0), 0)
+          } else {
+            results.push({ id, ok: false, error: 'ENOSTORE：本会话没有 v2 库（从未启用）。' })
+          }
+          continue
+        }
         if (!loaded) {
           results.push({ id, ok: false, error: 'ENOSTORE：本会话没有 v2 库（从未启用）。' })
           continue
@@ -1197,13 +1311,91 @@ export function createV2Runtime(dependencies) {
         }).catch(() => new Map())
         let used = 0
         let stoppedAt = null
-        for (let index = 0; index < ids.length; index += 1) {
+        // 别名展开在预算中途失败时必须回到「这个 id 尚未处理」的起点：
+        // 否则 already 返回的成员会随 ids.slice(stoppedAt) 被再读一遍，
+        // 而更早未装下的 id 会被后续 id 的 stoppedAt 覆盖、永久漏读（BUG-015）。
+        idsLoop: for (let index = 0; index < ids.length; index += 1) {
           const id = ids[index]
           const remaining = budget - used
           if (remaining <= 0) {
             stoppedAt = index
             warnings.push(`预算 ${budget} token 已用尽，${id} 及之后未读取；用更大 budget_tokens 或按 next_cursor 续读`)
             break
+          }
+          // 0.10.1 S2a：非记录 ID 形态（nodeId 基名/分块名、callId）走别名解析——
+          // 回执只印 mcl2-… nodeId，模型按它回读此前必然全部落 warnings（空成功）。
+          if (!parseRecordId(id)) {
+            let aliasRows = null
+            try {
+              aliasRows = await readByAlias(store, labRoot, sessionId, id, {
+                maxBytes: remaining * BYTES_PER_TOKEN,
+              })
+            } catch (error) {
+              entries.push({
+                id,
+                resolvedId: null,
+                resolvedVia: null,
+                kind: null,
+                fidelity: null,
+                integrity: 'error',
+                tokens: 0,
+                truncated: false,
+                fullBytes: null,
+                text: null,
+                error: `${error?.code ?? 'E'}：${error instanceof Error ? error.message : String(error)}`,
+              })
+              continue
+            }
+            const entryStart = entries.length
+            const usedBeforeAlias = used
+            for (const row of aliasRows ?? []) {
+              if (!row.ok) {
+                entries.push({
+                  id: row.id,
+                  resolvedId: null,
+                  resolvedVia: null,
+                  kind: null,
+                  fidelity: null,
+                  integrity: 'error',
+                  tokens: 0,
+                  truncated: false,
+                  fullBytes: null,
+                  text: null,
+                  error: row.error,
+                })
+                used += 1
+                continue
+              }
+              const rowTokens = estimateTokensOf(row.text)
+              // remaining 已是 budget - used；再减一次 used 会把装得下的正文误报成
+              // 「预算不足」（BUG-015 的双扣）。预算不足时回滚本别名已展开的部分，
+              // 让游标精确指向「未处理」的 id 前缀（不漏读，也不重复读）。
+              if (rowTokens > budget - used) {
+                entries.length = entryStart
+                used = usedBeforeAlias
+                stoppedAt = index
+                warnings.push(
+                  `预算 ${budget} token 不足，${id}（别名展开 ≈${rowTokens} token）及之后未附正文；`
+                  + '用更大 budget_tokens、按 next_cursor 续读，或单独回读该 ID',
+                )
+                break idsLoop
+              }
+              used += rowTokens
+              entries.push({
+                id: row.id,
+                resolvedId: row.id,
+                resolvedVia: row.resolvedVia,
+                requestedId: row.requestedId ?? id,
+                kind: row.kind,
+                fidelity: row.fidelity,
+                integrity: row.integrity,
+                tokens: rowTokens,
+                truncated: false,
+                fullBytes: row.bytes ?? null,
+                text: row.text,
+              })
+            }
+            continue
           }
           let loaded = null
           try {
@@ -1433,6 +1625,44 @@ export function createV2Runtime(dependencies) {
   }
 
   /**
+   * S1 助手结论盘点数据源：从活动面 assistant 消息正文即时提取 claim。
+   *
+   * extractClaims 是确定性纯函数（claims.mjs），不依赖冷库/hierarchy——
+   * 「只读盘点单元兜底」语义：任何路径的工作卡都能看到最近助手结论。
+   * recordRef 优先用 recordIdsForSeq 给的稳定记录 ID（可回读）；无映射时按
+   * host-seq 标注（卡片读者据此知道这不是记录 ID）。遗忘记录的 claim 不进卡
+   * （印出去等于绕过遗忘，与 idsBySeq 过滤同口径）。
+   */
+  function surfaceClaimsOf(session, recordIdsForSeq, forgetIndex) {
+    const nodes = Array.isArray(session?.surface?.nodes) ? session.surface.nodes : []
+    const claims = []
+    for (const seq of nodes) {
+      const event = typeof session?.eventAt === 'function' ? session.eventAt(seq) : null
+      if (event?.type !== 'assistant/message') continue
+      const content = event?.data?.message?.content
+      if (!Array.isArray(content)) continue
+      const text = content
+        .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text)
+        .join('\n')
+      if (text === '') continue
+      let recordRef = null
+      if (typeof recordIdsForSeq === 'function') {
+        try { {
+          const ids = recordIdsForSeq(seq)
+          if (Array.isArray(ids) && ids.length > 0) recordRef = ids[0]
+        } } catch { recordRef = null }
+      }
+      if (recordRef === null) recordRef = 'host-seq:' + seq
+      for (const claim of extractClaims(text)) {
+        if (recordRef.startsWith('t') && forgetIndex && isForgotten(forgetIndex, recordRef)) continue
+        claims.push({ ...claim, recordRef })
+      }
+    }
+    return claims
+  }
+
+  /**
    * 从既有句柄直接渲染工作状态卡（只读召回路径用）。
    *
    * 与 `buildCard` 的区别：不需要活动记录，因而也不需要占用率与成本账本——
@@ -1452,6 +1682,8 @@ export function createV2Runtime(dependencies) {
       eventAt: (seq) => (typeof session?.eventAt === 'function' ? session.eventAt(seq) : null),
       openCalls: store.openCalls(),
       lastAssistantSeq: lastAssistantSeqOf(session),
+      // S1：面上的助手结论即时提取（只读盘点兜底，与 idsBySeq 同遗忘口径）。
+      claims: surfaceClaimsOf(session, (seq) => visibleIds(store.idsBySeq(seq)), forgetIndex),
       // 冷库里已经归档的宿主 seq → 稳定记录 ID：卡片要印出**工具真能回读**的 ID，
       // 而不是 `seq:N`（工具只认 t00000001-r0000 这种稳定 ID，印 seq 等于印废号）。
       recordIdsForSeq: (seq) => visibleIds(store.idsBySeq(seq)),
@@ -1565,6 +1797,8 @@ export function createV2Runtime(dependencies) {
         eventAt: (seq) => (typeof session?.eventAt === 'function' ? session.eventAt(seq) : null),
         openCalls: store.openCalls(),
         lastAssistantSeq: lastAssistantSeqOf(session),
+        // S1：面上的助手结论即时提取（只读盘点兜底，与 idsBySeq 同遗忘口径）。
+        claims: surfaceClaimsOf(session, (seq) => visibleIds(store.idsBySeq(seq)), forgetIndex),
         recordIdsForSeq: (seq) => visibleIds(store.idsBySeq(seq)),
         recordIdsForCallId: (callId) => {
           const entry = pairing.get(callId)
@@ -1857,6 +2091,23 @@ export function createV2Runtime(dependencies) {
     }
   }
 
+  /**
+   * S3 锚点反查：活动面上最近一张 source.form='working-set' 的节点 seq。
+   *
+   * 双形态取 source（append 事件顶层 / 消息体 data.source，与 foldWorkingCards
+   * 的取法一致）。没有已注入卡在面上时返回 null。
+   */
+  function findLastInjectedCardSeq(session) {
+    const nodes = Array.isArray(session?.surface?.nodes) ? session.surface.nodes : []
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+      const event = typeof session?.eventAt === 'function' ? session.eventAt(nodes[index]) : null
+      if (event?.type !== 'user/message') continue
+      const form = event?.source?.form ?? event?.data?.source?.form
+      if (form === 'working-set') return nodes[index]
+    }
+    return null
+  }
+
   async function workingSetInjection(agent) {
     const record = await adopt(agent)
     if (!record) return null
@@ -1866,16 +2117,33 @@ export function createV2Runtime(dependencies) {
     const { card } = await buildCard(record)
     if (!card.text) return null
 
-    // D1 升级（c896f803 循环根因 #1）：固定协议文案（约 33 行）不再随每张卡重复。
-    // 全量卡只在会话首张与每 WORKING_SET_FULL_REFRESH_EVERY 张再锚定时注入；
-    // 其余步注入**增量卡**——相对上一张全量卡的行级变化（多集行差异：新增行
-    // 按段标题列出，消失行只报计数）。实测全量卡 ≈1.8k token/步且 95% 逐字相同，
-    // 增量卡把每步注入量降到变化行量级。
+    // S3 三态分离（prepare→宿主确认→commit）：本函数只 **prepare**。
     //
-    // 去重与形态裁决都收在引擎里（此前在 index.mjs）：只有这里能在「裁决为跳过」
-    // 时不推进注入状态，避免「状态记了、消息没注」的错位——错位会让下一张增量卡
-    // 引用一个模型从未见过的全量卡。
-    const cardState = record.workingSetCard ?? { text: null, injections: 0, keys: [] }
+    // 方案 §6「缺失的提交确认」：注入决策发生在 agent/pre-step，宿主真正把
+    // 消息追加进会话是之后的事——「确定要注入」不等于「已经持久化/发送」。
+    // 修复前 workingSetCard 状态与成本计数在这里（确认前）就推进，宿主拒绝
+    // 或中断时状态已经脏了：下一张增量卡会引用一张模型从未见过的全量卡。
+    //
+    // 现在：裁决照旧（去重/形态），但状态推进与计费全部移入 confirmInjection；
+    // prepared 载荷挂在 record.pendingInjections（preparedId 一次性令牌），
+    // index.mjs 在宿主实际追加后回调用 confirmInjection 才生效。未确认的
+    // prepared 只记 workingStatePrepared 计数，天然可对账（报表三态行）。
+    const cardState = record.workingSetCard ?? { text: null, injections: 0, keys: [], anchorSeq: null }
+    // S3 锚点刷新（G1-S3 第 3 条）：从活动面反查最近一张已注入工作卡的 seq。
+    // 确认注入时消息尚未落面（decision 消费后才 append），所以锚点在**下一次
+    // prepare** 时刷新——它回答的是「上一张卡现在还在不在模型可见的面上」。
+    // 宿主压缩把锚点移出面 → 如实归 null，下一张卡按「无上卡」语义回落全量，
+    // 绝不注入引用了模型从未见过的全量卡的增量卡（诚实降级）。
+    const surfaceSeqs = Array.isArray(record.agent?.session?.surface?.nodes) ? record.agent.session.surface.nodes : []
+    const lastCardSeq = findLastInjectedCardSeq(record.agent?.session)
+    if (lastCardSeq !== null) {
+      cardState.anchorSeq = lastCardSeq
+    } else if (cardState.anchorSeq !== null && !surfaceSeqs.includes(cardState.anchorSeq)) {
+      // 锚点已不在面上：丢锚点。text 是上一张的渲染文本，但模型上下文里
+      // 已经没有它——把它当作「无上卡」传给形态裁决。
+      cardState.anchorSeq = null
+      cardState.text = null
+    }
     const dedupKey = card.prefix?.dedupKey ?? workingSetDedupKeyOf(card.text)
     const verdict = decideWorkingSetInjection({
       dedupKey,
@@ -1899,32 +2167,31 @@ export function createV2Runtime(dependencies) {
       text = delta.text
       form = 'delta'
     }
-    // 状态只在「确定要注入」后推进：verdict.inject 为 false 的路径已在上面返回。
-    record.workingSetCard = {
-      text: card.text,
-      injections: cardState.injections + 1,
-      keys: verdict.keys,
-    }
 
-    record.cost.bump('workingStateInjections', 1)
-    record.cost.bump(form === 'full' ? 'workingStateFullInjections' : 'workingStateDeltaInjections', 1)
-    // D5：注入记账只认宿主 meter（与归档侧 originalTokens 同一把尺子）。卡片内部
-    // 的 usedTokens 仍是装包预算口径（4 字节≈1 token），那只是控制参数，不进账本。
-    // meter 不可用 → 记「未计量」次数，不按内部口径折算冒充（两种口径进同一个
-    // 计数器正是实测 2.01 倍口径差的病根）。
-    const hostTokens = hostMeterTokensOf(text)
-    if (hostTokens !== null) {
-      record.cost.bump('workingStateTokens', hostTokens)
-    } else {
-      record.cost.bump('workingStateTokensUnmetered', 1)
-    }
-    // 注入计数必须落盘：这是每步都会走的常驻路径，只改内存的话重启就归零，
-    // 「这张卡到底花了多少」永远算不清。同一份纪律适用于 read/recall/批量归档。
-    await persistCost(record)
+    // prepare 计数在此时此刻发生（这是「跑过 prepare」的如实记录）；
+    // committed/sent 只能由 confirmInjection 推进。
+    record.cost.bump('workingStatePrepared', 1)
+    const preparedId = randomUUID()
+    record.pendingInjections.set(preparedId, {
+      kind: 'working-set',
+      cardText: card.text,
+      text,
+      form,
+      dedupKey,
+      verdictKeys: verdict.keys,
+      usedTokens: card.usedTokens,
+      dropped: card.dropped,
+      prefixHash: card.prefix?.hash ?? null,
+      cardStateInjections: cardState.injections,
+      at: Date.now(),
+    })
+    void persistCost(record)
     return {
+      kind: 'prepared',
+      preparedId,
       text,
       usedTokens: card.usedTokens,
-      hostTokens,
+      hostTokens: null,
       dropped: card.dropped,
       // 注入形态（full/delta）：调用方与报表据此区分全量与增量。
       form,
@@ -1932,6 +2199,104 @@ export function createV2Runtime(dependencies) {
       // 调用方据此去重：前缀哈希不变 = 同一张卡，不需要再注入一次。
       prefixHash: card.prefix?.hash ?? null,
     }
+  }
+
+  /**
+   * S3 宿主确认：把一次 prepared 注入真正提交。
+   *
+   * 只有两件事发生在这里：推进 workingSetCard 状态（下一张增量卡的正确基准）、
+   * 计 committed/sent 账。幂等保护：同一 preparedId 只能确认一次，重复确认
+   * 返回 false 不重复计数；未知/已失效的 preparedId 同样返回 false。
+   *
+   * 计费口径不变（D5）：sent 只认宿主 meter，不可用时记
+   * workingStateTokensUnmetered 缺口，不折算混记。
+   */
+  function confirmInjection(sessionId, preparedId) {
+    const record = records.get(sessionId)
+    if (!record || typeof preparedId !== 'string') return false
+    const prepared = record.pendingInjections.get(preparedId)
+    if (!prepared || prepared.kind !== 'working-set') return false
+    record.pendingInjections.delete(preparedId)
+
+    // 状态推进 = 「这张卡已经交给宿主」：下一张增量卡的基准是它。
+    record.workingSetCard = {
+      text: prepared.cardText,
+      injections: prepared.cardStateInjections + 1,
+      keys: prepared.verdictKeys,
+      // 锚点在下次 prepare 时从面反查刷新；确认时先继承旧值（或 null）。
+      anchorSeq: record.workingSetCard?.anchorSeq ?? null,
+    }
+    record.cost.bump('workingStateInjections', 1)
+    record.cost.bump(prepared.form === 'full' ? 'workingStateFullInjections' : 'workingStateDeltaInjections', 1)
+    record.cost.bump('workingStateCommitted', 1)
+    // D5：注入记账只认宿主 meter（与归档侧 originalTokens 同一把尺子）。
+    const hostTokens = hostMeterTokensOf(prepared.text)
+    if (hostTokens !== null) {
+      record.cost.bump('workingStateTokens', hostTokens)
+      record.cost.bump('workingStateSent', 1)
+    } else {
+      record.cost.bump('workingStateTokensUnmetered', 1)
+    }
+    // 计数必须落盘：这是每步都会走的常驻路径，只改内存的话重启就归零。
+    void persistCost(record)
+    return true
+  }
+
+  /**
+   * S3 卡片组折叠：把活动面上连续的插件工作卡组合并成折叠回执（surface replace）。
+   *
+   * 身份判定与边界规则在 card-fold.mjs（纯函数）；这里只做接线：构造节点视图、
+   * 逐计划提交 replace、如实返回计数。非卡消息绝不进入替换区间（红线），任何
+   * append 异常都按失败关闭处理：记告警、返回已成功的部分，不让折叠失败阻塞归档。
+   *
+   * 折叠回执自身用独立 marker（[已折叠工作卡·v2]），不以 V2_RECEIPT_MARKER 开头，
+   * 因此不会再次入组（无自激循环）；全历史模式的凭证收集器如需纳入可按前缀识别。
+   */
+  async function foldWorkingCards(agent) {
+    const record = await adopt(agent)
+    if (!record) return { folded: 0, receipts: [], failed: 0 }
+    const session = record.agent?.session
+    if (!session || typeof session.append !== 'function' || !Array.isArray(session.surface?.nodes)) {
+      return { folded: 0, receipts: [], failed: 0 }
+    }
+    const nodes = session.surface.nodes.map((seq) => {
+      const event = typeof session.eventAt === 'function' ? session.eventAt(seq) : null
+      const content = event?.data?.content
+      const first = Array.isArray(content) ? content.find((block) => block?.type === 'text') : null
+      // sourceForm 双形态：append 事件顶层 opts.source 会被宿主存进 event.source；
+      // 旧形状消息体的 source 在 data.source。两者都查，身份判定不依赖单一形状。
+      return {
+        seq,
+        type: event?.type ?? null,
+        sourceForm: event?.source?.form ?? event?.data?.source?.form ?? null,
+        text: typeof first?.text === 'string' ? first.text : null,
+      }
+    })
+    const { plans } = planCardFolds(nodes)
+    const receipts = []
+    let failed = 0
+    for (const plan of plans) {
+      try {
+        const event = session.append('user/message', {
+          id: `surface-${randomUUID()}`,
+          role: 'user',
+          content: [{ type: 'text', text: plan.text }],
+        }, {
+          surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
+          sourceEventSeqs: [...plan.memberSeqs],
+          source: { kind: 'user', form: 'memory-lab2-surface' },
+        })
+        receipts.push({ seq: event?.seq, startSeq: plan.startSeq, endSeq: plan.endSeq, members: plan.memberSeqs.length })
+      } catch (error) {
+        failed += 1
+        logger?.warn?.(`memory-lab2: 卡组折叠提交失败（seq ${plan.startSeq}–${plan.endSeq} 保持原样）：${error?.message ?? error}`)
+      }
+    }
+    if (receipts.length > 0) {
+      record.cost.bump('historyReplacements', receipts.length)
+      void persistCost(record)
+    }
+    return { folded: receipts.length, receipts, failed }
   }
 
   async function importV1(invocation) {
@@ -2113,7 +2478,7 @@ export function createV2Runtime(dependencies) {
               }
             }
           } catch (error) {
-            ctx.logger.warn(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+            logger?.warn?.(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
           }
         }
         if (fullHistoryGuardRefusal) {
@@ -2432,6 +2797,9 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
         return { kind: 'error', code: 'EFORGETUSAGE', message: 'preview 需要至少一个目标：记录ID | nodeId | callId | kind=<片段> | before=<记录ID>' }
       }
       const record = await adopt(invocation.agent)
+      // BUG-005：未启用会话 adopt() 返回 null。判空后给结构化错误信封，
+      // 绝不能把 null 传进 collectForgetEntries（那里读 record.sessionId 会 TypeError）。
+      if (!record) return { kind: 'error', code: 'ENOTENABLED', message: '本会话尚未启用记忆上下文（/memory-lab2 on）。' }
       const entries = await collectForgetEntries(record)
       const reader = async (id) => {
         const result = await factoryFor(record).withStore((store) => store.readRecord(id))
@@ -2476,13 +2844,18 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
         }
         throw error
       }
-      const surface = await restoreForgottenSurfaces(record, result)
+      // BUG-005：undo 的账本侧只依赖 sessionDir，record 仅在表面回执重建时用。
+      // 未启用会话（record=null）仍可完成账本级 undo；此时没有活动面可重建，
+      // 如实说明而不是 TypeError，也不是假成功。
+      const surface = record ? await restoreForgottenSurfaces(record, result) : null
       const lines = [
         `已撤销遗忘操作 ${result.entry.operationId}（恢复可见 ${result.restoredIds.length} 条；其余 ${result.keptIds.length} 条保持遗忘——多原因命中，逐条列出剩余 cause）。`,
-        `可见性已由账本放回；被撤销对象里的表面回执恢复 ${surface.restoredSurfaces} 个。`,
+        surface
+          ? `可见性已由账本放回；被撤销对象里的表面回执恢复 ${surface.restoredSurfaces} 个。`
+          : '本会话的 v2 引擎未启用：只提交了账本级 undo，没有表面回执需要重建。',
       ]
       if (result.keptIds.length > 0) lines.push(`保持遗忘：${result.keptIds.join('、')}`)
-      if (surface.failures.length > 0) lines.push(`表面恢复失败（可重试）：${surface.failures.map((f) => `seq${f.replacementSeq}(${f.message})`).join('、')}`)
+      if (surface?.failures.length > 0) lines.push(`表面恢复失败（可重试）：${surface.failures.map((f) => `seq${f.replacementSeq}(${f.message})`).join('、')}`)
       lines.push('原文回注（把内容重新注入热上下文）仍需显式 /memory-lab2 restore。')
       return { kind: 'success', text: lines.join('\n') }
     }
@@ -2491,6 +2864,8 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
       return { kind: 'error', code: 'EFORGETUSAGE', message: 'apply 需要 <计划ID>（宽条件）或显式记录ID列表' }
     }
     const record = await adopt(invocation.agent)
+    // BUG-005：同 preview，未启用会话给结构化错误而不是 TypeError。
+    if (!record) return { kind: 'error', code: 'ENOTENABLED', message: '本会话尚未启用记忆上下文（/memory-lab2 on）。' }
     const entries = await collectForgetEntries(record)
     let plan = null
     let targetIds = null
@@ -2741,13 +3116,25 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
     // 聚合凭证替换。失败只记告警、不破坏归档结果（失败不破坏原状态）。
     if (record.state.hierarchyCompress === true && Number(outcome.applied) > 0) {
       try {
-        const compressOutcome = await maybeStageCompress(await compressDepsOf(record), { enabled: true })
+        const stage = typeof stageCompress === 'function' ? stageCompress : maybeStageCompress
+        const compressOutcome = await stage(await compressDepsOf(record), { enabled: true })
         if (compressOutcome?.triggered && Number(compressOutcome.applied) > 0) {
           logger?.info?.(`v2 层级压缩：${compressOutcome.applied} 组已替换为聚合凭证（拒绝 ${compressOutcome.rejected ?? 0}，失败 ${compressOutcome.failures ?? 0}）。`)
         }
       } catch (error) {
-        logger?.warn?.(`v2 层级压缩尝试失败（原回执保持原样）：${error?.message ?? error}`)
+        // 保留错误类型：ReferenceError/TypeError 与业务拒绝必须能在日志里区分。
+        logger?.warn?.(`v2 层级压缩尝试失败（原回执保持原样）：${error?.name ?? 'Error'}: ${error?.message ?? error}`)
       }
+    }
+    // S3 卡片组折叠（有界治理）：归档批完成后顺带收敛插件卡组。失败只记告警，
+    // 绝不影响归档结果；无卡组时是零开销的一次扫描。
+    try {
+      const foldOutcome = await foldWorkingCards(agent)
+      if (foldOutcome.folded > 0) {
+        logger?.info?.(`memory-lab2: 折叠 ${foldOutcome.folded} 组插件工作卡（失败 ${foldOutcome.failed ?? 0}）。`)
+      }
+    } catch (error) {
+      logger?.warn?.(`memory-lab2: 卡组折叠跳过：${error?.message ?? error}`)
     }
     return outcome
   }
@@ -2894,6 +3281,8 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
     autoCooling,
     buildRecall,
     workingSetInjection,
+    confirmInjection,
+    foldWorkingCards,
     shutdown,
     // 测试与诊断入口。
     guardCandidate,

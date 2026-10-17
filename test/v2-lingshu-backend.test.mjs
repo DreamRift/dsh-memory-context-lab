@@ -121,7 +121,8 @@ test('同 ID 不同正文被灵枢排入复核队列时，回读不符必须报�
         return { ok: true }
       },
       async getNode() {
-        return { ok: true, text: '完全不同的旧正文' }
+        // 真实契约（normalizeNodeRead）返回 content，不是 text。
+        return { ok: true, content: '完全不同的旧正文' }
       },
     },
   })
@@ -137,7 +138,7 @@ test('同 ID 且回读内容一致时视为幂等重写成功', async () => {
     client: {
       sessionId: 's',
       async callTool() { return { ok: true, committed: false } },
-      async getNode(id) { return { ok: true, text: `[v2 派生索引] 记录 ${id} ...` } },
+      async getNode(id) { return { ok: true, content: `[v2 派生索引] 记录 ${id} ...` } },
     },
   })
   const result = await backend.index([recordFixture()])

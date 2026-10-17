@@ -76,11 +76,26 @@ async function sha256Of(file) {
  * - 单条记录指纹采集失败只跳过该记录并告警，不拖垮整批归档（归档是主事务，验证是旁证）。
  */
 export async function captureFingerprints({ store, sessionDir, recordIds, warn = () => {} }) {
-  if (!sessionDir || !Array.isArray(recordIds) || recordIds.length === 0) return
+  if (!sessionDir || !Array.isArray(recordIds) || recordIds.length === 0) return { captured: 0 }
+  // BUG-014：旁证损坏后「空表重建」会丢掉全部旧指纹。如果这时按当前哈希补采，
+  // 归档后已经改动的文件会拿到新指纹并被判 valid——把 stale 洗白。重建后的
+  // 旁证带 frozenBefore：在该时点之前落库的记录一律拒绝重采（宁判 unverified）。
+  // 旁证当前就是损坏态时，本次也无法知道哪些记录曾有过指纹——全部拒绝。
+  const existing = await readSidecar(sessionDir)
+  if (!existing.ok) {
+    warn('verification: 旁证文件损坏，本次拒绝重采任何指纹（重建后按 frozenBefore 冻结）')
+    return { captured: 0 }
+  }
+  const frozenBefore = existing.frozenBefore
   const additions = {}
+  let captured = 0
   for (const id of recordIds) {
     try {
       const loaded = await store.readRecord(id, { verifyHash: false, maxBytes: PARAMS_MAX_BYTES })
+      if (isFrozenRecord(loaded?.record?.createdAt, frozenBefore)) {
+        warn(`verification: 记录 ${id} 早于旁证损坏时点（${frozenBefore}），拒绝重采指纹（保持未验证，防止事后改动洗成 valid）`)
+        continue
+      }
       // 非 operation.call、参数无候选路径、候选文件当前不可读：统一记「看管过、无指纹」
       // （files: []）。必须记账，否则差集永不收敛、每批归档都重扫全部旧记录。
       const recordable = { files: [], stale: null, capturedAt: new Date().toISOString() }
@@ -93,16 +108,18 @@ export async function captureFingerprints({ store, sessionDir, recordIds, warn =
         }
       }
       additions[id] = recordable
+      captured += 1
     } catch (error) {
       warn(`verification: 记录 ${id} 指纹采集失败（跳过，该记录按未验证处理）：${error?.message ?? error}`)
     }
   }
   const keys = Object.keys(additions)
-  if (keys.length === 0) return
+  if (keys.length === 0) return { captured: 0 }
   await updateSidecar(sessionDir, (current) => {
     for (const key of keys) current[key] = additions[key]
     return current
-  })
+  }, { warn })
+  return { captured }
 }
 
 /**
@@ -120,10 +137,23 @@ export async function syncVerification({ store, sessionDir, warn = () => {} }) {
   }
   const known = new Set(Object.keys(existing.data))
   const entries = store.listEntries({ limit: Number.MAX_SAFE_INTEGER }).entries
-  const pending = entries.map((entry) => entry.id).filter((id) => !known.has(id))
-  if (pending.length === 0) return { captured: 0 }
-  await captureFingerprints({ store, sessionDir, recordIds: pending, warn })
-  return { captured: pending.length }
+  // BUG-014：旁证损坏重建后 known 只剩重建时写入的条目；早于 frozenBefore 的
+  // 记录不能当「新记录」补采（那正是洗白路径）。
+  const frozen = []
+  const pending = entries
+    .filter((entry) => !known.has(entry.id))
+    .filter((entry) => {
+      if (!isFrozenRecord(entry.createdAt, existing.frozenBefore)) return true
+      frozen.push(entry.id)
+      return false
+    })
+    .map((entry) => entry.id)
+  if (frozen.length > 0) {
+    warn(`verification: ${frozen.length} 条记录早于旁证损坏时点，跳过增量采集（保持未验证，不洗白 stale）`)
+  }
+  if (pending.length === 0) return { captured: 0, frozen: frozen.length }
+  const outcome = await captureFingerprints({ store, sessionDir, recordIds: pending, warn })
+  return { captured: outcome.captured ?? pending.length, frozen: frozen.length }
 }
 
 async function readSidecar(sessionDir) {
@@ -143,20 +173,44 @@ async function readSidecar(sessionDir) {
     if (parsed?.records === null || typeof parsed?.records !== 'object' || Array.isArray(parsed?.records)) {
       throw new Error('records 字段形态不对')
     }
-    return { ok: true, data: parsed.records }
+    return {
+      ok: true,
+      data: parsed.records,
+      // BUG-014：损坏重建时写入的冻结时点。此后重建的旁证仍记得「哪些记录早于
+      // 损坏」，从而拒绝补采（具体记录 ID 已不可知，按时间作保守上界）。
+      frozenBefore: typeof parsed.frozenBefore === 'string' && parsed.frozenBefore.length > 0
+        ? parsed.frozenBefore
+        : null,
+    }
   } catch {
     // 失败关闭：损坏旁证按「什么都没验过」处理，由调用方决定要不要告警，绝不当 valid。
-    return { ok: false, data: {} }
+    return { ok: false, data: {}, frozenBefore: null }
   }
 }
 
-async function updateSidecar(sessionDir, mutate) {
+/**
+ * 记录是否早于旁证损坏时点（BUG-014）。
+ *
+ * 缺 createdAt 的旧记录按「冻结」处理：无法证明它是损坏后新增的，就不能给它
+ * 补采当前指纹——宁可 unverified，绝不把事后改动洗成 valid。
+ */
+function isFrozenRecord(createdAt, frozenBefore) {
+  if (!frozenBefore) return false
+  if (typeof createdAt !== 'string' || createdAt.length === 0) return true
+  return createdAt <= frozenBefore
+}
+
+async function updateSidecar(sessionDir, mutate, { warn = () => {} } = {}) {
   const file = verificationFilePath(sessionDir)
   const current = await readSidecarRawForUpdate(sessionDir)
-  const next = mutate(current)
+  if (current.rebuilt) {
+    warn(`verification: 旁证文件损坏，已按空表重建；${current.frozenBefore} 之前落库的记录冻结重采（旧指纹丢失 → 未验证，绝不洗成 valid）`)
+  }
+  const next = mutate(current.records)
   await writeJsonFileAtomic(file, {
     kind: VERIFICATION_KIND,
     schemaVersion: VERIFICATION_SCHEMA_VERSION,
+    ...(current.frozenBefore ? { frozenBefore: current.frozenBefore } : {}),
     records: next,
   })
 }
@@ -164,8 +218,12 @@ async function updateSidecar(sessionDir, mutate) {
 async function readSidecarRawForUpdate(sessionDir) {
   const loaded = await readSidecar(sessionDir)
   // 更新路径遇到损坏旁证：以空表重建（markStale 不应因为旁证坏了而永远失败）。
-  // 重建会丢掉旧指纹——可接受：指纹丢了退化成 unverified，不会伪造 valid。
-  return loaded.data
+  // 重建会丢掉旧指纹——但必须记下冻结时点，syncVerification 据此拒绝重采，
+  // 否则丢失指纹的记录会被「当前哈希」补采，把归档后的改动洗成 valid（BUG-014）。
+  if (!loaded.ok) {
+    return { records: {}, frozenBefore: new Date().toISOString(), rebuilt: true }
+  }
+  return { records: loaded.data, frozenBefore: loaded.frozenBefore, rebuilt: false }
 }
 
 /**
@@ -261,6 +319,6 @@ export async function markRecordsStale({ sessionDir, recordIds, reason, warn = (
       current[id].stale = { reason: reason.trim(), markedAt }
     }
     return current
-  })
+  }, { warn })
   return { ok: true, marked: recordIds.length, markedAt }
 }

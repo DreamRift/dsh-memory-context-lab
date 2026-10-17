@@ -22,6 +22,7 @@ import { createHash } from 'node:crypto'
 
 import { extractCallLocator } from '../core.mjs'
 import { SPAN_KINDS } from './history.mjs'
+import { extractClaims } from './claims.mjs'
 
 /** 原子/事实的属性类别（封闭集；扩集须同步升 hierarchy schema 语义）。 */
 export const ATOM_ATTRIBUTES = Object.freeze({
@@ -33,6 +34,8 @@ export const ATOM_ATTRIBUTES = Object.freeze({
   TIME: 'time',
   EXCERPT: 'excerpt',
   SPAN_EXCERPT: 'span-excerpt',
+  /** S1：assistant 结论行（claim≠事实，默认 unverified，见 claims.mjs 铁律）。 */
+  CLAIM: 'claim',
 })
 
 /** 属性 → 归组家族（分桶用的 kind 面）。 */
@@ -45,6 +48,7 @@ export const ATTRIBUTE_FAMILY = Object.freeze({
   [ATOM_ATTRIBUTES.TIME]: 'time',
   [ATOM_ATTRIBUTES.EXCERPT]: 'excerpt',
   [ATOM_ATTRIBUTES.SPAN_EXCERPT]: 'excerpt',
+  [ATOM_ATTRIBUTES.CLAIM]: 'claim',
 })
 
 /**
@@ -186,26 +190,54 @@ export function parseTestSummary(text) {
   let passed = 0
   let failed = 0
   for (const row of rows) {
+    // BUG-011：一行里可能同时有通过数与失败数（"Tests: 3 passed | 2 failed"）。
+    // 逐分支命中就 continue 会把 failed 永远留在 0，摘要据此报「全绿」——
+    // 这正是模块红线禁止的「没有失败信号猜成成功」。所以先收集本行全部数字，
+    // 再一次性聚合。
+    let rowPassed = 0
+    let rowFailed = 0
+    let rowMatched = false
     let match
     // 中文形态：N 项全绿 / N 项失败 / N 项（含「通过」）
     if ((match = /(\d+)\s*项\s*全绿/.exec(row))) {
-      total += Number(match[1]); passed += Number(match[1]); continue
+      rowPassed += Number(match[1])
+      rowMatched = true
     }
     if ((match = /(\d+)\s*项\s*失败/.exec(row))) {
-      total += Number(match[1]); failed += Number(match[1]); continue
+      rowFailed += Number(match[1])
+      rowMatched = true
     }
-    if ((match = /(\d+)\s*项/.exec(row)) && /(通过|绿)/.test(row)) {
-      total += Number(match[1]); passed += Number(match[1]); continue
+    if (!rowMatched && (match = /(\d+)\s*项/.exec(row)) && /(通过|绿)/.test(row)) {
+      rowPassed += Number(match[1])
+      rowMatched = true
     }
-    // 英文形态：N passed / N failed / N tests
-    if ((match = /(\d+)\s*pass(?:ed|es)?/i.exec(row))) {
-      passed += Number(match[1]); total += Number(match[1]); continue
+    // 英文形态：收集所有 N passed / N failed（同行多数字不丢）
+    for (const pass of row.matchAll(/(\d+)\s*pass(?:ed|es)?/gi)) {
+      rowPassed += Number(pass[1])
+      rowMatched = true
     }
-    if ((match = /(\d+)\s*fail(?:ed|ing|s)?/i.exec(row))) {
-      failed += Number(match[1]); total += Number(match[1]); continue
+    for (const fail of row.matchAll(/(\d+)\s*fail(?:ed|ing|s)?/gi)) {
+      rowFailed += Number(fail[1])
+      rowMatched = true
     }
+    if (rowMatched) {
+      const counted = rowPassed + rowFailed
+      // 显式 "N tests" 同时出现时以两者较大值为总数：总数可能大于已说明的
+      // 通过/失败之和（如 "5 tests, 3 passed"），此时后面的「全绿」必须不成立。
+      const explicit = /(\d+)\s*tests?\b/i.exec(row)
+      const explicitTotal = explicit ? Number(explicit[1]) : 0
+      total += Math.max(counted, explicitTotal)
+      passed += rowPassed
+      failed += rowFailed
+      continue
+    }
+    // 只有总数的行：N tests / 中文 N 项
     if ((match = /(\d+)\s*tests?\b/i.exec(row))) {
-      total += Number(match[1]); continue
+      total += Number(match[1])
+      continue
+    }
+    if ((match = /(\d+)\s*项/.exec(row))) {
+      total += Number(match[1])
     }
   }
   if (total === 0 && passed === 0 && failed === 0) return null
@@ -213,7 +245,8 @@ export function parseTestSummary(text) {
   if (passed > 0) parts.push(passed + ' 通过')
   if (failed > 0) parts.push(failed + ' 失败')
   if (failed > 0) parts.push('存在失败')
-  else if (passed > 0 && total >= passed) parts.push('全绿')
+  else if (passed > 0 && total === passed) parts.push('全绿')
+  else if (total > passed) parts.push('有项未说明结果')
   return { total, passed, failed, summary: parts.join('、') }
 }
 
@@ -303,7 +336,15 @@ function pushAtom(out, atom) {
   const scope = String(atom?.scope ?? 'session')
   const entity = String(atom?.entity ?? '')
   const attribute = String(atom?.attribute ?? ATOM_ATTRIBUTES.EXCERPT)
-  const polarity = atom?.polarity === 'negative' ? 'negative' : 'positive'
+  // S1：claim 极性是五值封闭集（claims.mjs CLAIM_POLARITIES），其他属性保持
+  // positive/negative 二值。五值里的 negated/retracted 映射语义与 negative 同向，
+  // 但保留原值供上游区分（冲突判定按值全等）。
+  const claimPolarities = new Set(['positive', 'negated', 'conditional', 'cited', 'retracted'])
+  const rawPolarity = String(atom?.polarity ?? 'positive')
+  const isClaimAtom = atom?.attribute === ATOM_ATTRIBUTES.CLAIM
+  const polarity = isClaimAtom && claimPolarities.has(rawPolarity)
+    ? rawPolarity
+    : (rawPolarity === 'negative' ? 'negative' : 'positive')
   const qualifier = atom?.qualifier ?? null
   const key = atomKey({ scope, entity, attribute, value, polarity, qualifier })
   out.push({
@@ -319,6 +360,8 @@ function pushAtom(out, atom) {
     sourceRefs,
     ...(atom?.pluginAuthored === true ? { pluginAuthored: true } : {}),
     ...(atom?.excerpt ? { excerpt: String(atom.excerpt) } : {}),
+    // S1：claim 原子显式携带 unverified（缺省不写，兼容既有原子形状）。
+    ...(isClaimAtom ? { verified: false } : {}),
   })
 }
 
@@ -440,6 +483,24 @@ export function extractAtoms(member) {
     })
     return atoms
   }
+  // S1：assistant 正文先提结论行（claim 原子，默认 unverified），再走保守摘录。
+  // claim 只从 assistant.text 跨度提取——用户消息/工具结果里的「已完成」不是
+  // 助手结论（工具侧由 exit-code/test-summary 原子覆盖，用户侧是外部陈述）。
+  const assistantClaims = member.spanKind === SPAN_KINDS.ASSISTANT_TEXT
+    ? extractClaims(member.body)
+    : []
+  for (const claim of assistantClaims) {
+    pushAtom(atoms, {
+      scope,
+      entity: 'assistant',
+      attribute: ATOM_ATTRIBUTES.CLAIM,
+      value: claim.value,
+      polarity: claim.polarity,
+      qualifier: claim.polarity === 'conditional' || claim.polarity === 'cited' ? claim.polarity : null,
+      verified: false,
+      sourceRefs: [baseRef(null)],
+    })
+  }
   // 普通历史段：整段保守摘录（span 拆行后逐段提一行摘录）。
   const parsedSpan = parseSpanBody(member.body)
   const label = member.spanKind ?? 'span'
@@ -541,6 +602,8 @@ export function mergeFacts(atoms) {
         qualifier: atom.qualifier,
         sourceRefs: [...atom.sourceRefs],
         ...(atom.pluginAuthored === true ? { pluginAuthored: true } : {}),
+        // S1：claim 原子的 unverified 标记随事实透传（claim 去重合并不等于验证）。
+        ...(atom.verified === false ? { verified: false } : {}),
         relation: null,
         supersedes: [],
         required: atom.polarity === 'negative',

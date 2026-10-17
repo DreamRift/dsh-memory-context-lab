@@ -10,7 +10,7 @@
 
 ## 缓存纪律
 
-在位置 i 替换内容，会让 i 之后的一切按未命中价重算。插件据此**一批做够**（批次数才是代价来源）、**回注只落在批次尾部**（每条用户消息最多一次）、**工具集恒定**。完整说明见[架构与边界](../docs/架构与边界.md#前缀缓存纪律)。
+在位置 i 替换内容，会让 i 之后的一切按未命中价重算。插件据此**一批做够**（批次数才是代价来源）、**回注只落在批次尾部**（每条用户消息最多一次）、**工具集恒定**。完整说明见[架构设计](docs/architecture-design.md)。
 
 ## 已核验范围
 
@@ -21,13 +21,13 @@
 | 冷库 | 复合后端：灵枢子进程（T2）/ 本地 Node store（T1） |
 | 会话目录 | `$DSH_HOME/.memory-context-lab/sessions/<session-id 的 sha256 前 24 位>/` |
 | 真实灵枢保护 | 启用期间按会话抑制 `dsh-memory` 的自动读写（不改动工具集） |
-| 依赖的宿主接口 | `agent/pre-step`、`session.surface`、`session.append`、`session.requestHeader()`、`session.requestContext()`、`ctx.tokenMeter`、`ctx.llm.resolveModelInfo`、`ctx.sessionProjections`、`ctx.commands`；可选：`ctx.get('planMode')` 与共享 `plan` 投影（计划先行，缺失时如实降级） |
+| 依赖的宿主接口 | `agent/pre-step`、`session.surface`、`session.append`、`requestHeader()`、`requestContext()`、`tokenMeter`、`llm`、`sessionProjections`、`commands`；可选 `planMode`（缺失时如实降级）。详见[架构设计](docs/architecture-design.md) |
 
-冷库不可用不阻止启用（本地 T1 兜底）：归档/回注失败关闭；占用率缺 `requestHeader()` / `ctx.tokenMeter.measure` / `context.contextWindow` 时**失败关闭**，原因见 `status` / `dry-run`。
+冷库不可用不阻止启用（T1 兜底）：归档/回注失败关闭；占用率缺 `requestHeader()` / `tokenMeter.measure` / `contextWindow` 时**失败关闭**，原因见 `status` / `dry-run`。
 
 ## 使用
 
-**v1 命令面**（`/memory-lab on|off|status|set|preset|now|dry-run|restore|clean|protect|pin|unpin|help`）的语义归[旧版说明](../plugin-v1/README.md)。两引擎**共用一个包**（`plugin-v1/` 是旧独立打包线）。两个**插件级**新开关：
+**v1 命令面**（`/memory-lab on|off|status|set|preset|now|dry-run|restore|clean|protect|pin|unpin|help`）的语义见旧独立打包线（`plugin-v1/`，不随本包分发）。两个**插件级**开关：
 
 ```text
 /memory-lab2 set fullhistory on|off   全历史记忆上下文（仅 v2 引擎消费）
@@ -45,7 +45,7 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），与 v1
 /memory-lab2 set auto|recall|batch|retain|fullhistory <值>   与 v1 同名同义，写入 v2 账本
 /memory-lab2 now | dry-run           走一次「测量→门禁→提交→替换」；dry-run 零副作用
 /memory-lab2 history [页]            分页列出冷库记录（稳定 ID）
-/memory-lab2 read <记录ID…>          按稳定 ID 回读原文（支持 cursor 续读）
+/memory-lab2 read <记录ID…>          回读原文（精确 ID / 冷节点基名 / callId 均可；cursor 续读）
 /memory-lab2 verify <记录ID…>        验证跟踪：核对引用与归档时是否一致（valid/stale/unverified）
 /memory-lab2 mark-stale <记录ID> <原因>   人工标记失效（只写旁证）
 /memory-lab2 recall [预算] [查询]    按预算回读；query 走检索面
@@ -56,10 +56,12 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），与 v1
 /memory-lab2 import-v1               把本会话 v1 归档按指针导入 v2（不复制正文）
 /memory-lab2 fork <子会话ID> | fork-status | fork-reset <子会话ID>   迁移闭包 / 预览 / 清半成品
 /memory-lab2 cost | help             成本账本 / 以上全部
+```
+
 **模型可见工具只有一个**：`memory_lab_recall`（`record_ids` / `query` / `budget_tokens` / `cursor`），只读；`budget_tokens` 非正整数返回错误「本次未执行」，超上限夹到并标注，**不静默换值**。
 
 
-**检索如实分级**：T0 字面索引（记录 ID、工具名、callId、seq 等）恒在；T1 本地词法索引；T2 可选隔离灵枢后端（`index sync` 或全历史模式自动启动）。T2 不可用时**如实降级到 T1**，绝不读正式灵枢根；冷库读写同理（T1 兜底）。详见[降温模式](../docs/降温模式.md)。
+**检索如实分级**：T0 字面索引（记录 ID、工具名、callId、seq 等）恒在；T1 本地词法索引；T2 可选隔离灵枢后端（`index sync` 或全历史模式自动启动）。T2 不可用时**如实降级到 T1**，绝不读**正式灵枢根**；冷库读写同理（T1 兜底）。0.10.1 起 read 另接受别名、弱候选只给弱指针、状态卡含助手结论盘点（unverified）并自动折叠连续卡组（机制见 [架构设计](docs/architecture-design.md)）。
 
 ### 全历史记忆上下文（v2 模式开关）
 
@@ -77,7 +79,7 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），与 v1
 
 ### 单一触发线怎么算
 
-「保留最近 N 个操作」一直生效，只受批量阈值约束（窗口外攒够 `batch` 个才提交一批；批量阈值是成本杠杆，实测数字见[降温模式](../docs/降温模式.md#单一触发线保留数)）；硬保护只有 system 指令节点与最新用户消息。提交时按**相邻性**切成连续段（run）：受保护/不够格/冷写失败的单元会切段，回执的 N 可小于批量阈值，机制见[降温模式](../docs/降温模式.md#单一触发线保留数)。
+「保留最近 N 个操作」一直生效，只受批量阈值约束（窗口外攒够 `batch` 个才提交一批；批量阈值是成本杠杆）；硬保护只有 system 指令节点与最新用户消息。提交时按**相邻性**切成连续段（run）：受保护/不够格/冷写失败的单元会切段，回执的 N 可小于批量阈值。
 
 ## 安全边界
 
@@ -97,11 +99,11 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），与 v1
 ## 验证
 
 ```text
-cd 记忆上下文/plugin && npm test              # 31 套（含 plan-first / fullhistory / 验证跟踪 / 后端指定），失败 0
-cd 记忆上下文/plugin && npm run probe:host    # 用宿主真实 JSON Schema 校验器核验工具 schema（需 DSH_ASAR，无参数时 SKIP）
-cd 记忆上下文/plugin && npm run probe:revert  # 20 个回退场景，确认对应测试确实会失败
+npm test              # 57 套 664 项（含 fix-brief 回归），失败 0
+npm run probe:host    # 用宿主真实 JSON Schema 校验器核验工具 schema（需 DSH_ASAR，无参数时 SKIP）
+npm run probe:revert  # 20 个回退场景，确认对应测试确实会失败
 ```
 
-**`npm test` 的第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。全套 31 套（v1 六套 + v2 全套 + 灵枢后端 + plan-first / fullhistory / reliability / 验证跟踪 / 独立运行三套）；逐套件范围与日期见[验证与评估](../docs/验证与评估.md#v2-测试覆盖2026-10-13)。
+**`npm test` 的第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。全套 57 套（v1 六套 + v2 全套 + 灵枢后端 + plan-first / fullhistory / reliability / 验证跟踪 / 独立运行三套 + fix-brief 三套）；逐套件范围与日期见工作区《验证与评估》（不随本包分发）。
 
-`FakeSession` 按宿主真实折叠规则实现校验，「整段区间替换成一条 user 回执」是被宿主契约验证过的替身——契约忠实度与逐套件范围的权威出处见[验证与评估](../docs/验证与评估.md)。
+`FakeSession` 按宿主真实折叠规则实现校验，「整段区间替换成一条 user 回执」是被宿主契约验证过的替身——契约忠实度与逐套件范围以 `npm test` 输出为准。

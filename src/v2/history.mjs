@@ -18,7 +18,7 @@
  * 自己注入的卡片/回执/召回包不算人类请求。
  */
 
-import { isHumanAuthoredMessage, isPluginAuthoredMessage, RECEIPT_MARKER, V2_RECEIPT_MARKER } from '../core.mjs'
+import { isHumanAuthoredMessage, isPluginAuthoredMessage, RECEIPT_FORMAT_SPAN, RECEIPT_MARKER, V2_RECEIPT_MARKER } from '../core.mjs'
 import { contentHasPlanToolCall } from '../plan-first.mjs'
 
 /** 跨度种类：回执与冷库记录都按它区分正文形态，工具操作不冒充普通历史。 */
@@ -407,6 +407,10 @@ export function collectHistoryCandidates(view) {
     raw.push({
       startIndex: index,
       endIndex: index,
+      // BUG-001：普通历史段的归档行必须记下专用回执版本与标签，恢复侧才能按
+      // buildSpanReceipt 重建同一字节。标签与回执渲染共用一份判定（作者区分）。
+      receiptFormat: RECEIPT_FORMAT_SPAN,
+      spanLabel: pluginAuthored ? '插件工作资料' : spanLabelOf(kind),
       spanKind: kind,
       body,
       callIds: [],
@@ -450,6 +454,8 @@ export function collectHistoryCandidates(view) {
       surfaceEndIndex: entry.endIndex,
       shadowedSeqs: surfaceNodes.slice(entry.startIndex, entry.endIndex + 1),
       spanKind: entry.spanKind,
+      // 普通历史段的回执格式与标签随候选一路传到归档行（BUG-001）。
+      ...(entry.receiptFormat ? { receiptFormat: entry.receiptFormat, spanLabel: entry.spanLabel } : {}),
       callIds: entry.callIds,
       tools: entry.tools,
       sources: entry.sources,

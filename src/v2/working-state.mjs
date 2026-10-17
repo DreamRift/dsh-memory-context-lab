@@ -75,6 +75,8 @@ export const WORKING_SET_DEFAULTS = Object.freeze({
   maxNonEssentialHistory: 6,
   maxRejectedOptions: 6,
   maxOpenQuestions: 6,
+  /** S1：助手结论（claim）盘点配额——全局有界，不是每单元无限兜底（方案 §7）。 */
+  maxAssistantClaims: 8,
   /** 最近重读证据的临时 pin 默认有效期（软保留口径，不是硬保护的驱逐手段）。 */
   pinTtlMs: 30 * 60 * 1000,
 })
@@ -810,7 +812,7 @@ function protectedItem({
 }
 
 /** 造一个软保留项：同样带 reason / source / releaseCondition。 */
-function retentionItem({ retentionClass, itemId, lines = [], reason = null, source = null, releaseCondition = null, sourceRef = null }) {
+function retentionItem({ retentionClass, itemId, lines = [], reason = null, source = null, releaseCondition = null, sourceRef = null, required = null }) {
   const rule = RETENTION_RULES[retentionClass] ?? null
   return {
     itemId,
@@ -821,6 +823,9 @@ function retentionItem({ retentionClass, itemId, lines = [], reason = null, sour
     source: source ?? 'unknown',
     releaseCondition: releaseCondition ?? rule?.releaseCondition ?? '未给出释放条件。',
     sourceRef,
+    // S1：required=true 的软条目在预算覆盖选择时必选（否定/更正可见）；
+    // 其余条目缺省 undefined（不改变既有消费方对「无 required 字段」的读取）。
+    ...(required === true ? { required: true } : {}),
   }
 }
 
@@ -870,6 +875,9 @@ export function buildWorkingState({
   nonEssentialHistory = [],
   rejectedOptions = [],
   openQuestions = [],
+  // S1：助手结论盘点（方案 §7）——{ value, polarity, verified, recordRef }。
+  // 默认 unverified；否定/撤回标 required（可见性不靠关键词升级）。
+  claims = [],
   relations = [],
   projection = null,
   recordIdsForSeq = null,
@@ -1468,15 +1476,42 @@ export function buildWorkingState({
         source: item.source,
         sourceRef: item.recordRef,
       })),
-    [RETENTION_CLASSES.UNVERIFIED_EVIDENCE]: boundEvidence
-      .filter((item) => item.status === EVIDENCE_STATUS.UNVERIFIED)
-      .map((item) => retentionItem({
-        retentionClass: RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
-        itemId: item.itemId,
-        lines: [`unverified 证据 ${item.recordRef}：${item.statusReason}`],
-        source: item.source,
-        sourceRef: item.recordRef,
-      })),
+    [RETENTION_CLASSES.UNVERIFIED_EVIDENCE]: [
+      ...boundEvidence
+        .filter((item) => item.status === EVIDENCE_STATUS.UNVERIFIED)
+        .map((item) => retentionItem({
+          retentionClass: RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
+          itemId: item.itemId,
+          lines: [`unverified 证据 ${item.recordRef}：${item.statusReason}`],
+          source: item.source,
+          sourceRef: item.recordRef,
+        })),
+      // S1 助手结论盘点（方案 §7）：claim 默认 unverified，进同一软保留段；
+      // 否定/撤回标 required（否定/更正可见），positive 不标 required（不冒充已完成）。
+      // 配额 maxAssistantClaims 全局有界；超出只报数量（不静默丢）。
+      ...take(claims, config.maxAssistantClaims).items.map((raw, index) => {
+        const item = typeof raw === 'string' ? { value: raw } : (raw ?? {})
+        const recordRef = item.recordRef ?? `claim:${index}`
+        const polarity = item.polarity ?? 'positive'
+        const negativeVisible = polarity === 'negated' || polarity === 'retracted'
+        return retentionItem({
+          retentionClass: RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
+          itemId: `assistant-claim:${item.recordRef ?? index}`,
+          lines: [`助手结论（${polarity}，unverified，此前助手判断，不是事实）：${item.value}`],
+          source: `claim:${item.sourceRef ?? item.recordRef ?? index}`,
+          sourceRef: recordRef,
+          required: negativeVisible === true,
+        })
+      }),
+      ...(Array.isArray(claims) && claims.length > config.maxAssistantClaims
+        ? [retentionItem({
+          retentionClass: RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
+          itemId: 'assistant-claim:overflow',
+          lines: [`另有 ${claims.length - config.maxAssistantClaims} 条助手结论未展开（只报数量，unverified）`],
+          source: 'claim:overflow',
+        })]
+        : []),
+    ],
     [RETENTION_CLASSES.EXPIRED_PIN]: [...expiredPins, ...invalidPins].map((pin) => retentionItem({
       retentionClass: RETENTION_CLASSES.EXPIRED_PIN,
       itemId: pin.itemId,

@@ -503,12 +503,17 @@ test('D5 失败关闭：宿主 meter 不可用时注入照常、token 不折算�
       const session = buildSession({ operations: 1, id: sessionId })
       const card = await runtime.workingSetInjection(agentFor(session))
       assert.ok(card, 'meter 不可用不得影响注入本身——卡片是功能，不是记账的副产品')
+      assert.equal(card.kind, 'prepared', 'S3 三态：注入面返回 prepared 载荷')
       assert.equal(card.hostTokens, null, 'meter 不可用时 hostTokens 如实为 null')
 
       const record = runtime.records.get(sessionId)
       assert.ok(record, '注入后 record 必须在册')
+      // S3：prepare 不计 committed；宿主确认（直连测试里手动 confirm）才入账。
+      assert.equal(record.cost.snapshot().workingStateInjections, 0, '确认前不得计入注入次数')
+      assert.equal(runtime.confirmInjection(sessionId, card.preparedId), true)
       const snapshot = record.cost.snapshot()
       assert.equal(snapshot.workingStateInjections, 1)
+      assert.equal(snapshot.workingStateCommitted, 1)
       assert.equal(snapshot.workingStateTokensUnmetered, 1, '缺口单独计数')
       assert.equal(snapshot.workingStateTokens, 0, '不得按卡片内部口径折算混记（D5 的病根就是两种口径进同一个计数器）')
     } finally {

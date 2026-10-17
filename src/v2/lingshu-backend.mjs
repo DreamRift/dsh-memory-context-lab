@@ -117,8 +117,12 @@ export function createLingshuSemanticBackend({ client, logger = null, name = LIN
       // 同 ID 已存在不同正文时灵枢排入复核队列而非覆写。派生索引是幂等重写，
       // 所以必须回读核对：内容一致 = 重试成功；不一致 = 真实冲突，绝不放过。
       const existing = await client.getNode(record.id)
-      const same = existing?.ok !== false && typeof existing?.text === 'string'
-        && existing.text.includes(record.id)
+      // BUG-016: normalizeNodeRead returns { ok, content, id } (no text field).
+      // Checking existing.text was always undefined, so same was always false and
+      // the idempotent rewrite was misreported as a conflict. The index body
+      // always contains the record id, so content containing it means same body.
+      const same = existing?.ok !== false && typeof existing?.content === 'string'
+        && existing.content.includes(record.id)
       if (!same) {
         throw new Error(`灵枢未提交派生索引且回读不符（${record.id}）：同 ID 已持有不同正文`)
       }

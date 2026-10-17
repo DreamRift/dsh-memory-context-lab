@@ -386,6 +386,18 @@ export async function apply(ctx, config) {
   }
 
   /**
+   * 设置页的全局默认「层级压缩模型模式」（BUG-008）。
+   *
+   * 字段定义在 schema 的 `defaults` 子对象里（buildConfigSchema 的 defaults 块），
+   * 不在根配置上。此前读 `config?.compressModelDefault` 恒为 undefined，新 v2
+   * 账本永远播种 false——设置页开关看起来可用，实际不生效。
+   */
+  function resolveCompressModelDefault(configObject) {
+    const defaults = unwrapVolatile(configObject?.defaults)
+    return defaults?.compressModelDefault === true
+  }
+
+  /**
    * User-managed presets from the plugin config. Shipped presets are only the
    * schema default for fresh installs; once the user edits the list the saved
    * value (even an empty one) wins.
@@ -787,7 +799,7 @@ export async function apply(ctx, config) {
     recallQueryFrom,
     defaultSettings: resolveDefaultsSettings,
     defaultFullHistory: () => resolveFullHistoryDefault(config),
-    defaultCompressModel: () => config?.compressModelDefault === true,
+    defaultCompressModel: () => resolveCompressModelDefault(config),
     // P4 拍板：宿主没有已核验的插件侧 LLM 调用契约 → 解析点恒返回 null。
     // 模型模式全链路按程序档工作（失败关闭）；未来接入宿主契约时只改这里。
     modelPhaseResolver: () => null,
@@ -1579,6 +1591,11 @@ export async function apply(ctx, config) {
     try {
       const card = await v2.workingSetInjection(agent)
       if (!card) return decision
+      // S3 prepare→确认→commit：pre-step 钩子返回的 decision 就是「宿主已接受
+      // 本次注入」的确认面——消息被宿主实际携带进这一步，等价于已经持久化到
+      // 会话批次。只有走到这里才 confirm；早退路径（skip / aborted / 抛错）
+      // 不会到这里，prepared 载荷自然留在未确认账上（prepared−committed 残差）。
+      v2.confirmInjection(sessionIdOf(agent.session), card.preparedId)
       const content = escapePromptBraces(card.text)
       return {
         ...decision,

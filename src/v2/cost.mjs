@@ -37,8 +37,35 @@ export const COST_COUNTER_KEYS = Object.freeze([
   'recallReads',
   /** 召回实际带回热上下文的 token 估算（含元数据、包装与告警）。 */
   'recallReturnedTokens',
-  /** 有界工作状态注入次数（全量 + 增量合计）。 */
+  /**
+   * 有界工作状态注入次数（全量 + 增量合计）。
+   *
+   * 口径（S3 三态分离后）：只有宿主确认过的注入才计入（= committed）。
+   * prepared / committed / sent 三态分别由下面三个计数器对账。
+   */
   'workingStateInjections',
+  /**
+   * S3 三态之一：prepare 出载荷但**尚未获得宿主确认**的次数。
+   *
+   * 每次成功 prepare 计 1（确认时不再重复计）。abort / 宿主拒绝的注入
+   * 只留在这个计数器里——「跑过但没注入」不是「注入了」，成本报表必须
+   * 能把这部分残差单独读出来。
+   */
+  'workingStatePrepared',
+  /**
+   * S3 三态之二：宿主确认（confirmInjection）过的注入次数。
+   *
+   * 与 workingStateInjections（committed 口径）相等是健康不变量；两者
+   * 分开保留是为了让「确认」这一步在账本上可审计。
+   */
+  'workingStateCommitted',
+  /**
+   * S3 三态之三：确认后宿主 meter 成功计量的注入次数。
+   *
+   * meter 不可用的确认计入 workingStateTokensUnmetered，不折算混记
+   * （D5 纪律）：sent ≤ committed 是结构事实，不是抽样。
+   */
+  'workingStateSent',
   /** 全量状态卡注入次数（会话首张 + 周期性再锚定）。 */
   'workingStateFullInjections',
   /** 增量状态卡注入次数（只带相对上一张全量卡的变化行）。 */
@@ -141,6 +168,9 @@ export function renderCostReport(counters, { sessionId = null } = {}) {
     `- 证据重读次数：${value.evidenceReReads}（带回 ≈${value.evidenceReReadTokens} token）`,
     `- 召回请求次数：${value.recallReads}（带回 ≈${value.recallReturnedTokens} token，含元数据/包装/告警）`,
     `- 工作状态注入：${value.workingStateInjections} 次，≈${value.workingStateTokens} token（宿主 meter 口径，与归档侧同一把尺子）`,
+    ...(value.workingStatePrepared > value.workingStateCommitted
+      ? [`- 注入三态对账：prepared ${value.workingStatePrepared} / committed ${value.workingStateCommitted} / sent ${value.workingStateSent}（差值 = 准备后未获宿主确认的残差，不算注入）`]
+      : []),
     ...(value.workingStateFullInjections > 0 || value.workingStateDeltaInjections > 0
       ? [`- 其中全量卡 ${value.workingStateFullInjections} 次 / 增量卡 ${value.workingStateDeltaInjections} 次（增量卡只带相对上一张全量卡的变化行）`]
       : []),

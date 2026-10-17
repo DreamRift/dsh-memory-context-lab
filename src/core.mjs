@@ -43,17 +43,24 @@ export const RECEIPT_MARKER = '[已归档操作]'
 export const V2_RECEIPT_MARKER = '[已归档操作·v2]'
 
 /**
- * 回执格式版本。
+ * 回执格式版本（0.10.1 S2c：显式 dispatch，废弃「>= 最新」比较）。
  *
  * 1 = 历史格式（只有工具／来源／冷记录／hash）；
- * 2 = 增加确定性定位元数据（每次调用的对象与返回状态、稳定调用引用）。
+ * 2 = 增加确定性定位元数据（每次调用的对象与返回状态、稳定调用引用）；
+ * 4 = 在 2 的基础上增加「记录 ID」行——规划期 recordId 尚未产生（它在冷写提交后才
+ *      存在），该行指路到 nodeId 别名回读（0.10.1 S2a 已支持）；提交期拿到可用
+ *      recordIds 时渲染真实记录 ID。
  *
- * 恢复的精确比较要求回执正文逐字节相等，所以**老格式必须继续可渲染**：归档行
- * 记录自己写入时的版本，恢复时按该版本重建期望正文；缺失该字段的旧行按 1 处理。
- * v2 的跨度回执与不带 locators 的调用不受格式版本影响（附加行整体省略）。
+ * **编号 3 被 RECEIPT_FORMAT_BATCH（批次摘要）占用**，新格式从 4 起。
+ *
+ * 恢复的精确比较要求回执正文逐字节相等，所以**每个历史版本必须继续可渲染**：
+ * 归档行记录自己写入时的版本，恢复时按该版本重建期望正文；缺失该字段的旧行按 1
+ * 处理。dispatch 表是**冻结的历史版本映射**——常量递增不得改变旧版本的渲染结果
+ * （取证 R0 问题 4 实证：`>=` 比较在升版后会丢弃 format 2 旧行的 locator/status
+ * 行，恢复被整体拒绝）。未知版本抛错（失败关闭），不猜测渲染。
  */
 export const RECEIPT_FORMAT_LEGACY = 1
-export const RECEIPT_FORMAT_VERSION = 2
+export const RECEIPT_FORMAT_VERSION = 4
 /**
  * 批次摘要回执（P1-5）。
  *
@@ -62,6 +69,15 @@ export const RECEIPT_FORMAT_VERSION = 2
  * 相邻）重建整条摘要并一次性恢复全部原文。格式 2 的逐条回执保持字节不变。
  */
 export const RECEIPT_FORMAT_BATCH = 3
+/**
+ * 普通历史段回执（0.10.1 修复 BUG-001）。
+ *
+ * v2 对非工具操作跨度（用户/助手正文、旧卡、召回包）用 buildSpanReceipt 渲染，
+ * 与工具操作回执（buildReceipt）逐字节不同。归档行必须记录这个专用版本，恢复侧
+ * 才能按同一函数重建期望正文——曾经统一记成 4，恢复时套用 buildReceipt 重建，
+ * 逐字节不等 → 永久 `回执正文已变化` 跳过，原文滞留冷库且无恢复通道。
+ */
+export const RECEIPT_FORMAT_SPAN = 5
 /** Cold-record origin for archived operations. */
 export const ARCHIVE_ORIGIN = 'archive'
 
@@ -742,19 +758,32 @@ export function buildReceipt({
   formatVersion = RECEIPT_FORMAT_VERSION,
   locators = [],
   statuses = [],
+  recordIds = [],
 }) {
+  // 显式 dispatch（0.10.1 S2c）：每个历史版本一个冻结分支，未知版本失败关闭。
+  if (formatVersion !== RECEIPT_FORMAT_LEGACY && formatVersion !== 2 && formatVersion !== RECEIPT_FORMAT_VERSION) {
+    throw new Error(`未知的回执格式版本：${JSON.stringify(formatVersion)}（已知 1/2/4；批次摘要走 buildBatchReceipt，片段回执走 buildSpanReceipt）`)
+  }
   const lines = [
     marker,
     `工具：${tools.join('、') || '(unknown)'}`,
     `来源：seq ${range.start}–${range.end}（${callIds.length} 次调用，原 ≈${tokens} token / ${chars} 字）`,
   ]
-  if (formatVersion >= RECEIPT_FORMAT_VERSION) {
+  if (formatVersion >= 2) {
     const located = locators.length ? formatLocatorLine(tools, callIds, locators) : ''
     if (located) lines.push(located)
     const statusLine = formatStatusLine(tools, callIds, statuses)
     if (statusLine) lines.push(statusLine)
   }
   lines.push(`冷记录：${nodeId}`)
+  if (formatVersion === RECEIPT_FORMAT_VERSION) {
+    const ids = (Array.isArray(recordIds) ? recordIds : []).filter((id) => typeof id === 'string' && id.length > 0)
+    if (ids.length > 0) {
+      lines.push(`记录 ID：${ids.join('、')}`)
+    } else {
+      lines.push(`记录 ID：按 ${nodeId} 别名回读（/memory-lab2 read ${nodeId}）`)
+    }
+  }
   if (chunks > 1) lines.push(`分块：${chunks} 段（恢复时按序拼接）`)
   lines.push(
     '正文已沉入本会话隔离冷库；相关提问会自动回注要点。',

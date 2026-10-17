@@ -36,6 +36,35 @@ const COMMAND_ENGINE = new Map([['memory-lab', 'v1'], ['memory-lab2', 'v2']])
 /** The projection registry only requires a `.parse`; values are already plain JSON. */
 export const PASSTHROUGH_SCHEMA = Object.freeze({ parse: (value) => value })
 
+/**
+ * Resolve the fold context to plain values (BUG-009).
+ *
+ * The plugin registers the projection with lazy getters so a settings-page edit
+ * is reflected on the next replay without a manual sync. `foldCommandIntoState`
+ * reads value fields (`context.presets` / `context.defaults`), so passing the
+ * getter object straight through made every preset fold fall back to the
+ * built-in list — the panel and the command handler could disagree after
+ * resume/fork. Resolve here, at every fold, keeping that freshness contract.
+ */
+function resolvedFoldContext(context) {
+  if (!context || typeof context !== 'object') return context
+  let presets = context.presets
+  let defaults = context.defaults
+  try {
+    if (typeof context.getPresets === 'function') presets = context.getPresets()
+  } catch {
+    // 配置读取失败时保持原值（fold 仍用内置预设，不让投影抛错）。
+  }
+  try {
+    if (typeof context.getDefaults === 'function') defaults = context.getDefaults()
+  } catch {
+    // 同上。
+  }
+  return presets === context.presets && defaults === context.defaults
+    ? context
+    : { ...context, presets, defaults }
+}
+
 /** Build the initial fold state, including the receipt bookkeeping. */
 export function initProjectionState() {
   return { ...initialProjectionState(), receiptSeqs: [] }
@@ -122,7 +151,9 @@ export function applyEvent(state, event, context = null) {
     // 该位：v1 停用与 v2 的全历史开关无关。
     const fullHistoryCleared = engine === 'v2' && operation === 'off' && next.fullHistory === true
     if (fullHistoryCleared) next.fullHistory = false
-    if (!foldCommandIntoState(next, args, context) && !engineChanged && !fullHistoryCleared) return state
+    // BUG-009：每次折叠都重新取值（getter 形态也解包），保证 resume/fork 重放
+    // 与命令执行读的是同一份预设/默认值。
+    if (!foldCommandIntoState(next, args, resolvedFoldContext(context)) && !engineChanged && !fullHistoryCleared) return state
     next.revision = (state.revision ?? 0) + 1
     return next
   }

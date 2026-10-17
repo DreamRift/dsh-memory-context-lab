@@ -27,6 +27,7 @@ import {
   archiveChunkNodeId,
   buildBatchReceipt,
   buildReceipt,
+  buildSpanReceipt,
   chunkArchiveBody,
   coldRecordBody,
   extractCallLocator,
@@ -45,6 +46,7 @@ import {
   RECALL_STATUS,
   RECEIPT_FORMAT_BATCH,
   RECEIPT_FORMAT_LEGACY,
+  RECEIPT_FORMAT_SPAN,
   RECEIPT_FORMAT_VERSION,
   RECEIPT_MARKER,
   resultStatusOf,
@@ -843,7 +845,11 @@ function unitBaseOf(unit) {
     // the exact same receipt text at restore time (see `restoreReceipts`).
     locators: unit.locators ?? [],
     statuses: unit.statuses ?? [],
-    receiptFormat: RECEIPT_FORMAT_VERSION,
+    // BUG-001：普通历史段用专用格式（buildSpanReceipt），操作段仍是 4
+    // （buildReceipt）。规划期候选带着格式与标签一路传到归档行；恢复侧按行
+    // 内版本 dispatch，绝不拿另一种渲染器去猜。
+    receiptFormat: Number.isInteger(unit.receiptFormat) ? unit.receiptFormat : RECEIPT_FORMAT_VERSION,
+    spanLabel: typeof unit.spanLabel === 'string' && unit.spanLabel ? unit.spanLabel : null,
   }
 }
 
@@ -1574,7 +1580,10 @@ export async function restoreReceipts({ session, client, receipts, onOutcome, re
   }
   for (const group of groups) {
     const receiptsInGroup = group.rows
-    if (group.batch && receiptsInGroup.length > 1) {
+    // BUG-010：批摘要组无论剩下几个成员都走组路径。成员被 forget 逐条剔除后，
+    // 单成员残余若落进 restoreLegacyReceipt 会拿 buildReceipt(3) 抛错；组路径
+    // 至少能「部分恢复」或如实 skip，不会中止整次 restore。
+    if (group.batch) {
       await restoreBatchGroup({ session, client, receipts: receiptsInGroup, onOutcome, receiptMarker, outcomes })
       continue
     }
@@ -1618,22 +1627,68 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
     // byte-reproducible, so an old receipt still restores instead of being
     // rejected as "changed".
     const formatVersion = Number.isInteger(receipt.receiptFormat) ? receipt.receiptFormat : RECEIPT_FORMAT_LEGACY
-    const expected = buildReceipt({
-      tools: receipt.tools ?? [],
-      range: { start: receipt.rangeStart, end: receipt.rangeEnd },
-      callIds: receipt.callIds ?? [],
-      nodeId: receipt.nodeId,
-      hash: receipt.hash,
-      chars: receipt.chars ?? 0,
-      tokens: receipt.originalTokens ?? 0,
-      chunks: receipt.chunkCount ?? 1,
-      marker: receiptMarker,
-      formatVersion,
-      locators: Array.isArray(receipt.locators) ? receipt.locators : [],
-      statuses: Array.isArray(receipt.statuses) ? receipt.statuses : [],
-    })
+    // BUG-001：0.10.1 旧 span 行把 buildSpanReceipt 正文记成了 receiptFormat=4，
+    // 行里没有可重建的标签。无法逐字节核对时不猜测覆写，如实指出冷库回读出路。
+    if (
+      formatVersion === RECEIPT_FORMAT_VERSION
+      && typeof receipt.spanKind === 'string' && receipt.spanKind.length > 0 && receipt.spanKind !== 'operation'
+      && (typeof receipt.spanLabel !== 'string' || receipt.spanLabel.length === 0)
+    ) {
+      outcomes.push({
+        ...base,
+        state: 'skipped',
+        reason: `旧 span 回执（format 4）没有可重建的标签，无法逐字节核对；原文仍在冷库，可用 /memory-lab2 read ${receipt.nodeId} 回读`,
+      })
+      continue
+    }
+    let expected
+    if (formatVersion === RECEIPT_FORMAT_LEGACY || formatVersion === 2 || formatVersion === RECEIPT_FORMAT_VERSION) {
+      expected = buildReceipt({
+        tools: receipt.tools ?? [],
+        range: { start: receipt.rangeStart, end: receipt.rangeEnd },
+        callIds: receipt.callIds ?? [],
+        nodeId: receipt.nodeId,
+        hash: receipt.hash,
+        chars: receipt.chars ?? 0,
+        tokens: receipt.originalTokens ?? 0,
+        chunks: receipt.chunkCount ?? 1,
+        marker: receiptMarker,
+        formatVersion,
+        locators: Array.isArray(receipt.locators) ? receipt.locators : [],
+        statuses: Array.isArray(receipt.statuses) ? receipt.statuses : [],
+      })
+    } else if (formatVersion === RECEIPT_FORMAT_SPAN) {
+      // 普通历史段：提交侧用 buildSpanReceipt 渲染，恢复侧必须用同一渲染器。
+      expected = buildSpanReceipt({
+        label: typeof receipt.spanLabel === 'string' ? receipt.spanLabel : '历史片段',
+        range: { start: receipt.rangeStart, end: receipt.rangeEnd },
+        nodeId: receipt.nodeId,
+        hash: receipt.hash,
+        chars: receipt.chars ?? 0,
+        tokens: receipt.originalTokens ?? 0,
+        chunks: receipt.chunkCount ?? 1,
+        marker: receiptMarker,
+      })
+    } else if (formatVersion === RECEIPT_FORMAT_BATCH) {
+      // BUG-010：批摘要成员被逐条剔除后可能只剩这一行；按单成员摘要重建，
+      // 与表面一致就恢复，不一致如实 skip——绝不用 buildReceipt(3) 抛错中止整次 restore。
+      expected = buildBatchReceipt({ marker: receiptMarker, members: [batchMemberOf(receipt)] })
+    } else {
+      outcomes.push({
+        ...base,
+        state: 'skipped',
+        reason: `未知回执格式 ${formatVersion}（行内 receiptFormat）；原文仍在冷库，可用 /memory-lab2 read ${receipt.nodeId} 回读`,
+      })
+      continue
+    }
     if (textFromContent(current.data?.content) !== expected) {
-      outcomes.push({ ...base, state: 'skipped', reason: '回执正文已变化，拒绝覆盖' })
+      outcomes.push({
+        ...base,
+        state: 'skipped',
+        reason: formatVersion === RECEIPT_FORMAT_BATCH
+          ? '批摘要成员不完整（部分成员可能已软遗忘或已被清理），无法逐字节重建摘要；该成员原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读'
+          : '回执正文已变化，拒绝覆盖',
+      })
       continue
     }
     // Read every chunk in order and reassemble. The whole-body hash is checked
@@ -1689,6 +1744,59 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
 }
 
 /**
+ * 找到软遗忘替换后的墓碑节点（BUG-010）。
+ *
+ * forget 会把整条批摘要换成一个新 seq 的墓碑，归档行仍指向旧摘要 seq。墓碑正文
+ * 以「来源：seq <旧 seq>–<旧 seq>」保留了组身份；据此认领当前表面节点，才能把
+ * 组内仍可见成员的原文恢复回去，而不是永远报「回执节点已不在活动面」。
+ */
+function forgetTombstoneSeqFor(session, replacementSeq) {
+  if (!Number.isInteger(replacementSeq)) return null
+  for (const seq of session.surface.nodes) {
+    const event = session.eventAt(seq)
+    if (event?.type !== 'user/message') continue
+    const text = textFromContent(event.data?.content)
+    if (typeof text !== 'string' || !text.includes('本段已按用户指令软遗忘')) continue
+    if (text.includes(`来源：seq ${replacementSeq}–${replacementSeq}`)) return seq
+  }
+  return null
+}
+
+/**
+ * 部分批组的可恢复性判定（BUG-010）。
+ *
+ * 批摘要的成员被软遗忘后会从恢复集合里剔除，剩余成员无法重建出原来那条
+ * 完整摘要（缺成员行）。这里不退化成「整组永久拒绝」，而是核对表面摘要里
+ * **确实逐条列出了这些剩余成员**的冷记录与 hash，然后只恢复它们的原文——
+ * 已遗忘成员的内容不会回来。任何一条标识对不上就返回 false，保持 fail-closed。
+ */
+function partialBatchMatches(text, receipts) {
+  if (typeof text !== 'string') return false
+  const header = /批次归档：(\d+) 个相邻操作/.exec(text)
+  if (!header) return false
+  if (Number(header[1]) < receipts.length) return false
+  for (const receipt of receipts) {
+    const hash = String(receipt.hash ?? '').slice(0, 12)
+    if (!text.includes(`冷记录 ${receipt.nodeId} hash ${hash}`)) return false
+  }
+  return true
+}
+
+/** One member line's render inputs (归档行 → buildBatchReceipt 的成员形状). */
+function batchMemberOf(receipt) {
+  return {
+    tools: receipt.tools ?? [],
+    range: { start: receipt.rangeStart, end: receipt.rangeEnd },
+    callIds: receipt.callIds ?? [],
+    nodeId: receipt.nodeId,
+    hash: receipt.hash,
+    chars: receipt.chars ?? 0,
+    tokens: receipt.originalTokens ?? 0,
+    chunks: receipt.chunkCount ?? 1,
+  }
+}
+
+/**
  * Restore one batch-summary group: rebuild the summary text from the member
  * rows, verify it byte-for-byte against the surface, then replace it once with
  * all member bodies joined in order.
@@ -1711,26 +1819,31 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
     return undefined
   }
 
-  const replacementSeq = receipts[0].replacementSeq
+  let replacementSeq = receipts[0].replacementSeq
   const nodes = session.surface.nodes
-  if (!nodes.includes(replacementSeq)) return skipAll('回执节点已不在活动面')
-  const current = session.eventAt(replacementSeq)
+  let current = session.eventAt(replacementSeq)
+  let partialTombstone = false
+  if (!nodes.includes(replacementSeq)) {
+    // 组内部分成员被 forget 后，表面摘要已换成墓碑（新 seq）。认领墓碑后按
+    // 「只恢复可见成员」处理；找不到墓碑仍按节点已不在活动面 skip。
+    const tombstoneSeq = forgetTombstoneSeqFor(session, replacementSeq)
+    if (tombstoneSeq === null) return skipAll('回执节点已不在活动面')
+    replacementSeq = tombstoneSeq
+    current = session.eventAt(replacementSeq)
+    partialTombstone = true
+  }
   if (current?.type !== 'user/message') return skipAll('回执节点不再是预期类型（surface 冲突）')
 
   const expected = buildBatchReceipt({
     marker: receiptMarker,
-    members: receipts.map((receipt) => ({
-      tools: receipt.tools ?? [],
-      range: { start: receipt.rangeStart, end: receipt.rangeEnd },
-      callIds: receipt.callIds ?? [],
-      nodeId: receipt.nodeId,
-      hash: receipt.hash,
-      chars: receipt.chars ?? 0,
-      tokens: receipt.originalTokens ?? 0,
-      chunks: receipt.chunkCount ?? 1,
-    })),
+    members: receipts.map(batchMemberOf),
   })
-  if (textFromContent(current.data?.content) !== expected) return skipAll('回执正文已变化，拒绝覆盖')
+  const currentText = textFromContent(current.data?.content)
+  // BUG-010：完整重建对不上时，检查表面是否仍是这条批摘要、且逐条列出了
+  // 当前恢复集合里的成员（其余成员可能已被软遗忘剔除）。只恢复能核对上的
+  // 成员正文；遗忘成员的内容绝不回来。对不上仍 fail-closed。
+  const partial = partialTombstone || (currentText !== expected && partialBatchMatches(currentText, receipts))
+  if (currentText !== expected && !partial) return skipAll('回执正文已变化，拒绝覆盖')
 
   // 逐成员读冷节点并核对各自 hash；任何成员失败整组跳过。
   const bodies = []
@@ -1771,7 +1884,10 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
       surfaceOp: { op: 'replace', startSeq: replacementSeq, endSeq: replacementSeq },
       sourceEventSeqs: [replacementSeq],
     })
-    const restoredRows = receipts.map((receipt) => ({ ...baseOf(receipt), state: 'restored', reason: '', restoredSeq: restored.seq }))
+    const reason = partial
+      ? '批摘要中有成员不在本次恢复集合（已软遗忘或已清理），只恢复可见成员的原文'
+      : ''
+    const restoredRows = receipts.map((receipt) => ({ ...baseOf(receipt), state: 'restored', reason, restoredSeq: restored.seq }))
     outcomes.push(...restoredRows)
     if (onOutcome) for (const outcome of restoredRows) await onOutcome(outcome)
   } catch (error) {

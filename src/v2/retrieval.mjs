@@ -91,6 +91,18 @@ export function assertBackendContract(backend) {
   return backend
 }
 
+/** 记录的元数据检索面（与 client-adapter 的 haystack 同口径的有界拼接）。 */
+function literalHaystackOf(store, entry) {
+  const parts = [entry.id, entry.kind, entry.fidelity ?? '']
+  const callId = entry.refs?.callId
+  if (typeof callId === 'string') parts.push(callId)
+  const nodeId = entry.inline?.nodeId
+  if (typeof nodeId === 'string') parts.push(nodeId)
+  const spanKind = entry.refs?.spanKind
+  if (typeof spanKind === 'string') parts.push(spanKind)
+  return parts.join(' ')
+}
+
 /** 读索引记账；文件缺失或 schema 陌生时按「未索引」处理，不采信陌生内容。 */
 export async function readRetrievalIndex(directory) {
   try {
@@ -371,12 +383,17 @@ export async function searchRecords({ store, backend = null, text, exact = [], l
     byId.set(id, { id, sources: [source] })
   }
   const entries = store.listEntries({ limit: Number.MAX_SAFE_INTEGER }).entries
-  // 字面探针：自由词 + 精确标识符/引号短语各自探一次（query-plan 的两通道在
-  // 字面检索侧同样成立——标识符按字面全文命中，自由词按整句子串命中）。
+  // 字面探针（0.10.1 R1-F2 修复）：自由词按 some（OR 召回），exact 约束按 every
+  // （AND 语义）——此前 probes.some 让「只命中一个 exact 约束」的文档进命中面，
+  // 与 T1 通道对同一 exact 数组的闸门口径不一致。
   const probes = [...new Set([needle, ...exactTokens])].filter((probe) => probe.length > 0)
   for (const entry of entries) {
     if (isPluginAuthoredEntry(entry)) continue
-    if (probes.some((probe) => literalMatcher(entry, probe))) push(entry.id, RETRIEVAL_SOURCES.INDEX)
+    const needleHit = needle.length > 0 ? literalMatcher(entry, needle) : false
+    const exactHit = exactTokens.length > 0
+      ? exactTokens.every((token) => literalMatcher(entry, token))
+      : false
+    if (needleHit || exactHit) push(entry.id, RETRIEVAL_SOURCES.INDEX)
   }
   let semanticUsed = false
   let semanticError = null
@@ -419,6 +436,27 @@ export async function searchRecords({ store, backend = null, text, exact = [], l
       semanticUsed = false
       semanticError = error instanceof Error ? error.message : String(error)
     }
+  }
+  // 0.10.1 统一 exact 后验（R1-F1）：所有通道（字面/T1/T2）合并后的候选在 top-k
+  // 前统一验证——每个 exact token 必须作为**子串**出现在记录正文（引号短语即连续
+  // 顺序；路径/ID 按字面边界）。T1 的词元闸门只保证「词都出现过」，不保证顺序；
+  // 短语语义在唯一有正文可读的这一层收口。读不到正文的候选如实丢弃（不猜）。
+  if (exactTokens.length > 0) {
+    const verified = new Map()
+    for (const [id, hit] of byId) {
+      const entry = store.getEntry(id)
+      if (!entry) continue
+      let body = null
+      try {
+        const loaded = await store.readRecord(id, { verifyHash: false, maxBytes: INDEX_TEXT_MAX_BYTES })
+        if (loaded.ok !== false) body = typeof loaded.payloadText === 'string' ? loaded.payloadText : null
+      } catch { body = null }
+      const hay = ((body ?? '') + ' ' + literalHaystackOf(store, entry)).toLowerCase()
+      const ok = exactTokens.every((token) => hay.includes(String(token).toLowerCase()))
+      if (ok) verified.set(id, hit)
+    }
+    byId.clear()
+    for (const [id, hit] of verified) byId.set(id, hit)
   }
   // P1-3 渲染前复验：命中的 id 在索引异步变更（遗忘、会话退出、并发同步）
   // 后可能已不在 store 里。返回前逐条重取，取不到的如实丢弃并计数，

@@ -165,7 +165,9 @@ export async function loadDisposition(sessionDir) {
   }
   const revision = parsed.entries.length
   return {
-    state: parsed.entries.length === 0 && parsed.header === null ? 'absent' : parsed.damaged ? 'damaged' : 'ok',
+    // BUG-013：损坏优先于 absent。首行坏 JSON 时 entries=[]、header=null，
+    // 先判 absent 会把「账本损坏」报成「全新会话」（旁路 damaged 字段才看得到）。
+    state: parsed.damaged ? 'damaged' : (parsed.entries.length === 0 && parsed.header === null ? 'absent' : 'ok'),
     entries: parsed.entries,
     revision,
     damaged: parsed.damaged,
@@ -620,10 +622,17 @@ export function evaluateForgetProtection({ recordIds, entries, index, mode = 'ex
       blocked.push({ id, rule: 'in-flight', detail: `在途工具调用（callId ${entry.refs?.callId}）尚未闭合` })
       continue
     }
+    // BUG-002：人类消息正文同时存在于两种记录形态里——
+    // ① verbatim 的 TURN_USER 记录（人类输入原文）；
+    // ② 投影跨度 PROJECTION_SPAN（spanKind=turn.user）。
+    // 只拦 ② 会让 `kind=turn.user` 宽条件把全部人类消息从读面抹掉。
+    // 两种形态按同一规则保护；pluginAuthored 的插件卡片不算人类消息。
     if (
-      entry.kind === RECORD_KINDS.PROJECTION_SPAN
-      && entry.refs?.spanKind === 'turn.user'
-      && entry.inline?.pluginAuthored !== true
+      entry.inline?.pluginAuthored !== true
+      && (
+        entry.kind === RECORD_KINDS.TURN_USER
+        || (entry.kind === RECORD_KINDS.PROJECTION_SPAN && entry.refs?.spanKind === 'turn.user')
+      )
     ) {
       const finding = { id, rule: 'human-user', detail: '人类用户消息' }
       if (mode === 'wide') blocked.push(finding)

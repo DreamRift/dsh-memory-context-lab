@@ -236,7 +236,9 @@ export function renderExpansionPage({ voucher, receiptTexts, forgottenMemberSeqs
     `■ 聚合凭证 ${voucher.voucherId}（seq ${voucher.startSeq}–${voucher.endSeq}，成员 ${total} 段）第 ${clampedPage}/${pageCount} 页`,
   ]
   slice.forEach((seq, index) => {
-    const receiptText = receiptTexts[index]
+    // BUG-006：receiptTexts 是全量数组（按成员 seq 平行），index 是页内下标；
+    // 第 2 页起必须加上页起点偏移，否则显示上一页原文（或把已遗忘占位错配）。
+    const receiptText = receiptTexts[from + index]
     lines.push('')
     if (forgotten.has(seq) || receiptText === undefined) {
       lines.push(`[成员 seq:${seq} 已软遗忘或不可读，原文不回注；undo 遗忘后可恢复]`)

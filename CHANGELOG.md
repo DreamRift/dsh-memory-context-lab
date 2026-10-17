@@ -2,6 +2,47 @@
 
 本文件记录 `dsh-memory-context-lab` 面向用户的版本变化。格式按「版本 + 日期 + 分类条目」组织，只写行为与契约层面的变化，不复制内部调研。
 
+## 0.10.1 — 2026-10-17
+
+回读闭环与卡片治理版：别名回读、检索契约修复、工作卡有界治理、助手结论盘点；并完成外部取证复核发现的 16 项缺陷修复。
+
+### 新增
+
+- **别名回读**（v2）：`read`/`memory_lab_recall` 接受三种 ID 形态——精确记录 ID 直通；冷节点基名展开为整单元（分块按序拼接）；callId 解析配对记录与依赖 span。别名展开有上限，未解析 ID 返回显式 error 行（不再伪装空成功）。回执格式升 format 4：新增「记录 ID」行；旧格式回执 restore-only 兼容（显式 dispatch，升版不吞旧行）。
+- **弱候选导航**：查询零命中但与冷记录有词元重合时，回注给 ≤3 条 pointerOnly 弱指针（只给 ID 与重合说明，不注入正文，不计入有效回读次数）；T1 检索面同步披露 queryDetailed 诊断（admitted/weak/oovTerms）。
+- **工作卡有界治理**（v2）：注入生命周期改 prepare→确认→commit 三态，成本账本新增 prepared/committed/sent 三计数器（未确认注入如实留残差）；活动面上连续的插件工作卡组（≥2 张）自动折叠为一条恒定回执（附成员范围与数量；绝不触碰用户/助手/工具消息）；锚点被宿主压缩移除时下一张状态卡自动回落全量（不虚构增量连续性）。
+- **助手结论盘点**（v2 工作状态卡）：新增「助手结论」段，确定性提取最近的助手结论行（保留原句与来源），恒标注 unverified——这是「此前助手判断」，不是事实；否定/撤回结论优先保留（可见性不靠关键词升级）；有界配额（8 条，超出只报数量）。
+
+### 修复
+
+- 检索契约（v2）：引号短语按连续顺序验证（换序/散落不再命中）；字面检索多精确词按 AND；语料外词元（OOV）不再稀释相关度分母；回注命中保持最相关在前；弱候选不计入 readCount/retrievalHits。
+- 0.10.0 遗留：层级压缩模型相位 over-budget 短路失效、P4 接线字段失配（模型摘要模式从未生效）、modelNote 作用域错误——三处修复后模型相位测试 3 项转绿。
+
+### 修复（复核批次：BUG-001…016）
+
+- **普通历史段归档可恢复（BUG-001）**：非工具跨度归档行改用专用回执格式 5 并记录 `spanLabel`；恢复侧按行内版本用 `buildSpanReceipt` 逐字节重建。旧 format 4 span 行没有可重建标签时如实 skip 并指路 `/memory-lab2 read <nodeId>`，不猜测覆写。
+- **人类消息硬保护（BUG-002）**：`forget` 宽条件同时拦截 verbatim `turn.user` 记录与 `projection.span(turn.user)`；显式点名仍允许但带警告。修复前 `kind=turn.user` 可软遗忘全部人类消息。
+- **停用路径（BUG-003）**：measure 抛错时 `off` 与 `set fullhistory off` 不再因未定义 `ctx` 抛 ReferenceError；恢复照常尝试、停用状态照常落盘并留告警。
+- **自动层级压缩收尾（BUG-004）**：补上 `maybeStageCompress` 导入，钩子可注入观测，失败日志保留错误类型。
+- **未启用会话 forget（BUG-005）**：`preview/apply` 返回 `ENOTENABLED` 结构化错误；`undo` 可完成账本级撤销，无活动面时如实说明。
+- **expand 分页（BUG-006）**：第 2 页起按全量成员数组偏移取原文，遗忘占位不再错位。
+- **L1 证据卡（BUG-007）**：按成员事实原子渲染，不再用不带来源的渲染块反查导致空卡。
+- **compressModelDefault（BUG-008）**：经 `defaults` 解包读取，设置页开关能真正播种新账本。
+- **投影折叠 context（BUG-009）**：每次折叠解包 `getPresets()/getDefaults()`，resume/fork 与命令执行一致。
+- **批摘要残余成员（BUG-010）**：不再用 `buildReceipt(formatVersion=3)` 抛错中止 restore；表面仍是该组摘要或已被 forget 换成该组墓碑时，只恢复可见成员原文，已遗忘成员绝不复活，其余 fail-closed。
+- **测试摘要（BUG-011）**：同行 passed+failed 聚合；`failed>0` 必报失败，未说明项不再判全绿。
+- **未验载荷（BUG-012）**：`readRecord` 增加 `verified` 维度；工作集扫描路径标 `ok(unverified)` 且 `verified:false`。
+- **损坏账本（BUG-013）**：hierarchy/disposition 首行损坏优先 `damaged`，空文件/ENOENT 仍 `absent`。
+- **旁证损坏（BUG-014）**：重建时写 `frozenBefore` 冻结重采，归档后改动的文件不得洗成 `valid`。
+- **recall 别名（BUG-015）**：预算判定不双扣；别名中断时游标指向未处理前缀，续读不漏不重。
+- **T2 幂等重写（BUG-016）**：`committed:false` 回读核对 `content`，内容一致走重试成功，不再误报冲突。
+
+### 测试
+
+- 全量 **57 套 / 664 项断言 0 失败**（Node v24.19.0，2026-10-17）；新增 3 套 fix-brief 回归 18 项，回退对应修复即变红。
+- `npm run probe:revert`：20 个回退场景全部“还原后测试失败”；修复探针在 Windows CRLF 下多行还原点失配与缺 `--test-force-exit` 的挂起问题。
+- 8 个变异验证（必红→复原）全部通过；独立复审（蜂巢验证单元，与作者不同会话）两批均 accept。
+
 ## 0.9.1 — 2026-10-15
 
 **紧急修复版**：0.9.0 正式版有一处读取错误会让整个插件加载失败（插件页显示「异常」），本版修正并补上回归防线。行为与 0.9.0 宣称的能力完全一致，无新增特性。

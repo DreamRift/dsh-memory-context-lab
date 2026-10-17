@@ -253,7 +253,9 @@ async function prepareWorkDir() {
 async function applyCase(work, caseId) {
   const spec = CASES[caseId]
   const target = path.join(work, spec.file)
-  let text = await readFile(target, 'utf8')
+  // 夹具里的还原点用 LF 书写；本仓在 Windows 检出可能是 CRLF，先归一化再匹配，
+  // 否则多行还原点会全部「找不到」而误报夹具脱节。临时副本不参与版本库，改行尾无副作用。
+  let text = (await readFile(target, 'utf8')).replace(/\r\n/g, '\n')
   for (const [from, to] of spec.edits) {
     if (!text.includes(from)) {
       throw new Error(`case ${caseId}: 还原点在当前源码里找不到，夹具与源码脱节了`)
@@ -279,7 +281,9 @@ if (caseId) {
   const work = await prepareWorkDir()
   try {
     await applyCase(work, caseId)
-    const result = await runNode([spec.test], work)
+    // 与 package.json 的测试链同口径：无 force-exit 时部分套件会因常驻句柄
+    // 挂住，探针永远等不到 close（把「测试失败」误读成「夹具卡死」）。
+    const result = await runNode(['--test-force-exit', spec.test], work)
     process.stdout.write(result.output)
     process.stdout.write(`\n[revert-probe] ${caseId}: exit=${result.code}\n`)
     process.exit(result.code === 0 ? 1 : 0)
@@ -298,7 +302,7 @@ for (const id of Object.keys(CASES)) {
   const work = await prepareWorkDir()
   try {
     await applyCase(work, id)
-    const result = await runNode([CASES[id].test], work)
+    const result = await runNode(['--test-force-exit', CASES[id].test], work)
     const caught = result.code !== 0
     if (!caught) broken += 1
     rows.push({ id, caught, code: result.code })

@@ -254,7 +254,13 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
         const df = current.postings.get(term)?.d.length ?? 0
         return [term, Math.log(1 + (docCount - df + 0.5) / (df + 0.5))]
       }))
-      const totalIdf = [...idfOf.values()].reduce((sum, value) => sum + value, 0) || 1
+      // OOV（语料外）词元不进 relevance 分母（0.10.1 R1-F3）：df=0 的词拿到的是
+      // 「全库都没有」的最大 idf，把它计入分母会让长问句的客套/未知词稀释相关
+      // 文档的覆盖率（实测 1 主题词 + 3 OOV → rel≈0.19 被误杀）。分母只计语料内
+      // 词元；OOV 单独计数披露，不静默删除（查询里出现过的事实保留在返回结构里）。
+      const knownTerms = terms.filter((term) => (current.postings.get(term)?.d.length ?? 0) > 0)
+      const oovTerms = terms.filter((term) => (current.postings.get(term)?.d.length ?? 0) === 0)
+      const totalIdf = knownTerms.reduce((sum, term) => sum + idfOf.get(term), 0) || 1
 
       // OR 召回：任一词元命中即入候选集（不再要求全部词元同时命中）。
       const candidates = new Map() // id -> Map<term, tf>
@@ -318,6 +324,89 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       }
       ranked.sort((a, b) => (b.score !== a.score ? b.score - a.score : b.seq - a.seq))
       return ranked.slice(0, Math.max(1, limit)).map((entry) => entry.id)
+    },
+
+    /**
+     * 0.10.1 弱候选诊断（G1 接口第 6 项）：与 query 同一召回/排序/门槛，但把
+     * 「门槛下未放行的候选」作为弱候选透出（有界），不改变 query 的返回契约。
+     * weak = OR 召回命中、通过 exact 闸门、但 relevance 低于放行线的候选；
+     * 只带 matchedTerms/coverage/rank——弱重合是 query 级信号，不是实际回读。
+     */
+    async queryDetailed(text, { limit = 20, exact = [], exclude = [], weakLimit = 3 } = {}) {
+      const current = await load()
+      const requiredTerms = [...new Set(tokenizeForLexicalIndex(Array.isArray(exact) ? exact.join(' ') : ''))]
+      const freeTerms = [...new Set(tokenizeForLexicalIndex(text))].filter((term) => !requiredTerms.includes(term))
+      const terms = [...requiredTerms, ...freeTerms]
+      if (terms.length === 0) return { admitted: [], weak: [], oovTerms: [] }
+      const excludedIds = new Set(Array.isArray(exclude) ? exclude.filter((x) => typeof x === 'string') : [])
+      const docCount = current.docs.size
+      if (docCount === 0) return { admitted: [], weak: [], oovTerms: [] }
+      const idfOf = new Map(terms.map((term) => {
+        const df = current.postings.get(term)?.d.length ?? 0
+        return [term, Math.log(1 + (docCount - df + 0.5) / (df + 0.5))]
+      }))
+      const knownTerms = terms.filter((term) => (current.postings.get(term)?.d.length ?? 0) > 0)
+      const oovTerms = terms.filter((term) => (current.postings.get(term)?.d.length ?? 0) === 0)
+      const totalIdf = knownTerms.reduce((sum, term) => sum + idfOf.get(term), 0) || 1
+      const candidates = new Map()
+      for (const term of terms) {
+        const posting = current.postings.get(term)
+        if (!posting) continue
+        for (let i = 0; i < posting.d.length; i += 1) {
+          if (excludedIds.has(posting.d[i])) continue
+          let tfByTerm = candidates.get(posting.d[i])
+          if (!tfByTerm) {
+            tfByTerm = new Map()
+            candidates.set(posting.d[i], tfByTerm)
+          }
+          tfByTerm.set(term, posting.f[i])
+        }
+      }
+      if (requiredTerms.length > 0) {
+        for (const [id, tfByTerm] of [...candidates]) {
+          if (requiredTerms.some((term) => !tfByTerm.has(term))) candidates.delete(id)
+        }
+      }
+      if (candidates.size === 0) return { admitted: [], weak: [], oovTerms }
+      const K1 = 1.5
+      const B = 0.75
+      let totalBytes = 0
+      for (const doc of current.docs.values()) totalBytes += doc?.coveredBytes ?? doc?.bytes ?? 0
+      const avgBytes = totalBytes / docCount || 1
+      const REL_FLOOR = 0.5
+      const MULTI_TERM_FLOOR = 0.25
+      const ranked = []
+      const weak = []
+      let rank = 0
+      for (const [id, tfByTerm] of candidates) {
+        const len = current.docs.get(id)?.bytes ?? 0
+        const norm = K1 * (1 - B + (B * len) / avgBytes)
+        let bm25 = 0
+        let matchedIdf = 0
+        for (const [term, tf] of tfByTerm) {
+          const weight = idfOf.get(term) ?? 0
+          matchedIdf += weight
+          bm25 += weight * ((tf * (K1 + 1)) / (tf + norm))
+        }
+        const relevance = matchedIdf / totalIdf
+        const paraphrase = tfByTerm.size >= 2 && relevance + 1e-9 >= MULTI_TERM_FLOOR
+        const admitted = requiredTerms.length > 0 || relevance + 1e-9 >= REL_FLOOR || paraphrase
+        const matchedTerms = [...tfByTerm.keys()].sort()
+        if (admitted) {
+          ranked.push({ id, score: bm25, seq: current.docs.get(id)?.seq ?? 0 })
+        } else {
+          rank += 1
+          if (weak.length < Math.max(1, weakLimit)) {
+            weak.push({ id, matchedTerms, coverage: Number(relevance.toFixed(3)), rank })
+          }
+        }
+      }
+      ranked.sort((a, b) => (b.score !== a.score ? b.score - a.score : b.seq - a.seq))
+      return {
+        admitted: ranked.slice(0, Math.max(1, limit)).map((entry) => entry.id),
+        weak,
+        oovTerms,
+      }
     },
 
     /** 本后端无进程、无外部连接：就绪恒真（装配期选择不依赖它）。 */

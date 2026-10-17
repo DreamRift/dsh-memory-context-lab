@@ -214,6 +214,7 @@ export async function packWorkingSet(labRoot, sessionId, {
           // 正文，「含载荷」就是一句无法兑现的声明。预算已经按它计过，带上不额外超支。
           header.text = loaded.payloadText
           header.integrity = loaded.integrity
+          header.verified = loaded.verified === true
         } else {
           warnings.push(`payload-deferred:${id}`)
         }
@@ -243,7 +244,13 @@ export async function packWorkingSet(labRoot, sessionId, {
             header.payloadIncluded = true
             // 同上：标了「含载荷」就必须真的带上正文。
             header.text = loaded.payloadText
-            header.integrity = loaded.integrity
+            // BUG-012：这台扫描路径用 verifyHash:false 读载荷，hash 根本没核对。
+            // 不能把 integrity 'ok'（只说明尺寸一致）写成「完整性 ok」；如实标注
+            // 未验证，并带上独立的 verified=false，调用方不会误读成「已验证」。
+            header.integrity = loaded.integrity === 'ok' && loaded.verified !== true
+              ? 'ok(unverified)'
+              : loaded.integrity
+            header.verified = loaded.verified === true
           } else {
             used -= headerTokens
             entries.pop()

@@ -1031,14 +1031,19 @@ export class V2SessionStore {
     let integrity = 'no-payload'
     let truncated = false
     let fullBytes = record.payload?.size ?? 0
+    // BUG-012：把「读取形态」（integrity）与「是否真的做过哈希校验」（verified）
+    // 拆成两维。verifyHash=false 时 integrity 仍是 'ok'（尺寸一致），但它**不是**
+    // 「已验证」；调用方不能再把 'ok' 读成完整校验通过。
+    let verified = record.payload ? false : true
     if (record.payload) {
       const loaded = await this.#readPayload(record.payload, { verifyHash, maxBytes, offsetBytes })
       integrity = loaded.integrity
       payloadText = loaded.text
       truncated = loaded.truncated === true
       fullBytes = loaded.fullBytes ?? fullBytes
+      verified = loaded.verified === true
     }
-    return { ok: true, id, record, entry, payloadText, integrity, truncated, fullBytes }
+    return { ok: true, id, record, entry, payloadText, integrity, truncated, fullBytes, verified }
   }
 
   async #readPayload(payload, { verifyHash, maxBytes = null, offsetBytes = 0 }) {
@@ -1056,23 +1061,25 @@ export class V2SessionStore {
         buffer = await readFile(file)
       }
     } catch (error) {
-      if (error?.code === 'ENOENT') return { integrity: 'payload-missing', text: null, fullBytes }
-      return { integrity: 'payload-unreadable', text: null, fullBytes }
+      if (error?.code === 'ENOENT') return { integrity: 'payload-missing', text: null, fullBytes, verified: false }
+      return { integrity: 'payload-unreadable', text: null, fullBytes, verified: false }
     }
     if (bounded) {
       // 只读了片段：不对全文做哈希断言，如实标 'prefix'（不是 'ok'）。
       const text = payload.encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf8')
-      return { integrity: 'prefix', text, truncated: fullBytes > (offsetBytes || 0) + buffer.byteLength, fullBytes, prefixBytes: (offsetBytes || 0) + buffer.byteLength }
+      return { integrity: 'prefix', text, truncated: fullBytes > (offsetBytes || 0) + buffer.byteLength, fullBytes, prefixBytes: (offsetBytes || 0) + buffer.byteLength, verified: false }
     }
     if (buffer.byteLength !== fullBytes) {
-      return { integrity: 'size-mismatch', text: null, fullBytes }
+      return { integrity: 'size-mismatch', text: null, fullBytes, verified: false }
     }
+    let verified = false
     if (verifyHash) {
       const actual = createHash('sha256').update(buffer).digest('hex')
-      if (actual !== hex) return { integrity: 'hash-mismatch', text: null, fullBytes }
+      if (actual !== hex) return { integrity: 'hash-mismatch', text: null, fullBytes, verified: false }
+      verified = true
     }
     const text = payload.encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf8')
-    return { integrity: 'ok', text, truncated: false, fullBytes }
+    return { integrity: 'ok', text, truncated: false, fullBytes, verified }
   }
 
   /** 观测统计（成本观测入口）。 */

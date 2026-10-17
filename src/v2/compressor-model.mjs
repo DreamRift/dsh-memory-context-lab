@@ -224,7 +224,12 @@ export async function runModelPhase({
   // 增益判定：模型卡必须严格短于程序卡，且不超卡预算。
   const card = renderModelPhaseCard({ summaryId, phaseLabel, memberCount, tools, lines: verdict.kept, manifestId, voucherId, rejectedCount: verdict.rejected.length })
   const cardTokens = approxTokens(card)
-  if (cardTokens >= Number(programCardTokens ?? Number.POSITIVE_INFINITY)) return program({ reason: cardTokens > MODEL_CARD_TOKEN_BUDGET ? 'over-budget' : 'no-gain' })
+  // 增益判定的两条独立闸门：①卡预算上限（MODEL_CARD_TOKEN_BUDGET）无条件生效——
+  // 超限的模型卡无论程序卡多大都不采纳（此前它在 programCardTokens 为 Infinity 时
+  // 被短路漏检，实测 32 行长文照常走 model 档，0.10.0 既有缺陷）；②严格短于程序卡。
+  // 顺序先 over-budget 后 no-gain：同卡超限且不省时按更具体的 over-budget 报因。
+  if (cardTokens > MODEL_CARD_TOKEN_BUDGET) return program({ reason: 'over-budget' })
+  if (cardTokens >= Number(programCardTokens ?? Number.POSITIVE_INFINITY)) return program({ reason: 'no-gain' })
 
   // 观察面：落账与缓存写入，抛错不阻断。
   await safely(() => onUsage?.({ model, usage, cacheHit: false }))
