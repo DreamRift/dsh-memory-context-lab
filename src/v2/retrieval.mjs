@@ -499,7 +499,7 @@ export async function searchRecords({ store, backend = null, text, exact = [], l
  * 只报可验证的结构关系（配对 callId、fork 映射、索引外部 ID），
  * 不做语义推断——「相关」是检索的事，不是来源关系。
  */
-export function describeRecordRelations({ store, recordId, forkMap = null, retrievalIndex = null, backendName = null }) {
+export function describeRecordRelations({ store, recordId, forkMap = null, retrievalIndex = null, backendName = null, forgetIndex = null }) {
   const entry = store.getEntry(recordId)
   if (!entry) {
     throw new EngineV2Error(`未知记录 ID：${recordId}`, { code: 'EREADNOTFOUND', details: { recordId } })
@@ -514,6 +514,8 @@ export function describeRecordRelations({ store, recordId, forkMap = null, retri
     for (const other of store.listEntries({ limit: Number.MAX_SAFE_INTEGER }).entries) {
       if (other.id === recordId) continue
       if (other.refs?.callId !== callId) continue
+      // 已遗忘的配对伙伴不进关系面（安全审计 2026-10-17）：存在性也不泄露。
+      if (forgetIndex && isForgotten(forgetIndex, other.id)) continue
       matched += 1
       relations.push({ kind: 'pairing', relation: other.kind === entry.kind ? 'same-kind' : 'call/result', recordId: other.id, callId })
     }

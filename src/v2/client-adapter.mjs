@@ -390,7 +390,13 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
             const liveBackend = typeof backendFor === 'function' ? backendFor() : null
             if (liveBackend && typeof liveBackend.queryDetailed === 'function') {
               try {
-                const detail = await liveBackend.queryDetailed(needle, { exact: plan.exact, limit: bounded, weakLimit: 3 })
+                // 弱候选同样过遗忘账本（安全审计 2026-10-17）：queryDetailed 支持
+                // exclude，遗忘后到下次索引同步之间索引里仍可能有已遗忘文档，
+                // 不传 exclude 弱指针就会指向它们（存在性泄露；回读仍 fail-closed）。
+                const detail = await liveBackend.queryDetailed(needle, {
+                  exact: plan.exact, limit: bounded, weakLimit: 3,
+                  exclude: [...(forgetIndex?.forgotten?.keys() ?? [])],
+                })
                 const weakSpans = (Array.isArray(detail?.weak) ? detail.weak : [])
                   .map((w) => ({ weak: w, entry: byId.get(w.id) }))
                   .filter((pair) => pair.entry)
