@@ -361,6 +361,31 @@ test('compaction 阈值跨重启：logBytes/docsSinceBase 由磁盘日志初始�
   assert.deepEqual((await second.query('厨房', { limit: 5 })).sort(), ['pad', 'r1'])
 })
 
+test('反向对照：删掉日志后新实例必须查不到——增量记录的唯一载体是日志，不是 base', async () => {
+  const dir = await newDir()
+  const writer = createLocalLexicalBackend({ directory: dir })
+  await writer.index([record('seed', '厨房做饭', 1)]) // 建立 base
+  const basePath = path.join(dir, LOCAL_LEXICAL_INDEX_FILE)
+  const baseBefore = await readFile(basePath)
+  const mtimeBefore = (await stat(basePath)).mtimeMs
+  await writer.index([record('fresh', '书房读书', 2)]) // 只应进日志
+  // 阳性对照的另一半：base 未被改写 ⇒ fresh 不可能藏在 base 里
+  assert.deepEqual(await readFile(basePath), baseBefore)
+  assert.equal((await stat(basePath)).mtimeMs, mtimeBefore)
+  assert.deepEqual(await writer.query('书房', { limit: 5 }), ['fresh'])
+  // 关键：**不 dispose**（dispose 会把日志折进 base），直接删日志，再让新实例读盘
+  await rm(logPathFor(dir), { force: true })
+  const reader = createLocalLexicalBackend({ directory: dir })
+  assert.deepEqual(
+    await reader.query('书房', { limit: 5 }),
+    [],
+    '删掉日志后仍命中 ⇒ 记录被静默写进了 base，增量路径失效（或日志只是摆设）',
+  )
+  assert.deepEqual(await reader.query('厨房', { limit: 5 }), ['seed'], 'base 既有记录不受影响')
+  await writer.dispose()
+  await reader.dispose()
+})
+
 test('cleanup', async () => {
   for (const root of tmpRoots.splice(0)) await rm(root, { recursive: true, force: true })
 })
