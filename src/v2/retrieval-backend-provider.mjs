@@ -98,12 +98,29 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
     },
 
     async close(sessionId) {
+      const entry = localEntries.get(sessionId)
       localEntries.delete(sessionId)
+      // K6：释放前把增量日志并入 base，避免「base 不自足」随会话释放留在磁盘上。
+      // dispose 自身幂等、无悬空日志时不写盘；失败不阻断关闭（日志仍在，下次加载重放）。
+      try {
+        await entry?.backend?.dispose?.()
+      } catch (error) {
+        logger?.warn?.('本地词法索引释放失败：' + (error?.message ?? String(error)))
+      }
       await lingshu?.close?.(sessionId)
     },
 
     async closeAll() {
+      const entries = [...localEntries.values()]
       localEntries.clear()
+      // K6：停机路径必须归并全部会话的日志；单个失败不阻断其余（同上，失败可重放）。
+      await Promise.all(entries.map(async (entry) => {
+        try {
+          await entry?.backend?.dispose?.()
+        } catch (error) {
+          logger?.warn?.('本地词法索引释放失败：' + (error?.message ?? String(error)))
+        }
+      }))
       await lingshu?.closeAll?.()
     },
 
