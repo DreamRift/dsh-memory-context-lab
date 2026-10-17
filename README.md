@@ -89,6 +89,8 @@ v2 是**独立引擎**（独立 schema、隔离目录与回执标记），与 v1
 
 ## 安装与卸载
 
+从 [GitHub Releases](https://github.com/DreamRift/dsh-memory-context-lab/releases) 下载对应版本的 `dsh-memory-context-lab-<版本>.tgz`，执行 `dsh plugin add <tgz 绝对路径>` 安装，随后重启 DSH Desktop。当前版本为 0.10.1。
+
 插件已作为 bundle 安装在 desktop profile。改动宿主侧源码后需要重启 DSH Desktop；只改 `src/client.js` 时刷新页面即可。
 
 ```text
