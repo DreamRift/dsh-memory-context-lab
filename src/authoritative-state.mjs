@@ -25,6 +25,7 @@ export const STATE_RECORD_FIELDS = Object.freeze([
   'planFirst',
   'hierarchyCompress',
   'compressModel',
+  'shareL2Content',
   'auto',
   'autoRecall',
   'autoRestore',
@@ -98,22 +99,40 @@ export function resetHostSessionModuleCache() {
  *
  * 只认记录自己的状态，不认命令意图：命令被拒绝时记录没变，这里读到的就是
  * 「仍然开着」。
+ *
+ * **只表态账本真的持有的字段**（0.12.0 修复）：v1 账本没有 `fullHistory`、
+ * `compressModel` 等 v2 专属位；v2 账本也不一定持有 `planFirst`（面板的计划
+ * 先行行走的是 `/memory-lab set planfirst`，v2 账本只在 `/memory-lab2 set
+ * planfirst` 时才有这一位）。旧实现按「缺省 false」补齐，于是每写一条权威记录
+ * 就把这些位压回关——面板开关闪一下又关掉。现在缺席即「本记录不表态」，投影
+ * 保留日志折叠出来的值。
+ *
+ * **v2 专属位在 v2 不持有时就是关**：全历史、层级压缩、压缩模型、层级卡共享正文
+ * 都只有 v2 引擎能实现。v2 一停用（无论是 `/memory-lab2 off` 还是面板把
+ * `/memory-lab off` 转交给 v2），这几位就是确定性的 false，必须写出来——否则
+ * 面板会停在「降温已停用、全历史仍显示开」，再点该开关只会得到「v2 引擎未启用」，
+ * 看起来就是「关不了」。
  */
 export function stateRecordDataOf({ enabled, engine, state } = {}) {
-  const settings = state?.settings ?? {}
-  return {
-    enabled: enabled === true,
-    engine: engine === 'v1' || engine === 'v2' ? engine : '',
-    fullHistory: state?.fullHistory === true,
-    planFirst: state?.planFirst === true,
-    hierarchyCompress: state?.hierarchyCompress === true,
-    compressModel: state?.compressModel === true,
-    auto: settings.auto !== false,
-    autoRecall: settings.autoRecall !== false,
-    autoRestore: settings.autoRestore !== false,
-    retainOperations: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 0,
-    archiveBatchSize: Number.isInteger(settings.archiveBatchSize) ? settings.archiveBatchSize : 10,
+  const holding = engine === 'v1' || engine === 'v2' ? engine : ''
+  const data = { enabled: enabled === true, engine: holding }
+  const source = state && typeof state === 'object' ? state : null
+  // v2 专属位：v2 不持有投影时一律关（事实，不是默认值）。
+  for (const field of ['fullHistory', 'hierarchyCompress', 'compressModel', 'shareL2Content']) {
+    if (holding === 'v2' && typeof source?.[field] === 'boolean') data[field] = source[field]
+    else if (holding !== 'v2') data[field] = false
   }
+  // 插件级开关：只有账本记着才表态（v1 账本与 v2 账本都可能持有它）。
+  if (typeof source?.planFirst === 'boolean') data.planFirst = source.planFirst
+  const settings = source?.settings && typeof source.settings === 'object' ? source.settings : null
+  if (settings) {
+    for (const key of ['auto', 'autoRecall', 'autoRestore']) {
+      if (typeof settings[key] === 'boolean') data[key] = settings[key]
+    }
+    if (Number.isInteger(settings.retainOperations)) data.retainOperations = settings.retainOperations
+    if (Number.isInteger(settings.archiveBatchSize)) data.archiveBatchSize = settings.archiveBatchSize
+  }
+  return data
 }
 
 /**
@@ -158,7 +177,7 @@ export function sanitizeStateRecord(data) {
   if (!data || typeof data !== 'object') return null
   const out = {}
   let seen = 0
-  const flags = ['enabled', 'fullHistory', 'planFirst', 'hierarchyCompress', 'compressModel', 'auto', 'autoRecall', 'autoRestore']
+  const flags = ['enabled', 'fullHistory', 'planFirst', 'hierarchyCompress', 'compressModel', 'shareL2Content', 'auto', 'autoRecall', 'autoRestore']
   for (const field of STATE_RECORD_FIELDS) {
     if (!(field in data)) continue
     const value = data[field]

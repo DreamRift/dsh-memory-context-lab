@@ -37,6 +37,7 @@ import { assertV2AllowsV1, getEngineRegistry } from './v2/engine.mjs'
 import { EngineV2Error } from './v2/errors.mjs'
 import { createV2Runtime, V2_COMMAND_NAME } from './v2/runtime.mjs'
 import { createV2ClientFactory } from './v2/client-adapter.mjs'
+import { writeV2SessionState } from './v2/state.mjs'
 import { v2SessionDirectoryFor } from './v2/store.mjs'
 import { createCompositeRetrievalBackendProvider } from './v2/retrieval-backend-provider.mjs'
 import { createPlanFirst } from './plan-first.mjs'
@@ -844,6 +845,12 @@ export async function apply(ctx, config) {
    * 它照样翻开关，面板与真实状态相反。这里在命令**结束后**（成功或失败都写）
    * 追加一条插件记录，值取自当时的记录/引擎状态而不是命令意图；投影以它为准。
    *
+   * 0.12.0 修复（面板开关闪烁）：v2 会话的账本在 `v2.records` 里，旧实现只读
+   * v1 的 `records`，于是 v2 命令写出的权威记录把所有开关位按「空账本默认值」
+   * 落成 false（实测：`/memory-lab2 set fullhistory on` 之后紧跟一条
+   * `fullHistory:false`），用户每点一次开关，面板就闪一下又回到关。现在按引擎
+   * 归属取对应账本；账本里没有的开关位不表态（见 stateRecordDataOf），折叠值保留。
+   *
    * 宿主拿不到 appendPluginRecord 时只返回 ok:false，由调用方如实说明并退回
    * 按命令行折叠；绝不假装写过。
    */
@@ -852,16 +859,18 @@ export async function apply(ctx, config) {
       const session = agent?.session
       if (!session) return { ok: false, reason: '当前会话不可用' }
       const sessionId = sessionIdOf(session)
-      const record = sessionId ? records.get(sessionId) : null
-      const stored = record?.state ?? null
+      const v1Record = sessionId ? records.get(sessionId) : null
+      const v2Record = sessionId ? v2.records.get(sessionId) : null
       // 引擎归属以台账为准（engine.json 声明），不是命令说了算。
       let engine = ''
       try {
         const holder = getEngineRegistry(labRoot, sessionId).holder
         engine = holder === 'v2' ? 'v2' : holder === 'v1' ? 'v1' : ''
       } catch {
-        engine = record ? engineName : ''
+        engine = v1Record || v2Record ? engineName : ''
       }
+      const record = engine === 'v2' ? (v2Record ?? v1Record) : (v1Record ?? v2Record)
+      const stored = record?.state ?? null
       const enabled = record
         ? record.state?.enabled !== false
         : engine !== ''
@@ -1148,14 +1157,21 @@ export async function apply(ctx, config) {
         }
         // rc.5：off 时若计划模式仍 active/pending，联动退出并如实报告。
         const note = rawValue === 'on' ? planFirst.enterIfFresh(invocation.agent) : planFirst.exitIfActive(invocation.agent)
-        const recordForPlan = records.get(sessionId)
-        if (recordForPlan) {
-          recordForPlan.state.planFirst = rawValue === 'on'
-          await persist(recordForPlan).catch(() => {})
+        // 0.12.0 修复：v2 会话的账本在 `v2.records`。旧实现只看 v1 的 `records`，
+        // 于是 v2 会话里翻这个开关既不落账，还误报「本会话尚未启用降温」。
+        const v1ForPlan = records.get(sessionId)
+        const v2ForPlan = v2.records.get(sessionId)
+        if (v1ForPlan) {
+          v1ForPlan.state.planFirst = rawValue === 'on'
+          await persist(v1ForPlan).catch(() => {})
+        }
+        if (v2ForPlan) {
+          v2ForPlan.state.planFirst = rawValue === 'on'
+          await writeV2SessionState(v2ForPlan.directory, v2ForPlan.state).catch(() => {})
         }
         const lines = [`新会话计划先行已设为 ${rawValue === 'on' ? '开' : '关'}。`]
         if (note?.text) lines.push(note.text)
-        if (!records.get(sessionId)) lines.push('（本会话尚未启用降温；开关位置已记下，随会话日志折叠生效。）')
+        if (!v1ForPlan && !v2ForPlan) lines.push('（本会话尚未启用降温；开关位置已记下，随会话日志折叠生效。）')
         return { kind: 'success', text: lines.join('\n') }
       }
       // 全历史只在 v2 引擎下存在：v1 命令面如实指路，不静默吞掉拼写正确的开关。
