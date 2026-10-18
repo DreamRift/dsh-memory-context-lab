@@ -80,6 +80,8 @@ test('normalizeSettings falls back to defaults for anything unusable', () => {
     autoRecall: DEFAULT_SETTINGS.autoRecall,
     autoRestore: DEFAULT_SETTINGS.autoRestore,
     protectBudgetTokens: DEFAULT_SETTINGS.protectBudgetTokens,
+    // 0.12.0 P0-3：读取租约随设置持久化；旧状态文件缺这个字段时回落到默认 3。
+    retainReads: DEFAULT_SETTINGS.retainReads,
   }
   assert.deepEqual(normalizeSettings(undefined), SNAPSHOT)
   assert.deepEqual(normalizeSettings({ retainOperations: -1, auto: 'yes' }), SNAPSHOT)
@@ -90,7 +92,7 @@ test('normalizeSettings falls back to defaults for anything unusable', () => {
   // Retired occupancy keys are no longer folded back in: they are gone from
   // DEFAULT_SETTINGS, so normalizeSettings must not resurrect them either.
   const kept = normalizeSettings({ targetOccupancy: 0.5, retainOperations: 3, archiveBatchSize: 4, releaseMarginRatio: 0.1, auto: false, autoRecall: false, autoRestore: false })
-  assert.deepEqual(kept, { retainOperations: 3, archiveBatchSize: 4, auto: false, autoRecall: false, autoRestore: false, protectBudgetTokens: DEFAULT_SETTINGS.protectBudgetTokens })
+  assert.deepEqual(kept, { retainOperations: 3, archiveBatchSize: 4, auto: false, autoRecall: false, autoRestore: false, protectBudgetTokens: DEFAULT_SETTINGS.protectBudgetTokens, retainReads: DEFAULT_SETTINGS.retainReads })
   // 写回路径不丢保护预算：显式值原样保留。
   assert.equal(normalizeSettings({ protectBudgetTokens: 8192 }).protectBudgetTokens, 8192)
 })

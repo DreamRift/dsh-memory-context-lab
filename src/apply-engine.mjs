@@ -39,6 +39,7 @@ import {
   PACKAGE_NAME,
   RECALL_STATUS,
   RECEIPT_MARKER,
+  retainReadsTtlOf,
   textFromContent,
 } from './core.mjs'
 import {
@@ -525,6 +526,10 @@ export function createEngine(dependencies) {
       measuredNodes,
       retainOperations: fullHistory ? 0 : settings.retainOperations,
       retainSpans: fullHistory ? 0 : settings.retainOperations,
+      // 0.12.0 P0-3：读取租约。只对全历史模式有意义（非全历史已有 retainOperations），
+      // 非全历史传 0 = 完全退回旧行为。
+      retainReads: fullHistory ? (Number.isInteger(settings.retainReads) ? settings.retainReads : 0) : 0,
+      retainReadsTtl: fullHistory ? retainReadsTtlOf(settings.retainReads) : 0,
       fullHistory,
       openTurn: openTurnOf(session),
       archivedRanges: pendingReceipts(record).map((row) => ({ start: row.rangeStart, end: row.rangeEnd })),
@@ -763,6 +768,11 @@ export function createEngine(dependencies) {
           locators: Array.isArray(outcome.locators) ? [...outcome.locators] : [],
           statuses: Array.isArray(outcome.statuses) ? [...outcome.statuses] : [],
           receiptFormat: Number.isInteger(outcome.receiptFormat) ? outcome.receiptFormat : undefined,
+          // 0.12.0：format 6/7 的投影头与 status 行要能从行内重建；读取键让
+          // 「同键重读」的账在重启后仍可对账（只记键，不记正文）。
+          ...(Number.isFinite(Number(outcome.releasedTokens)) ? { releasedTokens: Number(outcome.releasedTokens) } : {}),
+          ...(typeof outcome.firstErrorLine === 'string' && outcome.firstErrorLine ? { firstErrorLine: outcome.firstErrorLine } : {}),
+          ...(Array.isArray(outcome.readKeys) && outcome.readKeys.length > 0 ? { readKeys: [...outcome.readKeys] } : {}),
           // P1-5：批次摘要回执的成员数随行落盘——恢复分组与对账都靠它。
           batchSize: Number.isInteger(outcome.batchSize) && outcome.batchSize > 1 ? outcome.batchSize : undefined,
           appliedAt: new Date().toISOString(),

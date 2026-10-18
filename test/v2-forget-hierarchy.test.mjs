@@ -132,7 +132,22 @@ test('对照组：全部可见时压缩照常提交，证明守卫不是无条�
   await withTempDir(async (sessionDir) => {
     const ids = ['mcl2-aaaabbbbcccc-000011', 'mcl2-aaaabbbbcccc-000012', 'mcl2-aaaabbbbcccc-000013']
     const readBodies = []
-    const deps = makeDeps({ sessionDir, ids, readBodies })
+    // 0.12.0 P0-5：聚合凭证多了一行投影头（率 + 失真 + 取回代价），与本文件
+    // 第 76 行同一处理——成员回执按真实长度补齐，否则先触发 no-safe-gain，
+    // 测的就不是「守卫不是无条件拒绝」了。
+    const pad = NL + '正文：' + 'x'.repeat(1200)
+    const deps = makeDeps({
+      sessionDir,
+      ids,
+      readBodies,
+      eventAt: (seq) => ({
+        type: 'user/message',
+        data: {
+          content: [{ type: 'text', text: receiptOf(seq, ids[seq - 1]) + pad }],
+          source: { kind: 'user', form: 'memory-lab2-surface' },
+        },
+      }),
+    })
     const preview = await compressPreview(deps)
     assert.equal(preview.candidates[0]?.status, 'ready')
     assert.equal(readBodies.length, 3)

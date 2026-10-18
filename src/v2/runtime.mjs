@@ -24,6 +24,8 @@ import {
   buildReceipt,
   buildForgetTombstone,
   buildSpanReceipt,
+  RECEIPT_FORMAT_OPERATION,
+  RECEIPT_FORMAT_SPAN_V2,
   escapePromptBraces,
   normalizeSettings,
   renderRecallBlock,
@@ -74,9 +76,10 @@ import {
   resetForkChild,
 } from './fork.mjs'
 import { createCostLedger, renderCostReport } from './cost.mjs'
-import { planCardFolds } from './card-fold.mjs'
+import { CARD_NET_CHAR_CAP, cardOccupancyOf, planCardFolds } from './card-fold.mjs'
+import { invalidateReadLedger, loadReadLedger, registerReads, summarizeReadLedger } from './read-ledger.mjs'
 import { extractClaims } from './claims.mjs'
-import { renderToolOutput, toToolValue } from './tool.mjs'
+import { INDEX_TEXT_MAX_BYTES, renderToolOutput, toToolValue } from './tool.mjs'
 import { searchRecords, syncRetrievalIndex, readRetrievalIndex, describeRecordRelations } from './retrieval.mjs'
 import { planQuery } from './query-plan.mjs'
 import {
@@ -157,6 +160,8 @@ export const V2_HELP = [
   '/memory-lab2 set fullhistory on|off  全历史记忆上下文：除系统头、人类消息、凭证、',
   '                                  计划工件外全部退热入隔离灵枢临时记忆；「保留最近',
   '                                  操作」随之失效（面板变灰），保留由证据保护层裁决。',
+  '/memory-lab2 set readlease <0..50>   最近 N 个含读取结果的操作保留 M=2N 步（0=关闭）；',
+  '                                  这是带 TTL 的租约，不是保护集扩张。',
 ].join('\n')
 
 /** v2 归档节点的稳定 ID 前缀：与 v1 的 `archiveNodeId` 形状不同，两库节点 ID 不会撞车。 */
@@ -242,6 +247,7 @@ function renderV2Status(record, extra = {}) {
     lines.push(`批前后观测（${settled.at}）：批 ${settled.batchReplacements ?? '?'} 段替换后，最近请求未命中 +≈${settled.deltaTokens} token`
       + `（命中率 ${pct(settled.beforeHitRatio)} → ${pct(settled.afterHitRatio)}；含并发因素，仅量级参考）`)
   }
+  if (extra.readLedger?.length) lines.push(...extra.readLedger)
   if (extra.retrieval) lines.push(...extra.retrieval)
   if (extra.warnings?.length) lines.push(`告警：${extra.warnings.join('；')}`)
   return lines.join('\n')
@@ -457,6 +463,8 @@ export function createV2Runtime(dependencies) {
     spanBodyOf: (session, unit) => bodyOfSpan(session, unit),
     // 普通历史段的回执不冒充工具操作回执：操作段照旧印工具与调用次数，其他段
     // 印「片段：用户消息/助手消息/…」。
+    // 0.12.0 P0-5/P0-1/P1-5：v2 的回执走投影经济学版（format 6/7），
+    // 投影头、可回读动作行、status 都由同一批既有字段渲染，不新增计算。
     receiptOf: (candidate, { nodeId, hash, marker }) => (candidate.spanKind === SPAN_KINDS.OPERATION
       ? buildReceipt({
         tools: candidate.tools,
@@ -468,6 +476,9 @@ export function createV2Runtime(dependencies) {
         tokens: candidate.originalTokens,
         chunks: candidate.chunkCount ?? 1,
         marker,
+        formatVersion: RECEIPT_FORMAT_OPERATION,
+        releasedTokens: candidate.originalTokens,
+        errorLine: candidate.firstErrorLine ?? null,
       })
       : buildSpanReceipt({
         // D4：插件自己注入的跨度（工作状态卡/回注包/回执）不冒充「用户消息」，
@@ -481,6 +492,9 @@ export function createV2Runtime(dependencies) {
         tokens: candidate.originalTokens,
         chunks: candidate.chunkCount ?? 1,
         marker,
+        formatVersion: RECEIPT_FORMAT_SPAN_V2,
+        releasedTokens: candidate.originalTokens,
+        errorLine: candidate.firstErrorLine ?? null,
       })),
   })
 
@@ -874,14 +888,34 @@ export function createV2Runtime(dependencies) {
 
     if (warnings.length) logger?.warn?.(`memory-lab2: ${warnings.join('；')}`)
     // 计划先行联动（由 index.mjs 注入）：启用成功且开关为开、会话全新时进入计划模式。
-    // 失败只降级为提示，不阻断启用（计划模式不是降温的前置条件）。
-    const planNote = (await onEnabled?.(agent)?.catch(() => null)) ?? null
+    //
+    // 0.12.0 P1-1：`index.mjs` 注入的 onEnabled **返回同步对象**（plan-first 的
+    // `enterIfFresh` 是同步函数），旧写法 `onEnabled?.(agent)?.catch(...)` 在同步
+    // 返回值上访问 `.catch` 是 undefined → TypeError。而这段代码在 `enable()` 尾部、
+    // 记录与状态**已经落盘之后**且不在 try 内：命令显示失败，引擎其实已启用——
+    // 「失败关闭」在这里完全没生效。现在同步与异步都接，抛错一律降级为提示。
+    let planNote = null
+    let planNoteFailed = false
+    try {
+      const note = onEnabled?.(agent)
+      if (note && typeof note.then === 'function') {
+        // 异步分支的 rejection 同样要降级为提示（并留下「计划先行未生效」），
+        // 不能静默吞成 null —— 那会让回执看起来一切正常。
+        planNote = (await note.catch(() => { planNoteFailed = true; return null })) ?? null
+      } else {
+        planNote = note ?? null
+      }
+    } catch (error) {
+      planNoteFailed = true
+      logger?.warn?.(`memory-lab2: 计划先行联动失败（引擎已启用，计划模式未生效）：${error instanceof Error ? error.message : String(error)}`)
+    }
     return {
       kind: 'success',
       text: `已启用 v2 引擎（全历史按需记忆化）。\n隔离根：${created.directory}\n`
         + `本会话对真实灵枢的自动读写已抑制；v1 引擎在本会话不可同时启用。\n`
         + (warnings.length ? `告警：${warnings.join('；')}` : '')
-        + (planNote ? `\n${planNote.text}` : ''),
+        + (planNote ? `\n${planNote.text}` : '')
+        + (planNoteFailed ? '\n计划先行未生效：联动回调抛错（引擎已启用，降温照常；可稍后 `/memory-lab2 status` 复核）。' : ''),
     }
   }
 
@@ -930,6 +964,8 @@ export function createV2Runtime(dependencies) {
           const outcome = await engine.runRestore(record)
           restored = outcome?.restored ?? 0
           before = outcome?.before ?? 0
+          // 0.12.0 P0-2：恢复成功的区间已回活动面，读取账本里「已归档」的标记随之失效。
+          await invalidateLedgerForRestore(record, outcome)
           // P0-2：停用回执必须如实报告仍未恢复的行——它们的原文只在冷库，
           // 停用后冷库按只读保留，旧记录 ID 仍可回读，但不能宣称「全部恢复」。
           const stillSkipped = outcome?.stillSkipped ?? 0
@@ -1100,7 +1136,35 @@ export function createV2Runtime(dependencies) {
       extra = { warnings: [`读取 v2 库失败：${error instanceof Error ? error.message : String(error)}`] }
     }
     extra.retrieval = await retrievalStatusLines(record)
+    extra.readLedger = await readLedgerLines(record)
     return { kind: 'success', text: renderV2Status(record, extra) }
+  }
+
+  /**
+   * 状态面的「重复读取」行（0.12.0 P0-2）。
+   *
+   * 两个口径分开报，绝不混用（方案 P0-2 的复算纪律）：
+   * - 口径 A = 重读字符 / 全部内容字符；
+   * - 口径 B = 内容完全未变的重读 / 全部内容字符。
+   *
+   * 分母只取**本账本能看见的字符**：账本 0.12.0 才有，历史重读不在里面，
+   * 所以这里标「本账本口径」而不是「会话口径」——不把看不见的部分算成 0。
+   */
+  async function readLedgerLines(record) {
+    const ledger = await loadReadLedger(record.directory).catch(() => null)
+    if (!ledger || !ledger.ok) {
+      return ['重复读取：账本不可读（失败关闭，不重建为空）：' + (ledger?.error ?? '未知原因')]
+    }
+    if (ledger.entries.length === 0) return ['重复读取：账本为空（本会话尚未归档过读取类操作）']
+    const totalChars = ledger.entries.reduce((sum, entry) => sum + Number(entry.chars ?? 0), 0)
+    const summary = summarizeReadLedger(ledger, { totalChars })
+    const pct = (ratio) => (Number.isFinite(ratio) ? (ratio * 100).toFixed(2) + '%' : '未知')
+    return [
+      '重复读取（本账本口径）：键 ' + summary.keys + ' 个 / 读取 ' + summary.reads + ' 次 / 重读 '
+        + summary.repeats + ' 次（' + summary.repeatChars + ' 字）',
+      '重复读取占比：口径 A（重读字符/全部内容字符）' + pct(summary.ratioA)
+        + '；口径 B（内容未变的重读）' + pct(summary.ratioB) + '（分母=' + summary.totalChars + ' 字）',
+    ]
   }
 
   /**
@@ -1506,10 +1570,12 @@ export function createV2Runtime(dependencies) {
         if (found.semanticError) {
           warnings.push(`语义检索后端不可用，已降级为内置字面索引：${found.semanticError}`)
         } else if (!found.semanticUsed) {
-          // 没接上语义后端时说清楚「字面索引覆盖的是元数据」，别让模型把
-          // 「0 命中」读成「库里没有这段历史」——正文词只能靠语义后端或按 ID 回读。
-          warnings.push('本次只走内置字面索引（覆盖记录 ID、种类、工具名、callId、seq 范围等元数据，'
-            + '不含正文词）；需要按正文内容检索时先 `/memory-lab2 index sync` 启动语义后端，'
+          // 没接上语义后端时如实说清楚**字面索引到底覆盖什么**：它不只覆盖元数据，
+          // 还覆盖每条记录 ≤8 KiB 的正文词元（含中文二元组）。旧文案写「不含正文词」，
+          // 把模型劝退回 tools.read（P1-7 / G4）。
+          warnings.push('本次只走内置字面索引（覆盖记录 ID、种类、工具名、callId、seq 范围，'
+            + '以及每条记录 ≤' + (INDEX_TEXT_MAX_BYTES / 1024) + ' KiB 的正文词元（含中文二元组））；'
+            + '需要更强的语义召回时先 `/memory-lab2 index sync` 启动语义后端，'
             + '或用 record_ids 精确回读。')
         }
         // 续读：跳过已经列过的命中（稳定 ID 全序，游标只记住位置）。
@@ -1624,6 +1690,10 @@ export function createV2Runtime(dependencies) {
         record.cost.bump('evidenceReReads', hits)
         record.cost.bump('evidenceReReadTokens', tokens)
       }
+      // 0.12.0 P0-1：三路拆分。工具面与命令面**互不覆盖**——把两条入口混成一个数，
+      // 正是「插件以为自己回读 0 次」的原因。auto（自动回注）不计入这两路。
+      if (attribution === 'tool') record.cost.bump('toolRecallReads', 1)
+      else if (attribution === 'command') record.cost.bump('commandRecallReads', 1)
     }
     record.cost.bump('recallReads', 1)
     record.cost.bump('recallReturnedTokens', tokens)
@@ -1783,6 +1853,32 @@ export function createV2Runtime(dependencies) {
   }
 
   /**
+   * 「本步可回读」候选（0.12.0 P0-1）：最近 3 条已归档行 → 记录 ID + 结构摘要 + 取回代价。
+   *
+   * 只读归档行已有的字段（nodeId/tools/range/locators/originalTokens），不生成摘要正文、
+   * 不读冷库载荷——卡片是每步固定税，任何「为写卡去读冷库」都会把成本翻倍。
+   */
+  function readbackEntriesOf(record) {
+    const rows = engine.pendingReceipts(record)
+    const out = []
+    for (let index = rows.length - 1; index >= 0 && out.length < 3; index -= 1) {
+      const row = rows[index]
+      if (!row || typeof row.nodeId !== 'string' || row.nodeId === '') continue
+      const locator = Array.isArray(row.locators) && typeof row.locators[0] === 'string' && row.locators[0] !== ''
+        ? row.locators[0]
+        : null
+      out.push({
+        recordId: row.nodeId,
+        tools: Array.isArray(row.tools) ? row.tools : [],
+        range: { start: row.rangeStart, end: row.rangeEnd },
+        locator,
+        tokens: Number.isFinite(Number(row.originalTokens)) ? Number(row.originalTokens) : null,
+      })
+    }
+    return out
+  }
+
+  /**
    * 构建本会话的工作状态卡（有界常驻）。
    *
    * 只用宿主结构事实 + v2 配对账本，不调用模型、不生成有损摘要。
@@ -1818,6 +1914,8 @@ export function createV2Runtime(dependencies) {
           }
           return { callRecordId, resultRecordId }
         },
+        // P0-1：本步可回读（最近 3 条已归档，只给结构与取回代价）。
+        readback: readbackEntriesOf(record),
       })
     })
     const card = renderWorkingSetInjection(state, { budgetTokens })
@@ -2264,12 +2362,12 @@ export function createV2Runtime(dependencies) {
    * 折叠回执自身用独立 marker（[已折叠工作卡·v2]），不以 V2_RECEIPT_MARKER 开头，
    * 因此不会再次入组（无自激循环）；全历史模式的凭证收集器如需纳入可按前缀识别。
    */
-  async function foldWorkingCards(agent) {
+  async function foldWorkingCards(agent, { requireOverCap = false } = {}) {
     const record = await adopt(agent)
-    if (!record) return { folded: 0, receipts: [], failed: 0 }
+    if (!record) return { folded: 0, receipts: [], failed: 0, occupancy: null }
     const session = record.agent?.session
     if (!session || typeof session.append !== 'function' || !Array.isArray(session.surface?.nodes)) {
-      return { folded: 0, receipts: [], failed: 0 }
+      return { folded: 0, receipts: [], failed: 0, occupancy: null }
     }
     const nodes = session.surface.nodes.map((seq) => {
       const event = typeof session.eventAt === 'function' ? session.eventAt(seq) : null
@@ -2285,7 +2383,11 @@ export function createV2Runtime(dependencies) {
         text: typeof first?.text === 'string' ? first.text : null,
       }
     })
-    const { plans } = planCardFolds(nodes)
+    // 0.12.0 P0-4：最新一张工作状态卡永远保护；它是模型当前能看到的状态面。
+    const occupancy = cardOccupancyOf(nodes)
+    const { plans } = planCardFolds(nodes, {
+      protectSeqs: occupancy.newestWorkingStateSeq === null ? [] : [occupancy.newestWorkingStateSeq],
+    })
     const receipts = []
     let failed = 0
     for (const plan of plans) {
@@ -2308,9 +2410,10 @@ export function createV2Runtime(dependencies) {
     }
     if (receipts.length > 0) {
       record.cost.bump('historyReplacements', receipts.length)
+      record.cost.bump('cardFoldBatches', 1)
       void persistCost(record)
     }
-    return { folded: receipts.length, receipts, failed }
+    return { folded: receipts.length, receipts, failed, occupancy }
   }
 
   async function importV1(invocation) {
@@ -2459,6 +2562,14 @@ export function createV2Runtime(dependencies) {
         return { kind: 'error', text: `用法：\`/memory-lab2 set ${key} <正整数>\`` }
       }
       settings[target] = value
+    } else if (key === 'readlease') {
+      // 0.12.0 P0-3：读取租约长度（0 = 关闭）。0 必须可用——它是「退回旧行为」的
+      // 唯一入口；上界与 NUMERIC_SETTINGS.readlease 一致（50），越界不静默夹取。
+      const value = Number.parseInt(rawValue ?? '', 10)
+      if (!Number.isInteger(value) || value < 0 || value > 50) {
+        return { kind: 'error', text: '用法：`/memory-lab2 set readlease <0..50 的整数>`（0 = 关闭读取租约）' }
+      }
+      settings.retainReads = value
     } else if (key === 'fullhistory') {
       // 全历史记忆上下文：独立于 settings 五字段存在（normalizeSettings 会把它剥掉），
       // 引擎按 record.state.fullHistory 读取。开启即代表「除不可压缩凭证外全部退热」，
@@ -2580,7 +2691,7 @@ export function createV2Runtime(dependencies) {
       if (note) lines.push(note.text)
       return { kind: 'success', text: lines.join('\n') }
     } else {
-return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|fullhistory|planfirst|compress|compressmodel|sharel2content。` }
+return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|readlease|fullhistory|planfirst|compress|compressmodel|sharel2content。` }
     }
     record.state.settings = normalizeSettings(settings)
     // 设置必须落盘：只改内存会让「设置成功」在重启后失效，而 v1 的 set 是持久的。
@@ -3180,6 +3291,12 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
       const foldOutcome = await foldWorkingCards(agent)
       if (foldOutcome.folded > 0) {
         logger?.info?.(`memory-lab2: 折叠 ${foldOutcome.folded} 组插件工作卡（失败 ${foldOutcome.failed ?? 0}）。`)
+      } else if (foldOutcome.occupancy?.overCap === true) {
+        // P0-4：上界到了却折不动，必须说出来。真实形态下每步一卡会被 assistant
+        // 消息断开（G2），这时「净占用有上界」只是愿望；如实报告比假装有界好。
+        logger?.warn?.(`memory-lab2: 卡片净占用 ≈${foldOutcome.occupancy.chars} 字符超过上限 ${CARD_NET_CHAR_CAP}，但当前没有可折叠的连续卡组（卡之间隔着非卡节点）。`)
+        record.cost.bump('cardCapUnreached', 1)
+        void persistCost(record)
       }
     } catch (error) {
       logger?.warn?.(`memory-lab2: 卡组折叠跳过：${error?.message ?? error}`)
@@ -3252,6 +3369,74 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
     const written = Number(outcome.recordsWritten)
     record.cost.bump('recordsWritten', Number.isFinite(written) && written > 0 ? written : applied)
     void persistCost(record)
+    // 0.12.0 P0-2：把本批里含读取结果的操作登记进读取账本。只记键（path|offset）、
+    // 冷记录指针与 hash，**不记正文**；重读计数在这里才第一次可见。
+    void registerArchivedReads(record, outcome)
+  }
+
+  /**
+   * restore 后让读取账本失效（0.12.0 P0-2）。
+   *
+   * 被恢复的区间已回到活动面，再标「该区间已于 seq N 归档」就是谎报；失败只记
+   * 告警——账本写不进去不能让恢复本身看起来失败。
+   */
+  async function invalidateLedgerForRestore(record, outcome) {
+    // 引擎返回的是 `outcomes`（每行 `{ state, nodeId, rangeStart }`）；`rows` 是旧
+    // 形状的别名，两个都认，避免恢复路径因为字段改名而静默不失效账本。
+    const rows = Array.isArray(outcome?.outcomes) ? outcome.outcomes : (Array.isArray(outcome?.rows) ? outcome.rows : [])
+    const restoredRows = rows.filter((row) => row && (row.state === 'restored' || row.restored === true))
+    const nodeIds = restoredRows.map((row) => row.nodeId).filter((id) => typeof id === 'string' && id !== '')
+    const seqs = restoredRows.map((row) => row.rangeStart).filter((seq) => Number.isInteger(seq))
+    if (nodeIds.length === 0 && seqs.length === 0) return
+    try {
+      const removed = await invalidateReadLedger(record.directory, { nodeIds, seqs })
+      if (!removed.ok) {
+        logger?.warn?.('memory-lab2: 恢复后读取账本失效失败（原文已回活动面，账本标记可能陈旧）：' + (removed.error ?? '未知原因'))
+      }
+    } catch (error) {
+      logger?.warn?.('memory-lab2: 恢复后读取账本失效异常：' + (error?.message ?? String(error)))
+    }
+  }
+
+  /**
+   * 归档后登记读取键（0.12.0 P0-2）。
+   *
+   * 失败只记告警：账本损坏时**不重建为空**（失败关闭在 read-ledger 里），归档本身
+   * 已经成功，不能因为账本写不进去就把它说成失败。
+   */
+  async function registerArchivedReads(record, outcome) {
+    const rows = Array.isArray(outcome?.outcomes) ? outcome.outcomes : []
+    const reads = []
+    for (const row of rows) {
+      if (row?.state !== 'applied') continue
+      const keys = Array.isArray(row.readKeys) ? row.readKeys : []
+      if (keys.length === 0) continue
+      for (const key of keys) {
+        reads.push({
+          key,
+          seq: Number.isInteger(row.rangeStart) ? row.rangeStart : null,
+          coldRecordId: typeof row.nodeId === 'string' ? row.nodeId : null,
+          hash: typeof row.hash === 'string' ? row.hash : null,
+          chars: Number.isFinite(Number(row.chars)) ? Number(row.chars) : 0,
+        })
+      }
+    }
+    if (reads.length === 0) return
+    try {
+      const step = rows.reduce((max, row) => (Number.isInteger(row?.rangeEnd) ? Math.max(max, row.rangeEnd) : max), 0)
+      const registered = await registerReads(record.directory, { reads, step: step > 0 ? step : null })
+      if (!registered.ok) {
+        logger?.warn?.('memory-lab2: 读取账本写入失败（原文与归档均已落盘，重读计数暂不可见）：' + (registered.error ?? '未知原因'))
+        return
+      }
+      if (registered.repeats > 0) {
+        record.cost.bump('fileReReads', registered.repeats)
+        record.cost.bump('fileReReadChars', registered.repeatChars)
+        void persistCost(record)
+      }
+    } catch (error) {
+      logger?.warn?.('memory-lab2: 读取账本登记失败（归档不受影响）：' + (error?.message ?? String(error)))
+    }
   }
 
   async function buildRecall(agent, decision, signal) {

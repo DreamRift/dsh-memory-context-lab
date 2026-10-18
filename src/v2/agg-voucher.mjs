@@ -26,11 +26,12 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
 
-import { V2_RECEIPT_MARKER } from '../core.mjs'
+import { AGG_VOUCHER_MARKER, buildProjectionHeader, V2_RECEIPT_MARKER } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
 import { canonicalLine } from './disposition.mjs'
 
-export const AGG_VOUCHER_MARKER = '[聚合凭证·v2]'
+// 标记常量单一出处（core.mjs）：isReceiptMessage 与本模块共用同一份，改一处即两处同步。
+export { AGG_VOUCHER_MARKER }
 export const AGG_VOUCHER_PLANS_FILE = 'voucher-plans.json'
 export const AGG_VOUCHER_PLAN_LIMIT = 32
 /** 组长下限：低于它的连续回执组不值得换一条凭证（no-safe-gain）。 */
@@ -168,6 +169,7 @@ export function withMemberExclusions(plan, { excludedMembers = [] } = {}) {
       recordCount: included.length,
       toolHistogram: plan.toolHistogram,
       tokensEstimate: plan.tokensEstimate,
+      chars: plan.chars ?? 0,
       excludedCount: excludedIds.length,
     }),
   }
@@ -207,6 +209,7 @@ function buildVoucherPlan(memberNodes) {
   const recordIds = []
   const toolHistogram = Object.create(null)
   let tokensEstimate = 0
+  let chars = 0
   const memberTexts = []
   for (const node of memberNodes) {
     const text = nodeTextOf(node) ?? ''
@@ -216,6 +219,7 @@ function buildVoucherPlan(memberNodes) {
     }
     mergeHistogram(toolHistogram, parseReceiptTools(text))
     tokensEstimate += estimateTokensOf(text)
+    chars += text.length
   }
   const startSeq = memberSeqs[0]
   const endSeq = memberSeqs[memberSeqs.length - 1]
@@ -228,6 +232,7 @@ function buildVoucherPlan(memberNodes) {
     recordCount: recordIds.length,
     toolHistogram,
     tokensEstimate,
+    chars,
   })
   return {
     // T2/F-15：新计划一律带 schema 2 与空排除集（无排除时渲染与 0.10.x 逐字节一致）。
@@ -242,6 +247,7 @@ function buildVoucherPlan(memberNodes) {
     memberDigest: memberDigestOf({ memberSeqs, includedRecordIds: recordIds }),
     toolHistogram,
     tokensEstimate,
+    chars,
     memberCount: memberSeqs.length,
     memberTexts,
     voucherText,
@@ -251,13 +257,19 @@ function buildVoucherPlan(memberNodes) {
 // ---------------------------------------------------------------- 渲染与解析
 
 /** 恒定格式凭证文本：字段固定、无时间戳，同计划永远渲染同一字节。 */
-export function renderVoucherText({ voucherId, startSeq, endSeq, memberCount, recordCount, toolHistogram, tokensEstimate, excludedCount = 0 }) {
+export function renderVoucherText({ voucherId, startSeq, endSeq, memberCount, recordCount, toolHistogram, tokensEstimate, excludedCount = 0, chars = 0 }) {
   const tools = Object.entries(toolHistogram ?? {})
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([tool, count]) => `${tool}×${count}`)
     .join('、')
   const lines = [
     AGG_VOUCHER_MARKER,
+    // P0-5 / v1.2 P5-3：聚合凭证同样是一次投影，率与失真一起声明。
+    buildProjectionHeader({
+      releasedTokens: Number.isFinite(Number(tokensEstimate)) ? Number(tokensEstimate) : 0,
+      releasedChars: Number.isFinite(Number(chars)) ? Number(chars) : 0,
+      readbackTokens: Number.isFinite(Number(tokensEstimate)) ? Number(tokensEstimate) : null,
+    }),
     `范围：seq ${startSeq}–${endSeq}（${memberCount} 段已归档操作；本条为程序聚合凭证，成员原文在 append-only 日志）`,
     `凭证：${voucherId}`,
     `成员冷记录：${recordCount} 条${tools ? `；工具：${tools}` : ''}`,

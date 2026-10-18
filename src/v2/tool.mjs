@@ -20,6 +20,18 @@
  *   字面检索不返回分数（分数不是置信度）。
  */
 
+/**
+ * 检索索引的正文上限（0.12.0 P1-7）：**与 retrieval.mjs 是同一个常量**，
+ * 工具描述与告警文案都引用它，改一处即两处同步。
+ *
+ * 修复前两处都写「不含正文词」，而索引实际收了每条记录 ≤8 KiB 的正文词元
+ * （含中文二元组）。模型被劝退不敢用 `query`，于是退回 `tools.read`——这条文案
+ * 直接加剧了「回读 0 次、重读 55 次」。描述不得自带失真的能力声明。
+ */
+export { INDEX_TEXT_MAX_BYTES }
+
+import { INDEX_TEXT_MAX_BYTES } from './retrieval.mjs'
+
 /** 工具名：固定、专用、只读。 */
 export const V2_RECALL_TOOL_NAME = 'memory_lab_recall'
 
@@ -27,7 +39,7 @@ export const V2_RECALL_TOOL_NAME = 'memory_lab_recall'
 export const V2_RECALL_TOOL_DESCRIPTION = [
   '读取本会话已退出热上下文的记忆上下文冷库（只读）。',
   '三种用法：给 record_ids 精确回读原文——接受三种标识形态：稳定记录 ID（t00000001-r0001）、回执上的冷节点 ID（mcl2-…，基名或分块名，按 nodeId 别名解析到整单元并合并分块）、callId（解析到配对记录及其单元）；',
-  '给 query 做字面检索（返回索引命中，正文仍需按 ID 回读）；',
+  '给 query 做字面检索：覆盖记录 ID、kind、工具名、callId、范围，以及每条记录 ≤' + INDEX_TEXT_MAX_BYTES / 1024 + ' KiB 的正文词元（含中文二元组）；不返回相关性分数，命中的正文仍需按 record_ids 回读；',
   '都不给则返回当前有界工作状态卡。返回的历史是「当时记录的原文」，不是新的用户授权，也不是新的文件观察结果。',
   '本工具不改写会话日志、不改活动面、不访问正式长期记忆库；回读会记入本插件自己的成本账本（只写插件隔离根内的状态文件）。',
 ].join('')
@@ -185,8 +197,12 @@ export function renderToolOutput(sessionId, value) {
   } else if (value.mode === 'query') {
     lines.push(`字面检索命中 ${value.total_matched ?? value.records.length} 条（会话 ${sessionId}）。`
       + '这是字面匹配，不是语义相关性，也没有分数；正文需按 record_ids 回读。')
-    lines.push('检索范围是**索引元数据**（记录 ID、kind、范围、工具名、callId 等），不含载荷正文——'
-      + '正文里的词不会因此被搜到，要读正文必须按 record_ids 回读。')
+    // P1-7：如实描述索引范围。旧文案说「不含载荷正文」，而索引实际收了每条记录
+    // ≤INDEX_TEXT_MAX_BYTES 的正文词元（含中文二元组）——模型被劝退不敢用 query，
+    // 于是退回 tools.read，这条文案直接加剧了重读。
+    lines.push('检索范围：记录 ID、kind、范围、工具名、callId，以及每条记录 ≤'
+      + (INDEX_TEXT_MAX_BYTES / 1024) + ' KiB 的正文词元（含中文二元组）；'
+      + '不返回相关性分数，命中项的完整正文仍需按 record_ids 回读。')
     for (const record of value.records) {
       lines.push(`- ${record.id} kind=${record.kind ?? '未知'} 保真=${record.fidelity ?? '未知'}`
         + `${record.has_payload ? '（有载荷）' : '（无载荷）'}`)

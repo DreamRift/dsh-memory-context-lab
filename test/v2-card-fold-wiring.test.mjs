@@ -51,7 +51,7 @@ async function seedEnabled(labRoot, sessionId) {
 }
 
 function injectCard(session, text = '[工作状态·v2] 第几张卡', seqHint = null) {
-  // 0.11.2 回归：source 属于消息体（data），不属于 append 的 opts——宿主只摊
+  // 0.11.0 回归：source 属于消息体（data），不属于 append 的 opts——宿主只摊
   // surfaceOp/sourceEventSeqs。写在 opts 里会被静默丢弃，折叠器就认不出这是
   // 插件卡。夹具已收紧到宿主语义，这里必须按真实形状构造。
   const event = session.append('user/message', {
@@ -95,7 +95,11 @@ test('S3-W1 foldWorkingCards：连续卡组被折叠成单回执，非卡消息�
       assert.ok(Array.isArray(outcome.receipts))
 
       const nodesAfter = session.surface.nodes.length
-      assert.equal(nodesAfter, nodesBefore - 2, '3 张卡 → 1 条折叠回执，净减 2 个节点')
+      // 0.12.0 P0-4：最新一张工作状态卡永远保护（它是模型当前能看到的状态面），
+      // 所以 3 张卡里只有前 2 张被折，净减 1 个节点。
+      assert.equal(nodesAfter, nodesBefore - 1, '3 张卡（最新一张受保护）→ 折叠前 2 张成 1 条回执，净减 1 个节点')
+      const newestSeq = cardSeqs.at(-1)
+      assert.ok(session.surface.nodes.includes(newestSeq), '最新一张工作卡必须仍在活动面上（P0-4 保护）')
 
       // 折叠回执以 V2_RECEIPT_MARKER 开头（可被后续流程识别为凭证）。
       const foldNodeSeq = session.surface.nodes.find((seq) => {
@@ -106,7 +110,8 @@ test('S3-W1 foldWorkingCards：连续卡组被折叠成单回执，非卡消息�
       assert.ok(foldNodeSeq !== undefined, '折叠回执必须在活动面上')
       const foldEvent = session.eventAt(foldNodeSeq)
       assert.ok(foldEvent.sourceEventSeqs.includes(cardSeqs.at(-3)), 'sourceEventSeqs 必须覆盖被吞卡的 seq')
-      assert.ok(foldEvent.sourceEventSeqs.includes(cardSeqs.at(-1)))
+      assert.ok(foldEvent.sourceEventSeqs.includes(cardSeqs.at(-2)), 'sourceEventSeqs 覆盖被吞的第二张卡')
+      assert.ok(!foldEvent.sourceEventSeqs.includes(cardSeqs.at(-1)), '最新一张卡受保护，不得进入替换区间')
 
       // 人类/系统/助手/工具消息一个不动。
       const preserved = session.surface.nodes.filter((seq) => !cardSeqs.slice(-3).includes(seq))
@@ -138,6 +143,10 @@ test('S3-W2 幂等：无新卡组时二次折叠不产生新的 replace（replac
       await runtime.adopt(agent)
       injectCard(session, '[工作状态·v2] 卡1')
       injectCard(session, '[工作状态·v2] 卡2')
+      // 0.12.0 P0-4：最新一张卡受保护，所以两张卡时凑不满 minRun=2，不会折叠。
+      const zero = await runtime.foldWorkingCards(agent)
+      assert.equal(zero.folded, 0, '两张卡里最新一张受保护，剩 1 张不够 minRun')
+      injectCard(session, '[工作状态·v2] 卡3')
       const first = await runtime.foldWorkingCards(agent)
       assert.equal(first.folded, 1)
       const genAfterFirst = session.surface.replaceGeneration

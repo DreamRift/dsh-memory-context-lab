@@ -71,7 +71,7 @@ function runtimeWithMeter(labRoot) {
 }
 
 function injectCard(session, text) {
-  // 0.11.2 回归：宿主 `Session.append(type, data, opts)` 只从 opts 取
+  // 0.11.0 回归：宿主 `Session.append(type, data, opts)` 只从 opts 取
   // `surfaceOp`/`sourceEventSeqs`，其余键静默丢弃；`source` 必须写在 data 里
   // （投影按 `data.source.form` 判定注入来源）。夹具现在与宿主同语义，写错位置
   // 的用例会立刻变红——这里正是把它改对的地方，断言一条没放宽。

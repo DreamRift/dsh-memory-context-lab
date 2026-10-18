@@ -198,10 +198,13 @@ test('工具的字面检索只搜索引元数据，命中只给索引、正文�
       assert.equal(value.records.every((record) => record.text === null), true)
       assert.match(renderToolOutput(SESSION_ID, value), /不等于不存在/)
 
-      // 载荷正文里的词不在索引里：搜不到是如实边界，不是「不存在」。
+      // 检索范围必须**如实**描述（0.12.0 P1-7）：索引覆盖 ≤8 KiB 正文词元，
+      // 所以这里断言的是「描述与实现一致」，而不是旧文案的「不含载荷正文」。
+      // 该查询词不在任何正文里 → 0 命中，且文案要指路 record_ids。
       const payloadOnly = await tool.execute({ query: 'yyyyyyyy' }, { agent })
       assert.equal(payloadOnly.records.length, 0)
-      assert.match(renderToolOutput(SESSION_ID, payloadOnly), /不含载荷正文/)
+      assert.match(renderToolOutput(SESSION_ID, payloadOnly), /正文词元/)
+      assert.match(renderToolOutput(SESSION_ID, payloadOnly), /按 record_ids 回读/)
     } finally {
       await runtime.disable({ agent })
     }

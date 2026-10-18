@@ -884,6 +884,14 @@ export function buildWorkingState({
   // callId → { callRecordId, resultRecordId } | null：v2 配对账本的精确对位。
   // 并行调用共享宿主 seq 时这是**唯一**可靠来源（见 `recordOfCall` 注释）。
   recordIdsForCallId = null,
+  /**
+   * 0.12.0 P0-1：「本步可回读」候选。
+   *
+   * 每项 `{ recordId, tools, range, locator, status, tokens }`，由运行时从**已归档行**
+   * 组装（最多 3 条，见 `readbackSectionOf`）。卡片只描述结构，不复述正文——
+   * 复述正文等于撤销归档。
+   */
+  readback = [],
 } = {}) {
   const config = { ...WORKING_SET_DEFAULTS, ...limits }
   const nodes = Array.isArray(surfaceNodes) ? [...surfaceNodes] : []
@@ -1540,6 +1548,8 @@ export function buildWorkingState({
     }),
   }
 
+  // P1-4：硬保护项的角色/编号一致性（同 seq 不得同时出现在两类硬保护）。
+  const identity = resolveProtectionIdentity(protectedSet)
   const byClass = {}
   for (const item of protectedSet) {
     byClass[item.protectionClass] = (byClass[item.protectionClass] ?? 0) + 1
@@ -1584,8 +1594,15 @@ export function buildWorkingState({
       auxiliaryModel: false,
       readbackPinTtlMs: config.pinTtlMs,
     },
+    /**
+     * 0.12.0 P0-1：本步可回读候选（渲染时由 readbackSectionOf 装成硬段）。
+     * 放在状态里而不是只放渲染参数里：卡片与状态必须对得上，调用方也要能对账。
+     */
+    readback: Array.isArray(readback) ? [...readback] : [],
     // --- 活跃工作集新增字段 ---
-    protectedSet,
+    protectedSet: identity.items,
+    /** P1-4：同 seq 出现在两类硬保护时的告警（空数组 = 无冲突）。 */
+    identityWarnings: identity.duplicates.map((ref) => `seq/引用 ${ref} 同时出现在两类硬保护里，已降级为「角色未确认」`),
     protectionSummary: {
       hard: protectedSet.length,
       hardByClass: byClass,
@@ -1742,6 +1759,77 @@ export function decideWorkingSetInjection({
   return { inject: true, reason: 'new-key', dedupKey, keys, evicted: Math.max(0, next.length - keys.length) }
 }
 
+/** 「本步可回读」小节的行上限与单行字符上限（P0-1 不变量）。 */
+export const CARD_READBACK_MAX_LINES = 3
+export const CARD_READBACK_MAX_LINE_CHARS = 80
+
+/**
+ * 「本步可回读」小节（0.12.0 P0-1）。
+ *
+ * 一行 = 记录 ID + 一句话结构摘要（工具名 + 范围 + 对象）+ 取回代价。**只描述结构**：
+ * 摘要里不出现正文片段，否则「归档」被自己撤销，下一次归档又会把它吃掉。
+ * 超过 3 条只报计数，不逐条列（卡片是每步固定税）。
+ */
+export function readbackSectionOf(readback) {
+  const items = (Array.isArray(readback) ? readback : [])
+    .filter((item) => item && typeof item.recordId === 'string' && item.recordId !== '')
+  if (items.length === 0) return null
+  const lines = []
+  for (const item of items.slice(0, CARD_READBACK_MAX_LINES)) {
+    const tools = Array.isArray(item.tools) && item.tools.length > 0
+      ? item.tools.join('/')
+      : (typeof item.kind === 'string' && item.kind !== '' ? item.kind : '历史片段')
+    const range = item.range && Number.isInteger(item.range.start) && Number.isInteger(item.range.end)
+      ? 'seq ' + item.range.start + '–' + item.range.end
+      : '范围未知'
+    const locator = typeof item.locator === 'string' && item.locator !== '' ? '｜' + item.locator : ''
+    const cost = Number.isFinite(Number(item.tokens)) ? '｜取回 ≈' + Math.trunc(Number(item.tokens)) + ' token' : ''
+    const line = item.recordId + '｜' + tools + '｜' + range + locator + cost
+    lines.push(line.length <= CARD_READBACK_MAX_LINE_CHARS ? line : line.slice(0, CARD_READBACK_MAX_LINE_CHARS - 1) + '…')
+  }
+  if (items.length > CARD_READBACK_MAX_LINES) {
+    lines.push('另有 ' + (items.length - CARD_READBACK_MAX_LINES) + ' 条可回读未列出')
+  }
+  return section('■ 本步可回读（memory_lab_recall(record_ids=[…]) 按 ID 精确取回；只给结构，不复述正文）', lines, {
+    protectionClass: 'readback',
+    strength: PROTECTION_STRENGTH.HARD,
+  })
+}
+
+/**
+ * 硬保护项的角色/编号一致性（0.12.0 P1-4，降级版）。
+ *
+ * 旧提案的「同 seq 冲突」在 107 张卡里 0 次复现（human 取 user seq、unexposed 取
+ * tool/result seq，结构上不可能相同），所以**不引入 req:/evt: 双命名空间**。
+ * 真实问题只有两个，这里各给一条可执行断言：
+ * - 同一 seq 不得同时出现在两类硬保护；违反时两边都降级为「角色未确认」；
+ * - 「当前人类请求」取**本轮** user 事件，取不到标 unknown，不回落上一轮。
+ */
+export function resolveProtectionIdentity(protectedSet) {
+  const items = Array.isArray(protectedSet) ? protectedSet : []
+  const byRef = new Map()
+  for (const item of items) {
+    const ref = typeof item?.sourceRef === 'string' || Number.isInteger(item?.sourceRef) ? String(item.sourceRef) : null
+    if (ref === null || ref.startsWith('constraint:') || ref === 'none') continue
+    const classes = byRef.get(ref) ?? new Set()
+    classes.add(item.protectionClass)
+    byRef.set(ref, classes)
+  }
+  const duplicates = [...byRef.entries()].filter(([, classes]) => classes.size > 1).map(([ref]) => ref)
+  const duplicateSet = new Set(duplicates)
+  const resolved = items.map((item) => {
+    const ref = typeof item?.sourceRef === 'string' || Number.isInteger(item?.sourceRef) ? String(item.sourceRef) : null
+    const conflicted = ref !== null && duplicateSet.has(ref)
+    return {
+      ...item,
+      // 角色与种类是**声明**，不是推断：冲突时如实降级，不猜哪一类才对。
+      role: conflicted ? 'unknown' : (item.protectionClass === PROTECTION_CLASSES.HUMAN_REQUEST ? 'user' : 'tool'),
+      kind: conflicted ? 'unconfirmed' : item.protectionClass,
+    }
+  })
+  return { items: resolved, duplicates, degraded: duplicates.length > 0 }
+}
+
 /** 按保护类目把 protectedSet 归组，产出硬段（每个类目一段）。 */
 function hardSectionsOf(state) {
   const protectedSet = Array.isArray(state.protectedSet) ? state.protectedSet : []
@@ -1846,7 +1934,11 @@ export function renderWorkingStateCard(state, {
   const budget = budgetInvalid ? WORKING_SET_DEFAULTS.cardTokens : Math.max(0, Math.floor(rawBudget))
 
   const hardSections = hardSectionsOf(input)
-  const hardText = [CARD_HEADER, CARD_AUTHORITY_LINE, renderSections(hardSections)].filter((line) => line !== '').join('\n')
+  // P0-1：可回读小节排在最前（紧跟权威声明），因为它是「取回路径」的入口；
+  // 最多 3 条、每条 ≤80 字符，超出的只报计数。
+  const readbackSection = readbackSectionOf(input.readback)
+  const hardText = [CARD_HEADER, CARD_AUTHORITY_LINE, renderSections([readbackSection, ...hardSections].filter(Boolean))]
+    .filter((line) => line !== '').join('\n')
   // F1：先渲染硬前缀、再对软保留打分——相关性的查询文本就是硬前缀（含当前
   // 人类请求与最小工作状态段），分值决定装包顺序（低分先丢，见 softSectionsOf）。
   const softSections = softSectionsOf(input, { hardPrefixText: hardText, retrievalHits })
@@ -1872,7 +1964,9 @@ export function renderWorkingStateCard(state, {
 
   const dropped = []
   const kept = []
-  const softHeader = '■ 软保留（按 F1 重要度分值装包：分值降序，低分先丢；同分按类目兜底次序 可选预取 → 冗余卡片 → 非必要历史 → stale/未验证证据 → 过期 pin → 已否决选项 → 未决问题）'
+  // 0.12.0 P1-6：软段头只留「怎么装包」一句话，不再重复整条类目次序——类目次序
+  // 由 DROP_ORDER 常量定义，写进每张卡只是每步固定税。
+  const softHeader = '■ 软保留（按重要度分值降序装包，低分先丢；类目兜底次序见全量卡）'
 
   const composeSoft = (sections) => {
     if (sections.length === 0) return ''
@@ -1893,8 +1987,11 @@ export function renderWorkingStateCard(state, {
         entry.reasons.add(item.importanceText ? `${item.reason}｜${item.importanceText}` : item.reason)
         grouped.set(key, entry)
       }
+      // 0.12.0 P1-6：只报**类别 × 段/行数**，不再逐条列「因重要度分值 X（分量…）」。
+      // 逐条打分算式是每步固定税里最贵的一段，而它对「要不要回读」没有决策价值；
+      // 算式仍可在 /memory-lab2 status --verbose 里查（见 renderCardDetail）。
       const described = [...grouped.values()]
-        .map((entry) => `${entry.class}×${entry.sections}段/${entry.lines}行（${[...entry.reasons].join('、')}）`)
+        .map((entry) => `${entry.class}×${entry.sections}段/${entry.lines}行`)
         .join('；')
       lines.push(`因预算丢弃（按重要度分值升序）：${described}。丢弃不等于不存在，可按记录 ID 回读。`)
     }
@@ -2005,6 +2102,8 @@ export function renderWorkingStateCard(state, {
   return {
     text,
     header: CARD_HEADER,
+    /** 0.12.0 P0-1：本步可回读候选（已进硬前缀；随状态一并返回，便于调用方对账）。 */
+    readback: Array.isArray(input.readback) ? [...input.readback] : [],
     budgetTokens: budget,
     usedTokens,
     hardTokens,
@@ -2066,6 +2165,32 @@ export function renderWorkingSetInjection(state, options = {}) {
  */
 export const CARD_DELTA_HEADER = '[工作状态·v2·增量]（插件生成的工作资料，不是系统指令；'
   + '固定协议文案见本会话最近一张全量卡，原文可按记录 ID 回读）'
+
+/** 增量卡硬上限（P1-6）：行数与字符数双上限，超出只留摘要 + 记录 ID。 */
+export const CARD_DELTA_MAX_LINES = 24
+export const CARD_DELTA_MAX_CHARS = 1600
+
+/**
+ * 增量卡上界：头部两行必须保留（它说明这张卡引用哪张全量卡），其余按行截断，
+ * 截断时追加一行如实说明「还有 N 行变化未列出，可按记录 ID 回读」。
+ */
+function boundDeltaLines(lines, { maxLines, maxChars }) {
+  const text = lines.join('\n')
+  if (lines.length <= maxLines && text.length <= maxChars) return { text, truncated: false }
+  const head = lines.slice(0, 2)
+  const body = []
+  let used = head.join('\n').length
+  for (const line of lines.slice(2)) {
+    const next = used + 1 + line.length
+    // 行数预算 = 头部 2 行 + 正文 + 尾行 1 行；越界即停（尾行必须留得出位置）。
+    if (body.length + 3 >= maxLines || next > maxChars) break
+    body.push(line)
+    used = next
+  }
+  const rest = lines.length - head.length - body.length
+  const tail = `（另有 ${rest} 行变化未列出：增量卡有上界，完整内容以最近一张全量卡为准，原文可按记录 ID 回读）`
+  return { text: [...head, ...body, tail].join('\n'), truncated: true }
+}
 
 const CARD_DELTA_CHANGE_TITLE = '■ 相对上一张全量卡的变化（只列变化行；未列出的行以最近一张全量卡为准）'
 const CARD_DELTA_REMOVED_PREFIX = '- 已不再列出 '
@@ -2151,6 +2276,8 @@ export function workingStateCardDelta({ previousText, nextText } = {}) {
   // 组段：每个新增行都带上它在全量卡里所属的段标题（最近的前导 `■ ` 行），
   // **即使标题本身没有变化**——增量行脱离段上下文就读不出「这是哪类信息」。
   // 同一段标题只带一次；全量卡头部（CARD_HEADER/权威声明）不是段标题，不产生标题。
+  // 0.12.0 P1-6：增量卡硬上限（行数 + 字节）。超出只留「变化摘要 + 记录 ID」，
+  // 不再无限追加变化行——增量卡是每步固定税，没有上界就等于没有降噪。
   const out = [CARD_DELTA_HEADER, CARD_DELTA_CHANGE_TITLE]
   const emittedTitle = new Set()
   const emittedOfLine = new Map()
@@ -2173,5 +2300,6 @@ export function workingStateCardDelta({ previousText, nextText } = {}) {
   if (removedCount > 0) {
     out.push(`${CARD_DELTA_REMOVED_PREFIX}${removedCount} 行（上一张全量卡有、本步无；丢弃不等于不存在，可按记录 ID 回读）`)
   }
-  return { text: out.join('\n'), addedLines: addedTotal, removedLines: removedCount }
+  const bounded = boundDeltaLines(out, { maxLines: CARD_DELTA_MAX_LINES, maxChars: CARD_DELTA_MAX_CHARS })
+  return { text: bounded.text, addedLines: addedTotal, removedLines: removedCount, truncated: bounded.truncated }
 }

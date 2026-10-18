@@ -18,8 +18,17 @@
  * 自己注入的卡片/回执/召回包不算人类请求。
  */
 
-import { isHumanAuthoredMessage, isPluginAuthoredMessage, RECEIPT_FORMAT_SPAN, RECEIPT_MARKER, V2_RECEIPT_MARKER } from '../core.mjs'
+import {
+  isHumanAuthoredMessage,
+  isPluginAuthoredMessage,
+  RECEIPT_FORMAT_OPERATION,
+  RECEIPT_FORMAT_SPAN,
+  RECEIPT_FORMAT_SPAN_V2,
+  RECEIPT_MARKER,
+  V2_RECEIPT_MARKER,
+} from '../core.mjs'
 import { contentHasPlanToolCall } from '../plan-first.mjs'
+import { readKeyOf } from './read-ledger.mjs'
 
 /** 跨度种类：回执与冷库记录都按它区分正文形态，工具操作不冒充普通历史。 */
 export const SPAN_KINDS = Object.freeze({
@@ -188,6 +197,8 @@ function operationEntriesOf({ content, callIds, resultSeqs, eventOf }) {
       arguments: typeof calls[index].arguments === 'string' ? calls[index].arguments : '',
       // 失败结果如果连正文都没有，至少留下错误文本：失败证据不能是空的。
       text: failed && !text ? errorTextOf(result) : text,
+      // 回执 status 行（P1-5）只用它的首行：错误原文照旧进正文，这里只是摘要。
+      errorText: failed ? (errorTextOf(result) || text) : '',
       callId,
       blockIndex: blockIndexes[index] ?? null,
       resultMessageId: result.data?.message?.id ?? null,
@@ -238,6 +249,12 @@ export function collectHistoryCandidates(view) {
     // 全历史记忆上下文模式：除硬保护外的一切都可退热，保留窗口失效。
     // 由 v2 账本的 `set fullhistory on` 驱动（引擎 surfaceViewOf 注入）。
     fullHistory = false,
+    // 0.12.0 P0-3：最近 N 个含读取结果的操作强制保留，M 步后租约到期（不累积）。
+    retainReads = 0,
+    // TTL 缺省是 2×N（蜂巢复审 F2）：显式传 0 曾让「传了 retainReads 却没传 TTL」
+    // 的调用方拿到一个恒不生效的租约，还把全部读取标成 expired——既没保护，又谎报
+    // 「需复核」。传 null/undefined 才走默认；显式正整数仍按调用方给的走。
+    retainReadsTtl = null,
   } = view
   const total = surfaceNodes.length
   const eventOf = (index) => (typeof eventAt === 'function' ? eventAt(surfaceNodes[index]) : null)
@@ -429,6 +446,12 @@ export function collectHistoryCandidates(view) {
   // 历史段不占用这个窗口，否则一段长正文就能把窗口吃满、把更早的操作挤出去。
   // 全历史模式下保留窗口整体失效（面板上的「保留最近操作」同步变灰），留下与否
   // 完全由守卫与保护层按证据安全裁决。
+  // ── 0.12.0 P0-3：读取租约（带 TTL，不累积）──────────────────────────────
+  // 全历史模式下唯一节流阀是证据保护层，而它的判据不含「刚读过、很可能马上要用」。
+  // 这里按**读取新鲜度**（不是数量）给最近 N 个含读取结果的操作一个租约：M 步后
+  // 自动失效，绝不累积成永久保护位（v1.2 §8.3 的受保护集无界增长是未解问题）。
+  const readLease = planReadLease({ raw, eventOf, retainReads, retainReadsTtl })
+
   const operationUnits = raw.filter((entry) => entry.spanKind === SPAN_KINDS.OPERATION)
   let retentionFromIndex = total
   if (fullHistory) {
@@ -447,6 +470,11 @@ export function collectHistoryCandidates(view) {
       skip.set(surfaceNodes[entry.startIndex], 'not-yet-exposed')
       continue
     }
+    if (readLease.protectedIndexes.has(entry.startIndex)) {
+      // 读取租约生效：刚读过的证据留在热上下文，直到被更新的读取挤出或 TTL 到期。
+      skip.set(surfaceNodes[entry.startIndex], 'retained-recent-read')
+      continue
+    }
     candidates.push({
       rangeStart: surfaceNodes[entry.startIndex],
       rangeEnd: surfaceNodes[entry.endIndex],
@@ -458,6 +486,9 @@ export function collectHistoryCandidates(view) {
       ...(entry.receiptFormat ? { receiptFormat: entry.receiptFormat, spanLabel: entry.spanLabel } : {}),
       callIds: entry.callIds,
       tools: entry.tools,
+      // 读取账本与回执 status 的载体（操作段有，普通历史段是空数组/null）。
+      readKeys: Array.isArray(entry.readKeys) ? [...entry.readKeys] : [],
+      firstErrorLine: entry.firstErrorLine ?? null,
       sources: entry.sources,
       body: entry.body,
       chars: entry.body.length,
@@ -473,6 +504,9 @@ export function collectHistoryCandidates(view) {
       // 插件会自己把批次凑满、替换后立刻重注入、再凑满，形成自激循环（实测 181 批
       // 里 484 条 turn.user 全是插件卡片）。由 planCooling 拆 countable/piggyback。
       pluginAuthored: entry.pluginAuthored === true,
+      // 租约已到期的读取：照常进候选，但带上「需复核」标记——被归档的证据可能
+      // 早已过期，模型回读时应当知道这一点。
+      ...(readLease.expiredIndexes.has(entry.startIndex) ? { readLeaseExpired: true } : {}),
     })
   }
 
@@ -520,8 +554,19 @@ function operationCandidateAt({ index, event, content, calls, eventOf, eventAtSe
     ok: true,
     endIndex: index + callIds.length,
     spanKind: SPAN_KINDS.OPERATION,
+    // 0.12.0：操作回执用投影经济学版（format 6）。v1 走同一条 apply 管线但候选不带
+    // 这个字段，unitBaseOf 仍回落到 format 4，两边互不影响。
+    receiptFormat: RECEIPT_FORMAT_OPERATION,
     body,
     callIds,
+    // 读取账本（P0-2）：只取读取类工具的键，别的工具没有「重读」概念。
+    readKeys: built.entries
+      .map((entry) => readKeyOf(entry.name, entry.arguments))
+      .filter((key) => typeof key === 'string' && key !== ''),
+    // 失败结果的**首错行**（P1-5）：只取首行并截断，不改写原文。
+    firstErrorLine: built.entries
+      .map((entry) => entry.errorText ?? '')
+      .find((text) => typeof text === 'string' && text.trim() !== '') ?? null,
     tools: built.entries.map((entry) => entry.name),
     sources: built.entries.map((entry) => ({
       callId: entry.callId,
@@ -534,6 +579,43 @@ function operationCandidateAt({ index, event, content, calls, eventOf, eventAtSe
     step: event.data?.step ?? null,
     hasFailedResult: built.hasFailedResult,
   }
+}
+
+/**
+ * 读取租约计划（0.12.0 P0-3）：最近 N 个含读取结果的操作 → 保护；M 步后失效。
+ *
+ * 两个条件同时成立才保护：**在最近 N 个读取之内**且**年龄 < TTL**。任一不成立
+ * 就照常进候选——这就是「第 4 次挤出第 1 次」与「TTL 到期转需复核」。
+ * 纯函数：只看候选的 step 与读取键，不读时钟（同一会话导出可逐字节复现）。
+ */
+function planReadLease({ raw = [], eventOf, retainReads = 0, retainReadsTtl = 0 }) {
+  const n = Number.isInteger(retainReads) && retainReads > 0 ? retainReads : 0
+  const ttl = Number.isInteger(retainReadsTtl) && retainReadsTtl > 0 ? retainReadsTtl : n * 2
+  const protectedIndexes = new Set()
+  const expiredIndexes = new Set()
+  if (n === 0) return { protectedIndexes, expiredIndexes }
+  const readOps = raw.filter((entry) => entry.spanKind === SPAN_KINDS.OPERATION
+    && Array.isArray(entry.readKeys) && entry.readKeys.length > 0)
+  if (readOps.length === 0) return { protectedIndexes, expiredIndexes }
+  // 当前步：活动面上最大的 step。拿不到 step（旧日志/合成夹具）时按候选序号计龄，
+  // 与「按读取新鲜度而不是数量」的意图一致，且不依赖时钟。
+  let currentStep = null
+  for (const entry of raw) {
+    const step = Number.isInteger(entry.step) ? entry.step : null
+    if (step !== null) currentStep = currentStep === null ? step : Math.max(currentStep, step)
+  }
+  const stepOf = (entry, index) => (Number.isInteger(entry.step) ? entry.step : index)
+  const recent = readOps.slice(-n)
+  const recentSet = new Set(recent.map((entry) => entry.startIndex))
+  readOps.forEach((entry, index) => {
+    const age = currentStep === null
+      ? readOps.length - 1 - index
+      : currentStep - stepOf(entry, index)
+    const inWindow = recentSet.has(entry.startIndex)
+    if (inWindow && age < ttl) protectedIndexes.add(entry.startIndex)
+    else if (inWindow || age >= ttl) expiredIndexes.add(entry.startIndex)
+  })
+  return { protectedIndexes, expiredIndexes }
 }
 
 const HISTORY_SKIP_DESCRIPTIONS = Object.freeze({
@@ -550,6 +632,7 @@ const HISTORY_SKIP_DESCRIPTIONS = Object.freeze({
   'already-archived': '已经归档过',
   'not-yet-exposed': '主模型还没机会看到这段内容（当前回合）',
   'too-short': '太短，不值得单独归档',
+  'retained-recent-read': '最近读过（读取租约内），先留在热上下文',
   'no-call-id': '工具调用没有 callId，无法配对',
   'not-an-operation': '工具调用缺名字，不是合法操作',
   unpaired: '工具调用与结果没有同范围闭合',

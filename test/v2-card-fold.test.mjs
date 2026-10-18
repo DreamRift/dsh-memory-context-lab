@@ -43,16 +43,18 @@ function systemNode(seq) {
 // ---- planCardFolds：连续组与断组边界 -----------------------------------------
 
 test('S3-F1 连续插件卡组（≥minRun）产出折叠计划：范围/成员/文本齐全', () => {
+  // 0.12.0 P0-6：回注包（recall）是断组边界，不再算卡。所以连续卡组由
+  // 工作状态卡 + 回执凭证组成，回注包把组切开。
   const nodes = [
     systemNode(0),
     humanNode(1),
     cardNode(2),
-    cardNode(3, { form: 'recall' }),
+    cardNode(3, { form: 'working-state' }),
     receiptNode(4),
     humanNode(5),
   ]
   const { plans } = planCardFolds(nodes, { minRun: 2 })
-  assert.equal(plans.length, 1, '2,3,4 是一个连续卡组（working-set+recall+回执凭证）')
+  assert.equal(plans.length, 1, '2,3,4 是一个连续卡组（working-set + working-state + 回执凭证）')
   const plan = plans[0]
   assert.equal(plan.startSeq, 2)
   assert.equal(plan.endSeq, 4)
@@ -69,7 +71,7 @@ test('S3-F2 断组边界：assistant / tool-result / 人类 user 节点都切断
     cardNode(2),
     assistantNode(3),
     cardNode(4),
-    cardNode(5, { form: 'recall' }),
+    cardNode(5, { form: 'working-state' }),
     humanNode(6),
     cardNode(7),
   ]
@@ -99,8 +101,9 @@ test('S3-F3 吞卡不吞消息：折叠区间两端必须是卡节点，被吞�
     assert.notEqual(node.type, 'tool/result')
     assert.notEqual(node.type, 'system/message')
     if (node.type === 'user/message') {
+      // 0.12.0 P0-6：recall 不再是卡形态（回注包是断组边界）。
       const isCard = node.sourceForm === 'working-set' || node.sourceForm === 'working-state'
-        || node.sourceForm === 'recall' || (node.text ?? '').startsWith(V2_RECEIPT_MARKER)
+        || (node.text ?? '').startsWith(V2_RECEIPT_MARKER)
       assert.equal(isCard, true, 'user 节点入组必须满足卡身份判定')
     }
   }
@@ -139,8 +142,8 @@ test('S3-F6 低于 minRun 的组不折叠；无卡会话返回空计划', () => 
 // ---- renderFoldReceipt：确定性渲染 -------------------------------------------
 
 test('S3-F7 折叠回执是纯函数：同输入逐字节一致，含成员范围与计数，无时间戳', () => {
-  const a = renderFoldReceipt({ startSeq: 2, endSeq: 4, memberSeqs: [2, 3, 4], forms: ['working-set', 'recall', 'receipt'] })
-  const b = renderFoldReceipt({ startSeq: 2, endSeq: 4, memberSeqs: [2, 3, 4], forms: ['working-set', 'recall', 'receipt'] })
+  const a = renderFoldReceipt({ startSeq: 2, endSeq: 4, memberSeqs: [2, 3, 4], forms: ['working-set', 'working-state', 'receipt'] })
+  const b = renderFoldReceipt({ startSeq: 2, endSeq: 4, memberSeqs: [2, 3, 4], forms: ['working-set', 'working-state', 'receipt'] })
   assert.equal(a, b)
   assert.ok(a.includes('seq 2–4'))
   assert.ok(a.includes('3'), '必须报告成员数')

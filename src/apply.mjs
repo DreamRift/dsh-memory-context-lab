@@ -46,7 +46,9 @@ import {
   RECALL_STATUS,
   RECEIPT_FORMAT_BATCH,
   RECEIPT_FORMAT_LEGACY,
+  RECEIPT_FORMAT_OPERATION,
   RECEIPT_FORMAT_SPAN,
+  RECEIPT_FORMAT_SPAN_V2,
   RECEIPT_FORMAT_VERSION,
   RECEIPT_MARKER,
   resultStatusOf,
@@ -850,6 +852,10 @@ function unitBaseOf(unit) {
     // 内版本 dispatch，绝不拿另一种渲染器去猜。
     receiptFormat: Number.isInteger(unit.receiptFormat) ? unit.receiptFormat : RECEIPT_FORMAT_VERSION,
     spanLabel: typeof unit.spanLabel === 'string' && unit.spanLabel ? unit.spanLabel : null,
+    // 0.12.0：读取账本键与首错行随归档行落盘。前者让「同键重读」在重启后仍可对账，
+    // 后者让 format 6/7 的回执能被逐字节重建（status 行依赖它）。
+    readKeys: Array.isArray(unit.readKeys) ? [...unit.readKeys] : [],
+    firstErrorLine: typeof unit.firstErrorLine === 'string' && unit.firstErrorLine ? unit.firstErrorLine : null,
   }
 }
 
@@ -1699,7 +1705,7 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
     // BUG-001：0.10.1 旧 span 行把 buildSpanReceipt 正文记成了 receiptFormat=4，
     // 行里没有可重建的标签。无法逐字节核对时不猜测覆写，如实指出冷库回读出路。
     if (
-      formatVersion === RECEIPT_FORMAT_VERSION
+      (formatVersion === RECEIPT_FORMAT_VERSION || formatVersion === RECEIPT_FORMAT_SPAN_V2)
       && typeof receipt.spanKind === 'string' && receipt.spanKind.length > 0 && receipt.spanKind !== 'operation'
       && (typeof receipt.spanLabel !== 'string' || receipt.spanLabel.length === 0)
     ) {
@@ -1711,7 +1717,8 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
       continue
     }
     let expected
-    if (formatVersion === RECEIPT_FORMAT_LEGACY || formatVersion === 2 || formatVersion === RECEIPT_FORMAT_VERSION) {
+    if (formatVersion === RECEIPT_FORMAT_LEGACY || formatVersion === 2
+      || formatVersion === RECEIPT_FORMAT_VERSION || formatVersion === RECEIPT_FORMAT_OPERATION) {
       expected = buildReceipt({
         tools: receipt.tools ?? [],
         range: { start: receipt.rangeStart, end: receipt.rangeEnd },
@@ -1725,8 +1732,12 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
         formatVersion,
         locators: Array.isArray(receipt.locators) ? receipt.locators : [],
         statuses: Array.isArray(receipt.statuses) ? receipt.statuses : [],
+        // format 6 的投影头与 status 行依赖这两个**已落盘**的字段；缺了就按行内
+        // 值重建，绝不拿默认值猜一个「释放 ≈0」。
+        releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
+        errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
       })
-    } else if (formatVersion === RECEIPT_FORMAT_SPAN) {
+    } else if (formatVersion === RECEIPT_FORMAT_SPAN || formatVersion === RECEIPT_FORMAT_SPAN_V2) {
       // 普通历史段：提交侧用 buildSpanReceipt 渲染，恢复侧必须用同一渲染器。
       expected = buildSpanReceipt({
         label: typeof receipt.spanLabel === 'string' ? receipt.spanLabel : '历史片段',
@@ -1737,6 +1748,9 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
         tokens: receipt.originalTokens ?? 0,
         chunks: receipt.chunkCount ?? 1,
         marker: receiptMarker,
+        formatVersion,
+        releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
+        errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
       })
     } else if (formatVersion === RECEIPT_FORMAT_BATCH) {
       // BUG-010：批摘要成员被逐条剔除后可能只剩这一行；按单成员摘要重建，

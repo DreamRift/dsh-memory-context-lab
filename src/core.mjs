@@ -43,6 +43,41 @@ export const RECEIPT_MARKER = '[已归档操作]'
 export const V2_RECEIPT_MARKER = '[已归档操作·v2]'
 
 /**
+ * 卡组折叠回执的标记（0.10.1 S3）。
+ *
+ * 与回执标记分开：折叠回执替换的是插件工作卡，不是归档操作；两者都是插件
+ * 注入的 user/message，都必须被「最新人类请求」判定排除（0.12.0 P1-2）。
+ * 常量只在这里定义一份，card-fold.mjs 与判定函数共用，禁止各写一份。
+ */
+export const FOLD_RECEIPT_MARKER = '[已折叠工作卡·v2]'
+
+/**
+ * 聚合凭证的标记（P3-8/P3-9）。
+ *
+ * 同上：凭证是插件生成的指针卡，不是人类输入；常量单一出处。
+ */
+export const AGG_VOUCHER_MARKER = '[聚合凭证·v2]'
+
+/**
+ * 全部「活动面上的程序注入消息」标记（0.12.0 P1-2 单一判定函数）。
+ *
+ * 判定只认标记，不看内容前缀的相似度：人类手打同样的文字不会命中，
+ * 因为它不是以这些标记开头（标记都在正文第一行）。
+ */
+export const SURFACE_INJECTION_MARKERS = Object.freeze([
+  RECEIPT_MARKER,
+  V2_RECEIPT_MARKER,
+  FOLD_RECEIPT_MARKER,
+  AGG_VOUCHER_MARKER,
+])
+
+/** True when one text block starts with any plugin surface-injection marker. */
+export function isSurfaceInjectionText(text) {
+  if (typeof text !== 'string' || text === '') return false
+  return SURFACE_INJECTION_MARKERS.some((marker) => text.startsWith(marker))
+}
+
+/**
  * 回执格式版本（0.10.1 S2c：显式 dispatch，废弃「>= 最新」比较）。
  *
  * 1 = 历史格式（只有工具／来源／冷记录／hash）；
@@ -78,6 +113,20 @@ export const RECEIPT_FORMAT_BATCH = 3
  * 逐字节不等 → 永久 `回执正文已变化` 跳过，原文滞留冷库且无恢复通道。
  */
 export const RECEIPT_FORMAT_SPAN = 5
+/**
+ * 操作回执 · 投影经济学版（0.12.0 P0-5/P0-1/P1-5）。
+ *
+ * 与 format 4 的差别只有**追加/改写三类行**，正文、范围、hash 的渲染不变：
+ * - 投影头：同时声明「释放多少」与「失真等级 + 取回代价」（灵枢 v1.2 P5-3）；
+ * - 可回读：首行是**工具调用形式**（模型直接照抄），命令面提示降到第二行（给人）；
+ * - status：工具结果带 ok/fail/partial（失败附首错行，截断），非工具结果标 kind=message。
+ *
+ * 为什么要新号：恢复要求回执**逐字节**相等，旧行必须继续按旧渲染器重建，
+ * 所以新形状只能占新号，绝不改旧号的输出（{@link RECEIPT_FORMAT_LEGACY} 的教训）。
+ */
+export const RECEIPT_FORMAT_OPERATION = 6
+/** 普通历史段回执 · 投影经济学版（0.12.0）；与 format 5 的差别同 {@link RECEIPT_FORMAT_OPERATION}。 */
+export const RECEIPT_FORMAT_SPAN_V2 = 7
 /** Cold-record origin for archived operations. */
 export const ARCHIVE_ORIGIN = 'archive'
 
@@ -184,7 +233,25 @@ export const DEFAULT_SETTINGS = Object.freeze({
    * 最弱的一条并如实报告。它**不是**冷却参数，所以不进预设快照。
    */
   protectBudgetTokens: 32768,
+  /**
+   * 最近多少个**含读取结果**的操作强制保留（0.12.0 P0-3）。
+   *
+   * 全历史模式下 `retainOperations` 仍为 0（设计不变）：唯一的节流阀是证据保护层，
+   * 而它的判据里没有「刚读过、很可能马上要用」。实测可见窗口中位 9.5 步、18 次
+   * ≤2 步——证据刚读完就被归档，模型只能再读一次。
+   *
+   * 这是**带 TTL 的租约**（智能论 3.2.2 stable），不是永久保护位：被保护的读取在
+   * `retainReadsTtl` 步后自动失效，不累积（v1.2 §8.3「受保护集无界增长」是明确
+   * 未解问题，不能往里面加料）。设为 0 完全退回旧行为。
+   */
+  retainReads: 3,
 })
+
+/** retainReads 的租约步数：默认 2×N（N=0 时为 0，即不启用）。 */
+export function retainReadsTtlOf(retainReads) {
+  const n = Number.isInteger(retainReads) && retainReads > 0 ? retainReads : 0
+  return n === 0 ? 0 : n * 2
+}
 
 /** Label of the unnamed fallback preset: the global defaults. */
 export const GLOBAL_PRESET_LABEL = '全局预设'
@@ -247,6 +314,7 @@ export const NUMERIC_SETTINGS = Object.freeze({
   retain: { key: 'retainOperations', min: 0, max: 200, integer: true, label: '保留最近操作数' },
   batch: { key: 'archiveBatchSize', min: 1, max: 200, integer: true, label: '批量阈值' },
   protect: { key: 'protectBudgetTokens', min: 0, max: 2_000_000, integer: true, label: '软保护预算（估算 token）' },
+  readlease: { key: 'retainReads', min: 0, max: 50, integer: true, label: '最近读取保留数（带 TTL 租约）' },
 })
 
 /** Settings whose value is a boolean switch. */
@@ -377,6 +445,10 @@ export function normalizeSettings(raw) {
     // 旧实现把它丢掉，导致任何「读配置 → normalizeSettings → 写回」的路径
     // 都会把 protectBudgetTokens 静默重置回默认值。
     protectBudgetTokens: normalizeProtectionBudget(value.protectBudgetTokens),
+    // 0.12.0 P0-3：读取租约不是冷却成本档位，但必须随设置持久化与归一化；
+    // 旧状态文件没有这个字段时回落到默认 3（不是 0——0 会让修复对新会话失效）。
+    retainReads: boundedNumericSetting(value.retainReads, NUMERIC_SETTINGS.readlease)
+      ?? DEFAULT_SETTINGS.retainReads,
   }
 }
 
@@ -438,7 +510,7 @@ export const PRESET_RESET_WORDS = ['reset', '默认', '全局', 'global']
 /** One-line human summary of a settings snapshot, for preset listings. */
 export function formatPresetValue(settings) {
   const value = normalizeSettings(settings)
-  return `保留 ${value.retainOperations} / 批量 ${value.archiveBatchSize} / 自动 ${value.auto ? '开' : '关'} / 回注 ${value.autoRecall ? '开' : '关'} / 恢复 ${value.autoRestore ? '开' : '关'}`
+  return `保留 ${value.retainOperations} / 读取租约 ${value.retainReads} / 批量 ${value.archiveBatchSize} / 自动 ${value.auto ? '开' : '关'} / 回注 ${value.autoRecall ? '开' : '关'} / 恢复 ${value.autoRestore ? '开' : '关'}`
 }
 
 /** Find a preset by id or name; unique prefixes and unique substrings also count.
@@ -461,6 +533,7 @@ export function resolvePreset(presets, query) {
 function applySettingsSnapshot(state, settings) {
   const normalized = normalizeSettings(settings)
   state.retainOperations = normalized.retainOperations
+  state.retainReads = normalized.retainReads
   state.archiveBatchSize = normalized.archiveBatchSize
   state.auto = normalized.auto
   state.autoRecall = normalized.autoRecall
@@ -562,14 +635,22 @@ export function initialProjectionState() {
   }
 }
 
-/** True when one `user/message` event is one of this plugin's replacement receipts (v1 or v2). */
+/**
+ * True when one `user/message` event is one of this plugin's program-injected
+ * surface messages: v1/v2 归档回执、卡组折叠回执、聚合凭证。
+ *
+ * 0.12.0 P1-2：判定收进一个函数，标记常量单一出处（{@link SURFACE_INJECTION_MARKERS}）。
+ * 修复前只认前两种，于是**没有 `source.form` 的旧折叠回执**仍被「最新人类请求」
+ * 选中——实测 8 张工作卡锚到折叠回执 seq。折叠回执与聚合凭证同样是程序生成的，
+ * 把它们读成人类请求会把整轮任务陈述替换掉。
+ */
 export function isReceiptMessage(message) {
   if (!message || typeof message !== 'object') return false
   const blocks = message.content
   if (!Array.isArray(blocks) || blocks.length === 0) return false
   const first = blocks[0]
   if (!first || first.type !== 'text' || typeof first.text !== 'string') return false
-  return first.text.startsWith(RECEIPT_MARKER) || first.text.startsWith(V2_RECEIPT_MARKER)
+  return isSurfaceInjectionText(first.text)
 }
 
 /**
@@ -589,7 +670,7 @@ export const PLUGIN_SOURCE_FORMS = Object.freeze({
   RECALL: 'recall',
   // 活动面上的程序替换节点：聚合凭证、卡组折叠回执、遗忘墓碑。它们都以
   // `kind: 'user'` + 本形态出现在活动面上，但正文是插件生成的，不是人类输入；
-  // 不登记就会被「最新人类请求」判定当成任务陈述（0.11.2 缺陷修复）。
+  // 不登记就会被「最新人类请求」判定当成任务陈述（0.11.0 缺陷修复）。
   SURFACE_RECEIPT: 'memory-lab2-surface',
 })
 
@@ -753,6 +834,99 @@ export function normalizeColdBody(content) {
  * v2 的跨度回执（{@link buildSpanReceipt}）与不带 locators 的调用（两个附加行
  * 整体省略）不因格式版本而变化，输出与既有字节一致。
  */
+// ---------------------------------------------------------------- 投影头（P5-3）
+
+/**
+ * 投影失真等级。**只有 A 类**：原文在冷库、append-only 日志仍在、可逐字节重建。
+ *
+ * B 类（不可重建）在本项目里**禁止出现**（v1.2 P5-2 / 本项目「不做 B 类有损投影」）：
+ * 本函数对任何非 A 类输入直接抛错，把「本来就对」写成可执行的不变量，而不是注释。
+ */
+export const PROJECTION_KIND = Object.freeze({ EXACT: 'A' })
+
+/** 投影头一行的字符上限（不含换行）。超出说明我们把正文塞进了头部。 */
+export const PROJECTION_HEADER_MAX_CHARS = 120
+
+/**
+ * 投影头：**率与失真同时声明**（灵枢统一架构 v1.2 P5-3）。
+ *
+ * 形状（纯函数、无时间戳、逐字节确定）：
+ *
+ *     投影：A 类（可完整重建）｜释放 ≈3968 token / 15805 字｜取回 ≈1200 token
+ *
+ * - 释放 = 原文估算 token − 回执估算 token（归档行已算过，这里只做渲染）；
+ * - 取回 = 冷库载荷已有的 token 估算（originalTokens），**不新增计算**；
+ * - 拿不到取回估算时如实省略该段，不猜一个数。
+ */
+export function buildProjectionHeader({
+  kind = PROJECTION_KIND.EXACT,
+  releasedTokens = 0,
+  releasedChars = 0,
+  readbackTokens = null,
+} = {}) {
+  if (kind !== PROJECTION_KIND.EXACT) {
+    throw new Error('投影失真等级只能是 A 类（可完整重建）；B 类有损投影被禁止（收到 '
+      + JSON.stringify(kind) + '）')
+  }
+  const released = Math.max(0, Math.trunc(Number(releasedTokens) || 0))
+  const chars = Math.max(0, Math.trunc(Number(releasedChars) || 0))
+  const head = '投影：' + kind + ' 类（可完整重建）'
+  const release = '释放 ≈' + released + ' token / ' + chars + ' 字'
+  // null / undefined 表示「没有这个估算」，必须如实省略；Number(null) === 0，
+  // 不显式挡掉就会被渲染成「取回 ≈0 token」——那是编造。
+  const readback = readbackTokens === null || readbackTokens === undefined ? Number.NaN : Number(readbackTokens)
+  const hasReadback = Number.isFinite(readback) && readback >= 0
+  const full = [head, release, hasReadback ? '取回 ≈' + Math.trunc(readback) + ' token' : null]
+    .filter((part) => part !== null).join('｜')
+  // 上限是硬约束：超出时先丢取回段（它同时也出现在「可回读」行），再丢字数列。
+  if (full.length <= PROJECTION_HEADER_MAX_CHARS) return full
+  const shorter = head + '｜' + release
+  if (shorter.length <= PROJECTION_HEADER_MAX_CHARS) return shorter
+  return head + '｜释放 ≈' + released + ' token'
+}
+
+/**
+ * 工具结果的 status 行（0.12.0 P1-5）：ok / fail / partial，失败附首错行。
+ *
+ * 数据源是归档时已经算好的 `statuses`（`apply.mjs` 一直在算、v2 侧一直没渲染），
+ * 以及收集器从结果正文里取到的首错行——**不改写原文**，只取首行并截断。
+ */
+export function receiptStatusOf({ statuses = [], errorLine = null, spanKind = null } = {}) {
+  const list = (Array.isArray(statuses) ? statuses : []).filter((value) => typeof value === 'string' && value !== '')
+  if (list.length === 0) {
+    // 非工具结果（普通历史段、旧卡、回注包）：不硬造 status，如实标 kind=message。
+    return typeof spanKind === 'string' && spanKind !== '' ? 'kind=message' : null
+  }
+  const failed = list.filter((status) => /(?:^|\s)error\b|exit\s*[1-9]/i.test(status))
+  const verdict = failed.length === 0 ? 'ok' : failed.length === list.length ? 'fail' : 'partial'
+  const firstError = typeof errorLine === 'string' && errorLine.trim() !== '' ? clipErrorLine(errorLine) : null
+  return verdict === 'ok' || firstError === null
+    ? 'status=' + verdict
+    : 'status=' + verdict + '（首错：' + firstError + '）'
+}
+
+/** 首错行：单行、≤200 字符，超长截断并显式标出被截断。 */
+export function clipErrorLine(text, limit = 200) {
+  const single = String(text ?? '').split(/\r?\n/).map((line) => line.trim()).find((line) => line !== '') ?? ''
+  if (single.length <= limit) return single
+  return single.slice(0, limit) + '…（截断）'
+}
+
+/**
+ * 「可回读」两行：首行是**工具调用形式**（模型照抄即可），第二行是命令面（给人）。
+ *
+ * 0.12.0 P0-1 的核心：回读工具存在、系统提示也写了，但真实会话 303 步里调用 0 次——
+ * 因为回执只写「正文已沉入冷库」，从不把「用哪个动作、拿哪个 ID、花多少钱」推到
+ * 模型眼前。命令面提示降到第二行，不删（人还要用）。
+ */
+export function receiptReadbackLines(nodeId) {
+  const id = typeof nodeId === 'string' ? nodeId : ''
+  return [
+    '可回读：memory_lab_recall(record_ids=["' + id + '"])｜A 类可完整重建',
+    '命令面：/memory-lab2 read ' + id,
+  ]
+}
+
 export function buildReceipt({
   tools,
   range,
@@ -767,24 +941,45 @@ export function buildReceipt({
   locators = [],
   statuses = [],
   recordIds = [],
+  // 0.12.0：投影经济学所需的既有字段（都不新增计算）。releasedTokens 是原文载荷的
+  // token 估算（≈ 回执替换掉的那部分），不是「原文 − 回执」的净值——净值依赖回执
+  // 自身的 token 数，会让回执渲染自指。
+  releasedTokens = null,
+  errorLine = null,
 }) {
+  const known = [RECEIPT_FORMAT_LEGACY, 2, RECEIPT_FORMAT_VERSION, RECEIPT_FORMAT_OPERATION]
   // 显式 dispatch（0.10.1 S2c）：每个历史版本一个冻结分支，未知版本失败关闭。
-  if (formatVersion !== RECEIPT_FORMAT_LEGACY && formatVersion !== 2 && formatVersion !== RECEIPT_FORMAT_VERSION) {
-    throw new Error(`未知的回执格式版本：${JSON.stringify(formatVersion)}（已知 1/2/4；批次摘要走 buildBatchReceipt，片段回执走 buildSpanReceipt）`)
+  if (!known.includes(formatVersion)) {
+    throw new Error(`未知的回执格式版本：${JSON.stringify(formatVersion)}（已知 1/2/4/6；批次摘要走 buildBatchReceipt，片段回执走 buildSpanReceipt）`)
   }
-  const lines = [
-    marker,
+  const modern = formatVersion === RECEIPT_FORMAT_OPERATION
+  const lines = [marker]
+  if (modern) {
+    // P5-3：率与失真同时声明。取回代价直接取冷库载荷的既有 token 估算。
+    lines.push(buildProjectionHeader({
+      releasedTokens: releasedTokens === null ? tokens : releasedTokens,
+      releasedChars: chars,
+      readbackTokens: tokens,
+    }))
+  }
+  lines.push(
     `工具：${tools.join('、') || '(unknown)'}`,
     `来源：seq ${range.start}–${range.end}（${callIds.length} 次调用，原 ≈${tokens} token / ${chars} 字）`,
-  ]
+  )
   if (formatVersion >= 2) {
     const located = locators.length ? formatLocatorLine(tools, callIds, locators) : ''
     if (located) lines.push(located)
     const statusLine = formatStatusLine(tools, callIds, statuses)
     if (statusLine) lines.push(statusLine)
+    if (modern) {
+      const status = receiptStatusOf({ statuses, errorLine })
+      if (status) lines.push(status)
+    }
   }
   lines.push(`冷记录：${nodeId}`)
-  if (formatVersion === RECEIPT_FORMAT_VERSION) {
+  if (modern) {
+    lines.push(...receiptReadbackLines(nodeId))
+  } else if (formatVersion === RECEIPT_FORMAT_VERSION) {
     const ids = (Array.isArray(recordIds) ? recordIds : []).filter((id) => typeof id === 'string' && id.length > 0)
     if (ids.length > 0) {
       lines.push(`记录 ID：${ids.join('、')}`)
@@ -793,10 +988,12 @@ export function buildReceipt({
     }
   }
   if (chunks > 1) lines.push(`分块：${chunks} 段（恢复时按序拼接）`)
-  lines.push(
-    '正文已沉入本会话隔离冷库；相关提问会自动回注要点。',
-    `hash：${String(hash ?? '').slice(0, 12)}`,
-  )
+  if (!modern) {
+    // 旧格式的这句「会自动回注要点」在真实会话里一次都没兑现过，而且不给取回代价；
+    // 新格式用「可回读」两行取代它，不再重复声明。
+    lines.push('正文已沉入本会话隔离冷库；相关提问会自动回注要点。')
+  }
+  lines.push(`hash：${String(hash ?? '').slice(0, 12)}`)
   return lines.join('\n')
 }
 
@@ -948,18 +1145,46 @@ export function buildForgetTombstone({ range, nodeId, hash, reason = null }) {
   return lines.join('\n')
 }
 
-export function buildSpanReceipt({ label, range, nodeId, hash, chars, tokens, chunks = 1, marker = RECEIPT_MARKER }) {
-  const lines = [
-    marker,
+export function buildSpanReceipt({
+  label,
+  range,
+  nodeId,
+  hash,
+  chars,
+  tokens,
+  chunks = 1,
+  marker = RECEIPT_MARKER,
+  // 0.12.0：默认仍是 format 5（旧行逐字节可重建）；新写入显式传 format 7。
+  formatVersion = RECEIPT_FORMAT_SPAN,
+  releasedTokens = null,
+  errorLine = null,
+}) {
+  const known = [RECEIPT_FORMAT_SPAN, RECEIPT_FORMAT_SPAN_V2]
+  if (!known.includes(formatVersion)) {
+    throw new Error(`未知的片段回执格式版本：${JSON.stringify(formatVersion)}（已知 5/7）`)
+  }
+  const modern = formatVersion === RECEIPT_FORMAT_SPAN_V2
+  const lines = [marker]
+  if (modern) {
+    lines.push(buildProjectionHeader({
+      releasedTokens: releasedTokens === null ? tokens : releasedTokens,
+      releasedChars: chars,
+      readbackTokens: tokens,
+    }))
+  }
+  lines.push(
     `片段：${label || '历史片段'}`,
     `来源：seq ${range.start}–${range.end}（原 ≈${tokens} token / ${chars} 字）`,
-    `冷记录：${nodeId}`,
-  ]
-  if (chunks > 1) lines.push(`分块：${chunks} 段（恢复时按序拼接）`)
-  lines.push(
-    '正文已沉入本会话隔离冷库；相关提问会自动回注要点。',
-    `hash：${String(hash ?? '').slice(0, 12)}`,
   )
+  if (modern) {
+    const status = receiptStatusOf({ statuses: [], errorLine, spanKind: 'span' })
+    if (status) lines.push(status)
+  }
+  lines.push(`冷记录：${nodeId}`)
+  if (modern) lines.push(...receiptReadbackLines(nodeId))
+  if (chunks > 1) lines.push(`分块：${chunks} 段（恢复时按序拼接）`)
+  if (!modern) lines.push('正文已沉入本会话隔离冷库；相关提问会自动回注要点。')
+  lines.push(`hash：${String(hash ?? '').slice(0, 12)}`)
   return lines.join('\n')
 }
 

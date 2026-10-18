@@ -26,6 +26,25 @@ const ARCHIVED_TAG = 'archived'
 /** 插件来源跨度的回注标签：不冒充「用户消息」（D4）。 */
 const PLUGIN_SPAN_LABEL = '插件工作资料'
 
+/**
+ * 回注信息量门槛（0.12.0 P1-3）：这条命中值不值得进意识层。
+ *
+ * 准入只看「有没有命中」不看「命中里有没有值得说的」，于是纯壳也会注入——
+ * content 只有 `已归档…` 时，模型读到的是一句没有行动价值的话，还占预算。
+ * 判据只认**结构事实**（范围 / 工具 / 片段种类 / 插件来源），不复述正文：
+ * 复述正文等于撤销归档，会被下一次归档吃掉。
+ */
+export function hasInformativeStructure(entry) {
+  if (!entry || typeof entry !== 'object') return false
+  const range = entry.inline?.range
+  if (range && Number.isInteger(range.start) && Number.isInteger(range.end)) return true
+  const tools = entry.inline?.tools
+  if (Array.isArray(tools) ? tools.length > 0 : (typeof tools === 'string' && tools !== '')) return true
+  if (typeof entry.refs?.spanKind === 'string' && entry.refs.spanKind !== '') return true
+  // nodeId 不算信息：它只是取回句柄，每条记录都有。
+  return false
+}
+
 function spanInlineFromArgs({ nodeId, text, range, tools, callIds, contentHash, chunk, chunkCount, pluginAuthored = false }) {
   return {
     nodeId,
@@ -466,6 +485,10 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
             ? matched.slice(0, bounded)
             : matched.slice(-bounded).reverse()
           const hits = ordered
+            // 0.12.0 P1-3：回注信息量门槛。命中项必须至少有一条**结构事实**可讲
+            // （范围 / 工具 / 片段种类 / 插件来源标签）。三样都取不到的纯壳不注入——
+            // 它只会占预算，而模型从「已归档 xxx」里读不出任何可行动的信息。
+            .filter((entry) => hasInformativeStructure(entry))
             .map((entry) => {
               // range 是 `{start,end}` 对象：直接插值会渲染成 [object Object]。
               const range = entry.inline.range

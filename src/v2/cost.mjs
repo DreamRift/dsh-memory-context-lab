@@ -31,6 +31,27 @@ export const COST_COUNTER_KEYS = Object.freeze([
   'cacheInvalidations',
   /** 证据重读次数（退出热上下文后再次按 ID 回读）。 */
   'evidenceReReads',
+  /**
+   * 按 ID 回读的三路拆分（0.12.0 P0-1）。
+   *
+   * 修复前只有一个 `evidenceReReads`，把「按 ID 回读」与「重读文件」混在一起，
+   * 于是插件以为自己「回读 0 次」——真实会话 303 步里工具回读 0 次、文件重读 55 次，
+   * 账本却只有一个含混的数。三路**互不覆盖**：
+   * - `toolRecallReads`：模型可见工具 `memory_lab_recall` 的回读；
+   * - `commandRecallReads`：命令面 `/memory-lab2 read` 的回读（人用的那条）；
+   * - `fileReReads`：同键文件重读（同一个 path|offset 被再次归档）。
+   */
+  'toolRecallReads',
+  /** 命令面回读次数（与 toolRecallReads 互不覆盖）。 */
+  'commandRecallReads',
+  /** 同键文件重读次数（读取账本判定，不拦截、不改写工具行为）。 */
+  'fileReReads',
+  /** 同键文件重读带进来的字符数（口径 A 的分子，可复算）。 */
+  'fileReReadChars',
+  /** 卡片折叠批次数（P0-4：独立成批，不占用操作批的 countable）。 */
+  'cardFoldBatches',
+  /** 净占用已超上限、但活动面上没有可折叠连续卡组的步数（如实报告上界未达成）。 */
+  'cardCapUnreached',
   /** 证据重读带回的 token 估算（重读不是免费：这部分要计入成本）。 */
   'evidenceReReadTokens',
   /** 召回请求次数（命令面与模型可见工具面合并计数）。 */
@@ -166,6 +187,7 @@ export function renderCostReport(counters, { sessionId = null } = {}) {
     `- 本插件替换的历史段数：${value.historyReplacements}`,
     `- 供应商前缀缓存失效次数：unknown（宿主/供应商侧观测，插件看不到，不用替换次数冒充）`,
     `- 证据重读次数：${value.evidenceReReads}（带回 ≈${value.evidenceReReadTokens} token）`,
+    `- 回读三路：工具 memory_lab_recall ${value.toolRecallReads} 次 / 命令面 ${value.commandRecallReads} 次 / 同键文件重读 ${value.fileReReads} 次（${value.fileReReadChars} 字）`,
     `- 召回请求次数：${value.recallReads}（带回 ≈${value.recallReturnedTokens} token，含元数据/包装/告警）`,
     `- 工作状态注入：${value.workingStateInjections} 次，≈${value.workingStateTokens} token（宿主 meter 口径，与归档侧同一把尺子）`,
     ...(value.workingStatePrepared > value.workingStateCommitted
