@@ -55,12 +55,14 @@ test('P0-6d 仅工作卡相邻时仍然折叠（修复不得顺手关掉折叠�
 })
 
 test('P0-6e 折叠回执成员列表不含 recall 形态（按 forms 复核）', () => {
+  // 0.13.0 F0：归档回执（receipt 节点）也退出折叠——它是 restore 的唯一句柄，
+  // 折掉它等于删掉「原文可恢复」的承诺（实测 221/230 不可恢复）。
+  // 所以这里的回执节点同时是断组边界：2 与 4 各自单卡，不足 minRun，不折叠。
   const nodes = [human(1), card(2), receipt(3), card(4), assistant(5)]
-  const { plans } = planCardFolds(nodes, { minRun: 2 })
-  assert.equal(plans.length, 1)
-  // forms 取自节点的 sourceForm（回执凭证是 memory-lab2-surface）；关键是**没有 recall**。
-  assert.deepEqual(plans[0].forms, ['working-set', 'memory-lab2-surface', 'working-set'])
-  assert.equal(plans[0].forms.includes('recall'), false)
+  const { plans, runs } = planCardFolds(nodes, { minRun: 2 })
+  assert.equal(plans.length, 0, '回执把卡组切开，两侧单卡都不折叠')
+  assert.deepEqual(runs, [[2], [4]], '回执不是卡，且不被任何组包含')
+  for (const run of runs) assert.equal(run.includes(3), false, '回执不得进入任何折叠组')
 })
 
 test('P0-6f 人类 / assistant / tool-result 仍是硬边界（既有红线不变）', () => {

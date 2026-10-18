@@ -43,6 +43,7 @@ import {
   normalizeRecallPayload,
   PACKAGE_NAME,
   PLUGIN_SOURCE_FORMS,
+  PLUGIN_SOURCE_KIND,
   RECALL_STATUS,
   RECEIPT_FORMAT_BATCH,
   RECEIPT_FORMAT_LEGACY,
@@ -1153,7 +1154,7 @@ function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER,
       id: randomUUID(),
       role: 'user',
       content: [{ type: 'text', text: receipt }],
-      source: { kind: 'user', form: PLUGIN_SOURCE_FORMS.ARCHIVE_RECEIPT },
+      source: { kind: PLUGIN_SOURCE_KIND, form: PLUGIN_SOURCE_FORMS.ARCHIVE_RECEIPT },
     }, {
       surfaceOp: { op: 'replace', startSeq, endSeq },
       sourceEventSeqs: [prune.seq, ...shadowedSeqs],
@@ -1644,7 +1645,7 @@ export async function applyOperations({ session, client, units, meter, hostVersi
  * 冷节点缺失/hash 不符都让**整组**跳过（fail-closed）：半组恢复会让摘要指向
  * 已经不在冷库里的成员，比全部不恢复更糟。逐条回执（format 1/2）走原路径不变。
  */
-export async function restoreReceipts({ session, client, receipts, onOutcome, receiptMarker = RECEIPT_MARKER }) {
+export async function restoreReceipts({ session, client, receipts, onOutcome, receiptMarker = RECEIPT_MARKER, rebuildOrphan = false }) {
   const outcomes = []
   const groups = []
   for (const receipt of receipts ?? []) {
@@ -1666,7 +1667,81 @@ export async function restoreReceipts({ session, client, receipts, onOutcome, re
       await restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes })
     }
   }
+  // 0.13.0 F0 第二通道：回执节点已不在活动面时，上面两条路径都会 skip。
+  // 历史缺陷（221/230 不可恢复）的根因是折叠把回执换成了只留 seq 的折叠回执，
+  // 于是「回执不在面」不再是异常，而是**被我们自己的折叠制造出来的常态**。
+  // 既然原文与 hash 都在账本里、冷库也在，就没有理由把这段历史判为不可恢复：
+  // 在当前位置重建一条恢复消息，让原文回到活动面。
+  if (rebuildOrphan) {
+    const orphan = outcomes.filter((outcome) => outcome.state === 'skipped'
+      && /回执节点已不在活动面/.test(outcome.reason ?? ''))
+    for (const outcome of orphan) {
+      const receipt = (receipts ?? []).find((row) => row.nodeId === outcome.nodeId
+        && row.rangeStart === outcome.rangeStart)
+      if (!receipt) continue
+      const rebuilt = await rebuildOrphanReceipt({ session, client, receipt })
+      outcomes[outcomes.indexOf(outcome)] = rebuilt
+      if (onOutcome) await onOutcome(rebuilt)
+    }
+  }
   return outcomes
+}
+
+/**
+ * 第二通道：回执节点已不在活动面时，把冷库原文重新写回活动面。
+ *
+ * 与「替换回执」的区别：没有回执可以核对，所以**不做逐字节回执比对**，改为
+ * 冷库正文 hash 校验（与账本记录一致才放行）。校验不过仍然失败关闭——绝不
+ * 把来历不明的正文塞回上下文。
+ *
+ * 位置语义：回执不在面上时原位置已经丢了，这里 append 到尾部（append 不改变
+ * 已有节点的 seq，因此不破坏任何其它回执的定位）。`restoredSeq` 记下来，供
+ * 后续 restore 幂等判定与「恢复完整性」审计使用。
+ */
+async function rebuildOrphanReceipt({ session, client, receipt }) {
+  const base = {
+    rangeStart: receipt.rangeStart,
+    rangeEnd: receipt.rangeEnd,
+    nodeId: receipt.nodeId,
+    replacementSeq: receipt.replacementSeq,
+    hash: receipt.hash,
+  }
+  const chunkCount = Number.isInteger(receipt.chunkCount) && receipt.chunkCount > 0 ? receipt.chunkCount : 1
+  const parts = []
+  for (let index = 0; index < chunkCount; index += 1) {
+    const nodeId = archiveChunkNodeId(receipt.nodeId, index)
+    let readBack
+    try {
+      readBack = await client.getNode(nodeId)
+    } catch (error) {
+      return { ...base, state: 'skipped', reason: '冷库重建失败：' + nodeId + ' 不可读（' + messageOf(error) + '）；原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读' }
+    }
+    if (!readBack || readBack.ok === false || typeof readBack.content !== 'string') {
+      return { ...base, state: 'skipped', reason: '冷库重建失败：' + nodeId + ' 缺失；原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读' }
+    }
+    parts.push(normalizeColdBody(coldRecordBody(readBack.content)))
+  }
+  const body = parts.join('')
+  if (archiveMac(body) !== receipt.hash) {
+    return { ...base, state: 'skipped', reason: '冷库重建被拒：' + receipt.nodeId + ' 正文 hash 与账本不符（冷库可能被外部改写），不做恢复' }
+  }
+  try {
+    const restored = session.append('user/message', {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: body }],
+      source: { kind: PLUGIN_SOURCE_KIND, form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
+    }, { surfaceOp: 'append' })
+    return {
+      ...base,
+      state: 'restored',
+      reason: '回执节点已被折叠移除，按冷库 hash 校验后在活动面重建原文',
+      restoredSeq: restored.seq,
+      rebuilt: true,
+    }
+  } catch (error) {
+    return { ...base, state: 'skipped', reason: '冷库重建写回失败：' + messageOf(error) + '；原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读' }
+  }
 }
 
 /** Restore one format-1/2 per-unit receipt (legacy path, byte-identical behavior). */
@@ -1813,7 +1888,7 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
         id: randomUUID(),
         role: 'user',
         content: [{ type: 'text', text: body }],
-        source: { kind: 'user', form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
+        source: { kind: PLUGIN_SOURCE_KIND, form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
       }, {
         surfaceOp: { op: 'replace', startSeq: receipt.replacementSeq, endSeq: receipt.replacementSeq },
         sourceEventSeqs: [receipt.replacementSeq],
@@ -1962,7 +2037,7 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
       id: randomUUID(),
       role: 'user',
       content: [{ type: 'text', text: bodies.join('\n') }],
-      source: { kind: 'user', form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
+      source: { kind: PLUGIN_SOURCE_KIND, form: PLUGIN_SOURCE_FORMS.ARCHIVE_RESTORE },
     }, {
       surfaceOp: { op: 'replace', startSeq: replacementSeq, endSeq: replacementSeq },
       sourceEventSeqs: [replacementSeq],

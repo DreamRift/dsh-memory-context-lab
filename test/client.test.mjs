@@ -524,43 +524,42 @@ test('the stop-time restore switch is exposed, reflects the view, and sends its 
   assert.equal(offNode.props['aria-checked'], false, 'an explicit false must not read as the default')
 })
 
-test('B1: the full-history switch sends its off command unconditionally', async () => {
+test('0.13.0: the pressure gate switch sends 0 when off and the threshold when on', async () => {
+  // 取代已删除的「全历史记忆上下文」开关：全历史现在是唯一模式，不再有开关。
+  // 新的等价契约是压力闸门——关 = 写 0（无压力也降温），开 = 写阈值。
   const { entry, shim } = await loadClient()
   const sent = []
   const { context, slots } = createClientContext()
   entry.exports.apply(context)
   const chip = slots[0]
   const run = async (line) => { sent.push(line); return { ok: true, text: 'ok' } }
-  const labels = ['全历史记忆上下文', 'Full-history memory context']
-  const base = { targetOccupancy: 0.6, retainOperations: 10, releaseMarginRatio: 0.05, auto: true, autoRecall: true, archived: 0, restored: 0, revision: 1 }
+  const labels = ['压力闸门', 'Pressure gate']
+  const base = { enabled: true, engine: 'v2', pressureGate: 20, archiveBatchSize: 10, autoRestore: true, archived: 0, restored: 0, revision: 1 }
 
-  // B1 失同步形态（session-3e4bad47 实测）：`/memory-lab2 off` 停用 v2 后
-  // fullHistory 折叠残留 true —— enabled=false、engine 为空而开关仍显示
-  // 「已启用」。此时点「关」必须仍然发出命令，否则开关永远关不掉。
-  const staleView = { ...base, enabled: false, engine: '', fullHistory: true }
-  chipButton(shim.mount(chip.component, chipProps(staleView, { run }))).props.onClick({ preventDefault() {}, stopPropagation() {} })
-  let opened = shim.mount(chip.component, chipProps(staleView, { run }))
-  const staleSwitch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
-  assert.ok(staleSwitch, 'the panel must expose the full-history switch')
-  assert.equal(staleSwitch.props['aria-checked'], true, 'the stale fold still reads as enabled')
-  staleSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  // 闸门开着（20%）：点「关」必须写 0，而不是删掉这一行。
+  chipButton(shim.mount(chip.component, chipProps(base, { run }))).props.onClick({ preventDefault() {}, stopPropagation() {} })
+  let opened = shim.mount(chip.component, chipProps(base, { run }))
+  const onSwitch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
+  assert.ok(onSwitch, 'the panel must expose the pressure gate switch')
+  assert.equal(onSwitch.props['aria-checked'], true, 'gate at 20% reads as on')
+  onSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(
-    sent.includes('/memory-lab2 set fullhistory off'),
-    `turning off from the stale fold must still send the command, sent: ${JSON.stringify(sent)}`,
+    sent.includes('/memory-lab2 set pressure 0'),
+    `turning the gate off must write 0, sent: ${JSON.stringify(sent)}`,
   )
 
-  // 正常形态（v2 启用中）同样发这一条命令：关闭路径不按投影分流。弹层在
-  // shim 里保持打开（hook 状态跨 mount 保留），直接换投影重渲即可。
+  // 闸门关着（0）：点「开」必须写回默认阈值 20。
   sent.length = 0
-  const v2View = { ...base, enabled: true, engine: 'v2', fullHistory: true }
-  opened = shim.mount(chip.component, chipProps(v2View, { run }))
-  const v2Switch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
-  v2Switch.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  const offView = { ...base, pressureGate: 0 }
+  opened = shim.mount(chip.component, chipProps(offView, { run }))
+  const offSwitch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
+  assert.equal(offSwitch.props['aria-checked'], false, 'gate at 0 reads as off')
+  offSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(
-    sent.includes('/memory-lab2 set fullhistory off'),
-    `turning off while v2 owns the projection sends the same command, sent: ${JSON.stringify(sent)}`,
+    sent.includes('/memory-lab2 set pressure 20'),
+    `turning the gate on must restore the default threshold, sent: ${JSON.stringify(sent)}`,
   )
 })
 

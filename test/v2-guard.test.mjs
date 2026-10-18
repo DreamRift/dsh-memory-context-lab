@@ -650,7 +650,9 @@ test('要求5：全部单元失败时不得报成「已归档一批」（零成�
     agent: { session },
     state: {
       enabled: true,
-      settings: { auto: true, autoRecall: true, retainOperations: 0, archiveBatchSize: 1 },
+      // 0.13.0：验证的是「全失败不得报成已归档」，需要真的进入批次；
+      // 夹具占用远低于默认闸门（20%），故显式关闸门。
+      settings: { auto: true, autoRecall: true, retainOperations: 0, archiveBatchSize: 1, pressureGate: 0 },
       archive: [],
       lastMeasurement: null,
       lastFailures: [],

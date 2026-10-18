@@ -70,6 +70,8 @@ window.__ModuleLoader__.load({
       'field.batch': '攒够几个再归档',
       'field.auto': '自动降温',
       'field.recall': '自动回注',
+      'field.pressure': '压力闸门',
+      'field.pressureHint': '开启后，上下文占用率达到右侧百分比才自动归档；关闭 = 无压力也降温（旧行为，低占用时通常不划算）',
       'field.autorestore': '停用时恢复原文',
       'field.fullHistory': '全历史记忆上下文',
       'field.fullHistoryHint': '开启后除必要历史（系统头、人类消息、计划工件）外全部退热入本会话隔离灵枢临时记忆，只留不可压缩凭证；「保留最近操作」随之失效，去留由证据保护层自动裁决',
@@ -126,6 +128,8 @@ window.__ModuleLoader__.load({
       'field.batch': 'Archive after N pile up',
       'field.auto': 'Auto cooling',
       'field.recall': 'Auto recall',
+      'field.pressure': 'Pressure gate',
+      'field.pressureHint': 'When on, archiving starts only once context occupancy reaches the percentage on the right; off = cool regardless of pressure (the old behaviour, usually a net loss at low occupancy)',
       'field.autorestore': 'Restore text when stopping',
       'field.fullHistory': 'Full-history memory context',
       'field.fullHistoryHint': 'When on, everything except essentials (system head, human messages, plan artifacts) cools into this session\u2019s isolated Lingshu scratch memory, leaving only incompressible vouchers; \u201ckeep recent operations\u201d is disabled and evidence protection decides what stays',
@@ -171,6 +175,10 @@ window.__ModuleLoader__.load({
      * 仅弹层的预设列表退化为只有「全局预设」、设置页卡片不注册。
      */
     var CONFIG_NS = 'memory-context-lab';
+    // 压力闸门默认阈值（与 core.mjs 的 DEFAULT_SETTINGS.pressureGate 同源）。
+    // 客户端不能 import 服务端常量（不同 bundle），所以这里是一个显式副本，
+    // 由 config-contract 测试断言两者相等。
+    var DEFAULT_PRESSURE = 20;
     var SETTINGS_CARD_KEY = 'dsh-memory-context-lab#' + CONFIG_NS;
 
     function optionalService(ctx, id) {
@@ -680,8 +688,6 @@ window.__ModuleLoader__.load({
       var props = input.props;
 
       var enabled = boolOf(view != null ? view.enabled : undefined, false);
-      var auto = boolOf(view != null ? view.auto : undefined, false);
-      var autoRecall = boolOf(view != null ? view.autoRecall : undefined, false);
       var autoRestore = boolOf(view != null ? view.autoRestore : undefined, true);
       var retain = countOf(view != null ? view.retainOperations : undefined);
       var batch = countOf(view != null ? view.archiveBatchSize : undefined);
@@ -690,9 +696,13 @@ window.__ModuleLoader__.load({
       var fullHistory = boolOf(view != null ? view.fullHistory : undefined, false);
       var planFirst = boolOf(view != null ? view.planFirst : undefined, false);
       var compressModel = boolOf(view != null ? view.compressModel : undefined, false);
-    var shareL2Content = boolOf(view != null ? view.shareL2Content : undefined, false);
+      var shareL2Content = boolOf(view != null ? view.shareL2Content : undefined, false);
       var compressOn = boolOf(view != null ? view.hierarchyCompress : undefined, false);
       var planActive = boolOf(view != null ? view.planActive : undefined, false);
+      // 0.13.0 压力闸门：0 = 无压力也降温（旧行为），>0 = 达到该占用率才归档。
+      // 面板把它渲染成「开关 + 阈值」：开关关闭即写 0。
+      var pressure = countOf(view != null ? view.pressureGate : undefined);
+      var pressureOn = pressure > 0;
 
       var retainPair = React.useState(String(retain));
       var retainDraft = retainPair[0];
@@ -700,6 +710,11 @@ window.__ModuleLoader__.load({
       var batchPair = React.useState(String(batch));
       var batchDraft = batchPair[0];
       var setBatchDraft = batchPair[1];
+      // 闸门阈值草稿：闸门关闭（0）时输入框置灰，但仍保留上一次的非零值，
+      // 这样重新打开开关不会把用户设过的阈值丢掉。
+      var pressurePair = React.useState(String(pressure > 0 ? pressure : DEFAULT_PRESSURE));
+      var pressureDraft = pressurePair[0];
+      var setPressureDraft = pressurePair[1];
       var cleanPair = React.useState(false);
       var cleanArmed = cleanPair[0];
       var setCleanArmed = cleanPair[1];
@@ -736,6 +751,9 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         setRetainDraft(String(retain));
       }, [retain]);
+      React.useEffect(function () {
+        setPressureDraft(String(pressure > 0 ? pressure : DEFAULT_PRESSURE));
+      }, [pressure]);
       React.useEffect(function () {
         setBatchDraft(String(batch));
       }, [batch]);
@@ -786,6 +804,17 @@ window.__ModuleLoader__.load({
         run('/memory-lab set batch ' + String(parsed));
       }
 
+      function commitPressure() {
+        var parsed = parseCount(pressureDraft);
+        // 0 在面板上是「关」的语义，由开关表达；输入框只接受 1..95。
+        if (parsed == null || parsed < 1 || parsed > 95) {
+          setPressureDraft(String(pressure > 0 ? pressure : DEFAULT_PRESSURE));
+          return;
+        }
+        if (parsed === pressure) return;
+        run('/memory-lab2 set pressure ' + String(parsed));
+      }
+
       function onEnter(event) {
         if (event.key !== 'Enter') return;
         event.preventDefault();
@@ -793,18 +822,22 @@ window.__ModuleLoader__.load({
         if (el != null && typeof el.blur === 'function') el.blur();
       }
 
+      // 0.13.0：全历史是唯一模式，「自动降温」由压力闸门取代——状态行改成
+      // 「降温状态 · 压力闸门（阈值/关）· 已归档 · 计划中」。
+      var pressureLabel = pressureOn
+        ? t('field.pressure') + ' ≥' + pressure + '%'
+        : t('field.pressure') + ' ' + t('panel.status.off')
       var statusText = enabled
         ? t('panel.status.on') + (engine === 'v2' ? ' · ' + t('panel.status.v2') : '')
-          + ' · ' + (auto ? t('panel.status.auto') : t('panel.status.manual'))
+          + ' · ' + pressureLabel
           + ' · ' + t('panel.status.archived', { count: archived })
           + (planActive ? ' · ' + t('panel.status.planActive') : '')
         : t('panel.status.off');
 
       // rc.5：状态信息从开关后移到底部输出框（原「暂无输出」位）。
-      // 摘要恒显：降温状态行 + 全历史行 + 计划先行行；最近一次命令输出追加其下。
+      // 摘要恒显：降温状态行 + 计划先行行；最近一次命令输出追加其下。
       var statusSummary = [
         statusText,
-        (fullHistory ? t('panel.status.on') : t('panel.status.off')) + ' · ' + t('field.fullHistory'),
         planFirst
           ? (planActive ? t('panel.status.planActive') : t('panel.status.on')) + ' · ' + t('field.planFirst')
           : t('panel.status.off') + ' · ' + t('field.planFirst')
@@ -851,47 +884,9 @@ window.__ModuleLoader__.load({
           run(next ? '/memory-lab on' : '/memory-lab off');
         })));
 
-      rows.push(h('div', { className: 'mcl-row', key: 'retain' },
-        h('span', { className: 'mcl-label', title: fullHistory ? t('field.retainDisabled') : t('field.retain') }, t('field.retain')),
-        h('span', { className: 'mcl-field' },
-          h('input', {
-            type: 'text',
-            inputMode: 'numeric',
-            spellCheck: false,
-            autoComplete: 'off',
-            className: 'mcl-input',
-            value: retainDraft,
-            disabled: busy || fullHistory,
-            'aria-label': t('field.retain'),
-            title: fullHistory ? t('field.retainDisabled') : t('field.retain'),
-            onChange: function (event) { setRetainDraft(event.target.value); },
-            onBlur: commitRetain,
-            onKeyDown: onEnter
-          }))));
-
-      // 全历史记忆上下文（v2 引擎专属模式）。开启路径按当前引擎分流：
-      // - v1 启用中：先停 v1（恢复原文），再启 v2，最后写入开关；
-      // - v2 启用中 / 未启用任何引擎：直接「启用 v2 + 写开关」（set 需要 v2 账本在场）。
-      // 关闭路径无条件发 `set fullhistory off`（B1 修复）：投影折叠可能停在 v2
-      // 停用后的残留态（enabled=false、engine 为空而 fullHistory 仍为 true），
-      // 按引擎条件分流会让「关闭」一条命令都不发、开关永远关不掉。v2 未启用时
-      // 该命令返回「v2 引擎未启用」，属可接受的空操作。
-      rows.push(h('div', { className: 'mcl-row', key: 'fullHistory' },
-        h('span', { className: 'mcl-label', title: t('field.fullHistoryHint') }, t('field.fullHistory')),
-        switchNode(fullHistory, t('field.fullHistory'), busy, function (next) {
-          if (next) {
-            if (enabled && engine !== 'v2') {
-              runSequence(['/memory-lab off', '/memory-lab2 on', '/memory-lab2 set fullhistory on']);
-            } else if (enabled && engine === 'v2') {
-              run('/memory-lab2 set fullhistory on');
-            } else {
-              runSequence(['/memory-lab2 on', '/memory-lab2 set fullhistory on']);
-            }
-          } else {
-            run('/memory-lab2 set fullhistory off');
-          }
-        })));
-
+      // 0.13.0 瘦身：删除「保留最近操作」「全历史记忆上下文」两行。
+      // 前者已成死开关（全历史模式下恒为 0），后者是唯一模式、不再需要开关。
+      //
       // 新会话计划先行：插件级开关（从会话日志折叠，两个引擎通用）。
       // 「on」由宿主侧联动进入计划模式（仅全新会话；非全新会话由命令输出提示）。
       rows.push(h('div', { className: 'mcl-row', key: 'planFirst' },
@@ -935,17 +930,32 @@ window.__ModuleLoader__.load({
             onKeyDown: onEnter
           }))));
 
-      rows.push(h('div', { className: 'mcl-row', key: 'auto' },
-        h('span', { className: 'mcl-label' }, t('field.auto')),
-        switchNode(auto, t('field.auto'), busy, function (next) {
-          run('/memory-lab set auto ' + (next ? 'on' : 'off'));
-        })));
-
-      rows.push(h('div', { className: 'mcl-row', key: 'recall' },
-        h('span', { className: 'mcl-label' }, t('field.recall')),
-        switchNode(autoRecall, t('field.recall'), busy, function (next) {
-          run('/memory-lab set recall ' + (next ? 'on' : 'off'));
-        })));
+      // 0.13.0：删除「自动降温」「自动回注」两行。
+      // 「自动降温」由下面的压力闸门取代（闸门 0 = 无压力也降温，即旧行为）；
+      // 「自动回注」恒开——它是取回闭环的一部分，不是一个应该被关掉的选项。
+      //
+      // 压力闸门：开关 + 阈值。开关关闭 = 阈值 0 = 无压力也降温（旧行为）。
+      // 只有 v2 会话才有闸门（v1 没有这个判据），未启用时置灰。
+      rows.push(h('div', { className: 'mcl-row', key: 'pressure' },
+        h('span', { className: 'mcl-label', title: t('field.pressureHint') }, t('field.pressure')),
+        h('span', { className: 'mcl-field' },
+          switchNode(pressureOn, t('field.pressure'), busy || !enabled, function (next) {
+            run('/memory-lab2 set pressure ' + (next ? String(pressureDraft || DEFAULT_PRESSURE) : '0'));
+          }),
+          h('input', {
+            type: 'text',
+            inputMode: 'numeric',
+            spellCheck: false,
+            autoComplete: 'off',
+            className: 'mcl-input',
+            value: pressureDraft,
+            disabled: busy || !enabled || !pressureOn,
+            'aria-label': t('field.pressure'),
+            title: t('field.pressureHint'),
+            onChange: function (event) { setPressureDraft(event.target.value); },
+            onBlur: commitPressure,
+            onKeyDown: onEnter
+          }))));
 
       rows.push(h('div', { className: 'mcl-row', key: 'autorestore' },
         h('span', { className: 'mcl-label' }, t('field.autorestore')),

@@ -43,8 +43,9 @@ function systemNode(seq) {
 // ---- planCardFolds：连续组与断组边界 -----------------------------------------
 
 test('S3-F1 连续插件卡组（≥minRun）产出折叠计划：范围/成员/文本齐全', () => {
-  // 0.12.0 P0-6：回注包（recall）是断组边界，不再算卡。所以连续卡组由
-  // 工作状态卡 + 回执凭证组成，回注包把组切开。
+  // 0.12.0 P0-6：回注包（recall）是断组边界。
+  // 0.13.0 F0：归档回执同样是断组边界（它是 restore 的唯一句柄，折掉即不可恢复）。
+  // 因此连续卡组只由工作状态卡组成。
   const nodes = [
     systemNode(0),
     humanNode(1),
@@ -54,11 +55,11 @@ test('S3-F1 连续插件卡组（≥minRun）产出折叠计划：范围/成员/
     humanNode(5),
   ]
   const { plans } = planCardFolds(nodes, { minRun: 2 })
-  assert.equal(plans.length, 1, '2,3,4 是一个连续卡组（working-set + working-state + 回执凭证）')
+  assert.equal(plans.length, 1, '2,3 是一个连续卡组（working-set + working-state）')
   const plan = plans[0]
   assert.equal(plan.startSeq, 2)
-  assert.equal(plan.endSeq, 4)
-  assert.deepEqual(plan.memberSeqs, [2, 3, 4])
+  assert.equal(plan.endSeq, 3)
+  assert.deepEqual(plan.memberSeqs, [2, 3])
   assert.equal(typeof plan.text, 'string')
   assert.ok(plan.text.length > 0)
 })
@@ -82,17 +83,20 @@ test('S3-F2 断组边界：assistant / tool-result / 人类 user 节点都切断
 })
 
 test('S3-F3 吞卡不吞消息：折叠区间两端必须是卡节点，被吞区间内不得含非卡节点（对计划做端到端复核）', () => {
+  // 0.13.0 F0：回执是断组边界，因此用「工作卡 + 工作状态卡」构造连续组；
+  // 回执改为断言「绝不进入任何折叠区间」。
   const nodes = [
     systemNode(0),
     humanNode(1),
     cardNode(2),
-    receiptNode(3),
-    cardNode(4),
+    cardNode(3, { form: 'working-state' }),
+    receiptNode(4),
     humanNode(5),
   ]
   const { plans } = planCardFolds(nodes, { minRun: 2 })
   assert.equal(plans.length, 1)
   const plan = plans[0]
+  assert.equal(plan.memberSeqs.includes(4), false, '归档回执不得被折叠')
   // 对每个成员复核身份：区间内所有节点都必须是卡（按同一判定函数）。
   for (const seq of plan.memberSeqs) {
     const node = nodes.find((n) => n.seq === seq)

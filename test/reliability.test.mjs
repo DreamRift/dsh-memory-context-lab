@@ -494,7 +494,9 @@ function makeEngineRecord(session) {
     agent: { session },
     state: {
       enabled: true,
-      settings: { auto: true, autoRecall: true, retainOperations: 1, archiveBatchSize: 1 },
+      // 0.13.0：本套件验证的是归档机制，与压力无关；夹具占用只有约 2%，
+      // 默认闸门（20%）会正确地拒绝归档，所以显式关闸门。
+      settings: { auto: true, autoRecall: true, retainOperations: 1, archiveBatchSize: 1, pressureGate: 0 },
       archive: [],
       lastMeasurement: null,
       lastFailures: [],

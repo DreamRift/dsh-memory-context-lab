@@ -54,6 +54,13 @@ export const COST_COUNTER_KEYS = Object.freeze([
   'cardCapUnreached',
   /** 证据重读带回的 token 估算（重读不是免费：这部分要计入成本）。 */
   'evidenceReReadTokens',
+  /**
+   * 压力闸门关闭、因此没有归档的步数（0.13.0）。
+   *
+   * 这是「为什么没归档」的观测面：修复前低占用也降温，省下的是最便宜的缓存读、
+   * 付出的是最贵的未命中输入。有了这个计数，status 才能说清「不是坏了，是不划算」。
+   */
+  'belowGateCount',
   /** 召回请求次数（命令面与模型可见工具面合并计数）。 */
   'recallReads',
   /** 召回实际带回热上下文的 token 估算（含元数据、包装与告警）。 */

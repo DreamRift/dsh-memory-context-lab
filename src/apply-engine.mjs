@@ -42,6 +42,7 @@ import {
   retainReadsTtlOf,
   textFromContent,
 } from './core.mjs'
+import { PRESSURE_DEFAULTS, decidePressureGate, occupancyPercentOf } from './v2/pressure.mjs'
 import {
   ProtectionRegistry,
   PROTECTION_SOURCE,
@@ -116,12 +117,27 @@ export function formatStoredMeasurement(stored) {
     ? '已归档一批'
     : (stored?.kind === 'failed'
       ? `归档失败（0 段成功）——${stored.reason || '原因未记录'}`
-      : (stored?.reason === 'waiting-for-batch'
-        ? '未触发归档（等待批量攒满）'
-        : (stored?.reason === 'waiting-batch-protected'
-          ? '未触发归档（够条件的操作被保护挡住，等待解除）'
-          : '未触发归档')))
+      : describeHoldReason(stored?.reason))
   return `最近一次测量：${action}${stamp}——占用 ≈${assembled} token。`
+}
+
+/**
+ * 未归档理由的人类可读说明（0.13.0）。
+ *
+ * 用映射表而不是嵌套三元：修复前的深层三元已经出现过括号不匹配，而「为什么没归档」
+ * 恰恰是最需要一眼看懂的一行。未知理由原样带出，不吞成「未触发归档」。
+ */
+export function describeHoldReason(reason) {
+  const table = {
+    'waiting-for-batch': '未触发归档（等待批量攒满）',
+    'waiting-batch-protected': '未触发归档（够条件的操作被保护挡住，等待解除）',
+    'below-enter': '未触发归档（压力闸门：占用低于进入阈值，降温此时不划算）',
+    'below-exit': '未触发归档（压力闸门：占用已回落到退出阈值以下）',
+    'pressure-unknown': '未触发归档（压力闸门：占用率不可判定，失败关闭）',
+    'gate-disabled': '未触发归档（压力闸门已关闭：无压力也降温）',
+  }
+  if (typeof reason === 'string' && table[reason]) return table[reason]
+  return typeof reason === 'string' && reason ? `未触发归档（${reason}）` : '未触发归档'
 }
 
 /**
@@ -992,6 +1008,10 @@ export function createEngine(dependencies) {
       client,
       receipts: aliveRows,
       receiptMarker: dependencies.receiptMarker ?? RECEIPT_MARKER,
+      // 0.13.0 F0: when the receipt node was folded away, rebuild the original
+      // text from the cold store instead of declaring the history unrecoverable.
+      // Default on; the audit-only path can pass restoreOrphan:false.
+      rebuildOrphan: dependencies.restoreOrphan !== false,
     })]
     for (const outcome of outcomes) {
       if (outcome.state === 'forgotten') continue
@@ -1003,8 +1023,25 @@ export function createEngine(dependencies) {
     }
     await persist(record)
     const stillSkippedSet = new Set(restoreSkippedReceipts(record).map((row) => row.rangeStart))
+    // 0.13.0 F0: every input row must land in exactly one of restored / skipped /
+    // forgotten. If the three counts do not add up to the input count, some history
+    // was neither restored nor reported — the worst possible outcome. This is the
+    // accounting invariant the 221/230 incident violated silently.
+    const tally = { restored: 0, skipped: 0, forgotten: 0 }
+    for (const outcome of outcomes) {
+      if (outcome.state === 'restored') tally.restored += 1
+      else if (outcome.state === 'forgotten') tally.forgotten += 1
+      else tally.skipped += 1
+    }
+    const accounted = tally.restored + tally.skipped + tally.forgotten
+    if (accounted !== rows.length) {
+      logger?.warn?.('memory-lab2: restore accounting mismatch — input ' + rows.length
+        + ' rows, tallied ' + accounted + ' (restored=' + tally.restored
+        + ' skipped=' + tally.skipped + ' forgotten=' + tally.forgotten + ')')
+    }
     return {
       outcomes,
+      tally,
       restored: outcomes.filter((outcome) => outcome.state === 'restored').length,
       retriedSkipped: retriedRows.length,
       stillSkipped: restoreSkippedReceipts(record).length,
@@ -1059,6 +1096,34 @@ export function createEngine(dependencies) {
    * automatic mode and keeps the originals. Returns a decision object instead
    * of throwing so the caller only has to log it.
    */
+  /**
+   * 取占用率 → 滞回裁决 → 记账。纯读，不写状态（状态由调用方写）。
+   *
+   * 占用率样本存在 state.pressureSamples（有界，最近 30 个），用来算动态死区。
+   * 样本只在**成功测量**后追加，测量失败不污染分布。
+   */
+  function pressureVerdictOf(record, occupancy, settings) {
+    const host = occupancy?.host ?? {}
+    const percent = occupancyPercentOf(host)
+    const samples = Array.isArray(record.state.pressureSamples) ? record.state.pressureSamples : []
+    const verdict = decidePressureGate({
+      occupancyPercent: percent,
+      coolingOn: record.state.pressureCoolingOn === true,
+      enterPercent: settings.pressureGate,
+      recentPercents: samples,
+    })
+    // 只有测量可用时才把这一笔写进样本，并且只在「开闸」时推进滞回状态。
+    if (percent !== null) {
+      record.state.pressureSamples = [...samples, percent].slice(-PRESSURE_DEFAULTS.sigmaWindow)
+      record.state.pressureCoolingOn = verdict.open
+    }
+    return {
+      ...verdict,
+      occupancyPercent: percent,
+      enterPercent: settings.pressureGate,
+    }
+  }
+
   async function runAutoCooling(record, signal) {
     const settings = settingsOf(record)
     if (!settings.auto) return { action: 'skip' }
@@ -1072,6 +1137,16 @@ export function createEngine(dependencies) {
     }
     record.occupancy = occupancy
     record.occupancyError = null
+    // ── 0.13.0 压力闸门 ────────────────────────────────────────────────────
+    // 低占用时降温是净亏：释放的是最便宜的缓存读，付出的是最贵的未命中输入。
+    // 判据全部由纯函数给出（pressure.mjs），这里只负责取数与记账。
+    const pressure = pressureVerdictOf(record, occupancy, settings)
+    record.pressure = pressure
+    if (!pressure.open) {
+      await rememberMeasurement(record, occupancy, { action: 'below-gate', reason: pressure.reason })
+      record.cost?.bump?.('belowGateCount', 1)
+      return { action: 'noop', reason: pressure.reason, pressure }
+    }
     if (!occupancy.plan.units.length) {
       // Two distinct steady states must not be conflated: "fewer than batchSize
       // admissible operations have left the window" (normal waiting) versus

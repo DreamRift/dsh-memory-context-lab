@@ -10,8 +10,9 @@ test('记录 ID / 调用 ID / 文件名 / 路径进精确通道，自然语言�
 })
 
 test('Windows 路径与 CJK 混合路径整段进精确通道', () => {
-  const plan = planQuery('检查 C:\\Users\\cty05\\documents\\report.txt 和 记忆上下文/plugin/package.json')
-  assert.deepEqual(plan.exact, ['C:\\Users\\cty05\\documents\\report.txt', '记忆上下文/plugin/package.json'])
+  // §3 红线：测试字面量同样不带个人用户名，用中性占位符。
+  const plan = planQuery('检查 C:\\Users\\dev\\documents\\report.txt 和 记忆上下文/plugin/package.json')
+  assert.deepEqual(plan.exact, ['C:\\Users\\dev\\documents\\report.txt', '记忆上下文/plugin/package.json'])
   assert.equal(plan.text, '检查 和')
 })
 

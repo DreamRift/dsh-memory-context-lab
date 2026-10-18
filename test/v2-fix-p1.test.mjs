@@ -121,6 +121,9 @@ test('BUG-004: automatic compression hook is really called after an applied batc
     assert.equal((await invoke(rt, agent, 'on')).kind, 'success')
     assert.equal((await invoke(rt, agent, 'set compress on')).kind, 'success')
     assert.equal((await invoke(rt, agent, 'set batch 1')).kind, 'success')
+    // 0.13.0：本用例验证的是「批归档之后的压缩钩子」，与压力无关。
+    // 夹具占用只有约 4%，默认闸门（20%）会正确地拒绝归档，所以这里显式关闸门。
+    assert.equal((await invoke(rt, agent, 'set pressure 0')).kind, 'success')
     seedAutoCoolingSession(session)
     const outcome = await rt.autoCooling(agent)
     assert.ok(Number(outcome.applied) > 0, JSON.stringify(outcome))
@@ -137,6 +140,7 @@ test('BUG-004: missing stage import does not surface as ReferenceError-only warn
     assert.equal((await invoke(rt, agent, 'on')).kind, 'success')
     assert.equal((await invoke(rt, agent, 'set compress on')).kind, 'success')
     assert.equal((await invoke(rt, agent, 'set batch 1')).kind, 'success')
+    assert.equal((await invoke(rt, agent, 'set pressure 0')).kind, 'success')
     seedAutoCoolingSession(session)
     const outcome = await rt.autoCooling(agent)
     assert.ok(Number(outcome.applied) > 0, JSON.stringify(outcome))

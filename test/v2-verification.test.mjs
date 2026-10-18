@@ -58,7 +58,8 @@ function stubStore(records) {
 }
 
 test('extractFilePaths：白名单字段 + 绝对路径过滤，宁少勿错', () => {
-  const win = 'C:\\Users\\cty05\\Documents\\AI\\demo.md'
+  // §3 红线：测试字面量同样不带个人用户名，用中性占位符。
+  const win = 'C:\\Users\\dev\\Documents\\AI\\demo.md'
   assert.deepEqual(
     extractFilePaths(JSON.stringify({ file_path: win })),
     [win],

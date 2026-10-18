@@ -30,6 +30,7 @@ import {
   normalizeSettings,
   renderRecallBlock,
   restoreGrowth,
+  PLUGIN_SOURCE_KIND,
   V2_RECEIPT_MARKER,
 } from '../core.mjs'
 import { createEngine } from '../apply-engine.mjs'
@@ -2386,7 +2387,11 @@ export function createV2Runtime(dependencies) {
     // 0.12.0 P0-4：最新一张工作状态卡永远保护；它是模型当前能看到的状态面。
     const occupancy = cardOccupancyOf(nodes)
     const { plans } = planCardFolds(nodes, {
-      protectSeqs: occupancy.newestWorkingStateSeq === null ? [] : [occupancy.newestWorkingStateSeq],
+      // 0.13.0 F5：最新工作卡 + 最新**全量卡**都保护。增量卡的语义是「相对
+      // 最近一张全量卡的变化」，折掉全量卡等于抽掉增量卡的基准（实测 2565 被折
+      // 之后，后续 5 张增量卡仍写「以最近一张全量卡为准」）。
+      protectSeqs: [occupancy.newestWorkingStateSeq, occupancy.newestFullCardSeq]
+        .filter((seq) => Number.isInteger(seq)),
     })
     const receipts = []
     let failed = 0
@@ -2397,7 +2402,7 @@ export function createV2Runtime(dependencies) {
           role: 'user',
           content: [{ type: 'text', text: plan.text }],
           // 宿主只认 opts 的 surfaceOp/sourceEventSeqs，source 必须写进 data（缺了会让投影读 data.source.kind 崩掉整条历史）
-          source: { kind: 'user', form: 'memory-lab2-surface' },
+          source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-lab2-surface' },
         }, {
           surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
           sourceEventSeqs: [...plan.memberSeqs],
@@ -2570,6 +2575,17 @@ export function createV2Runtime(dependencies) {
         return { kind: 'error', text: '用法：`/memory-lab2 set readlease <0..50 的整数>`（0 = 关闭读取租约）' }
       }
       settings.retainReads = value
+    } else if (key === 'pressure') {
+      // 0.13.0 压力闸门：0 = 无压力也降温（旧行为），1..95 = 占用率达到该百分比才归档。
+      // 0 必须可用——它是「退回旧行为」的唯一入口。
+      const value = Number.parseInt(rawValue ?? '', 10)
+      if (!Number.isInteger(value) || value < 0 || value > 95) {
+        return { kind: 'error', text: '用法：`/memory-lab2 set pressure <0..95 的整数>`（0 = 无压力也降温）' }
+      }
+      settings.pressureGate = value
+      // 改阈值即重置滞回状态：否则旧状态会让新阈值的第一步按旧窗口裁决。
+      record.state.pressureCoolingOn = false
+      record.state.pressureSamples = []
     } else if (key === 'fullhistory') {
       // 全历史记忆上下文：独立于 settings 五字段存在（normalizeSettings 会把它剥掉），
       // 引擎按 record.state.fullHistory 读取。开启即代表「除不可压缩凭证外全部退热」，
@@ -2691,7 +2707,7 @@ export function createV2Runtime(dependencies) {
       if (note) lines.push(note.text)
       return { kind: 'success', text: lines.join('\n') }
     } else {
-return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|readlease|fullhistory|planfirst|compress|compressmodel|sharel2content。` }
+return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|readlease|pressure|fullhistory|planfirst|compress|compressmodel|sharel2content。` }
     }
     record.state.settings = normalizeSettings(settings)
     // 设置必须落盘：只改内存会让「设置成功」在重启后失效，而 v1 的 set 是持久的。
@@ -2779,7 +2795,7 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
         id: `surface-${randomUUID()}`,
         role: 'user',
         content: [{ type: 'text', text }],
-        source: { kind: 'user', form: 'memory-lab2-surface' },
+        source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-lab2-surface' },
       },
       { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] },
     )
@@ -3202,7 +3218,7 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
           id: `surface-${randomUUID()}`,
           role: 'user',
           content: [{ type: 'text', text }],
-          source: { kind: 'user', form: 'memory-lab2-surface' },
+          source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-lab2-surface' },
         }, {
           surfaceOp: { op: 'replace', startSeq, endSeq },
           sourceEventSeqs: shadowed,

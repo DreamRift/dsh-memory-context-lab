@@ -245,6 +245,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
    * 未解问题，不能往里面加料）。设为 0 完全退回旧行为。
    */
   retainReads: 3,
+  /**
+   * 压力闸门（0.13.0）：上下文占用率达到该百分比才自动降温；0 = 无压力也降温。
+   *
+   * 默认 20：实测会话占用 8.3%–13.5%，在这个默认下它一次都不会归档——
+   * 这正是修复。低占用时降温释放的是最便宜的缓存读，付出的是最贵的未命中输入。
+   */
+  pressureGate: 20,
 })
 
 /** retainReads 的租约步数：默认 2×N（N=0 时为 0，即不启用）。 */
@@ -315,6 +322,7 @@ export const NUMERIC_SETTINGS = Object.freeze({
   batch: { key: 'archiveBatchSize', min: 1, max: 200, integer: true, label: '批量阈值' },
   protect: { key: 'protectBudgetTokens', min: 0, max: 2_000_000, integer: true, label: '软保护预算（估算 token）' },
   readlease: { key: 'retainReads', min: 0, max: 50, integer: true, label: '最近读取保留数（带 TTL 租约）' },
+  pressure: { key: 'pressureGate', min: 0, max: 95, integer: true, label: '压力闸门阈值（占用率 %，0 = 无压力也降温）' },
 })
 
 /** Settings whose value is a boolean switch. */
@@ -449,6 +457,9 @@ export function normalizeSettings(raw) {
     // 旧状态文件没有这个字段时回落到默认 3（不是 0——0 会让修复对新会话失效）。
     retainReads: boundedNumericSetting(value.retainReads, NUMERIC_SETTINGS.readlease)
       ?? DEFAULT_SETTINGS.retainReads,
+    // 0.13.0 压力闸门：0 是合法值（= 无压力也降温），所以不能用 ?? 的语义丢掉 0。
+    pressureGate: boundedNumericSetting(value.pressureGate, NUMERIC_SETTINGS.pressure)
+      ?? DEFAULT_SETTINGS.pressureGate,
   }
 }
 
@@ -660,6 +671,26 @@ export function isReceiptMessage(message) {
  * 把它们的 `source.kind` 一律写成 `'user'`，于是所有「最新人类请求」的判定都被
  * 插件自己的消息占满（审计 P0-3）。现在写入端带上 `form`，读取端据来源判定。
  */
+/**
+ * 本插件注入消息的 `source.kind`（0.13.0 F8）。
+ *
+ * 修复前一律写 `'user'`，于是**宿主侧**所有按 `source.kind === 'user'` 取人类输入的
+ * 功能都把这些消息当成人类输入。已取证的宿主消费点（app.asar 源码核对）：
+ *   - `dsh-session-title`：标题生成把归档回执当人类消息（实测 seq 162 的
+ *     messageSeqs 是 [31, 155, 157, 159]，后三条全是回执）；
+ *   - `dsh-session-turn-outline`：轮次大纲用回执填「本轮提问」预览；
+ *   - `dsh-session-reference` / `dsh-web-deepseek-api`：prompt 推导与引用面；
+ *   - `dsh-client-ui-chat`：非 `'user'` 的 kind 走 `contextProducer` 默认分支，
+ *     渲染成 `role:'inject'`——比冒充用户气泡诚实。
+ *
+ * `dsh-session` 的 `user/message` 不变量对 `source.kind` **无约束**（已核对
+ * `lib/types/invariant.js`），所以改这个值不会让日志打不开。
+ *
+ * 兼容：旧日志里仍然是 `kind:'user'` + `form`，读取端继续按 `form` 识别
+ * （见 {@link isPluginAuthoredMessage}），不依赖 kind。
+ */
+export const PLUGIN_SOURCE_KIND = 'dsh-memory-context-lab'
+
 export const PLUGIN_SOURCE_FORMS = Object.freeze({
   ARCHIVE_RECEIPT: 'archive-receipt',
   ARCHIVE_RESTORE: 'archive-restore',
