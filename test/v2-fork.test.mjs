@@ -203,11 +203,12 @@ test('fork：映射解析是兜底路径——命中才回源，指向坏 ID 或
       (error) => error.code === 'EREADNOTFOUND',
     )
 
-    // 3) 映射文件本身不是 JSON：不得崩，按「无映射」处理并抛 not-found。
+    // 3) 映射文件本身不是 JSON：不得伪装成「没有映射」，按失败关闭报 EFORKMAP。
+    //    把损坏当空映射会把「解析不了」静默改写成「这条记录不存在」，是 PR #8 P2 的读面缺陷。
     await writeFile(mapFile, '{ not json', 'utf8')
     await assert.rejects(
       () => readRecordById(root, CHILD, 't00000042-r0000'),
-      (error) => error.code === 'EREADNOTFOUND',
+      (error) => error.code === 'EFORKMAP' && error.details?.error === 'parse',
     )
   } finally {
     await rm(root, { recursive: true, force: true })

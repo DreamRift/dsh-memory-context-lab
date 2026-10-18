@@ -14,7 +14,7 @@
  * - 词条总量有上限（默认 200k，对应常用上下文量级）：超限后停止增量并**如实报
  *   skipped**——绝不让记账把「没索引」当成「已索引」（盲区 61 的工程回应之一）。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { EngineV2Error } from './errors.mjs'
 
@@ -22,6 +22,11 @@ export const LOCAL_LEXICAL_BACKEND_NAME = 'local-lexical-v1'
 export const LOCAL_LEXICAL_INDEX_FILE = 'lexical-index.json'
 export const LOCAL_LEXICAL_INDEX_KIND = 'dsh-memory-context-lab/v2/lexical-index'
 export const LOCAL_LEXICAL_SCHEMA_VERSION = 1
+export const LOCAL_LEXICAL_LOG_FILE = 'lexical-index.log.jsonl'
+export const LOCAL_LEXICAL_LOG_KIND = 'dsh-memory-context-lab/v2/lexical-log'
+/** 增量日志压实阈值：行数或字节数任一越限就把日志并回 base（PR #7 重做）。 */
+export const LOCAL_LEXICAL_COMPACT_LINES = 512
+export const LOCAL_LEXICAL_COMPACT_BYTES = 1024 * 1024
 export const DEFAULT_LEXICAL_MAX_TERMS = 200000
 
 export const LOCAL_LEXICAL_CAPABILITIES = Object.freeze({
@@ -51,7 +56,53 @@ export function tokenizeForLexicalIndex(text) {
 }
 
 function emptyState() {
-  return { docs: new Map(), postings: new Map(), limitReached: false }
+  return {
+    docs: new Map(),
+    postings: new Map(),
+    limitReached: false,
+    // base 代次：日志条目只在 base 代次匹配时重放。压实是「写新 base（gen+1）
+    // → 清空日志」，两步之间崩溃时旧日志条目因代次不匹配被忽略，不会双计。
+    gen: 0,
+    logLines: 0,
+    logBytes: 0,
+    repairedLines: 0,
+  }
+}
+
+/**
+ * 重放一条增量日志（PR #7 重做）：日志只记「新增 doc / 删除 ids / 触顶」三种事件。
+ * base 与日志都按记录 ID 去重，重复送达不会把词频算两次。
+ */
+function applyLogEntry(current, entry) {
+  if (!entry || typeof entry !== 'object') return
+  if (entry.t === 'limit') {
+    current.limitReached = true
+    return
+  }
+  if (entry.t === 'remove') {
+    for (const id of Array.isArray(entry.ids) ? entry.ids : []) {
+      if (!current.docs.delete(id)) continue
+      for (const [term, posting] of current.postings) {
+        const at = posting.d.indexOf(id)
+        if (at < 0) continue
+        posting.d.splice(at, 1)
+        posting.f.splice(at, 1)
+        if (posting.d.length === 0) current.postings.delete(term)
+      }
+    }
+    return
+  }
+  if (entry.t !== 'doc' || typeof entry.id !== 'string' || current.docs.has(entry.id)) return
+  current.docs.set(entry.id, entry.meta ?? {})
+  for (const [term, tf] of Array.isArray(entry.terms) ? entry.terms : []) {
+    let posting = current.postings.get(term)
+    if (!posting) {
+      posting = { d: [], f: [] }
+      current.postings.set(term, posting)
+    }
+    posting.d.push(entry.id)
+    posting.f.push(tf)
+  }
 }
 
 export function createLocalLexicalBackend({ directory, logger = null, maxTerms = DEFAULT_LEXICAL_MAX_TERMS } = {}) {
@@ -62,34 +113,85 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
     throw new EngineV2Error('本地词法后端的词条上限必须是正整数。', { code: 'EINVAL' })
   }
   const indexFile = path.join(directory, LOCAL_LEXICAL_INDEX_FILE)
+  const logFile = path.join(directory, LOCAL_LEXICAL_LOG_FILE)
   let state = null
 
   async function load() {
     if (state) return state
+    let base = emptyState()
     try {
       const raw = JSON.parse(await readFile(indexFile, 'utf8'))
       if (raw && raw.kind === LOCAL_LEXICAL_INDEX_KIND && raw.schemaVersion === LOCAL_LEXICAL_SCHEMA_VERSION) {
-        state = {
+        base = {
           docs: new Map(Object.entries(raw.docs ?? {})),
           postings: new Map(Object.entries(raw.postings ?? {}).map(([term, posting]) => [term, { d: posting.d ?? [], f: posting.f ?? [] }])),
           limitReached: raw.limitReached === true,
+          gen: Number.isInteger(raw.gen) && raw.gen >= 0 ? raw.gen : 0,
+          logLines: 0,
+          logBytes: 0,
+          repairedLines: 0,
         }
-        return state
       }
-    } catch {
-      // 文件缺失/半截：从零重建。记账（retrieval-index.json）由调用方管理，
-      // 这里只保证自己的状态要么完整要么为空。
+    } catch (error) {
+      // 文件缺失是常态（首次）；半截/损坏只影响 base，日志仍可重放。
+      if (error?.code !== 'ENOENT') {
+        logger?.warn?.('local-lexical: base 不可读，按空 base 重放日志', error?.message ?? String(error))
+      }
     }
-    state = emptyState()
+    state = base
+    let text = ''
+    try {
+      text = await readFile(logFile, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        throw new EngineV2Error(`词法索引日志不可读：${error.message}`, { code: 'EDAMAGED', details: { file: logFile } })
+      }
+    }
+    if (text) {
+      let lines = 0
+      for (const line of text.split('\n')) {
+        if (!line) continue
+        lines += 1
+        let entry
+        try {
+          entry = JSON.parse(line)
+        } catch {
+          state.repairedLines += 1
+          continue
+        }
+        if (entry?.kind !== LOCAL_LEXICAL_LOG_KIND) {
+          state.repairedLines += 1
+          continue
+        }
+        // 代次不匹配 = 该条已随压实进入 base；跳过而不是重放，避免双计。
+        if (entry.base !== state.gen) continue
+        applyLogEntry(state, entry)
+      }
+      state.logLines = lines
+      state.logBytes = Buffer.byteLength(text, 'utf8')
+    }
     return state
   }
 
-  async function persist(current) {
+  async function appendLog(current, entries) {
+    if (entries.length === 0) return
+    const payload = entries
+      .map((entry) => JSON.stringify({ kind: LOCAL_LEXICAL_LOG_KIND, base: current.gen, ...entry }) + '\n')
+      .join('')
+    await mkdir(directory, { recursive: true })
+    await appendFile(logFile, payload, 'utf8')
+    current.logLines += entries.length
+    current.logBytes += Buffer.byteLength(payload, 'utf8')
+  }
+
+  async function compact(current) {
+    const gen = current.gen + 1
     const payload = {
       kind: LOCAL_LEXICAL_INDEX_KIND,
       schemaVersion: LOCAL_LEXICAL_SCHEMA_VERSION,
       backend: LOCAL_LEXICAL_BACKEND_NAME,
       updatedAt: new Date().toISOString(),
+      gen,
       limitReached: current.limitReached,
       docs: Object.fromEntries(current.docs),
       postings: Object.fromEntries([...current.postings].map(([term, posting]) => [term, posting])),
@@ -98,6 +200,20 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
     const temporary = path.join(directory, LOCAL_LEXICAL_INDEX_FILE + '.tmp-' + process.pid + '-' + Date.now())
     await writeFile(temporary, JSON.stringify(payload) + '\n', 'utf8')
     await rename(temporary, indexFile)
+    // 顺序是「新 base（gen+1）落地 → 清空日志」。崩在两者之间时旧日志因代次
+    // 不匹配被忽略；不存在「日志已清空而 base 未落盘」的窗口。
+    const logTemp = path.join(directory, LOCAL_LEXICAL_LOG_FILE + '.tmp-' + process.pid + '-' + Date.now())
+    await writeFile(logTemp, '', 'utf8')
+    await rename(logTemp, logFile)
+    current.gen = gen
+    current.logLines = 0
+    current.logBytes = 0
+  }
+
+  async function maybeCompact(current) {
+    if (current.logLines >= LOCAL_LEXICAL_COMPACT_LINES || current.logBytes >= LOCAL_LEXICAL_COMPACT_BYTES) {
+      await compact(current)
+    }
   }
 
   return {
@@ -114,7 +230,7 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       const externalIds = {}
       const skipped = []
       const conflicts = []
-      let dirty = false
+      const logEntries = []
       for (const record of Array.isArray(records) ? records : []) {
         const id = typeof record?.id === 'string' ? record.id : null
         if (!id) {
@@ -148,6 +264,7 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
         const freshTerms = [...unique.keys()].filter((term) => !current.postings.has(term))
         if (current.postings.size + freshTerms.length > maxTerms) {
           // 上限只挡「新词条」：已达上限后停止增量，并在状态面如实标注覆盖边界。
+          if (!current.limitReached) logEntries.push({ t: 'limit' })
           current.limitReached = true
           skipped.push({ id, reason: 'term-limit-reached' })
           logger?.warn?.('本地词法索引已达词条上限 ' + maxTerms + '，停止增量；检索覆盖以已索引记录为准。')
@@ -162,18 +279,21 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
           posting.d.push(id)
           posting.f.push(count)
         }
-        current.docs.set(id, {
+        const meta = {
           seq: record.seq ?? null,
           kind: record.kind ?? null,
           bytes: Buffer.byteLength(record.text, 'utf8'),
           // 覆盖披露（P1-7）：该文档词频来自多少字节的正文片段。
           coveredBytes: Number.isFinite(record.textCoveredBytes) ? record.textCoveredBytes : null,
           fullBytes: Number.isFinite(record.textFullBytes) ? record.textFullBytes : null,
-        })
+        }
+        current.docs.set(id, meta)
+        logEntries.push({ t: 'doc', id, meta, terms: [...unique] })
         externalIds[id] = id
-        dirty = true
       }
-      if (dirty) await persist(current)
+      // 追加一行日志即可，不再每次全量序列化 base（PR #7 的核心问题）。
+      await appendLog(current, logEntries)
+      await maybeCompact(current)
       return { externalIds, skipped, conflicts }
     },
 
@@ -215,7 +335,8 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
             posting.f = keepFreqs
           }
         }
-        await persist(current)
+        await appendLog(current, [{ t: 'remove', ids: removed }])
+        await maybeCompact(current)
       }
       return { removed, absent }
     },
@@ -415,6 +536,9 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
     },
 
     /** 无需刷新：每次 index 后已原子落盘。保留挂点与契约对齐。 */
-    async dispose() {},
+    async dispose() {
+      // 停机时把增量日志并回 base（自足）；此时没有并发索引，代价可接受。
+      if (state && (state.logLines > 0 || state.logBytes > 0)) await compact(state)
+    },
   }
 }

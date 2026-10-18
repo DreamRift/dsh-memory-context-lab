@@ -55,6 +55,7 @@ const CATALOG_KIND = 'dsh-memory-context-lab/v2/catalog'
 const TRANSACTION_KIND = 'dsh-memory-context-lab/v2/transaction'
 
 import { EngineV2Error } from './errors.mjs'
+import { acquireWriteLock } from './write-lock.mjs'
 
 export { EngineV2Error } from './errors.mjs'
 
@@ -99,15 +100,47 @@ async function readJsonStrict(file, { label }) {
   }
 }
 
+/**
+ * 原子写 + 落盘屏障（0.11.0）。
+ *
+ * 只做 temp→fsync→rename：rename 之后崩溃/断电，文件系统里存在的是一份**完整**
+ * 的新内容；rename 之前崩溃，旧内容仍在。目录 fsync 在 POSIX 上让 rename 本身
+ * 也落盘；Windows 不支持对目录 open，跳过（NTFS 的 rename 元数据由日志保证）。
+ *
+ * fsync 范围是有意收窄的：冷库载荷、事务 WAL、manifest、engine 声明这类
+ * 「丢了就等于丢原文/丢提交」的写才付 fsync 成本；词法索引等派生缓存由
+ * temp+rename 保证不半截，丢了可重建，不再逐条 fsync。
+ */
 async function writeFileAtomic(file, data) {
   const parent = path.dirname(file)
   await mkdir(parent, { recursive: true })
   const temp = path.join(parent, `.${path.basename(file)}.${randomUUID()}.tmp`)
+  let handle = null
   try {
-    await writeFile(temp, data)
+    handle = await open(temp, 'w')
+    await handle.writeFile(data)
+    await handle.sync()
+    await handle.close()
+    handle = null
     await rename(temp, file)
+    await syncDirectory(parent)
   } finally {
+    if (handle) await handle.close().catch(() => {})
     await rm(temp, { force: true }).catch(() => {})
+  }
+}
+
+/** 目录 fsync：POSIX 上让 rename 的目录项也落盘；Windows 不支持，静默跳过。 */
+async function syncDirectory(dir) {
+  if (process.platform === 'win32') return
+  let handle = null
+  try {
+    handle = await open(dir, 'r')
+    await handle.sync()
+  } catch {
+    /* 目录不可 fsync（部分文件系统/权限）不改变原子性结论，只作为尽力而为 */
+  } finally {
+    await handle?.close().catch(() => {})
   }
 }
 
@@ -220,14 +253,17 @@ export class V2SessionStore {
   #openTransactions = new Set()
   /** @type {string[]} */
   #committedTxnFiles = []
+  /** @type {null | { release: () => void }} 跨进程写锁（只读句柄为 null）。 */
+  #writeLock = null
 
-  constructor({ directory, engine, manifest, readOnly = false }) {
+  constructor({ directory, engine, manifest, readOnly = false, writeLock = null }) {
     this.directory = directory
     this.sessionId = engine.sessionId
     this.key = engine.key
     this.#engine = engine
     this.#manifest = manifest
     this.#readOnly = readOnly
+    this.#writeLock = writeLock
   }
 
   get disabled() {
@@ -280,13 +316,14 @@ export class V2SessionStore {
    * 目录占用检查），所以对账失败时也必须撤销登记：否则一次失败（例如事务目录
    * 权限问题）会把该会话在本进程内永久毒化成 EOPEN，磁盘修好也无法自愈。
    */
-  static async #openWithReconcile({ directory, engine, readOnly }) {
-    const store = new V2SessionStore({ directory, engine, readOnly })
+  static async #openWithReconcile({ directory, engine, readOnly, writeLock = null }) {
+    const store = new V2SessionStore({ directory, engine, readOnly, writeLock })
     openDirectories.set(directory, store)
     try {
       await store.#reconcile()
     } catch (error) {
       openDirectories.delete(directory)
+      writeLock?.release()
       throw error
     } finally {
       // 占位与真句柄在这一刻交接完成：无论成败都要撤掉占位，否则目录永久 EOPEN。
@@ -326,15 +363,18 @@ export class V2SessionStore {
     // 同步占位：下面的 mkdir / 读 engine.json / 写 engine.json 都是 await 点，
     // 并发 init 会双双通过「没打开过」的判断并各自建库。
     V2SessionStore.#reserveDirectory(directory)
+    let writeLock = null
     try {
-      return await V2SessionStore.#initReserved({ directory, sessionId })
+      writeLock = await acquireWriteLock(directory)
+      return await V2SessionStore.#initReserved({ directory, sessionId, writeLock })
     } catch (error) {
+      writeLock?.release()
       V2SessionStore.#releaseReservation(directory)
       throw error
     }
   }
 
-  static async #initReserved({ directory, sessionId }) {
+  static async #initReserved({ directory, sessionId, writeLock = null }) {
     await mkdir(path.join(directory, TRANSACTIONS_DIRECTORY), { recursive: true })
     await mkdir(path.join(directory, PAYLOADS_DIRECTORY), { recursive: true })
     const enginePath = path.join(directory, ENGINE_FILE)
@@ -354,7 +394,7 @@ export class V2SessionStore {
       }
       await writeJsonFileAtomic(enginePath, engine)
     }
-    return V2SessionStore.#openWithReconcile({ directory, engine, readOnly: false })
+    return V2SessionStore.#openWithReconcile({ directory, engine, readOnly: false, writeLock })
   }
 
   /** 打开既有 v2 会话库；从未初始化过返回 null。 */
@@ -363,9 +403,19 @@ export class V2SessionStore {
     // 同步占位：读 engine.json 是 await 点，并发 open 会双双通过检查。
     V2SessionStore.#reserveDirectory(directory)
     let handoff = false
+    let writeLock = null
     try {
+      // 写句柄先取跨进程锁再读盘：对账本身会重写 manifest/catalog，属于写操作。
+      // 目录不存在时不要为了取锁把它创建出来——open 的语义是「打开既有库」。
+      if (!readOnly) {
+        const exists = await access(directory).then(() => true, () => false)
+        if (exists) writeLock = await acquireWriteLock(directory)
+      }
       const engine = await readJsonStrict(path.join(directory, ENGINE_FILE), { label: 'v2 引擎声明' })
-      if (engine === null) return null
+      if (engine === null) {
+        writeLock?.release()
+        return null
+      }
       if (!isEngineFile(engine)) {
         throw new EngineV2Error('v2 引擎声明无效（kind/schema/engine 不匹配），拒绝读取。', { code: 'EDAMAGED', details: { directory } })
       }
@@ -373,7 +423,11 @@ export class V2SessionStore {
         throw new EngineV2Error('v2 引擎声明的 sessionId 与请求不符，拒绝读取。', { code: 'EDAMAGED', details: { directory } })
       }
       handoff = true
-      return await V2SessionStore.#openWithReconcile({ directory, engine, readOnly })
+      return await V2SessionStore.#openWithReconcile({ directory, engine, readOnly, writeLock })
+    } catch (error) {
+      // 对账失败时 #openWithReconcile 可能没接手这把锁；release 幂等，重复调用安全。
+      writeLock?.release()
+      throw error
     } finally {
       // 句柄交接由 #openWithReconcile 自己收尾；这条路径提前返回/抛错时在这里撤销。
       if (!handoff) V2SessionStore.#releaseReservation(directory)
@@ -939,7 +993,31 @@ export class V2SessionStore {
   }
 
   close() {
+    // 先放锁再撤登记：反过来会让下一次 open 在锁还没释放时就看到空位。
+    this.#writeLock?.release()
+    this.#writeLock = null
     openDirectories.delete(this.directory)
+  }
+
+  /**
+   * 关闭本进程内全部已打开句柄（插件卸载 / 测试收尾）。
+   *
+   * 不是常规路径：正常使用应按句柄 close。存在的理由是「进程内同目录单句柄」
+   * 是硬契约，而插件卸载时可能还有待收尾的异步任务持有只读句柄；不给一个
+   * 显式收口，测试或热重载之后的再打开会一直 EOPEN。
+   */
+  static closeAll() {
+    let closed = 0
+    for (const store of [...openDirectories.values()]) {
+      try {
+        store.close()
+        closed += 1
+      } catch {
+        /* 单个句柄关闭失败不阻断其余句柄 */
+      }
+    }
+    openDirectories.clear()
+    return closed
   }
 
   // ---------------------------------------------------------------- 目录查询

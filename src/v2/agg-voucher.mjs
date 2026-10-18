@@ -24,6 +24,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { withWriteLock } from './write-lock.mjs'
 
 import { V2_RECEIPT_MARKER } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
@@ -119,6 +120,59 @@ export function voucherIdOf(startSeq, endSeq, memberSeqs) {
  * 返回 { plans, runs, skippedShort }：plans 是可提交计划（含渲染文本）；
  * runs 是全部连续组（含太短的）；skippedShort 是因过短被跳过的组数。
  */
+/**
+ * 计划 schema 版本（T2/F-15 成员级排除）：2 起 recordIds 是「参与蒸馏的子集」，
+ * 被排除者进 excludedRecordIds/excludedMembers；缺省（无该字段）的计划按 v1 语义
+ * 处理——任一成员不可见即整条作废，不做子集。
+ */
+export const AGG_VOUCHER_PLAN_SCHEMA = 2
+
+/**
+ * 成员摘要：memberSeqs（表面全集）｜included｜excluded 三段拼接后取 sha256 前 12 位。
+ * 重放时与当前遗忘账本对不上，就说明计划已过期——不拿旧计划重放。
+ */
+export function memberDigestOf({ memberSeqs = [], includedRecordIds = [], excludedRecordIds = [] } = {}) {
+  const digest = createHash('sha256')
+  digest.update([...memberSeqs].join(','))
+  digest.update('|')
+  digest.update([...includedRecordIds].join(','))
+  digest.update('|')
+  digest.update([...excludedRecordIds].join(','))
+  return digest.digest('hex').slice(0, 12)
+}
+
+/**
+ * 把「哪些成员被排除」落到计划上（T2）：只收窄 recordIds（下游 sourceRecordIds、
+ * leafIds、L1 卡集合的唯一来源），memberSeqs/memberTexts 保持表面全集——区间身份
+ * 与 voucherId 因此不变。无排除时原样返回，保证输出逐字节不变。
+ */
+export function withMemberExclusions(plan, { excludedMembers = [] } = {}) {
+  const excluded = (Array.isArray(excludedMembers) ? excludedMembers : [])
+    .filter((member) => member && typeof member.recordId === 'string' && member.recordId)
+  if (excluded.length === 0) return plan
+  const excludedIds = excluded.map((member) => member.recordId)
+  const excludedSet = new Set(excludedIds)
+  const included = (plan.recordIds ?? []).filter((id) => !excludedSet.has(id))
+  return {
+    ...plan,
+    planSchema: AGG_VOUCHER_PLAN_SCHEMA,
+    recordIds: included,
+    excludedRecordIds: excludedIds,
+    excludedMembers: excluded,
+    memberDigest: memberDigestOf({ memberSeqs: plan.memberSeqs, includedRecordIds: included, excludedRecordIds: excludedIds }),
+    voucherText: renderVoucherText({
+      voucherId: plan.voucherId,
+      startSeq: plan.startSeq,
+      endSeq: plan.endSeq,
+      memberCount: plan.memberCount,
+      recordCount: included.length,
+      toolHistogram: plan.toolHistogram,
+      tokensEstimate: plan.tokensEstimate,
+      excludedCount: excludedIds.length,
+    }),
+  }
+}
+
 export function planAggregateVouchers(nodes, { minRunLength = AGG_VOUCHER_MIN_RUN, maxRunLength = AGG_VOUCHER_MAX_RUN } = {}) {
   const ordered = [...(nodes ?? [])].filter((node) => Number.isInteger(node?.seq)).sort((a, b) => a.seq - b.seq)
   const runs = []
@@ -176,11 +230,16 @@ function buildVoucherPlan(memberNodes) {
     tokensEstimate,
   })
   return {
+    // T2/F-15：新计划一律带 schema 2 与空排除集（无排除时渲染与 0.10.x 逐字节一致）。
+    planSchema: AGG_VOUCHER_PLAN_SCHEMA,
     voucherId,
     startSeq,
     endSeq,
     memberSeqs,
     recordIds,
+    excludedRecordIds: [],
+    excludedMembers: [],
+    memberDigest: memberDigestOf({ memberSeqs, includedRecordIds: recordIds }),
     toolHistogram,
     tokensEstimate,
     memberCount: memberSeqs.length,
@@ -192,18 +251,21 @@ function buildVoucherPlan(memberNodes) {
 // ---------------------------------------------------------------- 渲染与解析
 
 /** 恒定格式凭证文本：字段固定、无时间戳，同计划永远渲染同一字节。 */
-export function renderVoucherText({ voucherId, startSeq, endSeq, memberCount, recordCount, toolHistogram, tokensEstimate }) {
+export function renderVoucherText({ voucherId, startSeq, endSeq, memberCount, recordCount, toolHistogram, tokensEstimate, excludedCount = 0 }) {
   const tools = Object.entries(toolHistogram ?? {})
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([tool, count]) => `${tool}×${count}`)
     .join('、')
-  return [
+  const lines = [
     AGG_VOUCHER_MARKER,
     `范围：seq ${startSeq}–${endSeq}（${memberCount} 段已归档操作；本条为程序聚合凭证，成员原文在 append-only 日志）`,
     `凭证：${voucherId}`,
     `成员冷记录：${recordCount} 条${tools ? `；工具：${tools}` : ''}`,
     `展开：/memory-lab2 expand ${voucherId}（分页回读成员回执原文；已软遗忘的成员只显示占位）`,
-  ].join('\n')
+  ]
+  // T2/F-15：只有真的排除了成员才追加这一行——无排除时输出与今天逐字节一致。
+  if (Number(excludedCount) > 0) lines.push(`排除：${Number(excludedCount)} 段成员因遗忘未参与聚合（其余照常；成员原文仍在 append-only 日志）`)
+  return lines.join('\n')
 }
 
 /** 反向解析凭证文本（对账与 expand 用）；非凭证文本返回 null。 */
@@ -293,17 +355,61 @@ export async function loadVoucherPlans(sessionDir) {
   }
 }
 
-export async function dropVoucherPlan(sessionDir, voucherId) {
-  const plans = await loadVoucherPlans(sessionDir)
-  const next = plans.filter((item) => item?.voucherId !== voucherId)
-  if (next.length === plans.length) return { dropped: false, kept: next.length }
+async function writeVoucherPlans(sessionDir, plans) {
+  return withWriteLock(sessionDir, () => writeVoucherPlansUnlocked(sessionDir, plans))
+}
+
+async function writeVoucherPlansUnlocked(sessionDir, plans) {
   const file = voucherPlansPath(sessionDir)
-  const payload = canonicalLine({ plans: next }) + '\n'
+  const payload = canonicalLine({ plans }) + '\n'
   await mkdir(sessionDir, { recursive: true })
   const temp = file + '.tmp'
   await writeFile(temp, payload, 'utf8')
   await rename(temp, file)
+}
+
+export async function dropVoucherPlan(sessionDir, voucherId) {
+  const plans = await loadVoucherPlans(sessionDir)
+  const next = plans.filter((item) => item?.voucherId !== voucherId)
+  if (next.length === plans.length) return { dropped: false, kept: next.length }
+  await writeVoucherPlans(sessionDir, next)
   return { dropped: true, kept: next.length }
+}
+
+/**
+ * 遗忘后的计划失效（0.11.0，外部审计 P0 的配套）：只要计划里有一条成员记录已
+ * 不可见，就整条作废。计划文件是重放窗口而不是权威账本，删掉它不会丢原文；
+ * 留着它则会在崩溃窗口里把已遗忘成员的事实重新写成 L1/L2。
+ */
+export async function dropVoucherPlansForRecords(sessionDir, recordIds) {
+  const wanted = new Set((Array.isArray(recordIds) ? recordIds : []).filter((id) => typeof id === 'string' && id))
+  const plans = await loadVoucherPlans(sessionDir)
+  if (wanted.size === 0) return { dropped: [], kept: plans.length }
+  const dropped = []
+  const kept = []
+  for (const plan of plans) {
+    const ids = Array.isArray(plan?.recordIds) ? plan.recordIds : []
+    const hit = ids.filter((id) => wanted.has(id))
+    if (hit.length === 0) { kept.push(plan); continue }
+    // T2/F-15：v2 计划按子集重放——只把被遗忘的成员移出参与集，其余照常。
+    // 参与集被清空才整条作废（没有安全子集）。v1 计划（无 planSchema）保持整条作废。
+    if (plan?.planSchema === AGG_VOUCHER_PLAN_SCHEMA) {
+      const remaining = ids.filter((id) => !wanted.has(id))
+      if (remaining.length > 0) {
+        const excludedMembers = [...(Array.isArray(plan.excludedMembers) ? plan.excludedMembers : [])]
+        for (const id of hit) {
+          if (excludedMembers.some((member) => member?.recordId === id)) continue
+          excludedMembers.push({ recordId: id, seq: null, reason: 'forgotten' })
+        }
+        kept.push(withMemberExclusions({ ...plan, recordIds: ids }, { excludedMembers }))
+        continue
+      }
+    }
+    dropped.push(plan.voucherId)
+  }
+  if (dropped.length === 0) return { dropped, kept: plans.length }
+  await writeVoucherPlans(sessionDir, kept)
+  return { dropped, kept: kept.length }
 }
 
 export async function getVoucherPlan(sessionDir, voucherId) {

@@ -51,13 +51,16 @@ async function seedEnabled(labRoot, sessionId) {
 }
 
 function injectCard(session, text = '[工作状态·v2] 第几张卡', seqHint = null) {
+  // 0.11.2 回归：source 属于消息体（data），不属于 append 的 opts——宿主只摊
+  // surfaceOp/sourceEventSeqs。写在 opts 里会被静默丢弃，折叠器就认不出这是
+  // 插件卡。夹具已收紧到宿主语义，这里必须按真实形状构造。
   const event = session.append('user/message', {
     id: `card-${Math.random().toString(36).slice(2, 8)}`,
     role: 'user',
     content: [{ type: 'text', text }],
+    source: { kind: 'memory-context-lab', form: 'working-set' },
   }, {
     surfaceOp: 'append',
-    source: { kind: 'memory-context-lab', form: 'working-set' },
   })
   return event.seq
 }

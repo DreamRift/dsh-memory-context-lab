@@ -55,13 +55,15 @@ function runtimeWithMeter(labRoot) {
 }
 
 function injectCard(session, text) {
+  // 0.11.2 回归：source 写在 data 里（宿主 append 的 opts 只认 surfaceOp/
+  // sourceEventSeqs）。夹具同语义后，这里再写错就会让卡片不被识别成插件卡。
   return session.append('user/message', {
     id: `card-${Math.random().toString(36).slice(2, 8)}`,
     role: 'user',
     content: [{ type: 'text', text }],
+    source: { kind: 'memory-context-lab', form: 'working-set' },
   }, {
     surfaceOp: 'append',
-    source: { kind: 'memory-context-lab', form: 'working-set' },
   }).seq
 }
 

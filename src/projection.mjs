@@ -20,6 +20,7 @@
  */
 
 import { DEFAULT_SETTINGS, foldCommandIntoState, GLOBAL_PRESET_LABEL, initialProjectionState, isReceiptMessage, parseOperation } from './core.mjs'
+import { STATE_RECORD_TYPE, stateRecordOf } from './authoritative-state.mjs'
 
 /** Surface event types that can carry a `surfaceOp`. */
 const SURFACE_TYPES = new Set(['system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result'])
@@ -113,6 +114,8 @@ export function viewOf(state) {
     // 这两个键），面板也只在 v2 下渲染模型模式行。
     hierarchyCompress: state.hierarchyCompress === true,
     compressModel: state.compressModel === true,
+    // T1/F-03：默认关；只有显式开过才为真（失败关闭）。
+    shareL2Content: state.shareL2Content === true,
     archived: Array.isArray(state.receiptSeqs) ? state.receiptSeqs.length : 0,
     restored: Number.isInteger(state.restored) && state.restored >= 0 ? state.restored : 0,
     revision: Number.isInteger(state.revision) && state.revision >= 0 ? state.revision : 0,
@@ -129,6 +132,26 @@ export function viewOf(state) {
  */
 export function applyEvent(state, event, context = null) {
   if (!event || typeof event !== 'object') return state
+
+  // 权威状态记录（P0-3）：插件在每条状态类命令结束后追加，值取自当时的真实
+  // 状态。它排在 command/run 之后，天然后写覆盖前写——命令被拒绝时它写的是
+  // 「仍然开着」，面板因此不会显示成已生效。重放（resume/fork）同样生效。
+  if (event.type === STATE_RECORD_TYPE) {
+    const record = stateRecordOf(event, { requireFromPlugin: resolvedFoldContext(context)?.requireFromPlugin })
+    if (!record) return state
+    const next = { ...state, ...record }
+    // 设置类字段落在 settings 里，与 normalizeSettings 的形状一致。
+    const settings = { ...(state.settings ?? {}) }
+    let settingsChanged = false
+    for (const key of ['auto', 'autoRecall', 'autoRestore']) {
+      if (!(key in record) || settings[key] === record[key]) continue
+      settings[key] = record[key]
+      settingsChanged = true
+    }
+    if (settingsChanged) next.settings = settings
+    next.revision = (state.revision ?? 0) + 1
+    return next
+  }
 
   if (event.type === 'command/run') {
     const engine = COMMAND_ENGINE.get(event.data?.name)

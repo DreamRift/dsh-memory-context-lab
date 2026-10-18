@@ -7,7 +7,7 @@
  * 落地后，nodeId 基名/分块名/callId 三种形态都能解析到单元闭包的记录 ID。
  *
  * 判据来源：docs/0.10.1-方案复核与改进-20261016.md §5；G1 冻结接口
- * （docs/dev-0.10.1/README.md）。本守卫绿不等于回读链路端到端可用（runtime 接线
+ * （docs/dev-0.10.1/进展卡-0.10.1.md）。本守卫绿不等于回读链路端到端可用（runtime 接线
  * 由 v2-readback/v2-runtime 套件覆盖），勿据此推定。
  *
  * 不适用条件：宽条件（kind=/before=）与 v1 导入指针的读正文匹配属 forget 语义

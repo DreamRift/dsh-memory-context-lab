@@ -17,6 +17,7 @@ import {
   renderExpansionPage,
   saveVoucherPlan,
   voucherIdOf,
+  withMemberExclusions,
 } from './agg-voucher.mjs'
 import { extractAtoms, mergeFacts, groupAtoms } from './evidence-atoms.mjs'
 import { runModelPhase } from './compressor-model.mjs'
@@ -27,6 +28,7 @@ import {
   noSafeGainCheck,
   renderPhaseCard,
   renderEvidenceCard,
+  shareModeNote,
   renderTaskIndex,
 } from './compressor-program.mjs'
 import {
@@ -71,7 +73,7 @@ const RUN_OUTCOME_SKIPPED = 'skipped-damaged'
  * members 为冷库记录视图：{ recordId, kind, body, receiptText, receiptTokens }。
  * 净收益门槛走 P3-7 的 noSafeGainCheck：不净缩短或必需事实装不下都拒绝替换。
  */
-function evaluateCandidate(plan, membersById) {
+function evaluateCandidate(plan, membersById, { shareContent = false } = {}) {
   const members = []
   for (const recordId of plan.recordIds) {
     const member = membersById.get(recordId)
@@ -85,7 +87,7 @@ function evaluateCandidate(plan, membersById) {
   for (const member of members) atoms.push(...extractAtoms(member))
   const facts = mergeFacts(atoms)
   const grouping = groupAtoms(facts)
-  const blocks = buildBlocks(facts, grouping.groups)
+  const blocks = buildBlocks(facts, grouping.groups, { shareContent })
   const summary = budgetSelect(blocks, { budgetTokens: PHASE_CARD_MAX_TOKENS })
   const summaryId = 'ph-' + plan.voucherId.slice(-10)
   const toolNames = Object.entries(plan.toolHistogram ?? {})
@@ -101,6 +103,7 @@ function evaluateCandidate(plan, membersById) {
     voucherId: plan.voucherId,
     dropped: summary.dropped,
     truncated: grouping.truncated,
+    modeNote: shareModeNote(shareContent),
   })
   // 凭证正文用计划里的恒定渲染（与 preview/run 逐字节一致），相位卡只进层级账本。
   const voucherText = plan.voucherText
@@ -136,23 +139,48 @@ function evaluateCandidate(plan, membersById) {
  * 按组解析成员回执原文与 token：回执仍在日志里（被聚合替换前 surfaceNodes 就有，
  * 替换后也能从 eventAt 读回），凭证计划的 memberTexts 之外这是第二来源。
  */
+/**
+ * 从回执文本反查某条冷库记录所在的成员 seq（T2：账本要能回答「哪一段被排除」）。
+ * 反查不到返回 null——不猜 seq，也不编一个占位号。
+ */
+function seqOfRecordId(receiptTextBySeq, recordId) {
+  for (const [seq, text] of receiptTextBySeq) {
+    if (parseReceiptRecordIds(text).includes(recordId)) return seq
+  }
+  return null
+}
+
 async function memberViewOf(deps, plan) {
   const receiptTexts = []
   const receiptByRecordId = new Map()
+  const receiptTextBySeq = new Map()
   for (const seq of plan.memberSeqs) {
     const event = typeof deps.eventAt === 'function' ? deps.eventAt(seq) : null
     const text = receiptTextOf(event)
-    if (text === null) return null
+    if (text === null) return { blocked: 'member-unreadable' }
     receiptTexts.push(text)
+    receiptTextBySeq.set(seq, text)
     // 一条回执可以覆盖多条冷库记录（v1 批量回执）：文中列到的每个 id 都对到该回执。
     for (const recordId of parseReceiptRecordIds(text)) {
       if (!receiptByRecordId.has(recordId)) receiptByRecordId.set(recordId, text)
     }
   }
   const members = []
+  const excludedMembers = []
   for (const recordId of plan.recordIds) {
+    // 遗忘完整性（0.11.0，外部审计 P0）：候选阶段就查账本，绝不读取已遗忘成员的
+    // 冷库正文。展开页的 isRecordVisible 只管渲染已产出的卡，管不住
+    // extractAtoms → L1/L2 → 凭证计划这条蒸馏链。
+    //
+    // T2/F-15：粒度收窄到成员级——被遗忘的成员**排除出参与集**（不读正文、不进
+    // L1/L2/sourceRecordIds/leafIds），其余成员照常蒸馏。全部被排除时下面按
+    // member-forgotten 整组失败关闭（没有安全子集）。
+    if (typeof deps.isRecordVisible === 'function' && !deps.isRecordVisible(recordId)) {
+      excludedMembers.push({ recordId, seq: seqOfRecordId(receiptTextBySeq, recordId), reason: 'forgotten' })
+      continue
+    }
     const receiptText = receiptByRecordId.get(recordId)
-    if (receiptText === undefined) return null
+    if (receiptText === undefined) return { blocked: 'member-unreadable' }
     const body = await deps.getRecordBody(recordId)
     // 冷库正文不可读（已清理/隔离根缺失）不是阻断：回执文本本身就是本段操作的
     // 权威摘要（P3 无 LLM 管线），退化用它作证据基底，保来源不丢组。
@@ -164,7 +192,8 @@ async function memberViewOf(deps, plan) {
       receiptTokens: estimateTokensOf(receiptText),
     })
   }
-  return { members, receiptTexts }
+  if (members.length === 0) return { blocked: 'member-forgotten', excludedMembers }
+  return { members, receiptTexts, excludedMembers }
 }
 
 function receiptTextOf(event) {
@@ -245,14 +274,18 @@ async function computeCandidates(deps) {
       continue
     }
     const view = await memberViewOf(deps, plan)
-    if (view === null) {
-      candidates.push({ plan, status: 'blocked', reason: 'member-unreadable' })
+    if (!view || view.blocked) {
+      candidates.push({ plan, status: 'blocked', reason: view?.blocked ?? 'member-unreadable' })
       continue
     }
+    // T2/F-15：被遗忘的成员排除出参与集（recordIds 收窄），memberSeqs/memberTexts
+    // 保持表面全集——区间身份与 voucherId 不变。无排除时 withMemberExclusions 原样
+    // 返回计划，渲染与 0.10.x 逐字节一致。
+    const effectivePlan = withMemberExclusions(plan, { excludedMembers: view.excludedMembers })
     const membersById = new Map(view.members.map((member) => [member.recordId, member]))
-    const evaluation = evaluateCandidate(plan, membersById)
+    const evaluation = evaluateCandidate(effectivePlan, membersById, { shareContent: deps?.shareL2Content === true })
     candidates.push({
-      plan,
+      plan: effectivePlan,
       status: evaluation.ok ? 'ready' : evaluation.reason === RUN_OUTCOME_NO_SAFE_GAIN ? RUN_OUTCOME_NO_SAFE_GAIN : 'blocked',
       reason: evaluation.reason,
       detail: evaluation.ok
@@ -337,7 +370,12 @@ export async function compressPreview(deps) {
     )
   }
   for (const c of blocked) {
-    lines.push(`跳过 seq ${c.plan.startSeq}–${c.plan.endSeq}：${c.reason === 'member-unreadable' ? '成员回执或冷库不可读' : c.reason}。`)
+    const reasonText = c.reason === 'member-forgotten'
+      ? '成员已按遗忘账本隐藏，整组跳过（失败关闭）'
+      : c.reason === 'member-unreadable'
+        ? '成员回执或冷库不可读'
+        : c.reason
+    lines.push(`跳过 seq ${c.plan.startSeq}–${c.plan.endSeq}：${reasonText}。`)
   }
   for (const c of applied) {
     lines.push(`已应用 ${c.plan.voucherId}（seq ${c.plan.startSeq}–${c.plan.endSeq}），不重复替换。`)
@@ -442,6 +480,7 @@ async function applyVoucher(deps, { plan, evaluation, memberTexts, l2CardText })
     return { voucherId: plan.voucherId, startSeq: plan.startSeq, endSeq: plan.endSeq, memberCount: plan.memberCount, replacementSeq: replacement.seq, deduplicated: true }
   }
   const entries = ledgerEntryBatch({
+    deps,
     plan,
     evaluation,
     memberTexts,
@@ -461,7 +500,7 @@ async function applyVoucher(deps, { plan, evaluation, memberTexts, l2CardText })
 }
 
 /** 组装一次凭证应用产生的整批账本条目（L1 缓存 + L2 相位卡 + L3 索引 + 凭证 + 审计）。 */
-function ledgerEntryBatch({ plan, evaluation, memberTexts, l2CardText, replacementSeq, sourceRevision, at }) {
+function ledgerEntryBatch({ plan, evaluation, memberTexts, l2CardText, replacementSeq, sourceRevision, at, deps }) {
   const entries = []
   const l1Ids = []
   for (const member of evaluation.members) {
@@ -477,6 +516,8 @@ function ledgerEntryBatch({ plan, evaluation, memberTexts, l2CardText, replaceme
       recordId: member.recordId,
       spanLabel: `seq ${plan.startSeq}-${plan.endSeq}`,
       atoms: evidenceAtoms,
+      // T1/F-03：默认不把成员正文复制进 L1 卡；开关为真才放摘录。
+      shareContent: deps?.shareL2Content === true,
     })
     entries.push({
       kind: HIERARCHY_ENTRY_L1,
@@ -672,7 +713,7 @@ export async function expandVoucher(deps, voucherId, pageArg) {
 export async function reconcileVouchers(deps) {
   const ledger = await loadHierarchy(deps.sessionDir)
   const surface = collectSurfaceVouchers(deps)
-  const report = { pending: [], replayed: [], damaged: [], dropped: [] }
+  const report = { pending: [], replayed: [], damaged: [], dropped: [], forgotten: [] }
   for (const [voucherId, entry] of ledger.vouchers) {
     if (!surface.has(voucherId)) report.pending.push(voucherId)
   }
@@ -692,7 +733,17 @@ export async function reconcileVouchers(deps) {
       report.damaged.push(voucherId)
       continue
     }
-    const entries = replayEntriesFromPlan({ plan, replacementSeq: node.seq, sourceRevision: revision, at: new Date().toISOString() })
+    // 重放前再验一次可见性（F-01 配套）：计划保存到重放之间可能发生遗忘。
+    // 已遗忘成员的 fast/slow 路径都不得被重新写成 L1/L2；整条计划作废。
+    const invisible = typeof deps.isRecordVisible === 'function'
+      ? (Array.isArray(plan.recordIds) ? plan.recordIds : []).filter((recordId) => !deps.isRecordVisible(recordId))
+      : []
+    if (invisible.length > 0) {
+      await dropVoucherPlan(deps.sessionDir, voucherId)
+      report.forgotten.push({ voucherId, recordIds: invisible })
+      continue
+    }
+    const entries = replayEntriesFromPlan({ plan, replacementSeq: node.seq, sourceRevision: revision, at: new Date().toISOString(), deps })
     const appended = await appendHierarchyEntries(deps.sessionDir, entries, { expectedRevision: revision })
     revision = appended.revision
     report.replayed.push(voucherId)
@@ -700,21 +751,36 @@ export async function reconcileVouchers(deps) {
   return report
 }
 
-/** 从计划文件重放的账本批（复用 ledgerEntryBatch 的结构，证据来自计划快照）。 */
-function replayEntriesFromPlan({ plan, replacementSeq, sourceRevision, at }) {
+/**
+ * 从计划文件重放的账本批（复用 ledgerEntryBatch 的结构，证据来自计划快照）。
+ *
+ * 导出供测试直接钉住「重放同样受 shareL2Content 约束」：未共享正文时 L1 只写
+ * 占位，绝不把计划快照里的成员原文搬进账本。
+ */
+export function replayEntriesFromPlan({ plan, replacementSeq, sourceRevision, at, deps }) {
   const memberTexts = Array.isArray(plan.memberTexts) ? plan.memberTexts : []
-  const l1Entries = (plan.recordIds ?? []).map((recordId, i) => ({
-    kind: HIERARCHY_ENTRY_L1,
-    cardId: 'l1-' + recordId,
-    recordId,
-    // 计划快照可能缺成员原文（更旧的崩溃窗口）：占位保账本可读、审计可查。
-    text: memberTexts[i] ?? `（重放占位：${recordId} 的原文不在计划快照里）`,
-    tokens: estimateTokensOf(memberTexts[i] ?? `（重放占位：${recordId} 的原文不在计划快照里）`),
-    at,
-  }))
+  // T1/F-03：重放同样受开关约束——未共享正文时 L1 只写占位，绝不把成员原文
+  // 从计划快照搬进账本卡（否则「默认不复制正文」在崩溃重放路径上被绕过）。
+  const shareContent = deps?.shareL2Content === true
+  const l1Entries = (plan.recordIds ?? []).map((recordId, i) => {
+    const placeholder = `（L1 占位：${recordId} 的正文未共享；用 expand/read 显式展开）`
+    const text = shareContent
+      ? (memberTexts[i] ?? `（重放占位：${recordId} 的原文不在计划快照里）`)
+      : placeholder
+    return {
+      kind: HIERARCHY_ENTRY_L1,
+      cardId: 'l1-' + recordId,
+      recordId,
+      text,
+      tokens: estimateTokensOf(text),
+      at,
+    }
+  })
   const l2Text = typeof plan.phaseCard === 'string' && plan.phaseCard
     ? plan.phaseCard
-    : (memberTexts.length > 0 ? memberTexts.join('\n') : `（重放占位：凭证 ${plan.voucherId} 的阶段卡不在计划快照里）`)
+    : (shareContent && memberTexts.length > 0
+      ? memberTexts.join('\n')
+      : `（重放占位：凭证 ${plan.voucherId} 的阶段卡不在计划快照里）`)
   const entries = [
     ...l1Entries,
     {

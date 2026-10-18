@@ -25,6 +25,7 @@
 
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { withWriteLock } from './write-lock.mjs'
 
 import { canonicalLine } from './disposition.mjs'
 
@@ -286,7 +287,11 @@ async function ensureLedgerHeader(sessionDir) {
  * revision CAS：expectedRevision 与账本实际 revision 不一致即拒绝，
  * 要求调用方重读重算（preview 结果过期）。
  */
-export async function appendHierarchyEntry(sessionDir, entry, { expectedRevision = null } = {}) {
+export async function appendHierarchyEntry(sessionDir, entry, options = {}) {
+  return withWriteLock(sessionDir, () => appendHierarchyEntryUnlocked(sessionDir, entry, options))
+}
+
+async function appendHierarchyEntryUnlocked(sessionDir, entry, { expectedRevision = null } = {}) {
   const problems = validateEntryShape(entry)
   if (problems.length) throw new HierarchyStoreError(`hierarchy 条目非法：${problems.join('；')}`, { code: 'EINVAL' })
   const ledger = await loadHierarchy(sessionDir)
@@ -309,7 +314,11 @@ export async function appendHierarchyEntry(sessionDir, entry, { expectedRevision
  * 批量原子追加：要么全部写入（一次 appendFile 拼接所有行），要么一行都
  * 不写。批次内部保持给定顺序。同样受 revision CAS 与守卫约束。
  */
-export async function appendHierarchyEntries(sessionDir, entries, { expectedRevision = null } = {}) {
+export async function appendHierarchyEntries(sessionDir, entries, options = {}) {
+  return withWriteLock(sessionDir, () => appendHierarchyEntriesUnlocked(sessionDir, entries, options))
+}
+
+async function appendHierarchyEntriesUnlocked(sessionDir, entries, { expectedRevision = null } = {}) {
   if (!Array.isArray(entries) || entries.length === 0) return { appended: false, entries: [], revision: null }
   for (const entry of entries) {
     const problems = validateEntryShape(entry)

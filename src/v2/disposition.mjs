@@ -20,8 +20,9 @@
  */
 
 import { createHash } from 'node:crypto'
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { withWriteLock } from './write-lock.mjs'
 
 import { applyRecordToPairingLedger, compareRecordIds, openCallsOf, parseRecordId, RECORD_KINDS } from './records.mjs'
 
@@ -329,10 +330,22 @@ async function ensureLedgerHeader(sessionDir) {
  * 一行 + LF，进程在半行处中断时下次打开按半行截断修复）。
  */
 async function appendEntry(sessionDir, entry) {
+  return withWriteLock(sessionDir, () => appendEntryUnlocked(sessionDir, entry))
+}
+
+async function appendEntryUnlocked(sessionDir, entry) {
   const problems = validateEntryShape(entry)
   if (problems.length) throw new DispositionError(`disposition 条目非法：${problems.join('；')}`, { code: 'EINVAL' })
   await ensureLedgerHeader(sessionDir)
-  await appendFile(dispositionPath(sessionDir), canonicalLine(entry) + '\n', 'utf8')
+  // 可见性账本必须先于表面墓碑持久化：这行丢了，已遗忘的记录会在重启后重新
+  // 可见（隐私回退）。因此它与冷库载荷同口径付一次 fsync，不跟派生缓存合并。
+  const handle = await open(dispositionPath(sessionDir), 'a')
+  try {
+    await handle.writeFile(canonicalLine(entry) + '\n', 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
   invalidateForgetIndex(sessionDir)
 }
 
@@ -345,7 +358,11 @@ async function appendEntry(sessionDir, entry) {
  * 状态不由本命令产生（记录级幂等），但折叠与 undo 对它保持兼容：外部
  * 合并账本（如 P3 批量通道）带来的多 cause 记录按同一语义处理。
  */
-export async function applyForget({ sessionDir, targetIds, actor, reason, expectedRevision = null, withdrawals = [] }) {
+export async function applyForget(options) {
+  return withWriteLock(options.sessionDir, () => applyForgetUnlocked(options))
+}
+
+async function applyForgetUnlocked({ sessionDir, targetIds, actor, reason, expectedRevision = null, withdrawals = [] }) {
   const ledger = await loadDisposition(sessionDir)
   assertWritable(ledger, 'forget apply')
   if (expectedRevision !== null && ledger.revision !== expectedRevision) {
@@ -401,7 +418,11 @@ function normalizeWithdrawals(withdrawals) {
  *   runtime 层完成；多 cause 记录保持遗忘（`keptIds`）并逐条给出剩余 cause；
  * - 对同一操作重复 undo、或 undo 不存在的操作 → 明确报错，不静默成功。
  */
-export async function applyUndo({ sessionDir, operationId, actor, reason }) {
+export async function applyUndo(options) {
+  return withWriteLock(options.sessionDir, () => applyUndoUnlocked(options))
+}
+
+async function applyUndoUnlocked({ sessionDir, operationId, actor, reason }) {
   const ledger = await loadDisposition(sessionDir)
   assertWritable(ledger, 'forget undo')
   const target = ledger.entries.find((entry) => entry.kind === DISPOSITION_ENTRY_FORGET && entry.operationId === operationId)

@@ -16,7 +16,7 @@
 import { V2SessionStore, v2SessionDirectoryFor } from './store.mjs'
 import { RECORD_KINDS, draftRecord } from './records.mjs'
 import { SPAN_KINDS, spanLabelOf } from './history.mjs'
-import { INDEX_TEXT_MAX_BYTES, isPluginAuthoredEntry, pluginAuthoredBody, searchRecords } from './retrieval.mjs'
+import { INDEX_TEXT_MAX_BYTES, exactPostfilterHit, isPluginAuthoredEntry, pluginAuthoredBody, searchRecords } from './retrieval.mjs'
 import { planQuery } from './query-plan.mjs'
 import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { coldRecordContent } from '../core.mjs'
@@ -390,22 +390,63 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
             const liveBackend = typeof backendFor === 'function' ? backendFor() : null
             if (liveBackend && typeof liveBackend.queryDetailed === 'function') {
               try {
-                const detail = await liveBackend.queryDetailed(needle, { exact: plan.exact, limit: bounded, weakLimit: 3 })
+                // 遗忘面（0.11.0，PR #8 P2-1）：弱候选必须同样带 exclude。遗忘后、下次
+                // 索引同步前，倒排里仍可能留着已遗忘记录；弱指针会把它重新点名（虽不注入
+                // 正文，但 ID 与「命中词元」本身就是披露）。
+                const detail = await liveBackend.queryDetailed(needle, {
+                  exact: plan.exact,
+                  limit: bounded,
+                  weakLimit: 3,
+                  exclude: forgottenSpans,
+                })
                 const weakSpans = (Array.isArray(detail?.weak) ? detail.weak : [])
                   .map((w) => ({ weak: w, entry: byId.get(w.id) }))
                   .filter((pair) => pair.entry)
-                if (weakSpans.length > 0) {
+                // T3/F-09：弱候选与强命中走**同一份** exact 后验（纯函数
+                // exactPostfilterHit）。此前两处各写一份判定，弱指针会带着「通过了
+                // exact 闸门」的说法出现，而强命中用的是另一套规则。这里对每条弱
+                // 候选重读正文套同一判定；不通过的如实丢弃（不把「弱」当免责）。
+                const verifiedWeak = []
+                for (const pair of weakSpans) {
+                  let body = null
+                  try {
+                    const loaded = await store.readRecord(pair.weak.id, { verifyHash: false })
+                    if (loaded && loaded.ok !== false) body = typeof loaded.payloadText === 'string' ? loaded.payloadText : null
+                  } catch { body = null }
+                  const exactVerified = exactPostfilterHit({
+                    exactTokens: plan.exact,
+                    body,
+                    haystack: spanHaystackOf(pair.entry),
+                  })
+                  if (!exactVerified) continue
+                  verifiedWeak.push({ ...pair, exactVerified })
+                }
+                if (verifiedWeak.length > 0) {
                   matchedBy = 'partial-match'
-                  const weakNote = '（弱候选：以下记录与查询只有部分词元重合，不构成相关证据；仅提供 ID 供按需回读，本次未注入正文。）'
-                  weakHits = weakSpans.map((pair) => ({
-                    id: pair.weak.id,
-                    nodeId: pair.entry.inline?.nodeId,
-                    createdAt: pair.entry.createdAt,
-                    range: pair.entry.inline?.range ?? null,
-                    tools: pair.entry.inline?.tools ?? null,
-                    tags: [ARCHIVED_TAG],
-                    content: `弱候选 ${pair.weak.id}：词元重合 ${pair.weak.matchedTerms?.join('、') ?? '(unknown)'}（覆盖 ${pair.weak.coverage ?? '?'}）；原文需按 ID 显式回读。`,
-                  }))
+                  const weakNote = '（弱指针（不是命中）：以下记录与查询只有部分词元重合，不构成相关证据；只给 ID，不计入回读计数，本次未注入正文。）'
+                  weakHits = verifiedWeak.map((pair) => {
+                    const score = Number.isFinite(pair.weak.score) ? pair.weak.score : null
+                    const coverage = Number.isFinite(pair.weak.coverage) ? pair.weak.coverage : null
+                    return {
+                      id: pair.weak.id,
+                      nodeId: pair.entry.inline?.nodeId,
+                      createdAt: pair.entry.createdAt,
+                      range: pair.entry.inline?.range ?? null,
+                      tools: pair.entry.inline?.tools ?? null,
+                      tags: [ARCHIVED_TAG],
+                      // T3/F-09：显式置信度字段——弱指针不是命中，读面/计数/渲染都据此
+                      // 分流，不再靠字符串文案推断。
+                      weakPointer: true,
+                      isHit: false,
+                      confidence: {
+                        kind: 'weak',
+                        score,
+                        coverage,
+                        exactVerified: pair.exactVerified,
+                      },
+                      content: `弱指针 ${pair.weak.id}（不是命中）：词元重合 ${pair.weak.matchedTerms?.join('、') ?? '(unknown)'}（覆盖 ${coverage ?? '?'}）；只给 ID，不计入回读计数；原文需按 ID 显式回读。`,
+                    }
+                  })
                   weakHits[0] = { ...weakHits[0], content: `${weakNote}\n${weakHits[0].content}` }
                 }
               } catch { /* 诊断面失败保持 no-match（弱候选是加强信息，不反过来把回注打挂） */ }

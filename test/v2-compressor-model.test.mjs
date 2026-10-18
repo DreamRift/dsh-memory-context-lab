@@ -466,11 +466,17 @@ test('接线：模型模式开启时，ready 候选相位卡换成校验过的�
     // 消息里应带程序选中的块行文（含可校验的数字）；refs 必须用清单里的真实块 ID
     // （写死 'blk-1' 会因 invalid-ref 落回程序卡——0.10.1 修复时的实测教训）。
     const user = messages.find((m) => m.role === 'user')
-    assert.ok(user && user.content.includes('1.2.3'))
+    assert.ok(user, '模型相位必须收到一条用户消息')
+    // T1/F-03：模型相位的输入同样脱敏——成员正文不得出现在块行里。
+    assert.equal(user.content.includes('第 1 轮共 5 条输出'), false, '模型输入不得含成员正文')
+    assert.ok(user.content.includes('（正文摘录未共享）'), '脱敏后应留固定标记')
+    // refs 必须用清单里的真实块 ID（写死 blk-1 会因 invalid-ref 落回程序卡）。
     const blockIdMatch = /\[([^\]]+)\] /.exec(user.content)
     assert.ok(blockIdMatch, '事实清单必须带块 ID')
     const blockId = blockIdMatch[1]
-    return { text: JSON.stringify({ lines: [{ text: 'run_code exit 0，版本 1.2.3，共 5 条。', refs: [blockId] }] }), usage: { input: 7 } }
+    // 结论里的数字必须能在被引用块里原样找到（verifyModelSummary 的机械
+    // 对回契约）。正文已脱敏，所以模型只能给不带正文数字的结论。
+    return { text: JSON.stringify({ lines: [{ text: 'run_code 阶段内完成。', refs: [blockId] }] }), usage: { input: 7 } }
   } })
   // 8 成员：程序卡逐块行文（≥8 行）天然大于单行结论的模型卡——no-gain 判定
   // 的比对场景必须让「模型卡更省」成立，否则接线测试实际测的是 no-gain 落回。
@@ -484,7 +490,8 @@ test('接线：模型模式开启时，ready 候选相位卡换成校验过的�
   const l2 = ledger.entries.find((e) => e.kind === 'hierarchy/l2-phase')
   assert.ok(l2, '应有 L2 相位卡条目')
   assert.ok(l2.text.includes('模型摘要模式'), 'L2 应是模型卡：' + l2.text)
-  assert.ok(l2.text.includes('1.2.3'))
+  // T1/F-03 的硬约束：模型卡里也不得出现成员正文数字（旧断言依赖摘录泄漏）。
+  assert.equal(l2.text.includes('第 1 轮共 5 条输出'), false, '模型卡不得复制成员正文')
   // 凭证正文保持恒定渲染（不含模型卡脚注）。
   const voucher = ledger.entries.find((e) => e.kind === 'hierarchy/agg-voucher')
   assert.ok(!voucher.text.includes('模型摘要模式'))

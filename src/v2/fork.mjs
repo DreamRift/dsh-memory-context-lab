@@ -136,19 +136,29 @@ export async function executeForkClosure({ labRoot, parentSessionId, childSessio
     // 通过启用检查），所以带标记就一律允许清掉重来——否则失败一次就永久
     // 卡死，用户看到「可重试」而实际永远不可重试，那是死路。
     const stuck = await readNeedsMigration(labRoot, childSessionId)
+    // 只有「可解析的」标记才能作为删除子库的凭证。标记损坏（半截 JSON、
+    // 结构不符、无权限）时不能把「读不懂」当成「有标记」——那等于凭一个
+    // 解析失败的对象删掉可能是真账本的目录。失败关闭，交人工判断。
+    const markerValid = stuck !== null && stuck.unreadable !== true
     let count = null
     try {
       const acquired = await V2SessionStore.acquireShared({ labRoot, sessionId: childSessionId, readOnly: true })
       count = acquired.store ? acquired.store.recordCount : 0
       if (acquired.owned) acquired.store?.close()
     } catch (error) {
-      // 子库读不动（半成品/损坏）：只有带 needs-migration 标记才敢清，
+      // 子库读不动（半成品/损坏）：只有带可解析 needs-migration 标记才敢清，
       // 否则拒绝，避免覆盖一个用户真在用的账本。
-      if (!stuck) throw error
+      if (!markerValid) throw error
       count = null
     }
-    if (stuck) {
+    if (markerValid) {
       await rm(v2SessionDirectoryFor(labRoot, childSessionId), { recursive: true, force: true })
+    } else if (stuck?.unreadable) {
+      throw new EngineV2Error(
+        `子会话 ${childSessionId} 的 needs-migration 标记不可读（${stuck.error}）；无法判定它是否 fork 半成品，拒绝自动清理。`
+        + ' 请人工检查该子会话目录后，用 `/memory-lab2 fork-reset ' + childSessionId + '` 显式重试（标记仍需可读）。',
+        { code: 'EFORKMARKERCORRUPT', details: { childSessionId, error: stuck.error } },
+      )
     } else {
       throw new EngineV2Error(
         `子会话 ${childSessionId} 已存在 v2 账本（${count ?? '未知'} 条记录）；fork 只允许写入尚未建档的新会话。`
@@ -283,29 +293,53 @@ export async function executeForkClosure({ labRoot, parentSessionId, childSessio
   }
 }
 
-/** 读 fork 映射；不存在或损坏返回 null（调用方按「没有映射」处理，不猜）。 */
+/**
+ * 读 fork 映射。三态（0.11.0）：
+ * - 文件不存在（ENOENT）→ null：确实没有映射，调用方可以按「未迁移」处理；
+ * - 读到但解析/结构不符 → { unreadable: true, error }：旁车损坏，不能伪装成「没有映射」；
+ * - 正常 → parsed。
+ * 旧实现在 catch 里一律返回 null，把损坏、权限、半截 JSON 全折叠成「无映射」，读侧
+ * 因此把「解析不了」当成「记录不存在」。调用方必须显式区分三态。
+ */
 export async function readForkMap(labRoot, sessionId) {
+  let raw
   try {
-    const raw = await readFile(forkMapFileFor(labRoot, sessionId), 'utf8')
-    const parsed = JSON.parse(raw)
-    if (parsed?.kind !== 'dsh-memory-context-lab/v2/fork-map') return null
-    if (!parsed.mapping || typeof parsed.mapping !== 'object') return null
-    return parsed
-  } catch {
-    return null
+    raw = await readFile(forkMapFileFor(labRoot, sessionId), 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    return { unreadable: true, error: error?.code ?? 'read' }
   }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return { unreadable: true, error: 'parse' }
+  }
+  if (parsed?.kind !== 'dsh-memory-context-lab/v2/fork-map') return { unreadable: true, error: 'schema' }
+  if (!parsed.mapping || typeof parsed.mapping !== 'object') return { unreadable: true, error: 'schema' }
+  return parsed
 }
 
-/** 子会话是否停在 needs-migration（阻断自动激活）。 */
+/**
+ * 子会话是否停在 needs-migration（阻断自动激活）。损坏与不存在同样必须区分：
+ * 损坏时返回 { unreadable, error }，由调用方按失败关闭处理。
+ */
 export async function readNeedsMigration(labRoot, sessionId) {
+  let raw
   try {
-    const raw = await readFile(needsMigrationFileFor(labRoot, sessionId), 'utf8')
-    const parsed = JSON.parse(raw)
-    if (parsed?.kind !== 'dsh-memory-context-lab/v2/needs-migration') return null
-    return parsed
-  } catch {
-    return null
+    raw = await readFile(needsMigrationFileFor(labRoot, sessionId), 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    return { unreadable: true, error: error?.code ?? 'read' }
   }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return { unreadable: true, error: 'parse' }
+  }
+  if (parsed?.kind !== 'dsh-memory-context-lab/v2/needs-migration') return { unreadable: true, error: 'schema' }
+  return parsed
 }
 
 export async function markNeedsMigration(labRoot, sessionId, { parentSessionId, reason }) {
@@ -339,6 +373,12 @@ export async function resetForkChild({ labRoot, childSessionId }) {
   const stuck = await readNeedsMigration(labRoot, childSessionId)
   const exists = await V2SessionStore.exists(labRoot, childSessionId)
   if (!exists) return { reset: false, reason: 'no-child-ledger' }
+  if (stuck?.unreadable) {
+    throw new EngineV2Error(
+      `子会话 ${childSessionId} 的 needs-migration 标记不可读（${stuck.error}）；无法确认它是 fork 半成品，拒绝清理。`,
+      { code: 'EFORKMARKERCORRUPT', details: { childSessionId, error: stuck.error } },
+    )
+  }
   if (!stuck) {
     throw new EngineV2Error(
       `子会话 ${childSessionId} 没有 needs-migration 标记，不是 fork 半成品；拒绝清理（避免删掉真账本）。`,

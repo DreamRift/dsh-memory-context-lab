@@ -1045,21 +1045,81 @@ async function verifyUnitColdChunks({ client, unit, chunkIds, chunks, signal }) 
  * 已写好且校验通过，重试在各自 ordinal 上重写；同一 run 同生共死，避免出现
  * 「半条摘要回执」这种不可归因的状态。
  */
+/**
+ * P0-2：宿主校验的是**位置切片**，不是规划期名单。
+ *
+ * `compaction/prune.shadowedSeqs` 必须逐项等于
+ * `surface.slice(surface.indexOf(start), surface.indexOf(end) + 1)`（宿主
+ * `dsh-compaction/lib/types/invariant.js`）。规划期按单元算出的
+ * `unit.shadowedSeqs` 只覆盖单元自己的节点：区间里若夹着插件自己的回执
+ * （seq 数值比区间末尾小/大都可能，位置却落在区间内），它不会进名单 →
+ * prune 落盘即非法 → 下次冷加载 `SessionFormatError`，紧随的 replace 也被
+ * 宿主拒（`sourceEventSeqs must include every shadowed surface node`），
+ * 该区间从此永远归档不掉。
+ *
+ * 所以在**提交点**按活动面重新取位置切片，并自检：
+ * - 两端都还在活动面上、且 start 不晚于 end；
+ * - 每个单元自己的节点仍按序出现在切片里（单元没被换掉内容）。
+ * 任何一条不满足就失败关闭：不写 prune、不做替换，原文保留。
+ *
+ * @returns {{ok: true, seqs: number[]} | {ok: false, reason: string}}
+ */
+function resolveCommitSpan(session, run) {
+  const liveNodes = Array.isArray(session.surface?.nodes) ? session.surface.nodes : []
+  const startSeq = run[0].unit.rangeStart
+  const endSeq = run[run.length - 1].unit.rangeEnd
+  const liveStart = liveNodes.indexOf(startSeq)
+  const liveEnd = liveNodes.indexOf(endSeq)
+  if (liveStart < 0 || liveEnd < 0 || liveEnd < liveStart) {
+    return { ok: false, reason: '提交前复核：目标区间已不在活动面（surface 已变化）' }
+  }
+  const seqs = liveNodes.slice(liveStart, liveEnd + 1)
+  if (seqs.length === 0 || seqs[0] !== startSeq || seqs.at(-1) !== endSeq) {
+    return { ok: false, reason: '提交前复核：位置切片与规划区间两端不一致' }
+  }
+  // 单元自己的节点必须仍按序出现在切片里；夹在中间的外来节点（插件回执等）
+  // 允许存在——它们正是本修复要覆盖的情形。
+  let cursor = 0
+  for (const { unit } of run) {
+    for (const seq of unit.shadowedSeqs ?? []) {
+      const at = seqs.indexOf(seq, cursor)
+      if (at < 0) return { ok: false, reason: `提交前复核：单元 seq ${seq} 已不在区间切片内（surface 已变化）` }
+      cursor = at + 1
+    }
+  }
+  return { ok: true, seqs }
+}
+
 function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER, hostVersion }) {
-  const shadowedSeqs = run.flatMap(({ unit }) => unit.shadowedSeqs)
+  const span = resolveCommitSpan(session, run)
+  if (!span.ok) {
+    return {
+      outcomes: run.map(({ unit, chunkIds }) => ({
+        ...unitBaseOf(unit),
+        state: 'stale',
+        reason: span.reason,
+        orphanNodeIds: [...chunkIds],
+      })),
+    }
+  }
+  const shadowedSeqs = span.seqs
   const startSeq = run[0].unit.rangeStart
   const endSeq = run[run.length - 1].unit.rangeEnd
   // P0-2 对账口径：回执里的「原 ≈N token」与 `compaction/prune.shadowedTokenCount`
   // 量的是同一个对象、取的都是宿主 meter 的**启发式**那一份（回执 = 规划期
   // Σ heuristicTokens，prune = 提交期 Σ meter.estimateMessage）。合并提交后
-  // prune 记 run 总和，归档行仍逐单元记自己的那份，对账口径不变。
+  // prune 记整段位置切片的总和，归档行仍逐单元记自己的那份；切片里夹着的
+  // 外来节点（插件回执）不属于任何单元，其份额单独记在 run 首单元行上，
+  // 对账时相减（`tokenAccountingOf`），既不丢口径也不虚报差额。
   const perUnitTokens = new Map()
-  let shadowedTokens = 0
+  let unitTokens = 0
   for (const { unit } of run) {
     const tokens = sumShadowedTokens(session, meter, unit.shadowedSeqs)
     perUnitTokens.set(unit.nodeId, tokens)
-    shadowedTokens += tokens
+    unitTokens += tokens
   }
+  const shadowedTokens = sumShadowedTokens(session, meter, shadowedSeqs)
+  const spanExtraTokens = Math.max(0, shadowedTokens - unitTokens)
   const receipt = run.length === 1
     ? run[0].unit.receipt
     : buildBatchReceipt({
@@ -1128,16 +1188,22 @@ function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER,
   // 成另一种格式而比对失败（「回执正文已变化，拒绝覆盖」），原文永久不可恢复。
   // 只有 `state` 与 `reason` 随校验结果分叉。
   return {
-    outcomes: run.map(({ unit, chunkIds }) => ({
+    outcomes: run.map(({ unit, chunkIds }, index) => ({
       ...unitBaseOf(unit),
       replacementSeq: replacement.seq,
       /** Cold nodes this operation occupies; restore reads them back in order. */
       chunkCount: chunkIds.length,
       chunkIds: [...chunkIds],
-      /** Same number that went into `compaction/prune`; carried for P0-2 对账. */
+      /** This unit's own share of `compaction/prune.shadowedTokenCount`; carried for P0-2 对账. */
       shadowedTokenCount: perUnitTokens.get(unit.nodeId) ?? 0,
       surfaceGeneration: session.surface.replaceGeneration,
       hostVersion: hostVersion ?? 'unknown',
+      /**
+       * 位置切片里不属于任何单元的那部分 token（插件回执等）。它进了
+       * `compaction/prune.shadowedTokenCount`，但不该算到任何一个单元头上：
+       * 记在 run 首单元行，对账时减掉（见 `tokenAccountingOf`）。
+       */
+      ...(index === 0 && spanExtraTokens > 0 ? { spanExtraTokens } : {}),
       ...(run.length > 1
         ? { receiptFormat: RECEIPT_FORMAT_BATCH, batchSize: run.length }
         : {}),
@@ -1216,8 +1282,11 @@ export function tokenAccountingOf(rows) {
     const r = Number(row.originalTokens)
     const p = Number(row.shadowedTokenCount)
     if (!Number.isFinite(r) || !Number.isFinite(p)) continue
+    // 合并提交的 prune 记的是整段位置切片，切片里夹着的插件回执不属于任何单元；
+    // 它的份额单独挂在 run 首单元行上，这里减掉才和回执 Σ 比的是同一对象。
+    const extra = Number(row.spanExtraTokens)
     receipt += r
-    prune += p
+    prune += p - (Number.isFinite(extra) ? extra : 0)
     compared += 1
   }
   if (!compared) return null

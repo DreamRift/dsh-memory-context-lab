@@ -32,6 +32,7 @@ import {
 import { cleanDecision, recallQueryFrom } from './apply.mjs'
 import { createEngine, restoreSkippedReceipts } from './apply-engine.mjs'
 import { createMemoryContextLabProjection } from './projection.mjs'
+import { appendStateRecord, stateRecordDataOf } from './authoritative-state.mjs'
 import { assertV2AllowsV1, getEngineRegistry } from './v2/engine.mjs'
 import { EngineV2Error } from './v2/errors.mjs'
 import { createV2Runtime, V2_COMMAND_NAME } from './v2/runtime.mjs'
@@ -180,6 +181,10 @@ function buildConfigSchema() {
       // 层级压缩模型模式的全局默认（P4）：只影响 v2 新账本的播种值与面板初始
       // 位置；已有账本的会话内开关以 /memory-lab2 set compressmodel 为准。
       // 模型模式失败关闭：LLM 不可用或产出不合格时自动落回程序摘要。
+      // T1/F-03：层级卡是否共享成员正文摘录。默认 false——卡里只给属性、来源
+      // 与展开入口，不复制正文。不进预设行（同保护预算的理由）。
+      shareL2Content: SCHEMAS.boolean().default(false)
+        .i18n({ 'zh-CN': '层级卡共享正文摘录（v2，默认关）', en: 'Share member excerpts in hierarchy cards (v2, default off)' }),
       compressModelDefault: SCHEMAS.boolean().default(false)
         .i18n({ 'zh-CN': '层级压缩模型模式（默认关，失败自动落回程序摘要）', en: 'Hierarchy compression model mode (default off; falls back to program summaries)' }),
       // 检索后端显式指定（PR #4 接口设计 §端口二）：auto = 现状自动梯队（T2 优先、
@@ -395,6 +400,16 @@ export async function apply(ctx, config) {
   function resolveCompressModelDefault(configObject) {
     const defaults = unwrapVolatile(configObject?.defaults)
     return defaults?.compressModelDefault === true
+  }
+
+  /**
+   * T1/F-03：层级卡共享正文摘录的全局默认。与 compressModel 同口径——只在
+   * 「无会话内命令记录」时作为面板初始位置与新账本播种值。失败关闭：读不到
+   * 就按 false（不共享正文）。
+   */
+  function resolveShareL2ContentDefault(configObject) {
+    const defaults = unwrapVolatile(configObject?.defaults)
+    return defaults?.shareL2Content === true
   }
 
   /**
@@ -800,6 +815,7 @@ export async function apply(ctx, config) {
     defaultSettings: resolveDefaultsSettings,
     defaultFullHistory: () => resolveFullHistoryDefault(config),
     defaultCompressModel: () => resolveCompressModelDefault(config),
+    defaultShareL2Content: () => resolveShareL2ContentDefault(config),
     // P4 拍板：宿主没有已核验的插件侧 LLM 调用契约 → 解析点恒返回 null。
     // 模型模式全链路按程序档工作（失败关闭）；未来接入宿主契约时只改这里。
     modelPhaseResolver: () => null,
@@ -821,11 +837,104 @@ export async function apply(ctx, config) {
     semanticBackendCloseAll: () => retrievalBackend.closeAll(),
   })
 
+  /**
+   * P0-3：把「命令跑完之后的真实状态」写成一条权威记录。
+   *
+   * 宿主对每次斜杠命令都会记一条 command/run，投影按命令行折叠——命令被拒绝时
+   * 它照样翻开关，面板与真实状态相反。这里在命令**结束后**（成功或失败都写）
+   * 追加一条插件记录，值取自当时的记录/引擎状态而不是命令意图；投影以它为准。
+   *
+   * 宿主拿不到 appendPluginRecord 时只返回 ok:false，由调用方如实说明并退回
+   * 按命令行折叠；绝不假装写过。
+   */
+  function recordAuthoritativeState(agent, engineName) {
+    try {
+      const session = agent?.session
+      if (!session) return { ok: false, reason: '当前会话不可用' }
+      const sessionId = sessionIdOf(session)
+      const record = sessionId ? records.get(sessionId) : null
+      const stored = record?.state ?? null
+      // 引擎归属以台账为准（engine.json 声明），不是命令说了算。
+      let engine = ''
+      try {
+        const holder = getEngineRegistry(labRoot, sessionId).holder
+        engine = holder === 'v2' ? 'v2' : holder === 'v1' ? 'v1' : ''
+      } catch {
+        engine = record ? engineName : ''
+      }
+      const enabled = record
+        ? record.state?.enabled !== false
+        : engine !== ''
+      const data = stateRecordDataOf({ enabled, engine, state: stored ?? {} })
+      return appendStateRecord(session, data, { requireFromPlugin })
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * 命令是否可能改变投影状态（开关位、引擎归属、设置）。
+   *
+   * 只读命令（read/history/status/card/cost/recall/verify/relations/fork-status…）
+   * 不动状态，不必追加权威记录——每条都写会让日志无谓变长，也会让前缀缓存
+   * 白白多一段字节。
+   */
+  const STATE_CHANGING_V2 = new Set(['on', 'off', 'set', 'restore', 'forget', 'compress', 'expand', 'import-v1'])
+
+  function v2OperationOf(invocation) {
+    try {
+      const { operation } = parseOperation(invocation?.rawInput ?? invocation?.input ?? '')
+      return operation
+    } catch {
+      return ''
+    }
+  }
+
+  /** 可能改变投影状态的 v1 命令（只读命令不写权威记录）。 */
+  const STATE_CHANGING_V1 = new Set(['on', 'off', 'set', 'preset', 'restore', 'clean', 'import-v1'])
+
+  async function v1CommandHandler(invocation) {
+    const pending = commandHandler(invocation)
+    activeOperations.add(pending)
+    pending.finally(() => activeOperations.delete(pending)).catch(() => {})
+    let result
+    try {
+      result = await pending
+    } finally {
+      // P0-3：成功或失败都写；命令被拒绝时读到的仍是「开着」，面板不会翻转。
+      if (STATE_CHANGING_V1.has(v2OperationOf(invocation))) {
+        const written = recordAuthoritativeState(invocation?.agent, 'v1')
+        if (!written.ok && result && typeof result === 'object' && result.kind === 'success') {
+          result = {
+            ...result,
+            text: result.text + '\n（未能写入权威状态记录：' + written.reason + '；面板按命令行折叠，可能与真实状态不符。）',
+          }
+        }
+      }
+    }
+    return result
+  }
+
   async function v2CommandHandler(invocation) {
     const pending = v2.commandHandler(invocation)
     activeOperations.add(pending)
     pending.finally(() => activeOperations.delete(pending)).catch(() => {})
-    return pending
+    let result
+    try {
+      result = await pending
+    } finally {
+      // P0-3：成功或失败都写。命令被拒绝时读到的仍是「开着」，面板不会翻转。
+      if (STATE_CHANGING_V2.has(v2OperationOf(invocation))) {
+        const written = recordAuthoritativeState(invocation?.agent, 'v2')
+        if (!written.ok && result && typeof result === 'object' && result.kind === 'success') {
+          result = {
+            ...result,
+            text: result.text + '\n（未能写入权威状态记录：' + written.reason + '；面板按命令行折叠，可能与真实状态不符。）',
+          }
+        }
+      }
+    }
+    return result
   }
 
   // ── Command surface ──────────────────────────────────────────────────────
@@ -1705,12 +1814,7 @@ export async function apply(ctx, config) {
       name: COMMAND_NAME,
       description: 'Archive finished operations into an isolated cold store to reduce context',
       input: { hint: 'on | off | status | preset [名称|reset] | set retain|batch|auto|recall|autorestore <value> | now | dry-run | restore | clean | help' },
-      handler: (invocation) => {
-        const pending = commandHandler(invocation)
-        activeOperations.add(pending)
-        pending.finally(() => activeOperations.delete(pending)).catch(() => {})
-        return pending
-      },
+      handler: (invocation) => v1CommandHandler(invocation),
     })
     // v2 命令与 v1 命令并存：不隐藏、不改写 v1 的 schema，也不随 on/off 增删。
     yield ctx.commands.register({

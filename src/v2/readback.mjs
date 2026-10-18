@@ -54,14 +54,17 @@ export async function readRecordById(labRoot, sessionId, id, { verifyHash = true
       // 这条路径只在本地未命中时走，且映射来自本会话自己的迁移记录，不跨目录乱读。
       const mapped = await resolveViaForkMap(labRoot, sessionId, id)
       if (mapped) {
+        // 时间侧信道（0.11.0）：墓碑判定必须在读取映射后的正文之前——先读后拒
+        // 会让「已遗忘」与「不存在」在响应时间/磁盘访问上可区分。fork-map 本身
+        // 只含 ID 映射，不涉及正文，故可以先读映射再判定。
+        if (isForgotten(forgetIndex, mapped)) {
+          throw new EngineV2Error(`记录 ${id}（fork 解析为 ${mapped}）已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
+            code: 'EFORGOTTEN',
+            details: { id, mapped },
+          })
+        }
         const retried = await store.readRecord(mapped, { verifyHash, maxBytes })
         if (retried?.ok) {
-          if (isForgotten(forgetIndex, mapped)) {
-            throw new EngineV2Error(`记录 ${id}（fork 解析为 ${mapped}）已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
-              code: 'EFORGOTTEN',
-              details: { id, mapped },
-            })
-          }
           assertIntegrityAcceptable(retried, { id: mapped, verifyHash })
           const verified = retried.integrity === 'no-payload' || (verifyHash && retried.integrity === 'ok')
           return { ...retried, verified, requestedId: id, resolvedVia: 'fork-map' }
@@ -104,6 +107,13 @@ function assertIntegrityAcceptable(loaded, { id, verifyHash }) {
  */
 async function resolveViaForkMap(labRoot, sessionId, id) {
   const map = await readForkMap(labRoot, sessionId)
+  // 损坏的 fork-map 不能静默当「没有映射」：那会把「解析不了」伪装成「记录不存在」。
+  if (map?.unreadable) {
+    throw new EngineV2Error(`fork 映射不可读（${map.error}）：无法判定记录 ${id} 的迁移来源`, {
+      code: 'EFORKMAP',
+      details: { id, error: map.error },
+    })
+  }
   const mapped = map?.mapping?.[id]
   return typeof mapped === 'string' ? mapped : null
 }

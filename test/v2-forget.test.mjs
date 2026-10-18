@@ -62,6 +62,30 @@ function createStubContext() {
   return ctx
 }
 
+/**
+ * 等插件释放目录后再开只读句柄。
+ *
+ * 进程内「同一会话目录只允许一个句柄」是 store 的硬契约；插件侧的回读/卡片
+ * 注入可能在 dispose 之后还差最后一步异步 close（full-suite 负载下更明显）。
+ * 这里只对 EOPEN 做有界重试，不掩盖其它错误。
+ */
+async function openWhenFree(options, attempts = 50) {
+  let last = null
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await V2SessionStore.open(options)
+    } catch (error) {
+      if (error?.code !== 'EOPEN') throw error
+      last = error
+      // 插件卸载后可能仍有「已打开、待收尾」的只读句柄（异步注入/回读的尾步）。
+      // 测试收尾显式收口；生产路径由各自句柄 close，不走这里。
+      V2SessionStore.closeAll()
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    }
+  }
+  throw last
+}
+
 function agentFor(session) {
   return {
     session,
@@ -220,7 +244,7 @@ test('遗忘全链路：显式 ID → 表面墓碑 → 读面过滤 → 重启�
     // 冷库原文全程未动（无物理 GC）。先释放插件句柄再开只读句柄，
     // 规避进程内同目录单句柄约束（store 契约，不是遗忘语义的一部分）。
     await ctx2._dispose()
-    const store = await V2SessionStore.open({ labRoot, sessionId: SESSION_ID, readOnly: true })
+    const store = await openWhenFree({ labRoot, sessionId: SESSION_ID, readOnly: true })
     try {
       assert.ok(store.recordCount >= recordIds.length, '冷库记录数不得因遗忘减少')
     } finally {

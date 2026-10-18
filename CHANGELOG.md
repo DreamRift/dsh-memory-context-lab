@@ -2,46 +2,78 @@
 
 本文件记录 `dsh-memory-context-lab` 面向用户的版本变化。格式按「版本 + 日期 + 分类条目」组织，只写行为与契约层面的变化，不复制内部调研。
 
+## 0.11.0 — 2026-10-18
+
+收口 0.11.0 开发线：修掉三个 P0 缺陷（两个「写坏会话日志」的、一个「命令被拒绝但面板照样翻开关」的），
+完成计划里剩下的 T1（卡片默认脱敏 + `shareL2Content`）、T2（压缩成员级排除）、T3（弱候选置信度统一）。
+**不改变 v1 命令面；本版未打包、未推送、未安装。**
+
+### 会话日志完整性（P0）
+
+- **替换节点缺 `data.source`（持久性损坏）**：`session.append(type, data, opts)` 的 `opts` 只认 `surfaceOp`/`sourceEventSeqs`，其余键静默丢弃；插件把 `source` 写进 `opts`，落盘的 `user/message` 就没有 `source`，宿主投影无保护地读 `event.data.source.kind` 抛 `TypeError`，整条历史从此打不开（`SESSION_QUERY_CORRUPT_SESSION`）。已复发两次。现在折叠回执与凭证的 `source` 一律写在 `data` 里，并补 `id`/`role`；`test/v2-surface-source.test.mjs` 静态守卫 + 动态断言防回归（把 `source` 挪回 `opts` 必红）。
+- **`compaction/prune.shadowedSeqs` 与活动面不符**：提交点用 `run.flatMap(unit => unit.shadowedSeqs)` 拼名单，区间里若夹着插件自己的回执（seq 数值比区间末尾大、位置却在区间内），它不会进名单 → prune 落盘即非法 → 下次冷加载报 `SessionFormatError`，紧随的 replace 也被宿主拒（`sourceEventSeqs must include every shadowed surface node; missing <seq>`），该区间**永远归档不掉**。现在提交点按**活动面位置切片**取名单（`resolveCommitSpan`：两端必须在面上、顺序正确、逐项相等，否则失败关闭不写 prune），`shadowedTokenCount` 与名单同源，对账差额归零（不放宽容差）。
+
+### 面板状态与真实状态一致（P0）
+
+- **命令被拒绝时面板不再假装已生效**：宿主把每次斜杠命令都记成 `command/run`，投影只能按命令行折叠，看不出这次调用成没成——「关闭降温」被维护窗口拒绝（返回红字、持久状态一个字节没动）时面板照样翻成已关闭。现在每条状态类命令结束后（**成功或失败都写**）追加一条权威状态记录（`plugin:dsh-memory-context-lab/state`），值取自当时的真实记录/引擎状态；投影折叠到它时直接覆盖开关位，重放（resume/fork）同样生效。宿主拿不到 `appendPluginRecord` 时如实降级并在命令回执里说明，绝不假装写过。
+
+### 隐私与披露（T1 / F-03）
+
+- **L1 证据卡 / L2 阶段卡默认不复制正文**：摘录、跨度摘录、结论行这类自由文本原子的值默认渲染成固定标记 `（正文摘录未共享）`，只保留 entity、属性标签、极性/关系标签、来源 ID 与展开入口；结构化属性（`exit 1`、`465 项全绿`、版本号、错误签名）照常保留。新增插件级开关 `shareL2Content`（默认 `false`，失败关闭），显式开启才在卡里放正文摘录。
+- **开关覆盖全链路**：程序卡渲染、L1/L2 卡、模型相位的输入行（建块时就脱敏，保证模型消息、预算计量、`blocksHash` 与最终卡同源）、崩溃重放的 L1 占位都受同一开关约束；两种模式各自逐字节稳定（前缀缓存不受无谓扰动），卡里带一行恒定模式说明。
+- 命令面：`/memory-lab2 set sharel2content on|off`；设置页「全局默认」增对应复选项；面板在 `engine === 'v2' && compressOn` 时显示开关。
+
+### 压缩成员级排除（T2 / F-15）
+
+- **一条遗忘不再废掉整组**：此前任一成员被遗忘即整组 `member-forgotten` blocked，同组其余成员永远压不掉。现在只把被遗忘成员**排除出参与集**：不读其正文、不进 L1/L2/`sourceRecordIds`/`leafIds`，其余成员照常蒸馏；全部成员被排除时仍整组失败关闭（没有安全子集）。
+- **计划 schema 2**：`recordIds` 语义收紧为「参与蒸馏的子集」，新增 `excludedRecordIds`/`excludedMembers`（`{recordId, seq, reason}`）/`memberDigest`（sha256 前 12 位）；`memberSeqs`/`memberTexts` 仍是表面全集，区间身份与 `voucherId` 因此不变。v1 计划（无 `planSchema`）保持整条作废语义。
+- **披露有边界**：凭证文本与 L2 卡头只在真的排除了成员时追加一行（「M 段成员因遗忘未参与聚合」）；无排除时输出与 0.10.x **逐字节一致**，既有断言不被被动。
+- 设计定稿：0.11.0-压缩成员级排除设计-20261018.md。
+
+### 检索置信度（T3 / F-09）
+
+- **统一 exact 后验**：抽成纯函数 `exactPostfilterHit` + 共用驱动 `applyExactPostfilter`，检索通道与弱候选诊断走同一份判定（此前各写一份，口径会漂移）。
+- **弱指针带可机读置信度**：`weakPointer: true`、`isHit: false`、`confidence: { kind: 'weak', score, coverage, exactVerified }`；不通过 exact 后验的弱候选如实丢弃（「弱」不是免责条款）。回注文案改为「弱指针（不是命中），只给 ID，不计入回读计数」。
+- **真实灵枢端到端**：本机 `@furongjun1999/dsh-memory@0.8.1` 的 `md_cg/writepipe.py` 导入 `node_write_lock`，而 `md_cg/fsutil.py` 没有该符号，导致开发树灵枢写入全坏；已在 lingshu 检出补回（commit `601c8ebf`，跨进程排它锁复用既有 `FileLock`）。`npm run probe:lingshu` exit 0，`test/v2-lingshu-integration.test.mjs` **3/3 真实通过**（不再 skip）。
+
+### 测试与文档
+
+- 测试套件 **62 套全绿**（新增 `v2-surface-source`、`v2-share-l2-content`、`v2-weak-pointer`）；`entry-coverage` 保证入口 == 磁盘。
+- 文档：`docs/降温模式.md`（脱敏边界与权威状态记录）、`docs/验证与评估.md`（套数/断言数/灵枢版本）、`docs/演进路线.md`、`docs/README.md`、`plugin/README.md`、`AGENTS.md`。
 ## 0.10.1 — 2026-10-17
 
-回读闭环与卡片治理版：别名回读、检索契约修复、工作卡有界治理、助手结论盘点；并完成外部取证复核发现的 16 项缺陷修复。
+本版在 0.10.1 开发线内完成外部取证复核后的 16 项缺陷修复。**版本号保持 0.10.1**，不另开补丁号；0.10.1 功能面（回读闭环、检索契约、卡治理、助手结论盘点）见 `docs/降温模式.md` 同日修订与 `docs/演进路线.md`。
 
-### 新增
+### 修复 — 安全红线
 
-- **别名回读**（v2）：`read`/`memory_lab_recall` 接受三种 ID 形态——精确记录 ID 直通；冷节点基名展开为整单元（分块按序拼接）；callId 解析配对记录与依赖 span。别名展开有上限，未解析 ID 返回显式 error 行（不再伪装空成功）。回执格式升 format 4：新增「记录 ID」行；旧格式回执 restore-only 兼容（显式 dispatch，升版不吞旧行）。
-- **弱候选导航**：查询零命中但与冷记录有词元重合时，回注给 ≤3 条 pointerOnly 弱指针（只给 ID 与重合说明，不注入正文，不计入有效回读次数）；T1 检索面同步披露 queryDetailed 诊断（admitted/weak/oovTerms）。
-- **工作卡有界治理**（v2）：注入生命周期改 prepare→确认→commit 三态，成本账本新增 prepared/committed/sent 三计数器（未确认注入如实留残差）；活动面上连续的插件工作卡组（≥2 张）自动折叠为一条恒定回执（附成员范围与数量；绝不触碰用户/助手/工具消息）；锚点被宿主压缩移除时下一张状态卡自动回落全量（不虚构增量连续性）。
-- **助手结论盘点**（v2 工作状态卡）：新增「助手结论」段，确定性提取最近的助手结论行（保留原句与来源），恒标注 unverified——这是「此前助手判断」，不是事实；否定/撤回结论优先保留（可见性不靠关键词升级）；有界配额（8 条，超出只报数量）。
+- **普通历史段归档可恢复（BUG-001）**：v2 的非工具操作跨度归档行改用专用回执格式 5 并记录 `spanLabel`；恢复侧按行内 `receiptFormat` 显式 dispatch，用 `buildSpanReceipt` 逐字节重建。0.10.1 旧 format 4 span 行没有可重建标签时如实 skip 并指路 `/memory-lab2 read <nodeId>`，绝不猜测覆写。
+- **人类消息硬保护覆盖两种记录形态（BUG-002）**：`forget` 宽条件同时拦截 verbatim `turn.user` 记录与 `projection.span`（spanKind=turn.user）；显式点名仍允许但带警告。修复前 `kind=turn.user` 宽条件可软遗忘全部人类消息。
+- **停用路径不再崩溃（BUG-003）**：measure 抛错时 `off` 与 `set fullhistory off` 不再因未定义 `ctx` 抛 ReferenceError；恢复照常尝试、停用状态照常落盘，测量失败留告警。
 
-### 修复
+### 修复 — 功能
 
-- 检索契约（v2）：引号短语按连续顺序验证（换序/散落不再命中）；字面检索多精确词按 AND；语料外词元（OOV）不再稀释相关度分母；回注命中保持最相关在前；弱候选不计入 readCount/retrievalHits。
-- 0.10.0 遗留：层级压缩模型相位 over-budget 短路失效、P4 接线字段失配（模型摘要模式从未生效）、modelNote 作用域错误——三处修复后模型相位测试 3 项转绿。
+- **层级压缩自动收尾真实生效（BUG-004）**：补上 `maybeStageCompress` 导入；钩子可注入用于观测，失败日志保留错误类型。
+- **未启用会话的 forget 命令（BUG-005）**：`forget preview/apply` 返回 `ENOTENABLED` 结构化错误；`forget undo` 仍可完成账本级撤销，没有活动面时如实说明而不是 TypeError。
+- **expand 分页原文对齐（BUG-006）**：第 2 页起按全量成员数组偏移取原文，遗忘占位不再错位到其他成员。
+- **L1 证据卡有内容（BUG-007）**：按成员自己的事实原子（entity/attribute/value）渲染，不再用不带来源的渲染块反查导致空卡。
+- **compressModelDefault 读对层级（BUG-008）**：经 `defaults` 解包读取；设置页开关能真正播种新 v2 账本。
+- **投影折叠解包 getter context（BUG-009）**：每次折叠调用 `getPresets()/getDefaults()` 取新值，resume/fork 重放与命令执行一致。
+- **批摘要残余成员恢复（BUG-010）**：批组成员被逐条剔除后不再用 `buildReceipt(formatVersion=3)` 抛错中止整次 restore；完整重建对不上时，只在表面仍是该组摘要且逐条列出剩余成员冷记录与 hash、或表面已被 forget 换成该组墓碑（按「来源：seq <旧替换 seq>」认领）时，部分恢复可见成员原文；已遗忘成员绝不复活，其余情况仍 fail-closed。
 
-### 修复（复核批次：BUG-001…016）
+### 修复 — 如实性
 
-- **普通历史段归档可恢复（BUG-001）**：非工具跨度归档行改用专用回执格式 5 并记录 `spanLabel`；恢复侧按行内版本用 `buildSpanReceipt` 逐字节重建。旧 format 4 span 行没有可重建标签时如实 skip 并指路 `/memory-lab2 read <nodeId>`，不猜测覆写。
-- **人类消息硬保护（BUG-002）**：`forget` 宽条件同时拦截 verbatim `turn.user` 记录与 `projection.span(turn.user)`；显式点名仍允许但带警告。修复前 `kind=turn.user` 可软遗忘全部人类消息。
-- **停用路径（BUG-003）**：measure 抛错时 `off` 与 `set fullhistory off` 不再因未定义 `ctx` 抛 ReferenceError；恢复照常尝试、停用状态照常落盘并留告警。
-- **自动层级压缩收尾（BUG-004）**：补上 `maybeStageCompress` 导入，钩子可注入观测，失败日志保留错误类型。
-- **未启用会话 forget（BUG-005）**：`preview/apply` 返回 `ENOTENABLED` 结构化错误；`undo` 可完成账本级撤销，无活动面时如实说明。
-- **expand 分页（BUG-006）**：第 2 页起按全量成员数组偏移取原文，遗忘占位不再错位。
-- **L1 证据卡（BUG-007）**：按成员事实原子渲染，不再用不带来源的渲染块反查导致空卡。
-- **compressModelDefault（BUG-008）**：经 `defaults` 解包读取，设置页开关能真正播种新账本。
-- **投影折叠 context（BUG-009）**：每次折叠解包 `getPresets()/getDefaults()`，resume/fork 与命令执行一致。
-- **批摘要残余成员（BUG-010）**：不再用 `buildReceipt(formatVersion=3)` 抛错中止 restore；表面仍是该组摘要或已被 forget 换成该组墓碑时，只恢复可见成员原文，已遗忘成员绝不复活，其余 fail-closed。
-- **测试摘要（BUG-011）**：同行 passed+failed 聚合；`failed>0` 必报失败，未说明项不再判全绿。
-- **未验载荷（BUG-012）**：`readRecord` 增加 `verified` 维度；工作集扫描路径标 `ok(unverified)` 且 `verified:false`。
-- **损坏账本（BUG-013）**：hierarchy/disposition 首行损坏优先 `damaged`，空文件/ENOENT 仍 `absent`。
-- **旁证损坏（BUG-014）**：重建时写 `frozenBefore` 冻结重采，归档后改动的文件不得洗成 `valid`。
-- **recall 别名（BUG-015）**：预算判定不双扣；别名中断时游标指向未处理前缀，续读不漏不重。
-- **T2 幂等重写（BUG-016）**：`committed:false` 回读核对 `content`，内容一致走重试成功，不再误报冲突。
+- **测试摘要同行 passed+failed（BUG-011）**：先收集整行全部通过/失败数字再聚合；`failed>0` 必报失败，未说明项不再判「全绿」。
+- **未验载荷不冒充已验证（BUG-012）**：`readRecord` 增加 `verified` 维度；工作集头部扫描路径把 `verifyHash:false` 的载荷标为 `ok(unverified)` 且 `verified:false`，`integrity:'ok'` 不再被读成「完整校验通过」。
+- **损坏账本状态（BUG-013）**：`hierarchy.jsonl` 与 `disposition.jsonl` 首行损坏优先报 `damaged`，不再先命中 `absent`；空文件/ENOENT 仍为 `absent`。
+- **旁证损坏冻结重采（BUG-014）**：验证旁证损坏重建时写入 `frozenBefore`；早于该时点的记录拒绝补采指纹，已改动文件只能判 `unverified`，不会被当前哈希洗成 `valid`。`mark-stale` 仍可继续写人工标记。
+- **recall 别名预算与游标（BUG-015）**：别名展开的预算判定不再双扣已用 token；中断时回滚本别名已装下的部分并把游标指向「未处理」前缀，续读不漏读也不重复。装得下的别名正文不再被误报「预算不足」。
+- **T2 幂等重写核对字段（BUG-016）**：`committed:false` 回读核对 `content`（真实 `normalizeNodeRead` 契约），内容一致的重写走重试成功分支，不再误报冲突。
 
 ### 测试
 
-- 全量 **57 套 / 664 项断言 0 失败**（Node v24.19.0，2026-10-17）；新增 3 套 fix-brief 回归 18 项，回退对应修复即变红。
-- `npm run probe:revert`：20 个回退场景全部“还原后测试失败”；修复探针在 Windows CRLF 下多行还原点失配与缺 `--test-force-exit` 的挂起问题。
-- 8 个变异验证（必红→复原）全部通过；独立复审（蜂巢验证单元，与作者不同会话）两批均 accept。
+- 新增 `test/v2-fix-p0.test.mjs`、`test/v2-fix-p1.test.mjs`、`test/v2-fix-p2.test.mjs`，逐条覆盖上述 16 项修复；回退对应修复时测试变红。
+- 既有 `v2-lingshu-backend.test.mjs` 的冲突/幂等用例改用真实回读形状 `{ ok, content }`（不是 `text`）；`v2-agg-voucher.test.mjs` 的分页用例改为传入全量 `receiptTexts`（与真实 `expandVoucher` 调用一致）。
+- 全量 `npm test`：57 套 664 项 0 失败（2026-10-17，Node v24.19.0）。`npm run probe:revert`：20 个回退场景全部「还原后测试失败」；同步修复探针在 Windows CRLF 下多行还原点失配的问题，并统一加 `--test-force-exit`。
 
 ## 0.9.1 — 2026-10-15
 

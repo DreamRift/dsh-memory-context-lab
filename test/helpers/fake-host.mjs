@@ -124,7 +124,18 @@ export class FakeSession {
       }
     }
 
-    const event = { type, seq, time: seq, data, ...opts }
+    // 宿主 `Session.append(type, data, opts)` 只从 opts 取 `surfaceOp` /
+    // `sourceEventSeqs`，其余键一律静默丢弃。夹具必须同语义：此前 `...opts`
+    // 把 source 摊到事件顶层，于是「source 写错位置」在测试里看不出来，
+    // 真实宿主却把它丢掉、让投影读 `data.source.kind` 崩掉整条历史（0.11.2）。
+    const event = {
+      type,
+      seq,
+      time: seq,
+      data,
+      ...(opts.surfaceOp === undefined ? {} : { surfaceOp: opts.surfaceOp }),
+      ...(opts.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: opts.sourceEventSeqs }),
+    }
     this.events.push(event)
     if (isSurface) {
       if (op === 'append') {

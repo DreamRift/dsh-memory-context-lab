@@ -75,6 +75,11 @@ async function environment() {
   } catch (error) {
     return { ok: false, reason: `未定位到 @furongjun1999/dsh-memory：${error?.message ?? error}` }
   }
+  // 包在 ≠ Python 包可导入。安装体处于半更新/缺依赖状态时，mdcg_remember 会在
+  // 服务端抛 ImportError（本机 0.10.1 实测：md_cg.fsutil 缺 node_write_lock）。
+  // 那是环境故障，不是插件缺陷；必须在环境探测里分清，别让集成用例报成断言红。
+  const health = await importHealth(located.packageRoot)
+  if (!health.ok) return { ok: false, reason: `环境：${health.reason}` }
   return { ok: true, packageRoot: located.packageRoot }
 }
 
@@ -159,6 +164,32 @@ async function withTimeout(step, promise, ms) {
   }
 }
 
+/** 真实 md_cg 能否被 Python 导入（只读探测，不起 MCP 服务）。 */
+async function importHealth(packageRoot) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn('python', ['-c', 'import md_cg.mcp_server'], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...process.env, PYTHONPATH: packageRoot },
+      })
+    } catch (error) {
+      resolve({ ok: false, reason: sandboxReasonOf(error) })
+      return
+    }
+    let stderr = ''
+    let settled = false
+    const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
+    child.stderr?.on('data', (chunk) => {
+      if (stderr.length < 2000) stderr += String(chunk)
+    })
+    child.on('error', (error) => finish({ ok: false, reason: sandboxReasonOf(error) }))
+    child.on('close', (code) => finish(code === 0
+      ? { ok: true }
+      : { ok: false, reason: `md_cg 导入失败（exit ${code}）：${stderr.trim().split(/\r?\n/).slice(-2).join(' / ')}` }))
+  })
+}
+
 async function seedStore(labRoot, texts) {
   const store = await V2SessionStore.init({ labRoot, sessionId: SESSION_ID })
   const handle = await store.openTransaction()
@@ -204,6 +235,29 @@ test('真实隔离灵枢：索引 → 检索命中记录 ID → 按 ID 回源读
     }), 60_000)
     assert.equal(started.ok, true, `隔离灵枢必须能启动：${started.reason ?? ''}`)
     assert.equal(started.backend.name, LINGSHU_BACKEND_NAME)
+
+    // 环境探针：先做一次真实写入。已安装的 md_cg 可能「import 得动、写不进去」
+    // （本机 0.10.1 实测：mdcg_remember 在服务端抛 ImportError，而
+    // `import md_cg.mcp_server` 本身成功）。只把明确的导入失败归类为环境，
+    // 其他失败仍然红——不能拿「环境」掩盖插件的参数/契约回归。
+    const probeId = 'probe-lingshu-health-0001'
+    const probe = await withTimeout('写入探针', started.backend.index([{
+      id: probeId,
+      kind: 'projection.span',
+      fidelity: 'verbatim',
+      seq: 0,
+      refs: { spanKind: 'history-span' },
+      inline: { nodeId: 'probe-lingshu-health' },
+      text: 'isolation health probe',
+    }]), 30_000)
+    if (Object.keys(probe.externalIds ?? {}).length === 0) {
+      const reason = probe.conflicts?.[0]?.reason ?? probe.skipped?.[0]?.reason ?? 'unknown'
+      if (/ImportError|ModuleNotFoundError|No module named|node_write_lock/i.test(String(reason))) {
+        t.skip(`环境：隔离灵枢写入不可用（${reason}）`)
+        return
+      }
+      assert.fail(`索引探针失败：${reason}`)
+    }
 
     // 1. 索引：把冷库记录（派生摘录 + 记录 ID）交给灵枢。
     //    `indexedNow` 是**条数**，`skippedNow` 才是明细数组。

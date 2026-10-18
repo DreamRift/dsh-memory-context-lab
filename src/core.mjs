@@ -261,6 +261,8 @@ export const BOOLEAN_SETTINGS = Object.freeze({
   // v2 层级压缩（P3）与其模型模式（P4）：折叠进投影状态供面板显示开关位置。
   compress: { key: 'hierarchyCompress', label: '层级压缩（v2）' },
   compressmodel: { key: 'compressModel', label: '层级压缩模型模式（v2）' },
+  // T1/F-03：层级卡是否共享成员正文摘录。默认关（卡里只给属性与来源）。
+  sharel2content: { key: 'shareL2Content', label: '层级卡共享正文摘录（v2）' },
 })
 
 /** Split a slash-command's unparsed input into an operation and its literal remainder. */
@@ -549,6 +551,8 @@ export function initialProjectionState() {
     // v2 层级压缩与模型模式：同上，折叠位初始恒 false（层级压缩默认关是拍板决策）。
     hierarchyCompress: false,
     compressModel: false,
+    // T1/F-03：默认不共享正文摘录（失败关闭：没开就不复制正文）。
+    shareL2Content: false,
     presetId: '',
     presetLabel: GLOBAL_PRESET_LABEL,
     presetBaseline: null,
@@ -583,6 +587,10 @@ export const PLUGIN_SOURCE_FORMS = Object.freeze({
   WORKING_SET: 'working-set',
   // 自动回注包同样是插件自己注入的 user/message，不能占人类请求的位置。
   RECALL: 'recall',
+  // 活动面上的程序替换节点：聚合凭证、卡组折叠回执、遗忘墓碑。它们都以
+  // `kind: 'user'` + 本形态出现在活动面上，但正文是插件生成的，不是人类输入；
+  // 不登记就会被「最新人类请求」判定当成任务陈述（0.11.2 缺陷修复）。
+  SURFACE_RECEIPT: 'memory-lab2-surface',
 })
 
 const PLUGIN_SOURCE_FORM_SET = new Set(Object.values(PLUGIN_SOURCE_FORMS))

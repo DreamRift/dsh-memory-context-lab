@@ -3,7 +3,7 @@
  * 全部使用临时隔离目录，不触碰真实 $DSH_HOME，不依赖任何外部进程。
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -13,6 +13,9 @@ import {
   tokenizeForLexicalIndex,
   LOCAL_LEXICAL_BACKEND_NAME,
   LOCAL_LEXICAL_INDEX_FILE,
+  LOCAL_LEXICAL_LOG_FILE,
+  LOCAL_LEXICAL_LOG_KIND,
+  LOCAL_LEXICAL_COMPACT_LINES,
 } from '../src/v2/local-lexical-backend.mjs'
 
 const tmpRoots = []
@@ -103,13 +106,77 @@ test('持久化：新实例从同一目录读到已索引状态', async () => {
   assert.deepEqual(await second.query('厨房', { limit: 5 }), ['r1'])
 })
 
-test('崩溃/文件缺失：从空索引重建，如实返回空而不是假装命中', async () => {
+test('崩溃/文件缺失：base 与日志都缺失时从空索引重建', async () => {
   const dir = await newDir()
   const first = createLocalLexicalBackend({ directory: dir })
   await first.index([record('r1', '厨房做饭', 1)])
-  await rm(path.join(dir, LOCAL_LEXICAL_INDEX_FILE))
+  await rm(path.join(dir, LOCAL_LEXICAL_INDEX_FILE), { force: true })
+  await rm(path.join(dir, LOCAL_LEXICAL_LOG_FILE), { force: true })
   const second = createLocalLexicalBackend({ directory: dir })
   assert.deepEqual(await second.query('厨房', { limit: 5 }), [])
+})
+
+test('压实前崩溃：base 缺失但日志仍在，新实例重放日志后仍能命中', async () => {
+  const dir = await newDir()
+  const first = createLocalLexicalBackend({ directory: dir })
+  await first.index([record('r1', '厨房做饭', 1)])
+  // 只删 base：新 base 还没落盘（或写到一半），日志必须能独立重建已索引状态。
+  await rm(path.join(dir, LOCAL_LEXICAL_INDEX_FILE), { force: true })
+  const second = createLocalLexicalBackend({ directory: dir })
+  assert.deepEqual(await second.query('厨房', { limit: 5 }), ['r1'])
+})
+
+test('压实时 base 自足：日志清空后新实例仍能命中', async () => {
+  const dir = await newDir()
+  const first = createLocalLexicalBackend({ directory: dir })
+  await first.index([record('r1', '厨房做饭', 1)])
+  await first.dispose()
+  await rm(path.join(dir, LOCAL_LEXICAL_LOG_FILE), { force: true })
+  const second = createLocalLexicalBackend({ directory: dir })
+  assert.deepEqual(await second.query('厨房', { limit: 5 }), ['r1'])
+})
+
+test('代次不匹配的旧日志不重放：压实后不会把同一条增量算两次', async () => {
+  const dir = await newDir()
+  const first = createLocalLexicalBackend({ directory: dir })
+  await first.index([record('r1', '厨房做饭', 1)])
+  await first.dispose()
+  // base 已推进到 gen=1；再伪造一条 base=0 的旧日志，必须被忽略。
+  await writeFile(
+    path.join(dir, LOCAL_LEXICAL_LOG_FILE),
+    JSON.stringify({ kind: LOCAL_LEXICAL_LOG_KIND, base: 0, t: 'doc', id: 'r2', meta: {}, terms: [['书房', 1]] }) + '\n',
+    'utf8',
+  )
+  const second = createLocalLexicalBackend({ directory: dir })
+  assert.deepEqual(await second.query('书房', { limit: 5 }), [])
+  assert.deepEqual(await second.query('厨房', { limit: 5 }), ['r1'])
+})
+
+test('增量索引不重写 base：只追加日志（PR #7 回归）', async () => {
+  const dir = await newDir()
+  const backend = createLocalLexicalBackend({ directory: dir })
+  for (let i = 0; i < 40; i += 1) {
+    await backend.index([record('r' + i, '厨房记录' + i, i + 1)])
+  }
+  // base 只有压实时才写；40 条增量远未到阈值，目录里只应有日志。
+  await assert.rejects(stat(path.join(dir, LOCAL_LEXICAL_INDEX_FILE)), (error) => error.code === 'ENOENT')
+  const log = await stat(path.join(dir, LOCAL_LEXICAL_LOG_FILE))
+  assert.ok(log.size > 0, '日志应包含增量条目')
+})
+
+test('日志超过压实阈值：写 base 并清空日志，检索仍正确', async () => {
+  const dir = await newDir()
+  const backend = createLocalLexicalBackend({ directory: dir })
+  const total = LOCAL_LEXICAL_COMPACT_LINES
+  for (let i = 0; i < total; i += 1) {
+    await backend.index([record('r' + i, '厨房记录' + i, i + 1)])
+  }
+  const baseInfo = await stat(path.join(dir, LOCAL_LEXICAL_INDEX_FILE))
+  assert.ok(baseInfo.size > 0, '越过阈值后必须落一次 base')
+  const log = await stat(path.join(dir, LOCAL_LEXICAL_LOG_FILE))
+  assert.equal(log.size, 0, '压实后日志必须清空')
+  const second = createLocalLexicalBackend({ directory: dir })
+  assert.deepEqual(await second.query('厨房记录' + (total - 1), { limit: 5 }), ['r' + (total - 1)])
 })
 
 test('词条上限：超限后如实报 skipped，绝不算已索引', async () => {
@@ -132,6 +199,21 @@ test('空正文/缺正文如实报 skipped，不进命中面', async () => {
   assert.equal(result.skipped.length, 1)
   assert.match(result.skipped[0].reason, /^text-/)   
   assert.deepEqual(await backend.query('厨房', { limit: 5 }), [])
+})
+
+test('queryDetailed 的 exclude：被排除记录不进弱候选（PR #8 P2-1 回归）', async () => {
+  const dir = await newDir()
+  const backend = createLocalLexicalBackend({ directory: dir })
+  await backend.index([
+    record('r1', '厨房做饭', 1),
+    record('r2', '书房收纳', 2),
+    record('r3', '客厅布置', 3),
+  ])
+  // 三个词元都已知且各只被一条文档覆盖：单条文档的覆盖率约 1/3，落在弱候选区。
+  const detail = await backend.queryDetailed('厨房 书房 客厅', { weakLimit: 5 })
+  assert.ok(detail.weak.some((item) => item.id === 'r1'), '未排除时应能给出弱候选')
+  const excluded = await backend.queryDetailed('厨房 书房 客厅', { weakLimit: 5, exclude: ['r1'] })
+  assert.ok(!excluded.weak.some((item) => item.id === 'r1'), 'exclude 的记录不得出现在弱候选')
 })
 
 test('新近度破平：同分时 seq 大者优先', async () => {

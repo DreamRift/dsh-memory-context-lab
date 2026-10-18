@@ -18,6 +18,45 @@ import { ATOM_ATTRIBUTES, ATTRIBUTE_FAMILY } from './evidence-atoms.mjs'
 
 const EXCERPT_MAX_CHARS_DEFAULT = 240
 
+/**
+ * T1/F-03：默认不把成员正文复制进卡片。
+ *
+ * 自由文本类原子（摘录 / 跨度摘录 / 结论行）的 value 就是正文切片；默认渲染
+ * 成固定标记，只保留 entity、属性标签、极性/关系标签与来源 ID——模型仍能
+ * 判断「哪一步、什么性质、去哪展开」，但卡片本身不再是正文的副本。
+ *
+ * 恒定文本：模式说明行随开关变字节，同模式下的卡片逐字节稳定（可做前缀缓存）。
+ */
+const WITHHELD_EXCERPT_MARK = '（正文摘录未共享）'
+const SHARE_MODE_NOTE = '摘录已按 shareL2Content 共享正文片段'
+const WITHHOLD_MODE_NOTE = '摘录未共享正文（只给属性与来源；需要原文请用 expand/read 显式展开）'
+
+/** 脱敏标记（导出供测试与文档引用，避免两处字面量漂移）。 */
+export const WITHHELD_EXCERPT_MARK_FOR_TEST = WITHHELD_EXCERPT_MARK
+
+/** 自由文本属性：默认脱敏的那几类。 */
+const FREETEXT_ATTRIBUTES = new Set([
+  ATOM_ATTRIBUTES.EXCERPT,
+  ATOM_ATTRIBUTES.SPAN_EXCERPT,
+  ATOM_ATTRIBUTES.CLAIM,
+])
+
+/** 该原子的 value 是否属于「正文摘录」这一类（默认真身不外泄）。 */
+export function isFreetextAtom(atom) {
+  return FREETEXT_ATTRIBUTES.has(String(atom?.attribute ?? ATOM_ATTRIBUTES.EXCERPT))
+}
+
+/** 按开关给出该原子上屏的 value：关闭时换成固定标记，不保留任何正文片段。 */
+export function disclosedValue(atom, shareContent) {
+  if (shareContent === true) return String(atom?.value ?? '')
+  return isFreetextAtom(atom) ? WITHHELD_EXCERPT_MARK : String(atom?.value ?? '')
+}
+
+/** 模式说明行（恒定文本；两种模式各自字节稳定）。 */
+export function shareModeNote(shareContent) {
+  return shareContent === true ? SHARE_MODE_NOTE : WITHHOLD_MODE_NOTE
+}
+
 function hash16(text) {
   return createHash('sha256').update(String(text), 'utf8').digest('hex').slice(0, 16)
 }
@@ -127,24 +166,24 @@ function relationTag(fact) {
   return ''
 }
 
-function renderFactLine(fact) {
+function renderFactLine(fact, shareContent) {
   const label = attributeLabel(fact.attribute)
   const tag = relationTag(fact)
   const refs = fact.sourceRefs.slice(0, 3).map(refLabel).join('、')
   const refSuffix = fact.sourceRefs.length > 3 ? '等 ' + fact.sourceRefs.length + ' 处' : ''
   return (
-    '· ' + fact.entity + ' ' + label + ' ' + fact.value + tag +
+    '· ' + fact.entity + ' ' + label + ' ' + disclosedValue(fact, shareContent) + tag +
     (refs ? '｜来源 ' + refs + refSuffix : '')
   )
 }
 
-function renderTemplateLine(groupFacts) {
+function renderTemplateLine(groupFacts, shareContent) {
   // 模板共享（P3-4）：重复操作骨架只展示一次——骨架 + 变化值列表 + 次数 +
   // 首末时间 + 来源索引；成员按 seq 排序保序（失败→复验通过两行都在，顺序不换）。
   const sorted = [...groupFacts].sort((a, b) => firstSeqOfFact(a) - firstSeqOfFact(b) || a.key.localeCompare(b.key))
   const base = sorted[0]
   const label = attributeLabel(base.attribute)
-  const values = sorted.map((fact) => fact.value + relationTag(fact)).join('、')
+  const values = sorted.map((fact) => disclosedValue(fact, shareContent) + relationTag(fact)).join('、')
   const firstTime = firstNonNull(sorted.map(refTimeOfFact))
   const lastTime = lastNonNull(sorted.map(refTimeOfFact))
   const allRefs = []
@@ -203,7 +242,7 @@ function lastNonNull(values) {
  * 把事实集组织成渲染块。同组（模板共享组）合一块；单事实一块。
  * 每块带 token 计量、覆盖的原子键集、required 标志（组内任一成员必选即整块必选）。
  */
-export function buildBlocks(facts, groups) {
+export function buildBlocks(facts, groups, { shareContent = false } = {}) {
   const groupByKey = new Map()
   for (const group of groups?.groups ?? []) {
     for (const key of group.keys) groupByKey.set(key, group)
@@ -215,7 +254,7 @@ export function buildBlocks(facts, groups) {
     const members = group.keys.map((key) => byKey.get(key)).filter(Boolean)
     if (members.length < GROUP_MIN_MEMBERS_FOR_TEMPLATE) continue
     for (const key of group.keys) consumed.add(key)
-    const line = renderTemplateLine(members)
+    const line = renderTemplateLine(members, shareContent)
     const required = members.some(factRequired)
     blocks.push({
       blockId: 'blk-' + hash16('template|' + group.keys.join(',')),
@@ -227,7 +266,7 @@ export function buildBlocks(facts, groups) {
   }
   for (const fact of facts) {
     if (consumed.has(fact.key)) continue
-    const line = renderFactLine(fact)
+    const line = renderFactLine(fact, shareContent)
     blocks.push({
       blockId: 'blk-' + hash16('fact|' + fact.key),
       line,
@@ -424,13 +463,15 @@ export function renderTaskIndex({ summaryId, phases }) {
 }
 
 /** L1 证据卡（按需，单记录）：成员原子逐行，供 expand 的单条深挖。 */
-export function renderEvidenceCard({ recordId, spanLabel, atoms }) {
+export function renderEvidenceCard({ recordId, spanLabel, atoms, shareContent = false }) {
   const lines = [
     '【证据卡 ' + String(recordId ?? '') + '】' + String(spanLabel ?? 'span'),
   ]
   for (const atom of atoms ?? []) {
-    lines.push('· ' + atom.entity + ' ' + attributeLabel(atom.attribute) + ' ' + atom.value)
+    lines.push('· ' + atom.entity + ' ' + attributeLabel(atom.attribute) + ' ' + disclosedValue(atom, shareContent))
   }
+  // 模式说明行恒定：切换开关才变字节，同模式下逐字节稳定。
+  lines.push('（' + shareModeNote(shareContent) + '）')
   return clipText(lines.join('\n'), PHASE_CARD_MAX_TOKENS, '\n（卡超界截断）')
 }
 

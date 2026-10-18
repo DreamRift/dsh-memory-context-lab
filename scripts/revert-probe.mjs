@@ -12,7 +12,7 @@
 //
 // 只读本包、只写系统临时目录；不改本仓任何文件。
 import { cp, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -25,6 +25,85 @@ const PACKAGE_ROOT = path.resolve(import.meta.dirname, '..')
  * 所以源码被大改时这里会明确失败，而不是静默跳过。
  */
 const CASES = {
+  // 0.11.0：遗忘完整性 P0（去掉候选阶段的可见性检查，回归测试必须变红）
+  'member-forgotten': {
+    test: 'test/v2-forget-hierarchy.test.mjs',
+    file: 'src/v2/hierarchy-coordinator.mjs',
+    edits: [[
+      `    if (typeof deps.isRecordVisible === 'function' && !deps.isRecordVisible(recordId)) {
+      excludedMembers.push({ recordId, seq: seqOfRecordId(receiptTextBySeq, recordId), reason: 'forgotten' })
+      continue
+    }
+`,
+      '',
+    ]],
+  },
+  // T2/F-15：成员级排除（去掉子集收窄，被排除者会重新进参与集，回归测试必须变红）
+  'member-exclusion': {
+    test: 'test/v2-forget-hierarchy.test.mjs',
+    file: 'src/v2/hierarchy-coordinator.mjs',
+    edits: [['const effectivePlan = withMemberExclusions(plan, { excludedMembers: view.excludedMembers })', 'const effectivePlan = plan']],
+  },
+  // P0-1：替换节点缺 data.source（把 source 挪回 opts，宿主会静默丢弃，回归测试必须变红）
+  'surface-source-in-data': {
+    test: 'test/v2-surface-source.test.mjs',
+    file: 'src/v2/runtime.mjs',
+    edits: [[
+      `          source: { kind: 'user', form: 'memory-lab2-surface' },
+        }, {
+          surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
+          sourceEventSeqs: [...plan.memberSeqs],`,
+      `        }, {
+          surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
+          sourceEventSeqs: [...plan.memberSeqs],
+          source: { kind: 'user', form: 'memory-lab2-surface' },`,
+    ]],
+  },
+  // P0-2：prune 名单必须是活动面位置切片（改回 flatMap 拼名单，回归测试必须变红）
+  'prune-position-slice': {
+    test: 'test/v2-surface-source.test.mjs',
+    file: 'src/apply.mjs',
+    edits: [['const shadowedSeqs = span.seqs', 'const shadowedSeqs = run.flatMap(({ unit }) => unit.shadowedSeqs)']],
+  },
+  // P0-3：命令被拒绝时投影不得翻转（删掉权威状态记录的折叠，回归测试必须变红）
+  'authoritative-state-fold': {
+    test: 'test/v2-surface-source.test.mjs',
+    file: 'src/projection.mjs',
+    edits: [[
+      `  if (event.type === STATE_RECORD_TYPE) {
+    const record = stateRecordOf(event, { requireFromPlugin: resolvedFoldContext(context)?.requireFromPlugin })
+    if (!record) return state`,
+      `  if (event.type === STATE_RECORD_TYPE) {
+    const record = null
+    if (!record) return state`,
+    ]],
+  },
+  // T1/F-03：卡片默认脱敏（让 disclosedValue 永远返回原值，回归测试必须变红）
+  'share-l2-redaction': {
+    test: 'test/v2-share-l2-content.test.mjs',
+    file: 'src/v2/compressor-program.mjs',
+    edits: [[
+      `export function disclosedValue(atom, shareContent) {
+  if (shareContent === true) return String(atom?.value ?? '')
+  return isFreetextAtom(atom) ? WITHHELD_EXCERPT_MARK : String(atom?.value ?? '')
+}`,
+      `export function disclosedValue(atom, shareContent) {
+  return String(atom?.value ?? '')
+}`,
+    ]],
+  },
+  // T3/F-09：exact 后验是 AND 不是 OR（改成 some 后纯函数断言必须变红）
+  'exact-postfilter-and': {
+    test: 'test/v2-weak-pointer.test.mjs',
+    file: 'src/v2/retrieval.mjs',
+    edits: [['return tokens.every((token) => hay.includes(token.toLowerCase()))', 'return tokens.some((token) => hay.includes(token.toLowerCase()))']],
+  },
+  // 0.11.0：写锁释放必须校验 token（去掉校验后「不得误删别人的锁」必须变红）
+  'write-lock-token': {
+    test: 'test/v2-write-lock.test.mjs',
+    file: 'src/v2/write-lock.mjs',
+    edits: [['if (owner?.token !== entry.token) return false', 'if (false) return false']],
+  },
   'abandon-committed': {
     test: 'test/v2-regression.test.mjs',
     file: 'src/v2/store.mjs',
@@ -70,8 +149,9 @@ const CASES = {
     file: 'src/v2/store.mjs',
     edits: [[
       `      openDirectories.delete(directory)
+      writeLock?.release()
       throw error`,
-      '      throw error',
+      '      writeLock?.release()\n      throw error',
     ]],
   },
   'fork-borrow': {
@@ -225,14 +305,27 @@ const CASES = {
  * `EPERM`。改成把子进程的 stdout/stderr 接到一个临时日志文件的 fd 上——这不是管道，
  * 沙箱允许，而且照样能把输出读回来给报告用。
  */
-async function runNode(args, cwd) {
+async function runNode(args, cwd, { timeoutMs = 60_000 } = {}) {
   const logPath = path.join(cwd, `.revert-probe-${Date.now()}.log`)
   const handle = await open(logPath, 'w')
   try {
     const code = await new Promise((resolve) => {
       const child = spawn(process.execPath, args, { cwd, stdio: ['ignore', handle.fd, handle.fd] })
-      child.on('close', (value) => resolve(value))
-      child.on('error', () => resolve(null))
+      // 超时按「测试失败」计：反向验证只要求还原后**不能全绿**；性能型用例
+      // 在还原后会退化成 O(n) 长跑，没有上限会把整条探针拖成小时级。
+      const timer = setTimeout(() => {
+        // 杀掉整棵进程树：node --test 默认把测试文件放进子进程，父进程被杀后
+        // 子进程仍持有日志 fd，'close' 永远等不到。Windows 用 taskkill /T。
+        try {
+          if (process.platform === 'win32' && child.pid) {
+            spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+          } else {
+            child.kill('SIGKILL')
+          }
+        } catch { /* 已退出 */ }
+      }, timeoutMs)
+      child.on('close', (value) => { clearTimeout(timer); resolve(value) })
+      child.on('error', () => { clearTimeout(timer); resolve(null) })
     })
     const output = await readFile(logPath, 'utf8').catch(() => '')
     return { code, output }

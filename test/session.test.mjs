@@ -342,6 +342,8 @@ test('the projection rebuilds settings from the session log, not from plugin mem
     // 避免 schema 随引擎切换漂移——与 fullHistory 同一口径）。
     hierarchyCompress: false,
     compressModel: false,
+    // T1/F-03：层级卡是否共享成员正文摘录（默认关，失败关闭）。
+    shareL2Content: false,
     archived: 0,
     restored: 0,
     revision: lines.length,

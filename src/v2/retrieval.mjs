@@ -342,6 +342,53 @@ export async function syncRetrievalIndex({ directory, backend, store, batchSize 
 }
 
 /**
+ * 统一 exact 后验的**纯判定**（T3/F-09）：每个 exact token 必须作为子串出现在
+ * 「正文 + 字面海明」里（大小写不敏感）。
+ *
+ * 为什么必须收口在一个函数里：检索通道（searchRecords）与弱候选诊断
+ * （queryDetailed 的 weak）此前各写一份判定，口径迟早漂移——弱指针会带着
+ * 「通过了 exact 闸门」的说法出现，而强命中用的是另一套规则。抽成纯函数后，
+ * 两处调用的是同一段代码，测试也只需要钉这一份。
+ *
+ * @returns 是否通过（true = 所有 token 都在 hay 里）。
+ */
+export function exactPostfilterHit({ exactTokens, body, haystack }) {
+  const tokens = (Array.isArray(exactTokens) ? exactTokens : [])
+    .map((token) => (typeof token === 'string' ? token.trim() : ''))
+    .filter((token) => token.length > 0)
+  if (tokens.length === 0) return true
+  const hay = ((body ?? '') + ' ' + (haystack ?? '')).toLowerCase()
+  return tokens.every((token) => hay.includes(token.toLowerCase()))
+}
+
+/**
+ * 统一 exact 后验的共用驱动：对候选逐条读正文、套 {@link exactPostfilterHit}，
+ * 只把通过的留下。读不到正文的候选如实丢弃（不猜），与旧行为一致。
+ *
+ * @param candidates - Map<id, hit> 或 id 数组；返回同形状的 Map（保持原顺序）。
+ */
+export async function applyExactPostfilter({ exactTokens, candidates, readBody, haystackOf, entryOf } = {}) {
+  const verified = new Map()
+  const entries = candidates instanceof Map
+    ? [...candidates.entries()]
+    : (Array.isArray(candidates) ? candidates.map((id) => [id, { id }]) : [])
+  for (const [id, hit] of entries) {
+    // 索引与 store 可能不同步：取不到条目的候选如实丢弃（不猜），与旧行为一致。
+    if (typeof entryOf === 'function' && !entryOf(id)) continue
+    let body = null
+    if (typeof readBody === 'function') {
+      try {
+        const loaded = await readBody(id)
+        if (loaded && loaded.ok !== false) body = typeof loaded.payloadText === 'string' ? loaded.payloadText : null
+      } catch { body = null }
+    }
+    const haystack = typeof haystackOf === 'function' ? haystackOf(id, hit) : ''
+    if (exactPostfilterHit({ exactTokens, body, haystack })) verified.set(id, hit)
+  }
+  return verified
+}
+
+/**
  * 多路检索：内置字面索引 + 可选语义后端，合并去重并标注来源。
  *
  * 返回的命中**不带分数**：只带 `source` 与 `order`。排序是排序，不是置信度。
@@ -442,19 +489,15 @@ export async function searchRecords({ store, backend = null, text, exact = [], l
   // 顺序；路径/ID 按字面边界）。T1 的词元闸门只保证「词都出现过」，不保证顺序；
   // 短语语义在唯一有正文可读的这一层收口。读不到正文的候选如实丢弃（不猜）。
   if (exactTokens.length > 0) {
-    const verified = new Map()
-    for (const [id, hit] of byId) {
-      const entry = store.getEntry(id)
-      if (!entry) continue
-      let body = null
-      try {
-        const loaded = await store.readRecord(id, { verifyHash: false, maxBytes: INDEX_TEXT_MAX_BYTES })
-        if (loaded.ok !== false) body = typeof loaded.payloadText === 'string' ? loaded.payloadText : null
-      } catch { body = null }
-      const hay = ((body ?? '') + ' ' + literalHaystackOf(store, entry)).toLowerCase()
-      const ok = exactTokens.every((token) => hay.includes(String(token).toLowerCase()))
-      if (ok) verified.set(id, hit)
-    }
+    // T3/F-09：统一 exact 后验抽成纯函数（exactPostfilterHit）+ 共用驱动
+    // （applyExactPostfilter），检索通道与弱候选诊断走同一份判定。
+    const verified = await applyExactPostfilter({
+      exactTokens,
+      candidates: byId,
+      readBody: (id) => store.readRecord(id, { verifyHash: false, maxBytes: INDEX_TEXT_MAX_BYTES }),
+      entryOf: (id) => store.getEntry(id),
+      haystackOf: (id) => literalHaystackOf(store, store.getEntry(id)),
+    })
     byId.clear()
     for (const [id, hit] of verified) byId.set(id, hit)
   }
@@ -499,12 +542,17 @@ export async function searchRecords({ store, backend = null, text, exact = [], l
  * 只报可验证的结构关系（配对 callId、fork 映射、索引外部 ID），
  * 不做语义推断——「相关」是检索的事，不是来源关系。
  */
-export function describeRecordRelations({ store, recordId, forkMap = null, retrievalIndex = null, backendName = null }) {
+export function describeRecordRelations({ store, recordId, forkMap = null, retrievalIndex = null, backendName = null, forgetIndex = null }) {
   const entry = store.getEntry(recordId)
   if (!entry) {
     throw new EngineV2Error(`未知记录 ID：${recordId}`, { code: 'EREADNOTFOUND', details: { recordId } })
   }
   const relations = []
+  // 遗忘面（0.11.0，PR #8 P2-2）：关系面也要按账本过滤，否则 --relations 会把
+  // 「已遗忘的配对伙伴/父记录」作为结构关系重新列出来。过滤是披露，不是删除：
+  // 计数与 ID 单独放进 filtered，不冒充「无关系」。
+  const filtered = []
+  const visible = (id) => !(forgetIndex && isForgotten(forgetIndex, id))
   // 未解析的引用单独如实报告：refs 里写着 callId，但对应记录不在本库时，
   // 说「无结构关系」会误导——正确说法是「有引用，但目标记录不在本库」。
   const unresolved = []
@@ -515,6 +563,10 @@ export function describeRecordRelations({ store, recordId, forkMap = null, retri
       if (other.id === recordId) continue
       if (other.refs?.callId !== callId) continue
       matched += 1
+      if (!visible(other.id)) {
+        filtered.push({ kind: 'pairing', recordId: other.id, callId, reason: 'forgotten' })
+        continue
+      }
       relations.push({ kind: 'pairing', relation: other.kind === entry.kind ? 'same-kind' : 'call/result', recordId: other.id, callId })
     }
     if (matched === 0) {
@@ -525,12 +577,13 @@ export function describeRecordRelations({ store, recordId, forkMap = null, retri
     // fork 映射的方向是「父记录 ID → 子记录 ID」（readback 用它按父 ID 回源）。
     const childId = forkMap.mapping[recordId]
     if (typeof childId === 'string') {
-      relations.push({ kind: 'fork', relation: 'migrated-to-child', recordId: childId })
+      if (visible(childId)) relations.push({ kind: 'fork', relation: 'migrated-to-child', recordId: childId })
+      else filtered.push({ kind: 'fork', relation: 'migrated-to-child', recordId: childId, reason: 'forgotten' })
     }
     for (const [parentId, mapped] of Object.entries(forkMap.mapping)) {
-      if (mapped === recordId && parentId !== recordId) {
-        relations.push({ kind: 'fork', relation: 'inherited-from-parent', recordId: parentId })
-      }
+      if (mapped !== recordId || parentId === recordId) continue
+      if (visible(parentId)) relations.push({ kind: 'fork', relation: 'inherited-from-parent', recordId: parentId })
+      else filtered.push({ kind: 'fork', relation: 'inherited-from-parent', recordId: parentId, reason: 'forgotten' })
     }
   }
   if (retrievalIndex && backendName && retrievalIndex.backend === backendName) {
@@ -539,5 +592,5 @@ export function describeRecordRelations({ store, recordId, forkMap = null, retri
       relations.push({ kind: 'index', relation: 'indexed-as', backend: backendName, externalId })
     }
   }
-  return { recordId, kind: entry.kind, relations, unresolved }
+  return { recordId, kind: entry.kind, relations, unresolved, filtered }
 }

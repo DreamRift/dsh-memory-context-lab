@@ -49,7 +49,7 @@ import {
   maybeStageCompress,
   reconcileVouchers,
 } from './hierarchy-coordinator.mjs'
-import { AGG_VOUCHER_MARKER } from './agg-voucher.mjs'
+import { AGG_VOUCHER_MARKER, dropVoucherPlansForRecords } from './agg-voucher.mjs'
 import {
   createV2SessionState,
   disabledV2State,
@@ -380,6 +380,8 @@ export function createV2Runtime(dependencies) {
     // 层级压缩模型模式的全局默认（设置页）。缺省 false：旧账本无该字段时
     // 播种为关；只在值缺失时补，绝不覆盖用户在本会话写下的选择。
     defaultCompressModel = () => false,
+  // T1/F-03：层级卡共享正文摘录的全局默认（失败关闭：默认不共享）。
+  defaultShareL2Content = () => false,
     // 模型相位解析点（P4）：(sessionId, { signal }) => { stream, model, timeoutMs,
     // cacheLookup, cacheSave, onUsage } | null。宿主无已核验 LLM 契约时注入方
     // 直接返回 null，全链路按程序档工作；不在此直连宿主内部。
@@ -836,6 +838,11 @@ export function createV2Runtime(dependencies) {
     // 模型模式默认值播种：口径同上（只在缺失时补）。
     if (record.state.compressModel === undefined) {
       record.state.compressModel = defaultCompressModel() === true
+      await writeV2SessionState(record.directory, record.state).catch(() => {})
+    }
+    // T1/F-03：共享正文摘录默认值播种（口径同上：只在缺失时补）。
+    if (record.state.shareL2Content === undefined) {
+      record.state.shareL2Content = defaultShareL2Content() === true
       await writeV2SessionState(record.directory, record.state).catch(() => {})
     }
     records.set(sessionId, record)
@@ -2038,6 +2045,7 @@ export function createV2Runtime(dependencies) {
         forkMap,
         retrievalIndex,
         backendName: backendFor(record)?.name ?? null,
+        forgetIndex: await getForgetIndex(record.directory).catch(() => null),
       })
       const lines = []
       if (described.relations.length === 0) {
@@ -2045,6 +2053,10 @@ export function createV2Runtime(dependencies) {
       } else {
         lines.push(`${recordId}（${described.kind}）的结构关系：`)
         lines.push(...described.relations.map((relation) => `- ${relation.kind}/${relation.relation} → ${relation.recordId}${relation.callId ? `（callId ${relation.callId}）` : ''}`))
+      }
+      // 关系面按遗忘账本过滤后仍如实披露：被隐藏不等于不存在。
+      for (const item of described.filtered ?? []) {
+        lines.push(`- 已按遗忘账本隐藏：${item.kind}/${item.relation ?? 'pairing'} → ${item.recordId}`)
       }
       // 有引用但目标不在本库时如实说明，不用「无关系」掩盖。
       for (const item of described.unresolved ?? []) {
@@ -2263,8 +2275,9 @@ export function createV2Runtime(dependencies) {
       const event = typeof session.eventAt === 'function' ? session.eventAt(seq) : null
       const content = event?.data?.content
       const first = Array.isArray(content) ? content.find((block) => block?.type === 'text') : null
-      // sourceForm 双形态：append 事件顶层 opts.source 会被宿主存进 event.source；
-      // 旧形状消息体的 source 在 data.source。两者都查，身份判定不依赖单一形状。
+      // sourceForm 双形态：宿主只把 `source` 存进 `data`（append 的 opts 只认
+      // surfaceOp/sourceEventSeqs，其余键静默丢弃），历史日志里也出现过顶层
+      // `event.source` 的形状（旧夹具/旧版本），所以两处都查；读取端不假设单一形状。
       return {
         seq,
         type: event?.type ?? null,
@@ -2281,10 +2294,11 @@ export function createV2Runtime(dependencies) {
           id: `surface-${randomUUID()}`,
           role: 'user',
           content: [{ type: 'text', text: plan.text }],
+          // 宿主只认 opts 的 surfaceOp/sourceEventSeqs，source 必须写进 data（缺了会让投影读 data.source.kind 崩掉整条历史）
+          source: { kind: 'user', form: 'memory-lab2-surface' },
         }, {
           surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
           sourceEventSeqs: [...plan.memberSeqs],
-          source: { kind: 'user', form: 'memory-lab2-surface' },
         })
         receipts.push({ seq: event?.seq, startSeq: plan.startSeq, endSeq: plan.endSeq, members: plan.memberSeqs.length })
       } catch (error) {
@@ -2533,6 +2547,21 @@ export function createV2Runtime(dependencies) {
         ? '已设为开：聚合摘要将先经模型改写（注入的 stream 契约），失败或校验不过时自动落回程序摘要。'
         : '已设为关：聚合摘要直接用程序版本。'
       return { kind: 'success', text: `层级压缩模型模式已设为 ${rawValue === 'on' ? '开' : '关'}。${note}` }
+    } else if (key === 'sharel2content') {
+      // T1/F-03：层级卡共享正文摘录。默认关：卡里只给属性、来源与展开入口，
+      // 不复制成员正文。开启后 L1/L2 卡才带摘录。
+      if (rawValue !== 'on' && rawValue !== 'off') {
+        return { kind: 'error', text: '用法：' + BT + '/memory-lab2 set sharel2content on|off' + BT }
+      }
+      record.state.shareL2Content = rawValue === 'on'
+      record.state.settings = normalizeSettings(settings)
+      await writeV2SessionState(record.directory, record.state)
+      return {
+        kind: 'success',
+        text: record.state.shareL2Content
+          ? '层级卡共享正文摘录已设为开：L1/L2 卡会带成员正文片段。'
+          : '层级卡共享正文摘录已设为关：L1/L2 卡只给属性与来源，正文用 expand/read 显式展开。',
+      }
     } else if (key === 'planfirst') {
       // 插件级开关（与 /memory-lab set planfirst 同义）：v2 账本只记位置，
       // 联动动作由注入的回调执行（服务缺失时回调返回提示，不阻断）。
@@ -2551,7 +2580,7 @@ export function createV2Runtime(dependencies) {
       if (note) lines.push(note.text)
       return { kind: 'success', text: lines.join('\n') }
     } else {
-return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|fullhistory|planfirst|compress|compressmodel。` }
+return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall|batch|retain|fullhistory|planfirst|compress|compressmodel|sharel2content。` }
     }
     record.state.settings = normalizeSettings(settings)
     // 设置必须落盘：只改内存会让「设置成功」在重启后失效，而 v1 的 set 是持久的。
@@ -2923,8 +2952,18 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
       }
       throw error
     }
+    // 计划文件失效（F-01）：已遗忘成员不得再被崩溃窗口重放成 L1/L2。
+    // 这是派生缓存清理，不改变遗忘账本与冷库原文；失败只披露，不阻断遗忘本体。
+    let planCleanup = { dropped: [], kept: 0 }
+    try {
+      planCleanup = await dropVoucherPlansForRecords(sessionDir, result.appended ? result.entry.targetIds : targetIds)
+    } catch { /* 计划文件不可写时由 compress/reconcile 的可见性检查兜底 */ }
     if (!result.appended) {
-      return { kind: 'success', text: '目标已全部处于遗忘状态（幂等，未追加条目）；当前 revision ' + result.revision + '。' }
+      const idempotentLines = ['目标已全部处于遗忘状态（幂等，未追加条目）；当前 revision ' + result.revision + '。']
+      if (planCleanup.dropped.length > 0) {
+        idempotentLines.push('作废层级压缩计划 ' + planCleanup.dropped.length + ' 条（含已遗忘成员）：' + planCleanup.dropped.join('、') + '。')
+      }
+      return { kind: 'success', text: idempotentLines.join('\n') }
     }
     const withdrawal = await withdrawForgottenSurfaces(record, result, withdrawalPlan)
     // provenance：先注册「表面回执 ← 遗忘记录」来源边，再标记失效（undo 后复验
@@ -2946,6 +2985,9 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
       '软遗忘已生效（操作 ' + result.entry.operationId + '）：新增 ' + result.entry.targetIds.length + ' 条，已遗忘 ' + result.alreadyForgotten.length + ' 条幂等跳过。',
       '表面回执撤回 ' + withdrawal.withdrawn + ' 个节点' + (withdrawal.failures.length ? '，失败 ' + withdrawal.failures.length + ' 个（forget status 待收口清单可重放）' : '') + '。',
     ]
+    if (planCleanup.dropped.length > 0) {
+      lines.push('作废层级压缩计划 ' + planCleanup.dropped.length + ' 条（含已遗忘成员）：' + planCleanup.dropped.join('、') + '。')
+    }
     if (withdrawal.pendingWithdrawals.length > 0) {
       lines.push('表面缺失待对账 ' + withdrawal.pendingWithdrawals.length + ' 组（下次 adopt 时收敛）。')
     }
@@ -3024,6 +3066,8 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
         return kindById.get(recordId) ?? 'tool-output'
       },
       isRecordVisible: (recordId) => !forgotten.has(recordId),
+      // T1/F-03：层级卡是否共享成员正文摘录。默认 false，只有显式开过才为真。
+      shareL2Content: record.state.shareL2Content === true,
       // 模型相位（P4 依赖注入解析点）：所有宿主 LLM 契约风险收敛在
       // modelPhaseResolver 一个回调里。会话偏好未开或解析不出 stream 时返回
       // null → 协调器整体走程序档；解析失败同样按程序档处理（失败关闭）。
@@ -3043,10 +3087,14 @@ return { kind: 'error', text: `未知设置项 ${key ?? ''}；支持 auto|recall
         // 协调器显式给了来源事件就用之；否则按成员 seq 推导（仍是本段范围内的）。
         const given = (sourceEventSeqs ?? memberSeqs ?? []).filter((s) => Number.isSafeInteger(s) && s >= 0)
         const shadowed = given.length > 0 ? given : [startSeq]
-        const event = session.append('user/message', { content: [{ type: 'text', text }] }, {
+        const event = session.append('user/message', {
+          id: `surface-${randomUUID()}`,
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: { kind: 'user', form: 'memory-lab2-surface' },
+        }, {
           surfaceOp: { op: 'replace', startSeq, endSeq },
           sourceEventSeqs: shadowed,
-          source: { kind: 'user', form: 'memory-lab2-surface' },
         })
         return { seq: event?.seq }
       },

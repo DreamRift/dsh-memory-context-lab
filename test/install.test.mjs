@@ -18,6 +18,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { dshMemoryLookupRoots, locatePinnedDshMemory } from '../src/dsh-memory-suppression.mjs'
+import { memoryContextLabProjection } from '../src/projection.mjs'
 
 const DSH_HOME = process.env.DSH_HOME ?? path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
 const PROFILE = process.env.DSH_PROFILE ?? 'desktop'
@@ -186,7 +187,10 @@ test('the installed dsh-memory resolves to a real package root with MdcgClient',
     return t.skip(`dsh-memory is not resolvable here: ${error.message}`)
   }
   assert.equal(found.version, '0.8.1')
-  assert.ok(found.packageRoot.includes('dsh-memory'))
+  // 不按路径子串断言：junction / 符号链接安装时 realpath 的实体目录名
+  // 与包名不同（0.10.1 的 install 用例曾因此误红）。包身份以 manifest 为准。
+  const manifest = JSON.parse(await readFile(path.join(found.packageRoot, 'package.json'), 'utf8'))
+  assert.equal(manifest.name, '@furongjun1999/dsh-memory')
   assert.equal(typeof found.MdcgClient, 'function')
   // The cold store runs `python -m md_cg.mcp_server` with this as PYTHONPATH,
   // so the Python package must actually live at the resolved root.
@@ -233,17 +237,22 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   // The client-facing view must be plain JSON with no undefined holes.
   const projection = ctx._projections[0]
   const view = projection.wire.view(projection.init())
-  assert.deepEqual(Object.keys(view).sort(), [
-    'archiveBatchSize', 'archived', 'auto', 'autoRecall', 'autoRestore', 'enabled',
-    // `engine` 是 v2 引入的字段：面板据此显示当前由哪个引擎持有投影。
-    // `fullHistory` / `planFirst` 是开关位（v2 全历史 / 计划先行），初始恒 false。
-    // `planActive` 折叠宿主 plan/mode 事件，供面板显示计划模式状态。
-    'engine', 'fullHistory', 'planFirst', 'planActive', 'preset', 'restored', 'retainOperations', 'revision',
-  ].sort())
+  // 视图契约以**工作区源码**为准，不以「安装态当前是什么版本」为准：
+  // 0.10.1 的旧用例把键清单写死在测试里，安装版一升级就必红（issue #2 同类）。
+  // 安装版与源码版本一致时做精确比对；不一致时只验 JSON 安全并跳过形状比对，
+  // 让开发态（安装包落后于源码）不产生假红，发布态仍能抓住字段漂移。
+  const workspaceManifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  const installedManifest = JSON.parse(await readFile(path.join(path.dirname(installedEntry), '..', 'package.json'), 'utf8'))
+  const workspaceView = memoryContextLabProjection.wire.view(memoryContextLabProjection.init())
   for (const [key, value] of Object.entries(view)) {
     assert.notEqual(value, undefined, `${key} must not be undefined`)
   }
   assert.deepEqual(JSON.parse(JSON.stringify(view)), view)
+  if (installedManifest.version === workspaceManifest.version) {
+    assert.deepEqual(Object.keys(view).sort(), Object.keys(workspaceView).sort(), '安装版投影字段必须与工作区源码一致')
+  } else {
+    t.diagnostic(`installed ${installedManifest.version} != workspace ${workspaceManifest.version}；跳过字段清单精确比对`)
+  }
 })
 
 test('拿不到 tools 服务时插件照常加载：v1 不受影响，只跳过工具注册并告警', async (t) => {
