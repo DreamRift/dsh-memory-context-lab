@@ -20,8 +20,8 @@
 | `dsh-memory`（**可选**） | `0.8.1`；缺席时独立模式运行 |
 | 冷库 | 复合后端：灵枢子进程（T2）/ 本地 Node store（T1） |
 | 会话目录 | `$DSH_HOME/.memory-context-lab/sessions/<sha256 前24位>/` |
-| 真实灵枢保护 | 启用期间按会话抑制 `dsh-memory` 自动读写（不动工具集） |
-| 依赖的宿主接口 | `agent/pre-step`、`session.surface`/`append`、`requestHeader()`、`requestContext()`、`tokenMeter`、`llm`、`sessionProjections`、`commands`；可选 `planMode`。见[架构设计](docs/architecture-design.md) |
+| 真实灵枢保护 | 启用期间按会话抑制 `dsh-memory` 自动读写 |
+| 依赖的宿主接口 | `agent/pre-step`、`session.surface`/`append`、`requestHeader()`、`tokenMeter`、`llm`、`sessionProjections`、`commands`；可选 `planMode`。见[架构设计](docs/architecture-design.md) |
 
 冷库不可用不阻止启用（T1 兜底）：归档/回注失败关闭；占用率缺 `requestHeader()`/`measure`/`contextWindow` 时**失败关闭**。
 
@@ -60,7 +60,6 @@ v2 是**独立引擎**（独立 schema、目录与回执标记），与 v1 **互
 
 **模型可见工具只有一个**：`memory_lab_recall`（`record_ids`/`query`/`budget_tokens`/`cursor`），只读；`budget_tokens` 非正整数直接报错「本次未执行」，**不静默换值**。
 
-
 **检索如实分级**：T0 字面索引恒在；T1 本地词法；T2 可选隔离灵枢后端。T2 不可用时**如实降级到 T1**，绝不读**正式灵枢根**；冷库同理。见 [架构设计](docs/architecture-design.md)。
 
 ### 全历史记忆上下文（v2 模式开关）
@@ -75,15 +74,15 @@ v2 是**独立引擎**（独立 schema、目录与回执标记），与 v1 **互
 
 ### 0.12.0：投影经济学与「归档—重读」循环修复
 
-- **投影头**：回执/卡片声明 `投影：A 类｜释放 ≈N token / M 字｜取回 ≈K token`；失真只有 A 类，取回代价取载荷既有估算。
-- **取回动作可见**：回执末尾是可照抄的 `memory_lab_recall(record_ids=["mcl2-…"])`；工作卡「本步可回读」≤3 条、≤80 字符/条，只给结构。
+- **投影头**：回执/卡片声明 `投影：A 类｜释放 ≈N token / M 字｜取回 ≈K token`；失真只有 A 类。
+- **取回动作可见**：回执末尾是可照抄的 `memory_lab_recall(record_ids=["mcl2-…"])`；工作卡「本步可回读」≤3 条、≤80 字符/条。
 - **读取租约**：`set readlease <0..50>`（默认 3）让最近 N 个含读取的操作保留 M=2N 步，到期转「需复核」；是租约不是保护集扩张。
-- **读取账本**：`read-ledger.json` 只记 `path|offset` 键不记正文；`status` 分开报口径 A/B 重读占比；不拦截工具，损坏失败关闭。
+- **读取账本**：`read-ledger.json` 只记 `path|offset` 键不记正文；`status` 分开报口径 A/B 重读占比；损坏失败关闭。
 - **回注包不再被折掉**：`recall` 移出折叠卡形态，成为断组边界。
 - **卡片净占用上界**：按字符算（4000），最新工作卡永远保护，折叠回执保留全部成员 `seq:`。
 - **其它**：回执加 `status`；回注须有结构事实；卡片降噪；检索口径文案如实。
 
-**面板开关同步补丁（同日重打）**：权威状态记录改按引擎取账本（v2 读 v2 账本），且只表态账本真的持有的开关位——此前 v2 会话每写一条记录就把「全历史 / 计划先行」按默认 false 压回关，表现为开关闪一下又关掉；v2 停用后全历史位现在会写成关，不再出现「显示开却点不动」。
+**面板开关同步补丁（同日重打）**：权威状态记录改按引擎取账本，且只表态账本真的持有的开关位——修掉「v2 会话每写一条记录就把全历史/计划先行压回关」与「v2 停用后全历史显示开却点不动」。
 ### 0.11.0：脱敏、成员级排除、弱指针置信度与三个 P0
 
 **卡片默认不复制正文**：摘录类值渲染成 `（正文摘录未共享）`，只留属性标签、来源 ID 与 `expand`；结构化属性（退出码、测试摘要、版本号）照常保留。`set sharel2content on` 才放摘录。
@@ -94,11 +93,9 @@ v2 是**独立引擎**（独立 schema、目录与回执标记），与 v1 **互
 
 **两个会话日志 P0**：`user/message` 必带 `data.source`（写进 `opts` 会被丢弃）；`prune.shadowedSeqs` 按活动面位置切片取名单。
 
-**面板不再假装已生效**：状态类命令后追加权威状态记录，被拒绝时开关不翻转。
-
 图形入口：composer 工具行右侧「降温」触发器（同一套设置与动作），弹层底部显示三行摘要与最近一次命令输出；全局默认在 设置 → 组件 → 「记忆上下文」。
 
-**停用或归档都会把会话送回正常。** v2 会话的 `/memory-lab off`、`/memory-lab2 off` 或面板拨关都走 v2 停用路径（先恢复原文、再解除抑制、最后删隔离目录）；关「全历史」同样先恢复再翻位。恢复放不进窗口时如实拒绝；仍有未恢复回执时不删。插件只清理自有隔离数据，**从不写真实灵枢**，也不改写会话日志与命令审计。
+**停用或归档都会把会话送回正常。** v2 会话的 `/memory-lab off`、`/memory-lab2 off` 或面板拨关都走 v2 停用路径（先恢复原文、再解除抑制、最后删隔离目录）；关「全历史」同样先恢复再翻位。恢复放不进窗口时如实拒绝；仍有未恢复回执时不删。插件只清理自有隔离数据，**从不写真实灵枢**。
 
 ### 单一触发线怎么算
 
@@ -109,13 +106,11 @@ v2 是**独立引擎**（独立 schema、目录与回执标记），与 v1 **互
 - 归档前先把正文写进隔离冷库并**回读校验 hash**；失败、缺失、裁剪、hash 不符一律保留原文并报出阶段。超单节点上限时**按码点分块**，逐块校验后再校验整篇。
 - 回执只由稳定标识符构成，逐字节稳定，不扰动缓存；归档是表层替换，`restore` 按原字节写回。
 - `clean` 在仍有未恢复回执时拒绝删除；冷库删除只能删自有目录，且拒绝含链接的路径。
-
 ## 安装与卸载
 
 从 [GitHub Releases](https://github.com/DreamRift/dsh-memory-context-lab/releases) 下载对应版本的 `dsh-memory-context-lab-<版本>.tgz`，执行 `dsh plugin add <tgz 绝对路径>`，随后重启 DSH Desktop。当前版本为 0.12.0。
 
 插件已作为 bundle 装在 desktop profile。改宿主侧源码需重启 DSH Desktop；只改 `src/client.js` 刷新页面即可。
-
 ```text
 卸载：plugin_manager remove_bundle dsh-memory-context-lab
 清数据：删除 $DSH_HOME/.memory-context-lab/（或在每个会话执行 /memory-lab clean）
@@ -129,6 +124,6 @@ npm run probe:host    # 用宿主真实 JSON Schema 校验器核验工具 schema
 npm run probe:revert  # 28 个回退场景，确认对应测试确实会失败
 ```
 
-**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test`，防止写了测试却没接线。全套 76 套（v1 六套 + v2 全套 + 灵枢后端 + plan-first / fullhistory / reliability / 验证跟踪 / 独立运行三套 + fix-brief 三套 + 0.12.0 新增 14 套）；逐套件范围与日期见工作区《验证与评估》（不随本包分发）。
+**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test`，防止写了测试却没接线。全套 76 套（v1 六套 + v2 全套 + 灵枢后端 + plan-first / fullhistory / reliability / 验证跟踪 / 独立运行三套 + fix-brief 三套 + 0.12.0 新增 14 套）；逐套件范围见工作区《验证与评估》（不随本包分发）。
 
 `FakeSession` 按宿主真实折叠规则实现校验，「整段区间替换成一条 user 回执」是被宿主契约验证过的替身——契约忠实度与逐套件范围以 `npm test` 输出为准。
