@@ -327,6 +327,9 @@ test('the projection rebuilds settings from the session log, not from plugin mem
     enabled: true,
     retainOperations: 4,
     archiveBatchSize: 6,
+    // 0.13.1：闸门阈值也是视图字段（缺它面板 pressureOn 恒 false）。
+    // 无 set pressure 记录时是默认值 20；0 是合法值，不代表缺省。
+    pressureGate: 20,
     auto: false,
     autoRecall: false,
     autoRestore: false,

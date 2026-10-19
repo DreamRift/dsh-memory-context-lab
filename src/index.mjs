@@ -179,6 +179,14 @@ function buildConfigSchema() {
         .i18n({ 'zh-CN': '全历史记忆上下文（v2）', en: 'Full-history memory context (v2)' }),
       planFirst: SCHEMAS.boolean().default(false)
         .i18n({ 'zh-CN': '新会话计划先行', en: 'Plan first in new sessions' }),
+      // 0.13.1：压力闸门阈值。**不进 settingFields**——它是阈值不是档位，
+      // 与保护预算同理，预设行保持原有形状。取值为占用率百分比；0 = 无压力也降温。
+      // 范围与 core 的 NUMERIC_SETTINGS.pressure（0..95）同域，由 config-contract 守卫。
+      pressureGate: SCHEMAS.natural().max(95).default(DEFAULT_SETTINGS.pressureGate)
+        .i18n({
+          'zh-CN': '压力闸门阈值（占用率 %，0 = 无压力也降温）',
+          en: 'Pressure gate threshold (% occupancy; 0 = no gate)',
+        }),
       // 层级压缩模型模式的全局默认（P4）：只影响 v2 新账本的播种值与面板初始
       // 位置；已有账本的会话内开关以 /memory-lab2 set compressmodel 为准。
       // 模型模式失败关闭：LLM 不可用或产出不合格时自动落回程序摘要。

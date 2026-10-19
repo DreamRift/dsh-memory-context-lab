@@ -119,11 +119,11 @@ v2 是**独立引擎**（独立 schema、目录与回执标记），与 v1 **互
 ## 验证
 
 ```text
-npm test              # 83 套 826 项，失败 0
+npm test              # 84 套 832 项，失败 0
 npm run probe:host    # 用宿主真实 JSON Schema 校验器核验工具 schema（需 DSH_ASAR，无参数时 SKIP）
 npm run probe:revert  # 28 个回退场景，确认对应测试确实会失败
 ```
 
-**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test`，防止写了测试却没接线。全套 83 套（0.12.0 的 76 套 + 0.13.0 新增 7 套：恢复完整性 / 孤儿重建 / 压力闸门纯函数 / 压力闸门接线 / PTC 回读 / source.kind 契约 / 全量卡保护）；逐套件范围见工作区《验证与评估》（不随本包分发）。
+**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test`，防止写了测试却没接线。全套 84 套（0.12.0 的 76 套 + 0.13.0 新增 8 套：恢复完整性 / 孤儿重建 / 压力闸门纯函数 / 压力闸门接线 / 压力闸门投影视图 / PTC 回读 / source.kind 契约 / 全量卡保护）；逐套件范围见工作区《验证与评估》（不随本包分发）。
 
 `FakeSession` 按宿主真实折叠规则实现校验，「整段区间替换成一条 user 回执」是被宿主契约验证过的替身——契约忠实度与逐套件范围以 `npm test` 输出为准。

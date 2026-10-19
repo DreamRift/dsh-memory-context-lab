@@ -6,6 +6,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { Config } from '../src/index.mjs'
+import { DEFAULT_SETTINGS } from '../src/core.mjs'
 
 // Building Config needs BOTH optional peers: schemastery provides the schema
 // factory and cosmokit the volatile-reference protocol. When either is missing
@@ -41,9 +42,28 @@ test('fresh install resolves defaults/presets as volatile refs', { skip: skipRea
   const defaults = resolved.value.defaults.get()
   assert.equal(defaults?.retainOperations, 5)
   assert.equal(defaults?.auto, true)
+  // 0.13.1（报告 C）：闸门阈值必须出现在 schema 的 defaults 里，否则设置页
+  // 根本没有第二个入口，而唯一的入口（会话面板）当时正坏着。
+  assert.equal(
+    defaults?.pressureGate,
+    DEFAULT_SETTINGS.pressureGate,
+    'defaults.pressureGate 必须与 core 的默认值同源',
+  )
   const presets = resolved.value.presets.get()
   assert.ok(Array.isArray(presets) && presets.length > 0)
   assert.equal(typeof presets[0]?.name, 'string')
+})
+
+
+test('压力闸门阈值：schema 接受 0..95 并拒绝越界', { skip: skipReason }, () => {
+  const inside = Config['~standard'].validate({ defaults: { pressureGate: 95 } })
+  assert.equal(inside.issues, undefined)
+  assert.equal(inside.value.defaults.get().pressureGate, 95)
+  const zero = Config['~standard'].validate({ defaults: { pressureGate: 0 } })
+  assert.equal(zero.issues, undefined, '0 = 无压力也降温，必须合法')
+  assert.equal(zero.value.defaults.get().pressureGate, 0)
+  const outside = Config['~standard'].validate({ defaults: { pressureGate: 96 } })
+  assert.ok(Array.isArray(outside.issues) && outside.issues.length > 0, '96 必须被拒')
 })
 
 test('volatile wrapping preserves the standard-schema protocol', { skip: skipReason }, () => {

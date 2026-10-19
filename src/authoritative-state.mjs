@@ -31,6 +31,9 @@ export const STATE_RECORD_FIELDS = Object.freeze([
   'autoRestore',
   'retainOperations',
   'archiveBatchSize',
+  // 0.13.1：闸门阈值。权威记录的意义是「命令被拒绝时面板不得显示已生效」，
+  // 闸门也必须受同一约束，否则被拒绝的 set pressure 仍会停在面板上。
+  'pressureGate',
 ])
 
 let cachedModule
@@ -131,6 +134,7 @@ export function stateRecordDataOf({ enabled, engine, state } = {}) {
     }
     if (Number.isInteger(settings.retainOperations)) data.retainOperations = settings.retainOperations
     if (Number.isInteger(settings.archiveBatchSize)) data.archiveBatchSize = settings.archiveBatchSize
+    if (Number.isInteger(settings.pressureGate)) data.pressureGate = settings.pressureGate
   }
   return data
 }
@@ -189,6 +193,11 @@ export function sanitizeStateRecord(data) {
       seen += 1
     } else if (field === 'retainOperations' || field === 'archiveBatchSize') {
       if (!Number.isInteger(value) || value < 0) continue
+      out[field] = value
+      seen += 1
+    } else if (field === 'pressureGate') {
+      // 越界即丢弃（失败关闭）：宁可不表态，也不写一个越界的阈值进记录。
+      if (!Number.isInteger(value) || value < 0 || value > 95) continue
       out[field] = value
       seen += 1
     }

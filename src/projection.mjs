@@ -96,12 +96,22 @@ function presetViewOf(state) {
 export function viewOf(state) {
   const retain = state.retainOperations
   const batch = state.archiveBatchSize
+  // 0.13.1 修复（A2）：压力闸门是会话设置的一部分，视图必须带上它。
+  // 缺失时面板读到的永远是 undefined → `pressureOn` 恒为 false → 开关画成「关」、
+  // 阈值框永远 disabled、状态行永远「未启用」，而命令其实已经写出去了：
+  // 用户看到的就是「点了没反应」。范围与 core 的 NUMERIC_SETTINGS.pressure 同域（0..95）。
+  const pressure = Number.isInteger(state.pressureGate)
+    && state.pressureGate >= 0 && state.pressureGate <= 95
+    ? state.pressureGate
+    : DEFAULT_SETTINGS.pressureGate
   return {
     enabled: state.enabled === true,
     retainOperations: Number.isInteger(retain) && retain >= 0 && retain <= 200 ? retain : 0,
     // 兜底默认与 core 的 DEFAULT_SETTINGS 同源：批阈值的默认是 10（C2），面板
     // 折叠态不该再显示旧默认 5。
     archiveBatchSize: Number.isInteger(batch) && batch >= 1 && batch <= 200 ? batch : DEFAULT_SETTINGS.archiveBatchSize,
+    // 0.13.1：0 = 无压力也降温（旧行为），>0 = 达到该占用率才归档。
+    pressureGate: pressure,
     auto: state.auto === true,
     autoRecall: state.autoRecall === true,
     autoRestore: state.autoRestore !== false,

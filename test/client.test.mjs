@@ -274,7 +274,20 @@ test('applying registers the settings-page card only while the namespace is serv
   // mount()（而非直调）提供 hook 作用域：卡片组件现在无条件调用 hooks（H1 修复），
   // 直接 component() 调用会在真实 React 与本 shim 下同样缺作用域。
   const summary = shim.mount(card.component, { view: 'summary' })
-  assert.ok(textOf(summary).length > 0)
+  const summaryText = textOf(summary)
+  assert.ok(summaryText.length > 0)
+  // 0.13.1（报告 B）：宿主描述行刻意不传 form，这是**正常形态**而不是
+  // 「命名空间未服务」。原来的断言只要求文本非空，而误报文案恰好非空，
+  // 于是这条用例在缺陷存在时也是绿的。现在改成否定断言。
+  // 两条都要断言：**必须**走到摘要分支，且**不得**落到任何「未就绪」兜底。
+  // 只断言「没有配置加载中」是不够的——把分支关掉后会落到另一句兜底文案，
+  // 同样不含那句话，用例就会假绿（本用例第一次就是这么被骗过的）。
+  assert.match(summaryText, /全局默认与预设/, `summary 必须渲染摘要行，实际：${summaryText}`)
+  assert.equal(
+    /配置加载中|Loading|尚未服务|尚未就绪/.test(summaryText),
+    false,
+    `summary 视图不得渲染加载/未就绪文案，实际：${summaryText}`,
+  )
 })
 
 test('the settings card renders fields from both raw controllers and the thin form face', async () => {
@@ -560,6 +573,34 @@ test('0.13.0: the pressure gate switch sends 0 when off and the threshold when o
   assert.ok(
     sent.includes('/memory-lab2 set pressure 20'),
     `turning the gate on must restore the default threshold, sent: ${JSON.stringify(sent)}`,
+  )
+})
+
+test('0.13.1: v1 会话的闸门命令走 /memory-lab 前缀', async () => {
+  // 报告 D：闸门是 v1/v2 共用的引擎判据（apply-engine.runAutoCooling），
+  // 硬编码 /memory-lab2 会让 v1 会话的闸门开关必然失败。
+  const { entry, shim } = await loadClient()
+  const sent = []
+  const { context, slots } = createClientContext()
+  entry.exports.apply(context)
+  const chip = slots[0]
+  const run = async (line) => { sent.push(line); return { ok: true, text: 'ok' } }
+  const labels = ['压力闸门', 'Pressure gate']
+  const base = { enabled: true, engine: 'v1', pressureGate: 0, archiveBatchSize: 10, autoRestore: true, archived: 0, restored: 0, revision: 1 }
+  chipButton(shim.mount(chip.component, chipProps(base, { run }))).props.onClick({ preventDefault() {}, stopPropagation() {} })
+  const opened = shim.mount(chip.component, chipProps(base, { run }))
+  const gateSwitch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
+  assert.ok(gateSwitch, 'v1 会话也必须渲染闸门开关')
+  gateSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.ok(
+    sent.includes('/memory-lab set pressure 20'),
+    `v1 必须用 /memory-lab 前缀，实际发出：${JSON.stringify(sent)}`,
+  )
+  assert.equal(
+    sent.some((line) => line.startsWith('/memory-lab2')),
+    false,
+    'v1 会话不得发出 v2 命令',
   )
 })
 

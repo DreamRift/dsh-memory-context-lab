@@ -935,12 +935,16 @@ window.__ModuleLoader__.load({
       // 「自动回注」恒开——它是取回闭环的一部分，不是一个应该被关掉的选项。
       //
       // 压力闸门：开关 + 阈值。开关关闭 = 阈值 0 = 无压力也降温（旧行为）。
-      // 只有 v2 会话才有闸门（v1 没有这个判据），未启用时置灰。
+      // 闸门是 v1/v2 **共用**的引擎判据（apply-engine 的 runAutoCooling），
+      // 所以命令前缀按会话引擎分流；未启用降温时置灰（无会话可写设置）。
       rows.push(h('div', { className: 'mcl-row', key: 'pressure' },
         h('span', { className: 'mcl-label', title: t('field.pressureHint') }, t('field.pressure')),
         h('span', { className: 'mcl-field' },
           switchNode(pressureOn, t('field.pressure'), busy || !enabled, function (next) {
-            run('/memory-lab2 set pressure ' + (next ? String(pressureDraft || DEFAULT_PRESSURE) : '0'));
+            // 0.13.1 修复（D）：硬编码 /memory-lab2 会让 v1 会话必然失败——
+            // v1 也接受闸门设置（/memory-lab set pressure N 走通用数值设置分支）。
+            var prefix = engine === 'v2' ? '/memory-lab2' : '/memory-lab';
+            run(prefix + ' set pressure ' + (next ? String(pressureDraft || DEFAULT_PRESSURE) : '0'));
           }),
           h('input', {
             type: 'text',
@@ -1015,6 +1019,9 @@ window.__ModuleLoader__.load({
       return {
         retainOperations: clampInt(inner.retainOperations, 0, 200, 5),
         archiveBatchSize: clampInt(inner.archiveBatchSize, 1, 200, 10),
+        // 0.13.1：闸门阈值也在设置里（schema 有 default）。这里是**白名单构造**，
+        // 漏一个字段，用户保存其他设置时就会把它整块抹掉——必须与 schema 同步。
+        pressureGate: clampInt(inner.pressureGate, 0, 95, DEFAULT_PRESSURE),
         auto: inner.auto !== false,
         autoRecall: inner.autoRecall !== false,
         autoRestore: inner.autoRestore !== false,
@@ -1213,10 +1220,19 @@ window.__ModuleLoader__.load({
         return form.subscribe(function () { force(function (n) { return n + 1; }); });
       }, []);
 
+      // 0.13.1 修复（B）：宿主用**同一个组件**渲染两个座位——描述行传
+      // `{ view: 'summary' }` 且刻意不带 form，设置区传 `{ view: 'page', form }`。
+      // 所以 summary 没有 form 是正常形态，不是「命名空间未服务」：原来的实现
+      // 在判断 view 之前就因 !snapshot 早退，把视图差异写成了宿主故障，
+      // 结果详情页常驻一行「配置加载中…」，而下方设置卡其实工作正常。
+      // 这个分支必须在快照早退之前——两处都在 hooks 之后，早退是安全的。
+      if (view === 'summary') {
+        return h('span', { className: 'mcl-card-hint' }, '上下文降温：全局默认与预设');
+      }
       if (!snapshot) {
         return h('div', { className: 'mcl-card' },
           h(StyleTag, { key: 'style' }),
-          h('p', { className: 'mcl-card-hint' }, '配置加载中…（宿主尚未服务本插件的设置命名空间）'));
+          h('p', { className: 'mcl-card-hint' }, '设置尚未就绪：宿主未提供本插件的设置表单。'));
       }
 
       var server = draftFromValue(snapshot.value);
@@ -1275,6 +1291,13 @@ window.__ModuleLoader__.load({
             numberInputNode(current.defaults.archiveBatchSize, 1, 200, busy, function (v) {
               wrapSet(function (prev) {
                 return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { archiveBatchSize: v }) });
+              });
+            }),
+            // 0.13.1：闸门阈值的第二个入口（面板之外）——只坏面板时这里仍可配。
+            h('span', { className: 'mcl-card-hint' }, '压力闸门 %'),
+            numberInputNode(current.defaults.pressureGate, 0, 95, busy, function (v) {
+              wrapSet(function (prev) {
+                return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { pressureGate: v }) });
               });
             }),
             checkNode(current.defaults.auto, '自动降温', busy, function (v) {
