@@ -94,7 +94,7 @@ test('P0-1a 回执首行是可照抄的工具调用，命令形式仍在第二�
   const readbackIndex = lines.findIndex((line) => line.startsWith('可回读：'))
   assert.ok(readbackIndex > 0, '必须有「可回读」行')
   assert.match(lines[readbackIndex], /^可回读：memory_lab_recall\(record_ids=\["mcl2-aaaabbbbcccc-000001"\]\)｜A 类可完整重建$/)
-  assert.match(lines[readbackIndex + 1], /^命令面：\/memory-lab2 read mcl2-aaaabbbbcccc-000001$/)
+  assert.match(lines[readbackIndex + 1], /^命令面：\/memory-lab read mcl2-aaaabbbbcccc-000001$/)
   assert.ok(readbackIndex < lines.findIndex((line) => line.startsWith('命令面：')), '工具形式在命令形式之前')
 })
 

@@ -586,10 +586,14 @@ async function auditRun(deps, { applied, rejected, failures }) {
   const at = new Date().toISOString()
   const entries = []
   if (applied.length > 0) {
+    const runId = 'compress-run:' + randomUUID().slice(0, 8)
     entries.push({
       kind: HIERARCHY_ENTRY_RUN,
-      runId: 'compress-run:' + randomUUID().slice(0, 8),
-      phaseKey: null,
+      runId,
+      // phaseKey 必须是**非空字符串**（hierarchy-store 的写入校验）：旧值 null 会让
+      // 整批审计条目被 EINVAL 拒绝，而 compressRun 又用 .catch 吞掉了这个错误，
+      // 于是「成功压缩」永远没有 run 审计行——账本看上去像从没跑过。
+      phaseKey: runId,
       outcome: RUN_OUTCOME_COMMITTED,
       evidenceIds: [...applied],
       sourceRevision: ledger.revision,
@@ -646,7 +650,14 @@ export async function compressStatus(deps) {
     lines.push(`凭证：${[...ledger.vouchers.keys()].slice(0, 5).join('、')}${ledger.vouchers.size > 5 ? '（等）' : ''}`)
   }
   const damaged = ledger.damaged ? 1 : 0
-  if (ledger.damaged) lines.push(`账本带损坏修复记录 ${damaged} 次：${ledger.repairNotes.slice(-3).join('；') || '（详见账本）'}`)
+  // loadHierarchy 不返回 repairNotes（那是早期草稿的字段名），只有 damageDetail：
+  // 旧代码在账本损坏时必然抛 TypeError，把「带损坏的 status」变成一条崩溃。
+  if (ledger.damaged) {
+    const detail = typeof ledger.damageDetail === 'string' && ledger.damageDetail !== ''
+      ? ledger.damageDetail
+      : '（详见账本）'
+    lines.push(`账本带损坏修复记录 ${damaged} 次：${detail}`)
+  }
   return { text: lines.join('\n'), ledger, surface, plans }
 }
 

@@ -335,7 +335,7 @@ test('renderModelPhaseCard：与程序卡同构，剔除行数如实标注', () 
   assert.ok(card.startsWith('【阶段卡 ph-x】'))
   assert.ok(card.includes('· exit 0（blk-1）'))
   assert.ok(card.includes('2 条未通过对回 L0 的机械校验'))
-  assert.ok(card.includes('/memory-lab2 expand agg-0009'))
+  assert.ok(card.includes('/memory-lab expand agg-0009'))
 })
 
 // ── model-ledger：缓存/费用侧车（JSONL、双匹配、坏行跳过） ─────────────

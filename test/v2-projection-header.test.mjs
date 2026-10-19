@@ -76,7 +76,7 @@ test('P0-5d 操作回执（format 6）带投影头与可回读动作行', () => 
   assert.equal(lines[0], V2_RECEIPT_MARKER)
   assert.match(lines[1], /^投影：A 类（可完整重建）｜释放 ≈3968 token \/ 15805 字｜取回 ≈3968 token$/)
   assert.ok(text.includes('可回读：memory_lab_recall(record_ids=["mcl2-aaaabbbbcccc-000001"])｜A 类可完整重建'), text)
-  assert.ok(text.includes('命令面：/memory-lab2 read mcl2-aaaabbbbcccc-000001'), '命令形式仍在（给人看）')
+  assert.ok(text.includes('命令面：/memory-lab read mcl2-aaaabbbbcccc-000001'), '命令形式仍在（给人看）')
   // 旧文案「相关提问会自动回注要点」在真实会话里一次都没兑现，新格式不再重复声明。
   assert.equal(text.includes('自动回注要点'), false)
 })

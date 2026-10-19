@@ -7,7 +7,7 @@
  *
  * - 来源：seq 范围 + 成员冷记录 id（从回执原文逐条解析，不猜测）；
  * - 限制：凭证只是指针卡，成员原文仍在 append-only 日志里，分页展开
- *   `/memory-lab2 expand <凭证ID>` 走恒定只读面逐页回读；
+ *   `/memory-lab expand <凭证ID>` 走恒定只读面逐页回读；
  * - 精确值：成员数、冷记录数、工具直方图、token 估算都来自回执原文。
  *
  * 边界纪律：任何人类消息、插件状态卡、未归档事件都打断候选组；凭证
@@ -273,7 +273,7 @@ export function renderVoucherText({ voucherId, startSeq, endSeq, memberCount, re
     `范围：seq ${startSeq}–${endSeq}（${memberCount} 段已归档操作；本条为程序聚合凭证，成员原文在 append-only 日志）`,
     `凭证：${voucherId}`,
     `成员冷记录：${recordCount} 条${tools ? `；工具：${tools}` : ''}`,
-    `展开：/memory-lab2 expand ${voucherId}（分页回读成员回执原文；已软遗忘的成员只显示占位）`,
+    `展开：/memory-lab expand ${voucherId}（分页回读成员回执原文；已软遗忘的成员只显示占位）`,
   ]
   // T2/F-15：只有真的排除了成员才追加这一行——无排除时输出与今天逐字节一致。
   if (Number(excludedCount) > 0) lines.push(`排除：${Number(excludedCount)} 段成员因遗忘未参与聚合（其余照常；成员原文仍在 append-only 日志）`)
@@ -323,7 +323,7 @@ export function renderExpansionPage({ voucher, receiptTexts, forgottenMemberSeqs
   })
   lines.push('')
   if (clampedPage < pageCount) {
-    lines.push(`下一页：/memory-lab2 expand ${voucher.voucherId} ${clampedPage + 1}`)
+    lines.push(`下一页：/memory-lab expand ${voucher.voucherId} ${clampedPage + 1}`)
   } else {
     lines.push('（末页）')
   }

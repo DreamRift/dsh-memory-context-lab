@@ -94,7 +94,7 @@ test('planAggregateVouchers：连续组聚合成计划；边界打断、过短�
   assert.equal(first.voucherId, voucherIdOf(1, 4, [1, 2, 3, 4]))
   assert.equal(first.memberCount, 4)
   assert.ok(first.voucherText.startsWith(AGG_VOUCHER_MARKER))
-  assert.ok(first.voucherText.includes('/memory-lab2 expand ' + first.voucherId))
+  assert.ok(first.voucherText.includes('/memory-lab expand ' + first.voucherId))
 
   const big = Array.from({ length: 5 }, (_, i) => receiptNode(i + 1))
   const sliced = planAggregateVouchers(big, { maxRunLength: 2, minRunLength: 1 })

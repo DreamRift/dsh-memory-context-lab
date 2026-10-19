@@ -4,7 +4,7 @@
  * 与 v1 的 state.json 形状一致（enabled/settings/archive/nodeClaims 等字段复用
  * 同一套语义），但 kind 独立为 `dsh-memory-context-lab/v2/session`：
  * - 两种引擎的持久账本互不覆盖，谁持有投影一目了然；
- * - v1 的 readSessionState 永远不会读到 v2 目录，反之亦然；
+ * - 两个引擎的账本互不覆盖（0.13.1 起只剩 v2，历史 v1 目录不再被读取）；
  * - engine.json 只管互斥声明，状态文件才承载归档行与设置。
  */
 

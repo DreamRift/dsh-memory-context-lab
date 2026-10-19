@@ -8,7 +8,7 @@
  * 选择规则（装配期/ensure 期决定，运行期不换）：
  * - backendFor（同步热路径）：T2 已启动则用 T2；否则用 T1。T1 构造廉价、无进程，
  *   允许在取用路径惰性创建（每会话一个小对象；索引文件在首次 index/query 时才读）。
- * - ensureBackend（显式启动，/memory-lab2 index）：先试 T2（其 createClient 本就
+ * - ensureBackend（显式启动，/memory-lab index）：先试 T2（其 createClient 本就
  *   要求完成 tools/list 握手——即 D4 要求的「探到握手成功」）；T2 不可用则降级 T1，
  *   并把 T2 的失败原因原样带出（状态面如实展示，不静默）。
  *
@@ -97,7 +97,7 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
      *
      * P1-5 探测一次固定：auto/forced 的探测结果（成功或失败）按会话缓存，
      * 后续 ensure 不再重复起 T2 握手——失败每轮重试会让回注路径反复付握手
-     * 成本并打满日志。缓存随 close(sessionId) 失效；重启会话或重新 /memory-lab2
+     * 成本并打满日志。缓存随 close(sessionId) 失效；重启会话或重新 /memory-lab
      * index（close 后）即重新探测。代价是瞬断会被记住到会话结束，这在状态面
      * 上有 failureReason 如实可见，不算静默。 */
     async ensureBackend({ sessionId, storeRoot, signal }) {

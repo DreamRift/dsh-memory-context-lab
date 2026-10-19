@@ -829,9 +829,35 @@ function retentionItem({ retentionClass, itemId, lines = [], reason = null, sour
   }
 }
 
+/**
+ * claim 配额选择：**否定/撤回优先**，再按原顺序补 positive。
+ *
+ * 按列表顺序截断会让「最新」永远落选：`surfaceClaimsOf` 按 seq 升序产出（最旧在前），
+ * 于是超过配额的永远是最近的更正/撤回——而那正是 1498 行承诺必须可见的东西。
+ * 模型看不到「上一条结论作废」，就会按已撤回的结论继续行动。
+ *
+ * 返回 `{ raw, index }`：index 仍是**原列表下标**，用于 `claim:<index>` 之类的稳定引用
+ * （换成筛选后下标会让同一 claim 在不同步之间换 ID）。
+ */
+function selectClaims(claims, cap) {
+  const items = Array.isArray(claims) ? claims : []
+  const limit = Number.isFinite(Number(cap)) ? Math.max(0, Math.floor(Number(cap))) : items.length
+  const indexed = items.map((raw, index) => ({ raw, index }))
+  const negative = (entry) => {
+    const polarity = (typeof entry.raw === 'string' ? 'positive' : (entry.raw?.polarity ?? 'positive'))
+    return polarity === 'negated' || polarity === 'retracted'
+  }
+  if (limit >= items.length) return indexed
+  const negatives = indexed.filter(negative)
+  const positives = indexed.filter((entry) => !negative(entry))
+  return [...negatives.slice(-limit), ...positives.slice(0, Math.max(0, limit - Math.min(negatives.length, limit)))]
+    .sort((a, b) => a.index - b.index)
+}
+
 function take(list, cap) {
   const items = Array.isArray(list) ? list : []
-  return { items: items.slice(0, cap), total: items.length, dropped: Math.max(0, items.length - cap) }
+  const limit = capLimitOf(cap, items.length)
+  return { items: items.slice(0, limit), total: items.length, dropped: Math.max(0, items.length - limit) }
 }
 
 /**
@@ -843,9 +869,24 @@ function take(list, cap) {
  */
 function newestTake(list, cap) {
   const items = Array.isArray(list) ? list : []
-  const limit = Number.isFinite(Number(cap)) ? Math.max(0, Math.floor(Number(cap))) : 0
+  const limit = capLimitOf(cap, items.length)
   if (limit === 0) return []
   return items.slice(-limit)
+}
+
+/**
+ * 配额归一化：非有限/缺失一律回落到**全量**，不是 0。
+ *
+ * 旧实现里 `take()` 用 `slice(0, undefined)`（= 全量）而 `newestTake()` 把非有限夹成 0
+ * （= 一条不留），两套兜底方向相反。调用方从可选配置拼 `limits` 时很容易传进
+ * undefined，于是进度整段消失、连「另有 N 条」也不印（`length > undefined` 恒 false）。
+ * 「没设上限」的正确含义是「不截断」，不是「全丢」。
+ */
+function capLimitOf(cap, total) {
+  if (cap === undefined || cap === null) return total
+  const numeric = Number(cap)
+  if (!Number.isFinite(numeric)) return total
+  return Math.max(0, Math.floor(numeric))
 }
 
 /**
@@ -1199,8 +1240,11 @@ export function buildWorkingState({
   }
 
   // (c) 未曝光结果
-  const unseenTake = take(unseenResults, config.maxUnseenResults)
-  for (const item of unseenTake.items) {
+  // 未曝光结果按 seq 升序到达：`take` 留最旧的 6 条，最新结果只报数量并掉出
+  // minimalWorkingState.dependencyRefs——与进度列表（P2-5(d)）完全同一类「丢反了」。
+  const unseenItems = newestTake(unseenResults, config.maxUnseenResults)
+  const unseenDropped = Math.max(0, (Array.isArray(unseenResults) ? unseenResults.length : 0) - unseenItems.length)
+  for (const item of unseenItems) {
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.UNEXPOSED_RESULT,
       itemId: `unexposed:${item.recordRef}`,
@@ -1209,11 +1253,11 @@ export function buildWorkingState({
       sourceRef: item.recordRef,
     }))
   }
-  if (unseenTake.dropped > 0) {
+  if (unseenDropped > 0) {
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.UNEXPOSED_RESULT,
       itemId: 'unexposed:overflow',
-      lines: [`另有 ${unseenTake.dropped} 条未曝光结果未展开（同样不可丢弃）`],
+      lines: [`另有 ${unseenDropped} 条未曝光结果未展开（同样不可丢弃）`],
       source: 'surface:tool/result',
     }))
   }
@@ -1324,7 +1368,7 @@ export function buildWorkingState({
   }
   if (activeHumanRequest) pushDep(activeHumanRequest.sourceId)
   for (const action of openActions) pushDep(action.recordRef)
-  for (const item of unseenTake.items) pushDep(item.recordRef)
+  for (const item of unseenItems) pushDep(item.recordRef)
   for (const item of necessaryEvidence) pushDep(item.recordRef)
   for (const pin of validPins) pushDep(pin.recordRef)
   const minimalRefs = dependencyRefs.slice(0, config.maxMinimalDependencies)
@@ -1450,11 +1494,11 @@ export function buildWorkingState({
         source: 'surface:progress',
         sourceRef: item.itemId,
       })),
-      ...(progress.length > config.maxProgressItems
+      ...(progress.length > capLimitOf(config.maxProgressItems, progress.length)
         ? [retentionItem({
             retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
             itemId: 'progress:overflow',
-            lines: [`另有 ${progress.length - config.maxProgressItems} 条进度未展开（只报数量，正文按记录 ID 回读）`],
+            lines: [`另有 ${progress.length - capLimitOf(config.maxProgressItems, progress.length)} 条进度未展开（只报数量，正文按记录 ID 回读）`],
             reason: '进度超出单卡上限：属于可退役的非必要历史，超出部分只报数量，不静默丢。',
             source: 'surface:progress',
           })]
@@ -1497,7 +1541,7 @@ export function buildWorkingState({
       // S1 助手结论盘点（方案 §7）：claim 默认 unverified，进同一软保留段；
       // 否定/撤回标 required（否定/更正可见），positive 不标 required（不冒充已完成）。
       // 配额 maxAssistantClaims 全局有界；超出只报数量（不静默丢）。
-      ...take(claims, config.maxAssistantClaims).items.map((raw, index) => {
+      ...selectClaims(claims, config.maxAssistantClaims).map(({ raw, index }) => {
         const item = typeof raw === 'string' ? { value: raw } : (raw ?? {})
         const recordRef = item.recordRef ?? `claim:${index}`
         const polarity = item.polarity ?? 'positive'
@@ -1576,7 +1620,7 @@ export function buildWorkingState({
     })),
     openActions,
     unclosedPairCount: mergedOpenCalls.length,
-    unseenResults: unseenTake.items,
+    unseenResults: unseenItems,
     unseenResultCount: unseenResults.length,
     // 「不知道有没有未曝光结果」必须与「确认没有」分开报，否则卡片会把未知说成零。
     exposureDecidable,
@@ -1783,7 +1827,10 @@ export function readbackSectionOf(readback) {
       ? 'seq ' + item.range.start + '–' + item.range.end
       : '范围未知'
     const locator = typeof item.locator === 'string' && item.locator !== '' ? '｜' + item.locator : ''
-    const cost = Number.isFinite(Number(item.tokens)) ? '｜取回 ≈' + Math.trunc(Number(item.tokens)) + ' token' : ''
+    // 只认**有限数字**：tokens 为 null / '' 时 Number() 会给出 0，把「代价未知」
+    // 印成「取回 ≈0 token」——一个假的可执行结论（模型会以为回读免费）。
+    const tokenCount = typeof item.tokens === 'number' && Number.isFinite(item.tokens) ? item.tokens : null
+    const cost = tokenCount !== null ? '｜取回 ≈' + Math.trunc(tokenCount) + ' token' : ''
     const line = item.recordId + '｜' + tools + '｜' + range + locator + cost
     lines.push(line.length <= CARD_READBACK_MAX_LINE_CHARS ? line : line.slice(0, CARD_READBACK_MAX_LINE_CHARS - 1) + '…')
   }
@@ -1898,7 +1945,15 @@ function softSectionsOf(state, { hardPrefixText = '', retrievalHits = null } = {
         section: section(
           `■ ${RETENTION_TITLES[retentionClass]}（soft/${retentionClass}）`,
           [...item.lines],
-          { retentionClass, strength: PROTECTION_STRENGTH.SOFT, importance: result.score, importanceText: formatImportanceReason(result) },
+          {
+            retentionClass,
+            strength: PROTECTION_STRENGTH.SOFT,
+            importance: result.score,
+            importanceText: formatImportanceReason(result),
+            // required 必须随段传下去：预算装包只看段上的 required，丢了它
+            // 「否定/更正必选」就只是 retentionItem 里的一句注释。
+            ...(item.required === true ? { required: true } : {}),
+          },
         ),
       })
     }
@@ -1989,7 +2044,7 @@ export function renderWorkingStateCard(state, {
       }
       // 0.12.0 P1-6：只报**类别 × 段/行数**，不再逐条列「因重要度分值 X（分量…）」。
       // 逐条打分算式是每步固定税里最贵的一段，而它对「要不要回读」没有决策价值；
-      // 算式仍可在 /memory-lab2 status --verbose 里查（见 renderCardDetail）。
+      // 算式仍可在 /memory-lab status --verbose 里查（见 renderCardDetail）。
       const described = [...grouped.values()]
         .map((entry) => `${entry.class}×${entry.sections}段/${entry.lines}行`)
         .join('；')
@@ -2025,6 +2080,12 @@ export function renderWorkingStateCard(state, {
     usedTokens = estimateTokensOf(text)
   } else {
     for (const item of softSections) {
+      // required 段（否定/更正可见）**必选**：预算不够也留下，并在页脚如实报超支。
+      // 旧实现把它当普通软条目按分值丢弃，826 行「预算覆盖选择时必选」从不生效。
+      if (item.required === true) {
+        kept.push(item)
+        continue
+      }
       const candidate = composeSoft([...kept, item])
       const tokens = estimateTokensOf(`${hardText}\n\n${candidate}`)
       if (tokens > budget) {
@@ -2054,7 +2115,13 @@ export function renderWorkingStateCard(state, {
       text = parts.join('\n\n')
       usedTokens = estimateTokensOf(text)
       if (usedTokens <= budget || kept.length === 0) break
-      const removed = kept.pop()
+      // 退让只能退**非必选**段：required（否定/更正）是「宁可超预算也要可见」的
+      // 内容，被这条退让链从尾部弹掉就等于必选从未生效。全是必选时停手，
+      // 超支如实体现在 usedTokens > budget 与 overflow 上。
+      let index = kept.length - 1
+      while (index >= 0 && kept[index].required === true) index -= 1
+      if (index < 0) break
+      const [removed] = kept.splice(index, 1)
       dropped.push({
         class: removed.retentionClass,
         title: removed.title,
@@ -2188,7 +2255,10 @@ function boundDeltaLines(lines, { maxLines, maxChars }) {
     used = next
   }
   const rest = lines.length - head.length - body.length
-  const tail = `（另有 ${rest} 行变化未列出：增量卡有上界，完整内容以最近一张全量卡为准，原文可按记录 ID 回读）`
+  // 措辞必须成立：模型手里的「最近一张全量卡」是**上一张**，它不含这些新行——
+  // 旧文案「完整内容以最近一张全量卡为准」是一句假话。截断的增量卡由调用方
+  // 改发全量卡（见 runtime-card 的 delta 分支），这里只如实说明本卡不全。
+  const tail = `（另有 ${rest} 行变化未在本卡列出：增量卡有上界；这些行没有进入本卡，可按记录 ID 回读）`
   return { text: [...head, ...body, tail].join('\n'), truncated: true }
 }
 

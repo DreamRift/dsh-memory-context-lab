@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto'
 
 import { estimateTokensOf } from './budget.mjs'
-import { ATOM_ATTRIBUTES, ATTRIBUTE_FAMILY } from './evidence-atoms.mjs'
+import { ATOM_ATTRIBUTES } from './evidence-atoms.mjs'
 
 const EXCERPT_MAX_CHARS_DEFAULT = 240
 
@@ -445,7 +445,7 @@ export function renderPhaseCard({ summaryId, phaseLabel, memberCount, tools, blo
   }
   if (truncated === true) lines.push('（归组候选截断：桶过大，近似归组不完整）')
   if (modeNote) lines.push('（' + String(modeNote) + '）')
-  lines.push('来源清单 manifest ' + String(manifestId ?? '') + '；逐条展开：/memory-lab2 expand ' + String(voucherId ?? '') + ' --page 1')
+  lines.push('来源清单 manifest ' + String(manifestId ?? '') + '；逐条展开：/memory-lab expand ' + String(voucherId ?? '') + ' --page 1')
   return clipText(lines.join('\n'), PHASE_CARD_MAX_TOKENS, '\n（卡超界截断）')
 }
 

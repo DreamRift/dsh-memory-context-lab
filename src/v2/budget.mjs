@@ -1,4 +1,19 @@
 /**
+ * 工作状态卡 / 工作集一次装包的 token 上限。
+ *
+ * 有界是硬要求：没有上限时调用方一个巨大数字就能把卡撑成全文，
+ * 「有界热上下文」这条不变量当场失效。
+ */
+export const WORKING_SET_MAX_BUDGET_TOKENS = 16_000
+
+/** 只读召回（命令面与模型可见工具共用）的默认/上限 token 预算。 */
+export const RECALL_DEFAULT_BUDGET_TOKENS = 6000
+export const RECALL_MAX_BUDGET_TOKENS = 32_000
+
+/** 字面检索一次最多返回多少条索引命中（正文仍要按 ID 单独回读）。 */
+export const RECALL_MAX_QUERY_HITS = 20
+
+/**
  * v2 估算工具。
  *
  * 只做「字节 → token 估算」，不引入模型、不做分词。之所以单独成模块：

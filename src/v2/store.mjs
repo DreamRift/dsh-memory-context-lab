@@ -227,6 +227,16 @@ const openDirectories = new Map()
 const openingDirectories = new Set()
 
 /**
+ * 正在对账、尚未登记为「可借用」的句柄（directory → store）。
+ *
+ * 登记与对账之间的窗口里，句柄已经**握着写锁**，但还不能被 peekOpen 借用（它的
+ * #manifest 还没赋值）。这期间若进程收尾（插件卸载 / 测试 dispose）走 closeAll，
+ * 只清 openDirectories 会漏掉它：写锁被永久占住，同目录的下一次打开一路 ELOCKED。
+ * 所以对账中的句柄在这里单独登记，closeAll 一并关闭。
+ */
+const pendingDirectories = new Map()
+
+/**
  * 已初始化的 v2 会话库句柄。init 创建；open 采用既有目录并对账。
  */
 export class V2SessionStore {
@@ -318,17 +328,24 @@ export class V2SessionStore {
    */
   static async #openWithReconcile({ directory, engine, readOnly, writeLock = null }) {
     const store = new V2SessionStore({ directory, engine, readOnly, writeLock })
-    openDirectories.set(directory, store)
+    pendingDirectories.set(directory, store)
     try {
       await store.#reconcile()
     } catch (error) {
-      openDirectories.delete(directory)
+      pendingDirectories.delete(directory)
       writeLock?.release()
       throw error
     } finally {
       // 占位与真句柄在这一刻交接完成：无论成败都要撤掉占位，否则目录永久 EOPEN。
       V2SessionStore.#releaseReservation(directory)
     }
+    // **对账完成后**才登记为可借用句柄。旧实现先登记再对账，于是对账窗口里
+    // peekOpen()（fork 的 acquireShared 走这条路）能拿到 #manifest 尚未赋值的
+    // 半成品：warnings 直接 TypeError，recordCount 恒 0。若此时 fork 正把父闭包
+    // 当空集合迁移，子库会是 0 条记录而命令报成功——静默丢历史。closeAll() 也会
+    // 在这个窗口里关掉它：锁被释放而 reconcile 继续写。
+    pendingDirectories.delete(directory)
+    openDirectories.set(directory, store)
     return store
   }
 
@@ -712,14 +729,22 @@ export class V2SessionStore {
       openedAt: new Date().toISOString(),
     }
     this.#openTransactions.add(txn)
-    await writeJsonFileAtomic(path.join(this.directory, TRANSACTIONS_DIRECTORY, transactionFileName(txn)), {
-      kind: TRANSACTION_KIND,
-      schemaVersion: RECORDS_SCHEMA_VERSION,
-      txn,
-      openedAt: handle.openedAt,
-      committedAt: null,
-      records: [],
-    })
+    try {
+      await writeJsonFileAtomic(path.join(this.directory, TRANSACTIONS_DIRECTORY, transactionFileName(txn)), {
+        kind: TRANSACTION_KIND,
+        schemaVersion: RECORDS_SCHEMA_VERSION,
+        txn,
+        openedAt: handle.openedAt,
+        committedAt: null,
+        records: [],
+      })
+    } catch (error) {
+      // 意图文件没落盘就等于这个事务没开成：登记必须撤销，否则该号永久留在
+      // #openTransactions 里（hasOpenTransactions 恒 true、同号重试永远 EINVAL），
+      // 而 #nextTxn 已经推进——本进程内无法自愈，只能重启。
+      this.#openTransactions.delete(txn)
+      throw error
+    }
     return handle
   }
 
@@ -760,8 +785,26 @@ export class V2SessionStore {
   /**
    * 阶段化一条记录：载荷先落盘（内容寻址不可变），记录追加进事务文件。
    * 返回已赋稳定 ID 且通过 schema 校验的记录（不含 content）。
+   *
+   * **必须串行**：稳定 ID 取自 `handle.records.length`，而载荷落盘是 await 点。
+   * 两个并发调用（例如一步里多个并行工具调用的结果同时落库）会在 await 处交错，
+   * 双双读到同一个长度、拿到**同一个稳定 ID**；后写的覆盖先写的，catalog 少一条，
+   * 而提交报告仍按两条算——第一个调用方拿到的 ID 指向别人的正文。这里用一条
+   * promise 链把同一句柄上的阶段化排成队列（不是锁：出错不阻断后续）。
    */
   async stageRecord(handle, draft) {
+    const previous = this.#stageQueue
+    let release = () => {}
+    this.#stageQueue = new Promise((resolve) => { release = resolve })
+    try {
+      await previous.catch(() => {})
+      return await this.#stageRecordLocked(handle, draft)
+    } finally {
+      release()
+    }
+  }
+
+  async #stageRecordLocked(handle, draft) {
     this.#assertWritable(`事务 ${handle.txn} 写入`)
     if (!this.#openTransactions.has(handle.txn)) {
       throw new EngineV2Error(`事务 ${handle.txn} 未在本库打开`, { code: 'EINVAL' })
@@ -769,19 +812,36 @@ export class V2SessionStore {
     if (handle.records.length >= 10_000) {
       throw new EngineV2Error('单事务记录数超限（10000），请先提交', { code: 'ELIMIT' })
     }
+    const hasContent = draft.content !== undefined && draft.content !== null
     const id = recordId(handle.txn, handle.records.length)
     const validated = validateRecord({ ...draft, id })
-    if (validated.fidelity === 'verbatim' && !validated.payload
-      && (draft.content === undefined || draft.content === null)) {
+    if (validated.fidelity === 'verbatim' && !validated.payload && !hasContent) {
       throw new EngineV2Error(`记录 ${id} 声明 verbatim 但缺少载荷`, { code: 'ESCHEMA' })
     }
+    // 带正文却不声明载荷：记录会以「有正文、无载荷」的形态落库，之后既读不出正文
+    // 也不占载荷空间，是一条**永久不可读**的记录。旧代码在这里解引用
+    // validated.payload.hash 抛 TypeError（不是 EngineV2Error），调用方按 code
+    // 分支全部落空，事务号还残留在 #openTransactions 里。
+    if (hasContent && !validated.payload) {
+      throw new EngineV2Error(`记录 ${id} 带了正文但没有声明载荷（payload）`, { code: 'ESCHEMA' })
+    }
 
-    if (draft.content !== undefined && draft.content !== null) {
+    if (hasContent) {
       const buffer = typeof draft.content === 'string' ? Buffer.from(draft.content, 'utf8') : draft.content
       // 载荷哈希必须与声明一致，防止伪造内容寻址。
       const actual = `sha256:${createHash('sha256').update(buffer).digest('hex')}`
-      if (validated.payload && actual !== validated.payload.hash) {
+      if (actual !== validated.payload.hash) {
         throw new EngineV2Error(`记录 ${id} 的载荷哈希与内容不符（声明 ${validated.payload.hash}，实际 ${actual}）`, { code: 'EHASH' })
+      }
+      // 尺寸也必须一致：只校验 hash 时，把 size 按**字符数**算的调用方（中文 8 字符 /
+      // 24 字节）能提交成功，但此后每次 readRecord 都判 size-mismatch、payloadText
+      // 恒为 null——记录永久不可读却仍在 catalog 里，fork 还会因 integrity 不为 ok
+      // 直接失败。哈希对、尺寸错只可能来自调用方的计量错误，必须在写入前拦住。
+      if (validated.payload.size !== buffer.byteLength) {
+        throw new EngineV2Error(
+          `记录 ${id} 的载荷大小与正文不符（声明 ${validated.payload.size} 字节，实际 ${buffer.byteLength} 字节）`,
+          { code: 'ESCHEMA' },
+        )
       }
       await this.#writePayload(buffer, validated.payload.hash)
     } else if (validated.payload) {
@@ -799,6 +859,9 @@ export class V2SessionStore {
     })
     return validated
   }
+
+  /** 同一句柄上的阶段化队列（见 stageRecord 的串行要求）。 */
+  #stageQueue = Promise.resolve()
 
   async #writePayload(buffer, hashWithScheme) {
     const hex = hashWithScheme.slice('sha256:'.length)
@@ -1017,6 +1080,16 @@ export class V2SessionStore {
       }
     }
     openDirectories.clear()
+    // 对账中的句柄同样要关：它们已经握着写锁，漏掉就把目录锁死了。
+    for (const store of [...pendingDirectories.values()]) {
+      try {
+        store.close()
+        closed += 1
+      } catch {
+        /* 同上：单个失败不阻断其余 */
+      }
+    }
+    pendingDirectories.clear()
     return closed
   }
 
@@ -1128,24 +1201,46 @@ export class V2SessionStore {
     const hex = payload.hash.slice('sha256:'.length)
     const file = path.join(this.directory, PAYLOADS_DIRECTORY, hex.slice(0, 2), hex)
     const fullBytes = payload.size
-    const bounded = Number.isFinite(maxBytes) && maxBytes > 0 && fullBytes > maxBytes
+    const start = Math.max(0, Number.isFinite(offsetBytes) ? offsetBytes : 0)
+    // 分块判据必须把起点算进去：只看 fullBytes > maxBytes 时，「整篇不大于 maxBytes
+    // 但指定了起点」的读取会走全量分支，start 被静默丢弃——调用方拿到的是从头开始
+    // 的内容，分块读会重复同一段正文。
+    const bounded = Number.isFinite(maxBytes) && maxBytes > 0 && fullBytes > start + maxBytes
     let buffer
     try {
       if (bounded) {
         // P1-7：offsetBytes>0 时读中段（分块索引）；chunk 起点越界时返回空段。
-        const start = Math.max(0, Number.isFinite(offsetBytes) ? offsetBytes : 0)
         buffer = start >= fullBytes ? Buffer.alloc(0) : await readRange(file, start, maxBytes)
+      } else if (start >= fullBytes) {
+        // 起点越界：返回空段（不是「从头读」）。
+        buffer = Buffer.alloc(0)
       } else {
-        buffer = await readFile(file)
+        buffer = start > 0 ? await readRange(file, start, fullBytes - start) : await readFile(file)
       }
     } catch (error) {
       if (error?.code === 'ENOENT') return { integrity: 'payload-missing', text: null, fullBytes, verified: false }
       return { integrity: 'payload-unreadable', text: null, fullBytes, verified: false }
     }
-    if (bounded) {
+    if (bounded || start > 0) {
       // 只读了片段：不对全文做哈希断言，如实标 'prefix'（不是 'ok'）。
       const text = payload.encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf8')
-      return { integrity: 'prefix', text, truncated: fullBytes > (offsetBytes || 0) + buffer.byteLength, fullBytes, prefixBytes: (offsetBytes || 0) + buffer.byteLength, verified: false }
+      const covered = start + buffer.byteLength
+      // 起点越界：空段是**正确结果**（不是尺寸不符）。
+      if (start >= fullBytes) {
+        return { integrity: 'prefix', text: '', truncated: false, fullBytes, offsetBytes: start, prefixBytes: start, verified: false }
+      }
+      if (!bounded && buffer.byteLength !== fullBytes - start) {
+        return { integrity: 'size-mismatch', text: null, fullBytes, verified: false }
+      }
+      return {
+        integrity: 'prefix',
+        text,
+        truncated: bounded ? fullBytes > covered : false,
+        fullBytes,
+        offsetBytes: start,
+        prefixBytes: covered,
+        verified: false,
+      }
     }
     if (buffer.byteLength !== fullBytes) {
       return { integrity: 'size-mismatch', text: null, fullBytes, verified: false }

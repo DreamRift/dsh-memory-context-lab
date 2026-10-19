@@ -21,17 +21,17 @@ function fold(state, name, args) {
 
 test('压力闸门 P1：v2 会话 set pressure 30 后视图读到 30', () => {
   let state = initProjectionState()
-  state = fold(state, 'memory-lab2', 'on')
-  state = fold(state, 'memory-lab2', 'set pressure 30')
+  state = fold(state, 'memory-lab', 'on')
+  state = fold(state, 'memory-lab', 'set pressure 30')
   assert.equal(state.pressureGate, 30, '状态里必须先有值')
   assert.equal(viewOf(state).pressureGate, 30, '视图必须把状态里的值带出去')
 })
 
-test('压力闸门 P2：v1 会话同样读得到（闸门是两代共用判据）', () => {
+test('压力闸门 P2：单一引擎同样读得到', () => {
   let state = initProjectionState()
   state = fold(state, 'memory-lab', 'on')
   state = fold(state, 'memory-lab', 'set pressure 0')
-  assert.equal(state.engine, 'v1')
+  assert.equal(state.engine, 'v2', '0.13.1 只有 v2 引擎')
   assert.equal(viewOf(state).pressureGate, 0, '0 是合法值（无压力也降温），不能被当成缺省')
 })
 

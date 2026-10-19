@@ -259,7 +259,7 @@ test('renderPhaseCard：含 manifest、凭证与展开入口，字节稳定，�
   assert.ok(card.includes('3 个已完成操作'))
   assert.ok(card.includes('工具 pwsh'))
   assert.ok(card.includes('manifest mf-abc123'))
-  assert.ok(card.includes('/memory-lab2 expand vc-def456 --page 1'))
+  assert.ok(card.includes('/memory-lab expand vc-def456 --page 1'))
   assert.ok(!/d{4}-d{2}-d{2}T/.test(card), '卡内容不含时间戳')
   assert.ok(estimateTokensOf(card) <= PHASE_CARD_MAX_TOKENS + 4)
   const again = renderPhaseCard({

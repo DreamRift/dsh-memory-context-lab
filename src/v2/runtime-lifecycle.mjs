@@ -1,0 +1,607 @@
+/**
+ * v2 会话生命周期域（0.13.1 P4c）。
+ *
+ * 从 `runtime.mjs` 摘出：会话记录的建立与回收、启用/停用、重启对账、恢复与
+ * 计划先行联动，共 14 个函数。函数体**逐字搬移**，语义零改动；原本从闭包自由
+ * 读取的名字改为显式注入。
+ *
+ * ## 装配契约
+ * `createLifecycleDomain({...})` 收四类依赖：
+ *   - **共享注册表**（`records` / `factories` / `activeOperations`）传对象本体，
+ *     本域与 runtime 必须看到同一份，不能传副本；
+ *   - **engine**：本域在 engine 构造之后装配，engine 的回调只会在装配完成后才被
+ *     调用，因此这里直接收引用；
+ *   - **同级域的入口**（forget 域四个函数、`compressDepsOf` /
+ *     `invalidateLedgerForRestore`）：这些在 runtime 里是函数声明，会被提升，
+ *     本域只在调用时才取用；
+ *   - **宿主注入项**（`labRoot` / `services` / `logger` / `sessionIdOf` /
+ *     设置页默认值 / 计划先行回调 / 语义后端解析器 / `backendPrecheck`）。
+ *
+ * ## 依赖方向
+ * 本域**不**依赖 card 域与 read 域；反向依赖存在（card 域要 `adopt` /
+ * `persistCost`，read 域要 `adopt` / `withReadableStore`），所以装配顺序是
+ * forget → lifecycle → card → read。
+ *
+ * ## 不适用条件
+ * 本域不持有跨会话缓存：`reconciledAt` 只是本进程内的对账去重表，进程重启即
+ * 重建（这是有意的——重启后的第一次 adopt 必须重新对账）。
+ */
+import { rm } from 'node:fs/promises'
+
+import { V2_RECEIPT_MARKER, normalizeSettings, restoreGrowth } from '../core.mjs'
+import { EngineV2Error } from './errors.mjs'
+import { createCostLedger } from './cost.mjs'
+import { readRecordById } from './readback.mjs'
+import { claimV2Engine, disableV2Engine, releaseV2Engine } from './engine.mjs'
+import { createV2SessionState, disabledV2State, readV2SessionState, v2SessionDirectoryFor, writeV2SessionState } from './state.mjs'
+import { getForgetIndex } from './disposition.mjs'
+import { readNeedsMigration } from './fork.mjs'
+import { reconcileVouchers } from './hierarchy-coordinator.mjs'
+
+export function createLifecycleDomain({
+  // 共享注册表（活引用）
+  records,
+  factories,
+  activeOperations,
+  engine,
+  // 宿主注入
+  labRoot,
+  services,
+  logger,
+  sessionIdOf,
+  coordinator,
+  factoryFor,
+  receiptTextOf,
+  backendPrecheck,
+  onEnabled,
+  semanticBackend,
+  semanticBackendFor,
+  semanticBackendClose,
+  defaultSettings,
+  defaultFullHistory,
+  defaultCompressModel,
+  defaultShareL2Content,
+  // 同级域入口（runtime 里的函数声明，调用时才取用）
+  collectForgetEntries,
+  forgetNodeBasesOf,
+  planWithdrawals,
+  withdrawForgottenSurfaces,
+  compressDepsOf,
+  invalidateLedgerForRestore,
+}) {
+  /**
+   * 崩溃窗口对账：账本已提交、表面撤回/行状态未收口的残差，在下次 adopt 时收敛。
+   *
+   * 判定完全确定性：受影响回执组的期望墓碑文本逐字节重建后与当前比对——
+   * 只有「当前就是原回执」才替换（已撤过、或用户已手工改写过的都不动，如实计数）。
+   * 行状态只补标缺失的 forgotten 标记，不重放任何工具副作用。失败时下一次
+   * adopt 仍会重试（缓存只在成功后写入）。
+   */
+  const reconciledAt = new Map()
+
+  function makeRecord({ agent, sessionId, directory, state }) {
+    let suppressionLease = null
+    try {
+      suppressionLease = coordinator?.acquire(sessionId) ?? null
+    } catch (error) {
+      logger?.warn?.(`memory-context-lab: 灵枢抑制租约获取失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    return {
+      engineName: 'v2',
+      agent,
+      sessionId,
+      directory,
+      state: { ...state, settings: normalizeSettings(state.settings) },
+      suppressionLease,
+      client: null,
+      clientError: null,
+      occupancy: null,
+      occupancyError: null,
+      recallQueryId: null,
+      lastAction: null,
+      // 工作状态卡注入状态（D1 升级）：最近一次**渲染出的全量卡文本**与已注入
+      // 总数、已注入语义键的有界历史。只存内存：重启后丢失即回落「下一张全量卡」，
+      // 这是诚实降级（不注入引用了模型从未见过的全量卡的增量卡）。
+      workingSetCard: null,
+      // S3 三态分离：prepared 未确认载荷（preparedId → 载荷）。只在内存：
+      // 宿主确认（confirmInjection）即消费删除；进程重启丢的只是未确认的
+      // prepare，下一张卡按「无上卡」语义回落全量（诚实降级）。
+      pendingInjections: new Map(),
+      // 成本账本：从持久化快照续记，进程内累计；停用与每批降温后落盘。
+      cost: createCostLedger(state.cost),
+    }
+  }
+
+  /**
+   * 把成本计数落盘（best-effort）。
+   *
+   * 记账失败不能让降温或回读失败——但也不能静默：写失败会记一条告警，
+   * 并把内存里的计数保留到下次尝试。
+   */
+  async function persistCost(record) {
+    try {
+      const counters = record.cost.snapshot()
+      record.state = { ...record.state, cost: counters }
+      await writeV2SessionState(record.directory, record.state)
+    } catch (error) {
+      logger?.warn?.(`memory-context-lab: 成本计数落盘失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  async function reconcileForgetState(record) {
+    if (!record?.directory) return null
+    let forgetIndex
+    try {
+      forgetIndex = await getForgetIndex(record.directory)
+    } catch {
+      return null // 账本不可读：读面自带告警，这里不再放大。
+    }
+    const revision = forgetIndex?.revision ?? 0
+    if (reconciledAt.get(record.sessionId) === revision) return null
+    const targetIds = [...(forgetIndex?.forgotten?.keys() ?? [])]
+    if (targetIds.length === 0) {
+      reconciledAt.set(record.sessionId, revision)
+      return null
+    }
+    const plan = await planWithdrawals(
+      record,
+      forgetNodeBasesOf(await collectForgetEntries(record), targetIds),
+      targetIds,
+    )
+    const outcome = await withdrawForgottenSurfaces(
+      record,
+      { entry: { operationId: null }, targetIds },
+      plan,
+    )
+    reconciledAt.set(record.sessionId, revision)
+    if (outcome.withdrawn > 0 || outcome.reconciledRows > 0) {
+      logger?.info?.(`memory-context-lab: 遗忘对账收敛（撤回 ${outcome.withdrawn}，补标 ${outcome.reconciledRows}）`)
+    }
+    return outcome
+  }
+
+  async function adopt(agent) {
+    const sessionId = sessionIdOf(agent.session)
+    if (!sessionId) return null
+    const cached = records.get(sessionId)
+    if (cached) return cached
+    let loaded
+    try {
+      loaded = await readV2SessionState(labRoot, sessionId)
+    } catch (error) {
+      logger?.warn?.(`memory-context-lab: 状态文件不可读，本会话按未启用处理：${error instanceof Error ? error.message : String(error)}`)
+      return null
+    }
+    if (!loaded || loaded.state.enabled !== true) return null
+    const record = makeRecord({ agent, sessionId, directory: loaded.directory, state: loaded.state })
+    records.set(sessionId, record)
+    // P2：账本已提交但表面未收口的崩溃窗口，在此收敛（失败不阻塞命令主路径）。
+    reconcileForgetState(record).catch(() => {})
+    // P3：凭证计划已保存但替换未落表面的崩溃窗口，同路收敛（不阻塞 adopt）。
+    reconcileVouchers(await compressDepsOf(record)).catch(() => {})
+    return record
+  }
+
+  async function disposeRecord(record) {
+    try {
+      await record.client?.close?.()
+    } catch {
+      // 关闭失败不阻塞退出。
+    }
+    try {
+      await factories.get(record.sessionId)?.dispose?.()
+    } catch {
+      // 同上。
+    }
+    factories.delete(record.sessionId)
+    // 释放该会话的检索后端资源（隔离灵枢子进程）。会话停用后不再需要它，
+    // 留着会白白常驻一个 Python 进程。失败不阻塞退出。
+    try {
+      await semanticBackendClose?.({ sessionId: record.sessionId })
+    } catch (error) {
+      logger?.warn?.(`v2 检索后端释放失败（${record.sessionId}）：${error?.message ?? error}`)
+    }
+    try {
+      record.suppressionLease?.release?.()
+    } catch {
+      // 租约释放失败由协调器自己的超时兜底。
+    }
+  }
+
+  async function runExclusive(sessionId, work) {
+    const pending = (async () => work())()
+    activeOperations.add(pending)
+    try {
+      return await pending
+    } finally {
+      activeOperations.delete(pending)
+    }
+  }
+
+  /**
+   * 继承历史审计：热投影里的 v2 回执，其记录 ID 必须在本会话可解析。
+   *
+   * 存在的理由（规范 10.2）：「设置继承不等于历史可读性继承」。fork 出来的子会话
+   * 会带着父会话的对话历史（含父 namespace 的回执），但子会话自己的冷库是空的；
+   * 模型看到指向不存在证据的回执，比没有回执更糟。启用前查出来并阻断，
+   * 而不是等模型真的去读的时候才发现。
+   */
+  async function auditInheritedArchive(record, { maxCheck = 50 } = {}) {
+    const session = record.agent?.session
+    const nodes = Array.isArray(session?.surface?.nodes) ? session.surface.nodes : []
+    const referenced = []
+    for (const seq of nodes) {
+      const event = typeof session?.eventAt === 'function' ? session.eventAt(seq) : null
+      const text = receiptTextOf(event)
+      if (text === null || !text.startsWith(V2_RECEIPT_MARKER)) continue
+      for (const match of text.matchAll(/\bt\d{8}-r\d{4}\b/g)) referenced.push(match[0])
+    }
+    const unique = [...new Set(referenced)]
+    if (unique.length === 0) return { checked: 0, missing: [], truncated: false }
+    const sample = unique.slice(0, maxCheck)
+    const missing = []
+    const factory = factoryFor(record)
+    await factory.withStore(async (store) => {
+      for (const id of sample) {
+        try {
+          await readRecordById(labRoot, record.sessionId, id, { store })
+        } catch {
+          missing.push(id)
+        }
+      }
+    })
+    return { checked: sample.length, missing, truncated: unique.length > sample.length }
+  }
+
+  /**
+   * 阻断路径的完整回滚（审计 H2）：账本可能已初始化，单独 releaseV2Engine 会
+   * 因「已初始化且激活」抛 EENGINEACTIVE，被 .catch 吞掉后恰好留下最坏的
+   * 悬空状态（engine.json active + 台账在 + 账本 on）。先正式停用（写
+   * disabled）再 release，两步各自的失败都只降级为告警，不掩盖原始错误。
+   */
+  async function rollbackV2Activation(sessionId, reason) {
+    try {
+      await disableV2Engine(labRoot, sessionId, reason)
+    } catch (error) {
+      logger?.warn?.(`memory-context-lab: 阻断回滚时停用失败（${error instanceof Error ? error.message : String(error)}）`)
+    }
+    try {
+      await releaseV2Engine(labRoot, sessionId)
+    } catch (error) {
+      logger?.warn?.(`memory-context-lab: 阻断回滚时释放声明失败（${error instanceof Error ? error.message : String(error)}）`)
+    }
+  }
+
+  async function enable(invocation) {
+    const agent = invocation.agent
+    const sessionId = sessionIdOf(agent.session)
+    if (!sessionId) throw new EngineV2Error('无法确定会话 ID，拒绝启用 v2。', { code: 'EINVAL' })
+
+    // 1) 引擎所有权：v1 若持有本会话投影则拒绝（双引擎互斥的 v2→v1 方向）。
+    const claim = await claimV2Engine(labRoot, sessionId)
+    if (!claim.claimed) {
+      throw new EngineV2Error(
+        'v2 已持有本会话投影，无需重复启用。',
+        { code: 'EENGINEACTIVE', details: { holder: 'v2' } },
+      )
+    }
+    // 1a) 检索后端显式指定预检（PR #4 端口二）：强制 lingshu 时，dsh-memory
+    //     不在场或后端模块加载失败 → 拒绝启用（EBACKENDUNAVAILABLE），不静默降级。
+    //     auto / local-lexical-v1 模式不预检（auto 降级是既有语义，不是错误）。
+    if (typeof backendPrecheck === 'function') {
+      const precheck = await backendPrecheck()
+      if (precheck?.ok === false) {
+        await rollbackV2Activation(sessionId, precheck.reason ?? '检索后端预检失败，回滚启用')
+        throw new EngineV2Error(precheck.message ?? `检索后端不可用：${precheck.reason ?? '未知原因'}`, { code: precheck.code ?? 'EBACKENDUNAVAILABLE' })
+      }
+    }
+    // 1b) fork 阻断：子会话若停在 needs-migration，不得用空库继续任务（规范 10.2）。
+    const stuck = await readNeedsMigration(labRoot, sessionId)
+    if (stuck) {
+      await rollbackV2Activation(sessionId, '启用前发现 needs-migration 残留，回滚声明')
+      throw new EngineV2Error(
+        `本会话停在 needs-migration（父会话 ${stuck.parentSessionId ?? '未知'}，原因：${stuck.reason ?? '未记录'}）。\n`
+        + `继承历史不等于历史可读；请先完成迁移：\n${(stuck.steps ?? []).join('\n')}`,
+        { code: 'ENEEDSMIGRATION', details: { needsMigration: stuck } },
+      )
+    }
+    // 2) 会话账本：创建或重新启用（已启用时 createV2SessionState 抛 EALREADYON）。
+    let created
+    try {
+      created = await createV2SessionState(labRoot, sessionId, normalizeSettings(defaultSettings()))
+    } catch (error) {
+      // 账本建不起来就完整回滚（账本可能部分写入：停用再释放），避免留下
+      // 「已声明但无账本」或「账本 on + 声明 active」的悬空状态。
+      await rollbackV2Activation(sessionId, '账本创建失败，回滚启用')
+      throw error
+    }
+    const record = makeRecord({
+      agent,
+      sessionId,
+      directory: created.directory,
+      state: created.state,
+    })
+    // 全历史默认值播种：旧账本（含 off/on 往返）按已有值走；全新账本按设置页默认。
+    // 只在值缺失时补，绝不覆盖用户在本会话写下的选择。
+    if (record.state.fullHistory === undefined) {
+      record.state.fullHistory = defaultFullHistory() === true
+      await writeV2SessionState(record.directory, record.state).catch(() => {})
+    }
+    // 模型模式默认值播种：口径同上（只在缺失时补）。
+    if (record.state.compressModel === undefined) {
+      record.state.compressModel = defaultCompressModel() === true
+      await writeV2SessionState(record.directory, record.state).catch(() => {})
+    }
+    // T1/F-03：共享正文摘录默认值播种（口径同上：只在缺失时补）。
+    if (record.state.shareL2Content === undefined) {
+      record.state.shareL2Content = defaultShareL2Content() === true
+      await writeV2SessionState(record.directory, record.state).catch(() => {})
+    }
+    records.set(sessionId, record)
+    const warnings = [...(claim.warnings ?? [])]
+
+    // 3) 继承历史审计：热投影里已有 v2 回执但本会话库解析不到 → 阻断启用。
+    //    典型场景是 fork：子会话继承父会话对话历史，却没有父会话冷库闭包。
+    try {
+      const audit = await auditInheritedArchive(record)
+      if (audit.missing.length > 0) {
+        // 阻断启用：完整回滚（账本已 on、engine 已声明），先停用再释放，
+        // 保证「台账声明 / engine.json / 会话账本」三者回到启用前状态。
+        records.delete(sessionId)
+        await rollbackV2Activation(sessionId, `继承审计失败：${audit.missing.length} 条回执不可解析`)
+        throw new EngineV2Error(
+          `本会话热投影里有 ${audit.missing.length} 条 v2 回执指向本会话冷库中不存在的记录`
+          + `${audit.truncated ? '（仅抽查了前 50 条）' : ''}：${audit.missing.slice(0, 5).join('、')}\n`
+          + '这通常意味着会话是从父会话 fork 而来但历史尚未迁移。\n'
+          + `请先迁移：/memory-lab fork ${sessionId} 后重试。`,
+          { code: 'EINHERITEDUNREADABLE', details: audit },
+        )
+      }
+      if (audit.checked > 0) warnings.push(`继承审计：${audit.checked} 条回执在本会话可解析`)
+    } catch (error) {
+      if (error instanceof EngineV2Error) throw error
+      // 审计本身失败（例如库打不开）不阻断启用，但必须留下告警而不是静默放过。
+      warnings.push(`继承审计未完成：${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    if (warnings.length) logger?.warn?.(`memory-context-lab: ${warnings.join('；')}`)
+    // 计划先行联动（由 index.mjs 注入）：启用成功且开关为开、会话全新时进入计划模式。
+    //
+    // 0.12.0 P1-1：`index.mjs` 注入的 onEnabled **返回同步对象**（plan-first 的
+    // `enterIfFresh` 是同步函数），旧写法 `onEnabled?.(agent)?.catch(...)` 在同步
+    // 返回值上访问 `.catch` 是 undefined → TypeError。而这段代码在 `enable()` 尾部、
+    // 记录与状态**已经落盘之后**且不在 try 内：命令显示失败，引擎其实已启用——
+    // 「失败关闭」在这里完全没生效。现在同步与异步都接，抛错一律降级为提示。
+    let planNote = null
+    let planNoteFailed = false
+    try {
+      const note = onEnabled?.(agent)
+      if (note && typeof note.then === 'function') {
+        // 异步分支的 rejection 同样要降级为提示（并留下「计划先行未生效」），
+        // 不能静默吞成 null —— 那会让回执看起来一切正常。
+        planNote = (await note.catch(() => { planNoteFailed = true; return null })) ?? null
+      } else {
+        planNote = note ?? null
+      }
+    } catch (error) {
+      planNoteFailed = true
+      logger?.warn?.(`memory-context-lab: 计划先行联动失败（引擎已启用，计划模式未生效）：${error instanceof Error ? error.message : String(error)}`)
+    }
+    return {
+      kind: 'success',
+      text: `已启用 v2 引擎（全历史按需记忆化）。\n隔离根：${created.directory}\n`
+        + `本会话对真实灵枢的自动读写已抑制；v1 引擎在本会话不可同时启用。\n`
+        + (warnings.length ? `告警：${warnings.join('；')}` : '')
+        + (planNote ? `\n${planNote.text}` : '')
+        + (planNoteFailed ? '\n计划先行未生效：联动回调抛错（引擎已启用，降温照常；可稍后 `/memory-lab status` 复核）。' : ''),
+    }
+  }
+
+  /**
+   * 停用一个会话的 v2：先恢复投影，再置停用、清引擎声明。
+   *
+   * 以 record 为中心（而不是以命令调用为中心），因为归档清理路径只拿得到
+   * sessionId，拿不到命令 invocation，但两者必须是同一条停用语义。
+   */
+  async function disableRecord(record, sessionId, reason) {
+    const lines = []
+    let restored = 0
+    let before = 0
+    let windowGuardRefusal = null
+
+    if (record) {
+      // 0) 窗口守卫（rc.5，与 v1 normalizeAndStop 同口径）：恢复会让组装输入
+      // 超出模型窗口时跳过恢复、照常停用，原文留在冷库并如实给出路。
+      // 「无测量不设闸」——测量不可用时照常恢复（与 v1 一致），不静默扣留。
+      // P0-2：restore-skipped 的行同样「原文只在冷库」，停用前同样要走窗口守卫，
+      // 否则跳过行在恢复时突然全部回来会击穿模型窗口。
+      const pendingCount = engine.pendingReceipts(record).length + engine.restoreSkippedReceipts(record).length
+      if (pendingCount > 0 && engine.settingsOf(record).autoRestore) {
+        try {
+          const occupancy = await engine.measureOccupancy(record, undefined)
+          const growth = restoreGrowth([...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)], {
+            assembledTokens: occupancy.host.assembledTokens,
+            contextWindow: occupancy.host.contextWindow,
+          })
+          if (growth.overflow) {
+            windowGuardRefusal = {
+              total: growth.total,
+              heldByReceipts: growth.heldByReceipts,
+              assembled: occupancy.host.assembledTokens,
+              window: occupancy.host.contextWindow,
+            }
+          }
+        } catch (error) {
+          logger?.warn?.(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      // 1) 先恢复所有已替换区间：投影回到原文，再停用。
+      if (!windowGuardRefusal) {
+        try {
+          const outcome = await engine.runRestore(record)
+          restored = outcome?.restored ?? 0
+          before = outcome?.before ?? 0
+          // 0.12.0 P0-2：恢复成功的区间已回活动面，读取账本里「已归档」的标记随之失效。
+          await invalidateLedgerForRestore(record, outcome)
+          // P0-2：停用回执必须如实报告仍未恢复的行——它们的原文只在冷库，
+          // 停用后冷库按只读保留，旧记录 ID 仍可回读，但不能宣称「全部恢复」。
+          const stillSkipped = outcome?.stillSkipped ?? 0
+          if (stillSkipped > 0) {
+            lines.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过，原因见上）：它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
+          }
+          // P2：软遗忘的行不会随 off 恢复（可见性由 disposition 账本持有，
+          // 与引擎开关解耦）；停用回执必须如实披露这段「不在恢复范围内」。
+          const forgottenCount = outcome?.forgotten ?? 0
+          if (forgottenCount > 0) {
+            lines.push(`另有 ${forgottenCount} 段已软遗忘未恢复：off 只停用引擎，不改变遗忘状态；如需恢复可见性，先重新启用后用 /memory-lab forget undo <操作ID>。`)
+          }
+        } catch (error) {
+          // 恢复失败不静默：仍继续停用，但把失败写进回执文本，且不宣称已恢复。
+          lines.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}`)
+        }
+      } else {
+        const growth = windowGuardRefusal.total - (windowGuardRefusal.heldByReceipts ?? 0)
+        lines.push(
+          `停用了降温，但恢复会让组装输入超出模型窗口（当前约 ${windowGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${windowGuardRefusal.window}），`,
+          '因此**没有**恢复，原文仍在冷库里。要取回原文，请先缩小上下文，或直接丢弃冷库：',
+          '  /memory-lab clean confirm delete-session',
+        )
+      }
+      const disabledState = disabledV2State(record.state, reason)
+      await writeV2SessionState(record.directory, disabledState)
+      record.state = disabledState
+      await disposeRecord(record)
+      records.delete(sessionId)
+    } else {
+      lines.push('本会话没有活动的 v2 记录（可能已停用）。')
+    }
+
+    // 2) 引擎所有权：置 disabled 并清台账声明。
+    const outcome = await disableV2Engine(labRoot, sessionId, reason)
+    if (outcome.warnings?.length) lines.push(...outcome.warnings)
+
+    lines.unshift(
+      windowGuardRefusal
+        ? `已停用 v2 引擎，未恢复原文（窗口守卫拒绝，见下）。历史与载荷按只读保留，旧记录 ID 仍可回读。`
+        : `已停用 v2 引擎。恢复 ${restored}/${before} 段原文；`
+          + '历史与载荷按只读保留，旧记录 ID 仍可回读。',
+    )
+    return { kind: 'success', text: lines.join('\n'), restored, before }
+  }
+
+  async function disable(invocation, reason) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    if (!sessionId) throw new EngineV2Error('无法确定会话 ID，拒绝停用 v2。', { code: 'EINVAL' })
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
+    return disableRecord(record, sessionId, reason)
+  }
+
+  /**
+   * 只按 sessionId 停用（归档清理路径）。
+   *
+   * 会话已被归档、拿不到 Agent 时返回 skipped：没有活动面可恢复，此时删数据
+   * 才是错的——回执仍指向冷库，留着它才对。
+   */
+  async function disableById(sessionId, reason) {
+    const record = records.get(sessionId) ?? await adoptById(sessionId)
+    if (!record) return { restored: 0, before: 0, skipped: true }
+    return disableRecord(record, sessionId, reason)
+  }
+
+  async function adoptById(sessionId) {
+    const agents = services?.get?.('agents')
+    const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : null
+    if (!agent) return null
+    return adopt(agent)
+  }
+
+  /**
+   * `/memory-lab restore`（B2）：不停用引擎，把全部可恢复的回执恢复回原文。
+   *
+   * 与 `off` 的区别只在「不停用」：恢复管线复用同一套 `engine.runRestore`
+   * （逐回执校验冷节点与表层一致性，失败行如实逐条说明并保持可按 ID 回读）。
+   * 面板的「恢复原文」在 v2 会话改发本命令，不再硬编码 v1 的 `/memory-lab restore`
+   * （后者在 v1 adopt 为 null 时会误报「未启用」，见会话 c896f803 的排查）。
+   */
+  async function restoreOnly(invocation) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    if (!sessionId) throw new EngineV2Error('无法确定会话 ID，拒绝恢复。', { code: 'EINVAL' })
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
+    if (!record) {
+      return {
+        kind: 'error',
+        text: 'v2 引擎在本会话未启用，没有可整批恢复的 v2 回执。\n'
+          + '若此前启用过又停用：回执仍在会话日志里，单段原文可用 /memory-lab read <ID> 回读（停用后旧 ID 仍可解析）。',
+      }
+    }
+    const outcome = await engine.runRestore(record)
+    return {
+      kind: 'success',
+      text: `${outcome.text}\n引擎保持启用（本次不停用）；单段回读用 /memory-lab read <ID>，整批恢复并停用用 /memory-lab off。`,
+      restored: outcome.restored,
+      before: outcome.before,
+    }
+  }
+
+  /**
+   * `/memory-lab clean confirm delete-session`：丢弃本会话的隔离根。
+   *
+   * 为什么存在：停用时若恢复会让组装输入超出模型窗口，引擎会**拒绝恢复**并让原文
+   * 留在冷库——那时用户唯一的出路就是丢弃冷库。停用回执与 `set fullhistory off`
+   * 的提示都指向这条命令，所以它必须是真能执行的，不能只是文案。
+   *
+   * 安全口径：
+   *   - 必须显式带 `confirm delete-session`（两道词），少一个只回用法；
+   *   - 引擎仍启用时**拒绝**（先 `off`）——活动账本被删会让投影里的回执指向空冷库；
+   *   - 只删本会话自己的隔离根，不碰 DSH 会话日志、命令审计与真实灵枢根。
+   */
+  async function cleanSession(invocation, args) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    if (!sessionId) return { kind: 'error', text: '无法确定会话 ID，拒绝清理。' }
+    if (args.length !== 2 || args[0] !== 'confirm' || args[1] !== 'delete-session') {
+      return {
+        kind: 'error',
+        text: '用法：`/memory-lab clean confirm delete-session`。'
+          + '这会**永久删除**本会话的隔离冷库（已归档原文随之丢失），不可撤销。',
+      }
+    }
+    const record = records.get(sessionId)
+    if (record) {
+      return {
+        kind: 'error',
+        text: '本会话的记忆上下文仍处于启用状态，拒绝删除冷库。\n'
+          + '先 `/memory-lab off` 停用（它会尽量恢复原文），再执行本命令。',
+      }
+    }
+    const directory = v2SessionDirectoryFor(labRoot, sessionId)
+    try {
+      await rm(directory, { recursive: true, force: true })
+    } catch (error) {
+      return {
+        kind: 'error',
+        text: `删除隔离根失败：${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+    return {
+      kind: 'success',
+      text: [
+        '已删除本会话的隔离冷库：' + directory,
+        '会话日志与命令审计未改动；插件从不删除它们（那是宿主的 append-only 记录）。',
+      ].join('\n'),
+    }
+  }
+
+  return {
+    persistCost,
+    adopt,
+    disposeRecord,
+    runExclusive,
+    enable,
+    disable,
+    disableById,
+    adoptById,
+    restoreOnly,
+    cleanSession,
+  }
+}

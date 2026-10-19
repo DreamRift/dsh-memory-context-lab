@@ -194,7 +194,7 @@ test('P0-3g 租约是租约不是保护集扩张：受保护读取不在 candida
   assert.equal(retained.length, 3)
   assert.equal(result.candidates.some((row) => retained.some((skipRow) => skipRow.seq === row.rangeStart)), false)
 })
-test('P0-3i 命令面 `/memory-lab2 set readlease`：0..50 生效并落盘，越界与非法值拒绝', async () => {
+test('P0-3i 命令面 `/memory-lab set readlease`：0..50 生效并落盘，越界与非法值拒绝', async () => {
   const path = await import('node:path')
   const { mkdtemp, rm } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')

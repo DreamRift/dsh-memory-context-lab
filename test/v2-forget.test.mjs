@@ -15,7 +15,7 @@ import { apply as applyPlugin } from '../src/index.mjs'
 import { FakeSession, fakeMeter } from './helpers/fake-host.mjs'
 import { V2SessionStore } from '../src/v2/store.mjs'
 
-const COMMAND = 'memory-lab2'
+const COMMAND = 'memory-lab'
 const SESSION_ID = 'forget0000000000000000001'
 
 function createStubContext() {
@@ -96,7 +96,7 @@ function agentFor(session) {
 
 function run(ctx, agent, rawInput) {
   const definition = ctx._commands.find((row) => row.name === COMMAND)
-  assert.ok(definition, 'memory-lab2 命令必须已注册')
+  assert.ok(definition, 'memory-lab 命令必须已注册')
   return definition.handler({ agent, rawInput, signal: new AbortController().signal })
 }
 
@@ -197,7 +197,7 @@ test('遗忘全链路：显式 ID → 表面墓碑 → 读面过滤 → 重启�
     // 墓碑自身合法携带 V2 回执标记（凭证保护按行首标记识别），判「原回执残留」
     // 要用回执专属行（沉库指引/恢复指引），不能用共享标记。
     assert.ok(!visible.includes('正文已沉入本会话隔离冷库'), '表面不得残留原回执正文')
-    assert.ok(!visible.includes('恢复：/memory-lab restore 或 /memory-lab2 恢复流程'), '表面不得残留原回执恢复指引')
+    assert.ok(!visible.includes('恢复：/memory-lab restore 或 /memory-lab 恢复流程'), '表面不得残留原回执恢复指引')
     assert.ok(visible.includes('本段已按用户指令软遗忘'), '墓碑回执应在表面')
 
     // 幂等：重复 apply 同一批目标不追加条目。

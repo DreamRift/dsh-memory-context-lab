@@ -13,9 +13,9 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { access, readFile } from 'node:fs/promises'
+import { access, readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { dshMemoryLookupRoots, locatePinnedDshMemory } from '../src/dsh-memory-suppression.mjs'
 import { memoryContextLabProjection } from '../src/projection.mjs'
@@ -23,6 +23,41 @@ import { memoryContextLabProjection } from '../src/projection.mjs'
 const DSH_HOME = process.env.DSH_HOME ?? path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
 const PROFILE = process.env.DSH_PROFILE ?? 'desktop'
 const installedEntry = path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', 'dsh-memory-context-lab', 'src', 'index.mjs')
+
+/**
+ * 已安装副本与本仓源码是否同版。
+ *
+ * 安装面测试断言的是「profile 里那份能不能被宿主正确加载」。当 profile 装的是
+ * 更早的版本（升级前）时，断言命令面/钩子数量必然与源码不符——那是**版本差异**，
+ * 不是缺陷。此时跳过而不是判红：SKIP 单列计数，不冒充通过（规范 §10）。
+ * 安装新版后本组会自动真正执行。
+ */
+// **必须用 fileURLToPath**：URL 的 pathname 是百分号编码的，本仓路径里既有空格
+// （deepseek Harness）又有中文（Harness插件 / 记忆上下文），手工去掉前导斜杠之后
+// 仍然带着 %20、%E8%AE%B0…，readFile 必然 ENOENT → 判「不同版本」→ 三条安装面
+// 断言**永远 SKIP**。这正是 SKIP 冒充通过的典型形态（规范 §10）。
+const SOURCE_ENTRY = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.mjs')
+
+/**
+ * 换行归一：**必须**做，否则本判据在 Windows 上永远为假。
+ *
+ * profile 里的副本是 git checkout 出来的（autocrlf 转成 CRLF），工作树源码是 LF；
+ * 直接比字节会把「同版但换行不同」判成「不同版本」，于是三条安装面断言**永远
+ * SKIP**——而 SKIP 不是通过（规范 §10）。实测：0.13.1 装进 profile 后仍是 3 SKIP，
+ * 归一换行后三条立刻真正执行，并立刻暴露出 0.13.0 遗留的过期断言。
+ */
+async function installedMatchesSource() {
+  try {
+    const [installed, source] = await Promise.all([
+      readFile(installedEntry, 'utf8'),
+      readFile(SOURCE_ENTRY, 'utf8'),
+    ])
+    const normalize = (text) => text.split(String.fromCharCode(13)).join('')
+    return normalize(installed) === normalize(source)
+  } catch {
+    return false
+  }
+}
 
 async function exists(target) {
   try {
@@ -197,18 +232,63 @@ test('the installed dsh-memory resolves to a real package root with MdcgClient',
   assert.ok(await exists(path.join(found.packageRoot, 'md_cg', '__init__.py')), 'md_cg must exist at the resolved root')
 })
 
+/**
+ * 守卫：版本比对探针必须真的读到两个文件。
+ *
+ * 旧实现用 `new URL(import.meta.url).pathname` 拼路径——那是**百分号编码**的，
+ * 本仓路径含空格与中文，于是 readFile 必然 ENOENT、探针恒判「不同版本」，
+ * 三条安装面断言**永远 SKIP**。SKIP 不是通过（规范 §10）：0.13.0 删 v1 后
+ * 钩子数量从 6 变 4、prepend 从 2 条变 1 条，这些过期断言一直「绿」着没人发现。
+ */
+test('版本比对探针能真的读到已安装副本与本仓源码', async () => {
+  if (!(await exists(installedEntry))) return // 未安装环境不适用
+  const [installed, source] = await Promise.all([
+    readFile(installedEntry, 'utf8').catch((error) => ({ error })),
+    readFile(SOURCE_ENTRY, 'utf8').catch((error) => ({ error })),
+  ])
+  assert.ok(typeof installed === 'string', '已安装副本必须可读：' + (installed.error?.message ?? ''))
+  assert.ok(typeof source === 'string',
+    '本仓源码必须可读——读不到说明 SOURCE_ENTRY 又被写成了百分号编码路径：' + (source.error?.message ?? ''))
+  assert.ok(!/%[0-9A-F]{2}/i.test(SOURCE_ENTRY), 'SOURCE_ENTRY 不得含百分号编码：' + SOURCE_ENTRY)
+})
+
+test('test/ 与 src/ 不得用 URL.pathname 拼文件路径（本仓路径含空格与中文）', async () => {
+  const roots = [path.join(path.dirname(SOURCE_ENTRY), '..', 'test'), path.join(path.dirname(SOURCE_ENTRY), '..', 'src')]
+  const offenders = []
+  const walk = async (dir) => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) { await walk(full); continue }
+      if (!/\.(mjs|js)$/.test(entry.name)) continue
+      const body = await readFile(full, 'utf8')
+      // 只挡「把 pathname 当文件路径」这一种误用；注释里提到不算。
+      for (const line of body.split('\n')) {
+        if (line.trimStart().startsWith('*') || line.trimStart().startsWith('//')) continue
+        if (/\.pathname\b/.test(line) && /import\.meta\.url/.test(line)) {
+          offenders.push(path.relative(path.dirname(SOURCE_ENTRY), full) + ': ' + line.trim())
+        }
+      }
+    }
+  }
+  for (const root of roots) await walk(root)
+  assert.deepEqual(offenders, [], '用 URL.pathname 拼路径会在含空格/中文的路径下 ENOENT，请改用 fileURLToPath：\n' + offenders.join('\n'))
+})
+
 test('the installed host half loads, registers its surface, and finds dsh-memory', async (t) => {
   if (!(await exists(installedEntry))) {
     return t.skip(`the plugin is not installed at ${installedEntry}`)
   }
+  if (!(await installedMatchesSource())) {
+    return t.skip('profile 安装的版本与本仓源码不同（升级前），安装面断言留待安装后验证')
+  }
   const module = await import(pathToFileURL(installedEntry).href)
   assert.equal(module.name, 'memory-context-lab')
-  assert.deepEqual(module.inject, ['commands', 'sessionProjections'], '不得硬依赖 tools，否则拿不到时整个插件（含 v1）会挂')
+  assert.deepEqual(module.inject, ['commands', 'sessionProjections'], '不得硬依赖 tools，否则拿不到时整个插件会挂')
 
   const ctx = createStubContext()
   await module.apply(ctx)
 
-  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab', 'memory-lab2'])
+  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
   assert.deepEqual(ctx._projections.map((projection) => projection.key), ['memoryContextLab'])
   // Both features ride `agent/pre-step`: the cooler delegates then cools, and
   // recall is prepended so it can fold into the downstream enter decision —
@@ -219,9 +299,13 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   // domain's global singleton, so watching it catches every archive — including an
   // idle session, which never dispatches `workspace/session-stop`.
   assert.deepEqual([...ctx._listeners.keys()].sort(), ['agent/pre-step', 'domain/changed'])
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 6, 'v1 与 v2 各一个降温 + 一个回注，v2 一个工作状态注入，外加计划先行自动化钩子')
+  // 0.13.1 单引擎：只有一个降温、一个回注、一个工作状态注入，外加计划先行自动化钩子。
+  // 旧断言是 6 个 / 两条 prepend（v1 与 v2 各一套）——0.13.0 删 v1 后这些数字就过期了，
+  // 但因为本组三条用例一直 SKIP（见 SOURCE_ENTRY 的注释），过期断言**从未被执行**。
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 4,
+    '降温 + 回注 + 工作状态注入 + 计划先行自动化钩子（单引擎，v1 那一套已删）')
   assert.equal(ctx._listeners.get('domain/changed').length, 1)
-  assert.deepEqual(ctx._prependEvents, ['agent/pre-step', 'agent/pre-step'], '每个引擎各挂一个 prepend 回注')
+  assert.deepEqual(ctx._prependEvents, ['agent/pre-step'], '只挂一个 prepend 回注（单引擎）')
 
   // 固定注册的只读召回工具：恰好一个，名字与参数契约固定，不随引擎开关增删。
   assert.equal(ctx._tools.length, 1, '只注册一个模型可见工具')
@@ -255,16 +339,19 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   }
 })
 
-test('拿不到 tools 服务时插件照常加载：v1 不受影响，只跳过工具注册并告警', async (t) => {
+test('拿不到 tools 服务时插件照常加载：只跳过工具注册并告警', async (t) => {
+  if (!(await installedMatchesSource())) {
+    return t.skip('profile 安装的版本与本仓源码不同（升级前），安装面断言留待安装后验证')
+  }
   if (!(await exists(installedEntry))) return t.skip('not installed')
   const module = await import(pathToFileURL(installedEntry).href)
   const ctx = createStubContext({ withTools: false })
   await module.apply(ctx)
 
-  // v1 的两条命令与投影、两个引擎的钩子都必须在——插件不能因为缺 tools 整体挂掉。
-  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab', 'memory-lab2'])
+  // 唯一命令、投影与全部钩子都必须在——插件不能因为缺 tools 整体挂掉。
+  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
   assert.deepEqual(ctx._projections.map((projection) => projection.key), ['memoryContextLab'])
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 6)
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 4)
   assert.equal(ctx._tools.length, 0, '拿不到 tools 时不应注册工具')
   assert.ok(
     ctx._warnings.some((warning) => warning.includes('ctx.tools.register')),
@@ -273,6 +360,9 @@ test('拿不到 tools 服务时插件照常加载：v1 不受影响，只跳过�
 })
 
 test('不得读 ctx.config：config 只走 apply 的第二参数（0.9.0 加载失败回归）', async (t) => {
+  if (!(await installedMatchesSource())) {
+    return t.skip('profile 安装的版本与本仓源码不同（升级前），安装面断言留待安装后验证')
+  }
   if (!(await exists(installedEntry))) return t.skip('not installed')
 
   // 静态面：源码里任何 `ctx.config` 读取都是缺陷。宿主 cordis 的 context 代理对
@@ -291,7 +381,7 @@ test('不得读 ctx.config：config 只走 apply 的第二参数（0.9.0 加载�
   const module = await import(pathToFileURL(installedEntry).href)
   const ctx = createStubContext()
   await module.apply(ctx)
-  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab', 'memory-lab2'])
+  assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
 })
 
 test('the installed host half registers a command that records its input', async (t) => {

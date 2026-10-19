@@ -73,7 +73,10 @@ test('P1-6c 增量卡有硬上限（行数 + 字节），超出只留「变化�
   assert.equal(delta.truncated, true, '超长增量必须被截断并显式标记')
   assert.ok(delta.text.split('\n').length <= CARD_DELTA_MAX_LINES, '行数上限生效：' + delta.text.split('\n').length)
   assert.ok(delta.text.length <= CARD_DELTA_MAX_CHARS + 200, '字符上限生效（含尾行说明）')
-  assert.match(delta.text, /另有 \d+ 行变化未列出/, '必须如实说明还有多少行没列')
+  // 措辞在 0.13.1 更正：旧文案「完整内容以最近一张全量卡为准」是假话——模型手里的
+  // 最近一张全量卡是**上一张**，它不含这些新行。现在只说「没进本卡」并指路回读，
+  // 由 runtime-card 在截断时改发全量卡（见 v2-workingset-hardening 的同名用例）。
+  assert.match(delta.text, /另有 \d+ 行变化未在本卡列出/, '必须如实说明还有多少行没列')
   assert.match(delta.text, /按记录 ID 回读/, '截断后必须指路回读')
 })
 
@@ -83,5 +86,5 @@ test('P1-6d 信息不丢：被截断的行仍可按记录 ID 回读（卡片自�
   for (let index = 0; index < 100; index += 1) nextLines.push('- 新行 ' + index)
   const delta = workingStateCardDelta({ previousText: previous, nextText: nextLines.join('\n') })
   assert.ok(delta.truncated)
-  assert.ok(delta.text.includes('最近一张全量卡'), '必须说明完整内容以全量卡为准')
+  assert.ok(delta.text.includes('未在本卡列出'), '必须说明这些行没有进入本卡')
 })

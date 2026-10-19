@@ -105,6 +105,18 @@ export const RECEIPT_FORMAT_VERSION = 4
  */
 export const RECEIPT_FORMAT_BATCH = 3
 /**
+ * 0.13.1（F2/F3）：批次摘要回执的**新文案版本**。
+ *
+ * 旧 format 3 只写「N 个相邻操作」——那个 N 是相邻段长度，既不是本批操作数，
+ * 也不是配置阈值，事后审计读不出「阈值 10 是否生效」。新文案把三个数分开：
+ * 阈值 / 本批成员数 / 本段相邻数，并在被单批释放上限截断时如实说明。
+ *
+ * **为什么必须新开编号**：回执正文参与 restore 的逐字节比对。就地改 format 3
+ * 的渲染会让 0.13.0 及更早写下的批次回执全部对不上（「回执正文已变化」），
+ * 原文永久不可恢复。旧 3 的渲染路径保持冻结，新写入用 8。
+ */
+export const RECEIPT_FORMAT_BATCH_V2 = 8
+/**
  * 普通历史段回执（0.10.1 修复 BUG-001）。
  *
  * v2 对非工具操作跨度（用户/助手正文、旧卡、召回包）用 buildSpanReceipt 渲染，
@@ -162,8 +174,33 @@ export const MIN_NET_RELEASE_TOKENS = 128
  * One batch may release at most this many estimated tokens (C-12 sizing, C-07
  * bounded batches). A giant burst of old evidence is drained over several
  * measured turns instead of vanishing from the projection in one rewrite.
+ *
+ * 0.13.1：这个上限从**硬编码常量**改为「窗口百分比」，默认仍是 6.25%——
+ * 1M 窗口下正好等于原来的 65,536，行为不变；小窗口（200k）下不再让一批
+ * 吃掉三分之一的上下文。
+ *
+ * 实测依据（会话 c1787f24）：配置 `batch 10`，但第 1、2 批只提交了 6 和 3 个
+ * 操作——因为第 7 位操作本身就有 42,074 token，加上去就超了 65,536。用户看到
+ * 的是「没按 10 个归档」，而真实原因是这个隐藏常量。现在它出现在 `status` 里，
+ * 回执也会说明「被单批上限截断」。
  */
+export const MAX_BATCH_RELEASE_WINDOW_RATIO = 0.0625
+/** 兜底值：窗口不可判定时使用（与 0.13.0 的硬编码值相同）。 */
 export const MAX_BATCH_RELEASE_TOKENS = 65_536
+
+/**
+ * 按窗口解析单批释放上限。
+ *
+ * 窗口不可判定时回落到 {@link MAX_BATCH_RELEASE_TOKENS}——这是**保守**方向：
+ * 宁可沿用旧值，也不因为算不出窗口就把上限放大。
+ */
+export function batchReleaseCeilingOf(contextWindow) {
+  const window = Number(contextWindow)
+  if (!Number.isFinite(window) || window <= 0) return MAX_BATCH_RELEASE_TOKENS
+  const ceiling = Math.floor(window * MAX_BATCH_RELEASE_WINDOW_RATIO)
+  // 下限防止极小窗口算出「一批什么都放不下」。
+  return Math.max(4096, ceiling)
+}
 
 /** Recall digest bounds. */
 export const MAX_RECALL_QUERY_CHARS = 800
@@ -702,6 +739,10 @@ export const PLUGIN_SOURCE_FORMS = Object.freeze({
   // 活动面上的程序替换节点：聚合凭证、卡组折叠回执、遗忘墓碑。它们都以
   // `kind: 'user'` + 本形态出现在活动面上，但正文是插件生成的，不是人类输入；
   // 不登记就会被「最新人类请求」判定当成任务陈述（0.11.0 缺陷修复）。
+  //
+  // 0.13.1 保留旧字面量 `memory-lab2-surface`：它是**日志里的历史形态值**，
+  // 改名会让 0.13.0 及更早写下的表面节点重新被当成人类输入。命令已改名为
+  // `/memory-lab`，但形态标识符不随命令改名——形态是数据契约，命令是界面。
   SURFACE_RECEIPT: 'memory-lab2-surface',
 })
 
@@ -954,7 +995,7 @@ export function receiptReadbackLines(nodeId) {
   const id = typeof nodeId === 'string' ? nodeId : ''
   return [
     '可回读：memory_lab_recall(record_ids=["' + id + '"])｜A 类可完整重建',
-    '命令面：/memory-lab2 read ' + id,
+    '命令面：/memory-lab read ' + id,
   ]
 }
 
@@ -1015,7 +1056,7 @@ export function buildReceipt({
     if (ids.length > 0) {
       lines.push(`记录 ID：${ids.join('、')}`)
     } else {
-      lines.push(`记录 ID：按 ${nodeId} 别名回读（/memory-lab2 read ${nodeId}）`)
+      lines.push(`记录 ID：按 ${nodeId} 别名回读（/memory-lab read ${nodeId}）`)
     }
   }
   if (chunks > 1) lines.push(`分块：${chunks} 段（恢复时按序拼接）`)
@@ -1040,11 +1081,53 @@ export function buildReceipt({
  * `members` 每项：`{ tools, range: {start,end}, callIds, nodeId, hash, chars,
  * tokens, chunks }`——正是归档行已记录的字段，恢复侧无需额外信息。
  */
-export function buildBatchReceipt({ members, marker = RECEIPT_MARKER }) {
+export function buildBatchReceipt({ members, marker = RECEIPT_MARKER, batchThreshold = null, batchMembers = null, releaseCapped = false, formatVersion = RECEIPT_FORMAT_BATCH_V2, runLength = null }) {
   const rows = Array.isArray(members) ? members : []
+  // `runLength` 是**本段相邻成员数**（原文写入时的值）。恢复时可能只重建组内
+  // 一个成员（BUG-010 的部分恢复），此时 rows.length 会小于原文写的段长，
+  // 直接用它渲染必然对不上。默认取 rows.length，恢复侧从归档行取原值。
+  const runSize = Number.isInteger(runLength) && runLength > 0 ? runLength : rows.length
+  // format 3 的渲染**冻结**：0.13.0 及更早写下的批次回执必须逐字节可重建。
+  if (formatVersion === RECEIPT_FORMAT_BATCH) {
+    const legacyLines = [
+      marker,
+      `批次归档：${rows.length} 个相邻操作已合并替换；正文已沉入本会话隔离冷库，相关提问会自动回注要点。`,
+    ]
+    for (const [index, member] of rows.entries()) {
+      const tools = Array.isArray(member.tools) ? member.tools : []
+      const range = member.range ?? { start: 0, end: 0 }
+      const callIds = Array.isArray(member.callIds) ? member.callIds : []
+      const chunks = Number.isInteger(member.chunks) && member.chunks > 0 ? member.chunks : 1
+      const label = tools.length > 0 ? tools.join('、') : '历史片段'
+      let line = `- #${index + 1} ${label}：seq ${range.start}–${range.end}`
+        + `（${callIds.length} 次调用，原 ≈${member.tokens ?? 0} token / ${member.chars ?? 0} 字）`
+        + ` 冷记录 ${member.nodeId ?? '(unknown)'} hash ${String(member.hash ?? '').slice(0, 12)}`
+      if (chunks > 1) line += `（分块 ${chunks} 段）`
+      legacyLines.push(line)
+    }
+    legacyLines.push('恢复：/memory-lab restore 或 /memory-lab 恢复流程会把本条摘要连同全部成员原文一并还原。')
+    return legacyLines.join('\n')
+  }
+  // 0.13.1（F2/F3）：批次口径必须可审计。
+  //
+  // 旧文案只有一个「N 个相邻操作」——那个 N 是**相邻段长度**，不是本批操作数，
+  // 也不是配置阈值。实测会话 c1787f24 里配置 batch=10，回执却出现 6/3/2/4/1，
+  // 事后审计完全看不出「阈值 10 确实生效了 5 次，另有 2 次被单批释放上限截断」。
+  //
+  // 现在三个数分开写：阈值（配置）、本批成员数（实际提交）、本段相邻数（本回执）。
+  // 被上限截断时如实说明还剩多少留待下批。
+  const threshold = Number.isInteger(batchThreshold) && batchThreshold > 0 ? batchThreshold : null
+  const total = Number.isInteger(batchMembers) && batchMembers > 0 ? batchMembers : rows.length
+  // 三个数各说各的：阈值（配置）、本批成员（整批）、本段相邻（本条回执）。
+  // 三者相等时省略冗余，只报一次，避免短文案里出现「本批 4/4；本条覆盖 4 个」。
+  const head = threshold && total !== runSize
+    ? `批次归档：本批 ${total}/${threshold} 个操作${releaseCapped ? '（单批释放上限截断，其余留待下批）' : ''}；本条回执覆盖其中相邻的 ${runSize} 个。`
+    : threshold
+      ? `批次归档：本批 ${total}/${threshold} 个操作${releaseCapped ? '（单批释放上限截断，其余留待下批）' : ''}。`
+      : `批次归档：${runSize} 个相邻操作已合并替换。`
   const lines = [
     marker,
-    `批次归档：${rows.length} 个相邻操作已合并替换；正文已沉入本会话隔离冷库，相关提问会自动回注要点。`,
+    `${head}正文已沉入本会话隔离冷库，相关提问会自动回注要点。`,
   ]
   for (const [index, member] of rows.entries()) {
     const tools = Array.isArray(member.tools) ? member.tools : []
@@ -1058,7 +1141,7 @@ export function buildBatchReceipt({ members, marker = RECEIPT_MARKER }) {
     if (chunks > 1) line += `（分块 ${chunks} 段）`
     lines.push(line)
   }
-  lines.push('恢复：/memory-lab restore 或 /memory-lab2 恢复流程会把本条摘要连同全部成员原文一并还原。')
+  lines.push('恢复：/memory-lab restore 或 /memory-lab 恢复流程会把本条摘要连同全部成员原文一并还原。')
   return lines.join('\n')
 }
 
@@ -1169,8 +1252,8 @@ export function buildForgetTombstone({ range, nodeId, hash, reason = null }) {
   ]
   if (reason) lines.push(`缘由：${reason}`)
   lines.push(
-    '撤销遗忘：/memory-lab2 forget undo <操作ID>；恢复原文回注仍需显式 restore。',
-    '冷库原文与审计日志保留（软遗忘不是物理删除）；隔离灵枢检索侧可能仍有残留，见 /memory-lab2 forget status。',
+    '撤销遗忘：/memory-lab forget undo <操作ID>；恢复原文回注仍需显式 restore。',
+    '冷库原文与审计日志保留（软遗忘不是物理删除）；隔离灵枢检索侧可能仍有残留，见 /memory-lab forget status。',
     `hash：${String(hash ?? '').slice(0, 12)}`,
   )
   return lines.join('\n')

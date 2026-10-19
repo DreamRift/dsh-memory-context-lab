@@ -48,7 +48,30 @@ test('同进程重入：两次 acquire 只加引用，最后一次 release 才�
   })
 })
 
-test('跨进程独占：另一进程持锁时本进程失败关闭为 ELOCKED', async () => {
+/**
+ * 跨进程用例需要能 spawn 子进程。本机沙箱禁止命名管道时 spawn 直接 EPERM，
+ * 这不是代码缺陷而是环境限制——按 §10「SKIP ≠ 通过」显式跳过并单独计数，
+ * 绝不让它冒充通过，也不让它把套件判红。
+ */
+async function crossProcessAvailable() {
+  try {
+    await execFileAsync(process.execPath, ['-e', '0'], { timeout: 10_000 })
+    return { ok: true }
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.errno === -4048) {
+      return { ok: false, reason: '沙箱禁止跨进程管道（spawn EPERM）' }
+    }
+    return { ok: false, reason: `子进程不可用（${error?.code ?? error?.message}）` }
+  }
+}
+
+test('跨进程独占：另一进程持锁时本进程失败关闭为 ELOCKED', async (t) => {
+  const availability = await crossProcessAvailable()
+  if (!availability.ok) {
+    // 环境限制不是通过：显式跳过，汇总行会计入 skipped 而非 pass。
+    t.skip(availability.reason)
+    return
+  }
   await withTempDir(async (dir) => {
     const holder = acquireWriteLock(dir)
     const handle = await holder

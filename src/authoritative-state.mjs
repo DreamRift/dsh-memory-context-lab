@@ -105,13 +105,13 @@ export function resetHostSessionModuleCache() {
  *
  * **只表态账本真的持有的字段**（0.12.0 修复）：v1 账本没有 `fullHistory`、
  * `compressModel` 等 v2 专属位；v2 账本也不一定持有 `planFirst`（面板的计划
- * 先行行走的是 `/memory-lab set planfirst`，v2 账本只在 `/memory-lab2 set
+ * 先行行走的是 `/memory-lab set planfirst`，v2 账本只在 `/memory-lab set
  * planfirst` 时才有这一位）。旧实现按「缺省 false」补齐，于是每写一条权威记录
  * 就把这些位压回关——面板开关闪一下又关掉。现在缺席即「本记录不表态」，投影
  * 保留日志折叠出来的值。
  *
  * **v2 专属位在 v2 不持有时就是关**：全历史、层级压缩、压缩模型、层级卡共享正文
- * 都只有 v2 引擎能实现。v2 一停用（无论是 `/memory-lab2 off` 还是面板把
+ * 都只有 v2 引擎能实现。v2 一停用（无论是 `/memory-lab off` 还是面板把
  * `/memory-lab off` 转交给 v2），这几位就是确定性的 false，必须写出来——否则
  * 面板会停在「降温已停用、全历史仍显示开」，再点该开关只会得到「v2 引擎未启用」，
  * 看起来就是「关不了」。

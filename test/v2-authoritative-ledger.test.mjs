@@ -3,7 +3,7 @@
  *
  * 现场（2026-10-18 新会话实测，session-e57de9c9 / session-fa40b380）：
  * 新会话里先手动开「全历史记忆上下文」、再点「启用降温」，
- * `/memory-lab2 set fullhistory on` 的 command/done 明明写着「已设为 开」，
+ * `/memory-lab set fullhistory on` 的 command/done 明明写着「已设为 开」，
  * 紧跟其后的 `plugin:dsh-memory-context-lab/state` 却是 `fullHistory:false`、
  * `planFirst:false`、`retainOperations:0`——面板开关闪一下又回到关。
  *
@@ -144,10 +144,10 @@ test('v2 会话的权威状态记录取 v2 账本，且不把账本没有的开�
     const session = new FakeSession({ id: 'session-auth-v2' })
     const agent = agentFor(session)
 
-    const enabled = await runCommand(ctx, 'memory-lab2', agent, ' on')
+    const enabled = await runCommand(ctx, 'memory-lab', agent, ' on')
     assert.equal(enabled.kind, 'success', enabled.text)
 
-    const fullHistory = await runCommand(ctx, 'memory-lab2', agent, ' set fullhistory on')
+    const fullHistory = await runCommand(ctx, 'memory-lab', agent, ' set fullhistory on')
     assert.equal(fullHistory.kind, 'success', fullHistory.text)
 
     const afterFullHistory = stateRecordsOf(session).at(-1)
@@ -179,7 +179,7 @@ test('v2 会话里 /memory-lab set planfirst 落到 v2 账本，不再误报「�
 
     const session = new FakeSession({ id: 'session-auth-planfirst' })
     const agent = agentFor(session)
-    await runCommand(ctx, 'memory-lab2', agent, ' on')
+    await runCommand(ctx, 'memory-lab', agent, ' on')
 
     const result = await runCommand(ctx, 'memory-lab', agent, ' set planfirst on')
     assert.equal(result.kind, 'success', result.text)
@@ -243,7 +243,7 @@ test('完整往返：默认计划先行关 → 会话内开/关两个开关都�
 
     const session = new FakeSession({ id: 'session-auth-roundtrip' })
     const agent = agentFor(session)
-    await runCommand(ctx, 'memory-lab2', agent, ' on')
+    await runCommand(ctx, 'memory-lab', agent, ' on')
 
     const viewNow = () => viewAfterReplay(ctx, session)
     assert.equal(viewNow().planFirst, false, '默认关时新会话应为关')
@@ -260,7 +260,7 @@ test('完整往返：默认计划先行关 → 会话内开/关两个开关都�
     assert.equal((await readV2SessionState(labRoot, session.id))?.state.planFirst, false, 'v2 账本必须记住关')
 
     // 3) 全历史：开 → 关，两次都要落到面板与账本。
-    await runCommand(ctx, 'memory-lab2', agent, ' set fullhistory on')
+    await runCommand(ctx, 'memory-lab', agent, ' set fullhistory on')
     assert.equal(viewNow().fullHistory, true, '全历史开之后面板必须显示开')
     assert.equal((await readV2SessionState(labRoot, session.id))?.state.fullHistory, true)
 
@@ -286,10 +286,10 @@ test('完整往返：默认计划先行关 → 会话内开/关两个开关都�
 
     // 5) 关全历史：面板路径（v1 持有 → 停 v1 → 启 v2 → set），面板与账本同步。
     await runCommand(ctx, 'memory-lab', agent, ' off')
-    await runCommand(ctx, 'memory-lab2', agent, ' on')
-    await runCommand(ctx, 'memory-lab2', agent, ' set fullhistory on')
+    await runCommand(ctx, 'memory-lab', agent, ' on')
+    await runCommand(ctx, 'memory-lab', agent, ' set fullhistory on')
     assert.equal(viewNow().fullHistory, true)
-    await runCommand(ctx, 'memory-lab2', agent, ' set fullhistory off')
+    await runCommand(ctx, 'memory-lab', agent, ' set fullhistory off')
     assert.equal(viewNow().fullHistory, false, '全历史关之后面板必须显示关')
     assert.equal((await readV2SessionState(labRoot, session.id))?.state.fullHistory, false)
 

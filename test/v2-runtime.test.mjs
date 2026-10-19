@@ -3,7 +3,7 @@
  *
  * 走插件真实入口（`apply`）＋ 假宿主，覆盖规范里最关键的几条：
  * - 双引擎互斥（v2→v1 与 v1→v2 两个方向都必须挡住）；
- * - `/memory-lab2 on|off|status|read|history|working-set|import-v1` 的实际行为；
+ * - `/memory-lab on|off|status|read|history|working-set` 的实际行为；
  * - 停用后与重开进程后，旧记录 ID 仍可回读原文（回执必须能兑现）；
  * - 门禁拦下未闭合配对、未曝光范围与辅助模型事件，放行已闭合的已曝光范围；
  * - v2 回执标记与 v1 不同，两套引擎的日志回执不互相冒充。
@@ -13,13 +13,13 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { apply as applyPlugin } from '../src/index.mjs'
 import { buildSession, fakeMeter } from './helpers/fake-host.mjs'
-import { createSessionState, writeSessionState } from '../src/storage.mjs'
+import { sessionKeyFor } from '../src/storage.mjs'
 import { V2SessionStore } from '../src/v2/store.mjs'
 import { readV2SessionState, createV2SessionState, writeV2SessionState } from '../src/v2/state.mjs'
 import { claimV2Engine, releaseV2Engine } from '../src/v2/engine.mjs'
@@ -28,7 +28,7 @@ import { classifyRange, GUARD_CODES } from '../src/v2/guard.mjs'
 import { V2_RECEIPT_MARKER, RECEIPT_MARKER } from '../src/core.mjs'
 import { RECORD_KINDS, draftRecord } from '../src/v2/records.mjs'
 
-const COMMAND = 'memory-lab2'
+const COMMAND = 'memory-lab'
 
 /** Cordis 形状的最小上下文：记录注册，并允许测试派发监听的事件。 */
 function createStubContext() {
@@ -184,11 +184,6 @@ test('v2 运行时：on 建档、重复 on 被拒、v2 持有投影时 v1 不得
     // 重复 on：如实拒绝，不静默重来。
     await assert.rejects(() => run(ctx, agent, 'on'), (error) => error.code === 'EENGINEACTIVE')
 
-    // v2 持有投影时，v1 的 on 必须被挡下（互斥的 v1 方向）。
-    const v1Blocked = await command(ctx, 'memory-lab').handler(invocationFor(agent, 'on'))
-    assert.equal(v1Blocked.kind, 'error')
-    assert.match(v1Blocked.text, /v2|按需记忆化/)
-
     const status = await run(ctx, agent, 'status')
     assert.match(status.text, /v2 引擎：已启用/)
     assert.match(status.text, /v2 记录数：0/)
@@ -196,19 +191,27 @@ test('v2 运行时：on 建档、重复 on 被拒、v2 持有投影时 v1 不得
   })
 })
 
-test('v2 运行时：v1 已启用时 v2 拒绝接管，且不留下半成品账本', async () => {
-  await withTempLab('mutex', async (labRoot) => {
-    // createSessionState 落盘的 enabled 就是 true：等价于 v1 正持有投影。
-    await createSessionState(labRoot, 'session-v2-mutex-01', {})
+test('v2 运行时：遗留的 v1 账本不阻断 v2 启用（0.13.1 不再读取 v1 状态）', async () => {
+  await withTempLab('legacy-v1', async (labRoot) => {
+    // 0.13.0 及更早的会话在磁盘上留有 v1 账本。0.13.1 不读它，
+    // 因此一份 enabled:true 的 v1 state.json 不构成任何阻断。
+    const legacyDir = path.join(labRoot, 'sessions', sessionKeyFor('session-v2-mutex-01'))
+    await mkdir(legacyDir, { recursive: true })
+    await writeFile(path.join(legacyDir, 'state.json'), JSON.stringify({
+      kind: 'dsh-memory-context-lab/session',
+      schemaVersion: 1,
+      sessionId: 'session-v2-mutex-01',
+      createdAt: '2026-10-19T00:00:00.000Z',
+      enabled: true,
+      archive: [],
+    }), 'utf8')
 
     const ctx = await boot()
     const session = buildSession({ operations: 1, id: 'session-v2-mutex-01' })
     const agent = agentFor(session)
-    await assert.rejects(
-      () => run(ctx, agent, 'on'),
-      (error) => error.code === 'EV1ACTIVE',
-    )
-    assert.equal(await readV2SessionState(labRoot, 'session-v2-mutex-01'), null, '被拒后不得留下 v2 账本')
+    const enabled = await run(ctx, agent, 'on')
+    assert.equal(enabled.kind, 'success', enabled.text)
+    assert.equal((await readV2SessionState(labRoot, 'session-v2-mutex-01'))?.state?.enabled, true)
     await ctx._dispose()
   })
 })
@@ -257,59 +260,13 @@ test('v2 运行时：停用后与重开进程后，旧记录 ID 仍可回读原�
   })
 })
 
-test('v2 运行时：import-v1 复制成不可变副本、幂等、不改写 v1 数据', async () => {  await withTempLab('import', async (labRoot) => {
-    const sessionId = 'session-v2-import-01'
-    const created = await createSessionState(labRoot, sessionId, {})
-    created.state.archive.push({
-      rangeStart: 3,
-      rangeEnd: 4,
-      callIds: ['call-1'],
-      tools: ['read'],
-      nodeId: 'archived_session_1',
-      hash: 'b'.repeat(64),
-      chars: 120,
-      originalTokens: 300,
-      replacementSeq: 9,
-      chunkCount: 1,
-      appliedAt: '2026-10-11T10:00:00.000Z',
-      status: 'applied',
-    })
-    // v1 置为已停用，否则互斥会先挡住 v2 的 on（这正是上一条测试的语义）。
-    created.state.enabled = false
-    await writeSessionState(created.directory, created.state)
-    const v1StateBefore = await readFile(path.join(created.directory, 'state.json'), 'utf8')
-
-    const ctx = await boot()
-    const session = buildSession({ operations: 1, id: sessionId })
-    const agent = agentFor(session)
-    await run(ctx, agent, 'on')
-
-    const first = await run(ctx, agent, 'import-v1')
-    assert.match(first.text, /扫描 1 条，导入 1 条/)
-    const second = await run(ctx, agent, 'import-v1')
-    assert.match(second.text, /扫描 1 条，导入 0 条，跳过 1 条/)
-
-    // v1 账本只读：字节不变。
-    const v1StateAfter = await readFile(path.join(created.directory, 'state.json'), 'utf8')
-    assert.equal(v1StateAfter, v1StateBefore, '导入不得改写 v1 账本')
-
-    // 导入记录带来源指针、synthesized 保真，且可按 ID 回读描述符。
-    const listed = await run(ctx, agent, 'history 10')
-    assert.match(listed.text, /projection\.span/)
-    const importedId = listed.text.split('\n')[0].split(/\s+/)[0]
-    const loaded = await run(ctx, agent, `read ${importedId}`)
-    assert.ok(loaded.text.includes('archived_session_1'), '回读必须能取到来源指针')
-    await ctx._dispose()
-  })
-})
-
 test('v2 运行时：未启用会话里两个钩子都是纯 no-op，不触碰冷库', async () => {
   await withTempLab('hooks', async (labRoot) => {
     const ctx = await boot()
     const session = buildSession({ operations: 2, id: 'session-v2-hooks-01' })
     const agent = agentFor(session)
     const listeners = ctx._listeners.get('agent/pre-step')
-    assert.equal(listeners.length, 6, 'v1/v2 各一个降温 + 一个回注，v2 一个工作状态注入，外加计划先行自动化钩子')
+    assert.equal(listeners.length, 4, '计划先行自动化 + 自动降温 + 回注 + 工作状态注入（0.13.1 单引擎，v1 的两个钩子已删除）')
 
     const messages = [{ id: 'user-1', role: 'user', content: [{ type: 'text', text: '历史里写了什么？' }], source: { kind: 'user' } }]
     const warningsBefore = ctx._warnings.length
@@ -522,59 +479,34 @@ test('D5 失败关闭：宿主 meter 不可用时注入照常、token 不折算�
   })
 })
 
-test('D6：v2 持有投影时 v1 的 set 明确指路，不再谎报「on 后生效」', async () => {
-  await withTempLab('d6set', async () => {
+test('0.13.1：命令面只有一个引擎，v1 入口不再存在', async () => {
+  await withTempLab('single-surface', async () => {
     const ctx = await boot()
     try {
-      const session = buildSession({ operations: 1, id: 'session-v2-d6-01' })
+      // 唯一命令必须叫 memory-lab；旧的 memory-lab2 不得再注册。
+      const names = ctx._commands.map((row) => row.name)
+      assert.ok(names.includes('memory-lab'), '/memory-lab 必须注册')
+      assert.equal(names.includes('memory-lab2'), false, 'memory-lab2 已在 0.13.1 删除')
+      assert.equal(names.length, 1, '0.13.1 只注册一条命令')
+
+      const session = buildSession({ operations: 1, id: 'session-v2-single-01' })
       const agent = agentFor(session)
       const enabled = await run(ctx, agent, 'on')
       assert.equal(enabled.kind, 'success')
 
-      // v2 持有投影时，v1 的 set batch 不得再走「已记下、/memory-lab on 后生效」
-      // ——那个 on 会被 EV2ACTIVE 拒绝，设置永远不生效且毫无提示（实测 D6）。
-      const rejected = await command(ctx, 'memory-lab').handler(invocationFor(agent, 'set batch 10'))
-      assert.equal(rejected.kind, 'error', `应明确报错，实际 ${JSON.stringify(rejected.text)}`)
-      assert.match(rejected.text, /v2 引擎（\/memory-lab2）持有投影/)
-      assert.match(rejected.text, /\/memory-lab2 set batch/)
+      // 同一条命令上的 set 直接写 v2 账本，不存在「已记下、on 后生效」的中间态。
+      const set = await run(ctx, agent, 'set batch 9')
+      assert.equal(set.kind, 'success', set.text)
+      assert.match(set.text, /写入 v2 账本/)
+      assert.doesNotMatch(set.text, /on 后生效/)
 
-      // 防误杀：两引擎都不持有投影的会话里，v1 set 的「已记下」分支照常。
-      const other = buildSession({ operations: 1, id: 'session-v2-d6-02' })
+      // 未启用的会话里，只读命令如实报「未启用」，而不是指路另一个引擎。
+      const other = buildSession({ operations: 1, id: 'session-v2-single-02' })
       const otherAgent = agentFor(other)
-      const plain = await command(ctx, 'memory-lab').handler(invocationFor(otherAgent, 'set batch 10'))
-      assert.equal(plain.kind, 'success')
-      assert.match(plain.text, /已记下设置/)
-    } finally {
-      await ctx._dispose()
-    }
-  })
-})
-
-test('B2：v2 持有投影时 v1 的 restore/now 不再误报「未启用」，而是指路 v2', async () => {
-  await withTempLab('b2restore', async () => {
-    const ctx = await boot()
-    try {
-      const session = buildSession({ operations: 1, id: 'session-v2-b2-01' })
-      const agent = agentFor(session)
-      const enabled = await run(ctx, agent, 'on')
-      assert.equal(enabled.kind, 'success')
-
-      // c896f803 现场：v2 账本 1845 段完好，面板「恢复原文」却走 v1 入口报
-      // 「请先使用 /memory-lab on」。v1 的 restore/now/dry-run 在 v2 持有投影时
-      // 必须如实指路 v2 的等价入口。
-      for (const op of ['restore', 'now', 'dry-run']) {
-        const outcome = await command(ctx, 'memory-lab').handler(invocationFor(agent, op))
-        assert.equal(outcome.kind, 'error', `${op} 应明确报错，实际 ${JSON.stringify(outcome.text)}`)
-        assert.match(outcome.text, /v2 引擎（\/memory-lab2）持有投影/, `${op} 必须指明 v2 持有投影`)
-        assert.match(outcome.text, /\/memory-lab2 (restore|now|dry-run|read)/, `${op} 必须指路 v2 入口`)
-      }
-
-      // 防误杀：两引擎都不持有的会话里，v1 restore 维持原文案。
-      const other = buildSession({ operations: 1, id: 'session-v2-b2-02' })
-      const otherAgent = agentFor(other)
-      const plain = await command(ctx, 'memory-lab').handler(invocationFor(otherAgent, 'restore'))
-      assert.equal(plain.kind, 'error')
-      assert.match(plain.text, /请先使用 \/memory-lab on/)
+      const restore = await run(ctx, otherAgent, 'restore')
+      assert.equal(restore.kind, 'error')
+      assert.match(restore.text, /未启用/)
+      assert.doesNotMatch(restore.text, /memory-lab2/)
     } finally {
       await ctx._dispose()
     }

@@ -13,7 +13,7 @@ import { FakeSession, FakeColdStore, buildSession, fakeMeter, operation } from '
 import { apply as applyPlugin } from '../src/index.mjs'
 import { createV2Runtime } from '../src/v2/runtime.mjs'
 import { readV2SessionState } from '../src/v2/state.mjs'
-import { V2_RECEIPT_MARKER, RECEIPT_FORMAT_BATCH, RECEIPT_FORMAT_SPAN, buildForgetTombstone, buildSpanReceipt } from '../src/core.mjs'
+import { V2_RECEIPT_MARKER, RECEIPT_FORMAT_BATCH, RECEIPT_FORMAT_BATCH_V2, RECEIPT_FORMAT_SPAN, buildForgetTombstone, buildSpanReceipt } from '../src/core.mjs'
 import { applyOperations, planCooling, collectOperationCandidates, restoreReceipts } from '../src/apply.mjs'
 import { bodyOfSpan, collectHistoryCandidates, spanLabelOf } from '../src/v2/history.mjs'
 import { COMPRESS_SUBCOMMANDS, compressRun } from '../src/v2/hierarchy-coordinator.mjs'
@@ -97,6 +97,10 @@ function outcomeRow(outcome) {
     originalTokens: outcome.originalTokens,
     replacementSeq: outcome.replacementSeq,
     receiptFormat: outcome.receiptFormat,
+    batchSize: outcome.batchSize,
+    batchThreshold: outcome.batchThreshold,
+    batchMembers: outcome.batchMembers,
+    releaseCapped: outcome.releaseCapped,
     spanKind: outcome.spanKind,
     spanLabel: outcome.spanLabel,
     locators: outcome.locators ?? [],
@@ -286,7 +290,7 @@ test('BUG-008: defaults.compressModelDefault=true seeds a new v2 ledger', async 
       const ctx = createStubContext()
       await applyPlugin(ctx, { defaults: { compressModelDefault: true } })
       const session = buildSession({ operations: 0, id: 'session-bug008' })
-      const command = ctx._commands.find((row) => row.name === 'memory-lab2')
+      const command = ctx._commands.find((row) => row.name === 'memory-lab')
       assert.ok(command)
       const result = await command.handler({ agent: agentFor(session), rawInput: 'on', signal: new AbortController().signal })
       assert.equal(result.kind, 'success', result.text)
@@ -352,7 +356,7 @@ test('BUG-010: a 2-member batch with one member missing restores the other witho
     const outcomes = await applyOperations({ session, client: store, units: plan.units, meter: fakeMeter, hostVersion: 'test' })
     for (const outcome of outcomes) assert.equal(outcome.state, 'applied', outcome.reason)
     assert.equal(outcomes[0].replacementSeq, outcomes[1].replacementSeq)
-    assert.equal(outcomes[0].receiptFormat, RECEIPT_FORMAT_BATCH)
+    assert.equal(outcomes[0].receiptFormat, RECEIPT_FORMAT_BATCH_V2)
     const rows = outcomes.map(outcomeRow)
     // 模拟 forget 一组中的 1 个成员：表面摘要被换成墓碑（新 seq），归档行仍
     // 指向旧摘要 seq。可见成员必须仍能恢复原文（BUG-010 的真实 forget 形态）。

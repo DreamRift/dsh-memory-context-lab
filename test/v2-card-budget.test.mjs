@@ -190,11 +190,17 @@ test('Case A：200 步只有 seq 引用在变时，生产去重只注入 1 张�
   // 接线断言：去重与注入形态裁决收在引擎（runtime.mjs）里，index.mjs 的钩子只
   // 负责把返回的文本挂上稳定 id 追加——「裁决为跳过时不推进注入状态」只有引擎
   // 能保证。旧 Map 比较与 index.mjs 侧裁决必须已删除。
-  const runtimeSource = readFileSync(path.join(PLUGIN_DIR, 'src', 'v2', 'runtime.mjs'), 'utf8')
-  assert.match(runtimeSource, /decideWorkingSetInjection\(\{/, 'runtime.mjs 必须走生产去重裁决')
-  assert.match(runtimeSource, /workingSetDedupKeyOf\(card\.text\)/, 'runtime.mjs 必须按语义键口径计算去重键（回退口径）')
-  assert.match(runtimeSource, /shouldInjectFullWorkingStateCard\(\{/, 'runtime.mjs 必须按形态裁决选全量卡/增量卡')
-  assert.match(runtimeSource, /workingStateCardDelta\(\{/, 'runtime.mjs 必须在非全量步渲染增量卡')
+  // 0.13.1 P4b：注入裁决与卡组折叠已整体迁到 runtime-card.mjs，因此扫描面按
+  // 「runtime 侧 + card 域」合并——断言的是「生产路径确实调用了这三个裁决」，
+  // 不是「代码必须长在某个文件名里」。
+  const runtimeSource = [
+    readFileSync(path.join(PLUGIN_DIR, 'src', 'v2', 'runtime.mjs'), 'utf8'),
+    readFileSync(path.join(PLUGIN_DIR, 'src', 'v2', 'runtime-card.mjs'), 'utf8'),
+  ].join('\n')
+  assert.match(runtimeSource, /decideWorkingSetInjection\(\{/, '生产路径必须走去重裁决')
+  assert.match(runtimeSource, /workingSetDedupKeyOf\(card\.text\)/, '必须按语义键口径计算去重键（回退口径）')
+  assert.match(runtimeSource, /shouldInjectFullWorkingStateCard\(\{/, '必须按形态裁决选全量卡/增量卡')
+  assert.match(runtimeSource, /workingStateCardDelta\(\{/, '必须在非全量步渲染增量卡')
   const indexSource = readFileSync(path.join(PLUGIN_DIR, 'src', 'index.mjs'), 'utf8')
   assert.ok(!indexSource.includes('decideWorkingSetInjection'), 'index.mjs 不再持有去重裁决（收进引擎）')
   assert.ok(!indexSource.includes('injectedWorkingSetKeys'), 'index.mjs 侧的旧去重存储必须已删除')

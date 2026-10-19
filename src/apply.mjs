@@ -46,6 +46,9 @@ import {
   PLUGIN_SOURCE_KIND,
   RECALL_STATUS,
   RECEIPT_FORMAT_BATCH,
+  RECEIPT_FORMAT_BATCH_V2,
+  batchReleaseCeilingOf,
+  MAX_BATCH_RELEASE_WINDOW_RATIO,
   RECEIPT_FORMAT_LEGACY,
   RECEIPT_FORMAT_OPERATION,
   RECEIPT_FORMAT_SPAN,
@@ -1097,7 +1100,7 @@ function resolveCommitSpan(session, run) {
   return { ok: true, seqs }
 }
 
-function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER, hostVersion }) {
+function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER, hostVersion, batchThreshold = null, batchMembers = null, releaseCapped = false }) {
   const span = resolveCommitSpan(session, run)
   if (!span.ok) {
     return {
@@ -1131,6 +1134,11 @@ function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER,
     ? run[0].unit.receipt
     : buildBatchReceipt({
       marker: receiptMarker,
+      formatVersion: RECEIPT_FORMAT_BATCH_V2,
+      runLength: run.length,
+      batchThreshold,
+      batchMembers,
+      releaseCapped,
       members: run.map(({ unit, chunkIds }) => ({
         tools: unit.tools,
         range: { start: unit.rangeStart, end: unit.rangeEnd },
@@ -1212,7 +1220,15 @@ function commitSurfaceRun({ session, meter, run, receiptMarker = RECEIPT_MARKER,
        */
       ...(index === 0 && spanExtraTokens > 0 ? { spanExtraTokens } : {}),
       ...(run.length > 1
-        ? { receiptFormat: RECEIPT_FORMAT_BATCH, batchSize: run.length }
+        ? {
+            receiptFormat: RECEIPT_FORMAT_BATCH_V2,
+            // 0.13.1（F2）：batchSize 保留为「本段相邻数」以兼容既有账本读取，
+            // 新增三个字段把口径写清楚——restore 重建回执时按同一组值渲染。
+            batchSize: run.length,
+            ...(Number.isInteger(batchThreshold) ? { batchThreshold } : {}),
+            ...(Number.isInteger(batchMembers) ? { batchMembers } : {}),
+            ...(releaseCapped === true ? { releaseCapped: true } : {}),
+          }
         : {}),
       ...(problems.length
         ? { state: 'verify-failed', reason: problems.join('；') }
@@ -1382,6 +1398,9 @@ export function occupancyLines(occupancy) {
     `组装输入估算：≈${host.assembledTokens} token（来源：${host.baselineKind === 'usage' ? '提供方 usage 锚点 + 增量估算' : '宿主 estimator 纯估算'}）`,
     `当前占用率：${current === null ? '无法计算' : `${(current * 100).toFixed(1)}%`}`,
     formatCacheLine(cacheStats),
+    // 0.13.1（F3）：单批释放上限过去是隐藏常量，用户只看到「没按 10 个归档」。
+    // 现在把它算出来摆在状态里，短批才有可解释的原因。
+    `单批释放上限：≈${batchReleaseCeilingOf(host.contextWindow)} token（窗口的 ${(MAX_BATCH_RELEASE_WINDOW_RATIO * 100).toFixed(2)}%）`,
     `候选：${view.candidates.length} 个完整操作可归档（已保护／不合格 ${view.skipped.length} 条）；本批计划释放 ≈${plan.plannedReleaseTokens} token（含回执成本）`,
     `保留最近 ${plan.baselineRetention} 个操作（一直生效）：窗口外待归档 ${plan.outOfWindowCount} 个，`
     + `其中合格 ${plan.admissibleCount ?? plan.outOfWindowCount} 个，`
@@ -1484,7 +1503,7 @@ export function formatRestoreReport(result) {
   // 不能看起来一样，且必须指路 undo 而不是让用户反复重试 restore。
   const forgotten = Number(result.forgotten ?? 0)
   if (forgotten > 0) {
-    lines.push(`${forgotten} 个回执因软遗忘未恢复：先用 /memory-lab2 forget undo 撤销遗忘，再运行 restore。`)
+    lines.push(`${forgotten} 个回执因软遗忘未恢复：先用 /memory-lab forget undo 撤销遗忘，再运行 restore。`)
   }
   // P0-2：重试的跳过行必须有可见的结局——「重试后仍跳过」与「从未跳过」不能
   // 看起来一样。仍跳过的行原文依旧只在冷库（依赖未解除），不能让成功计数
@@ -1523,7 +1542,7 @@ export function cleanDecision({ pendingReceipts, confirmDelete }) {
  * skipped with its own state, is never counted as applied, and keeps its cold
  * node claim so the next measurement reuses the same id (idempotent).
  */
-export async function applyOperations({ session, client, units, meter, hostVersion, signal, onOutcome, guard = null, bodyOf = null, receiptMarker = RECEIPT_MARKER }) {
+export async function applyOperations({ session, client, units, meter, hostVersion, signal, onOutcome, guard = null, bodyOf = null, receiptMarker = RECEIPT_MARKER, batchThreshold = null, batchMembers = null, releaseCapped = false }) {
   const outcomes = []
 
   // ── 阶段 1：逐单元门禁复核 + 冷写（不替换表面）────────────────────────────
@@ -1614,7 +1633,19 @@ export async function applyOperations({ session, client, units, meter, hostVersi
     index = end
     let committed
     try {
-      committed = commitSurfaceRun({ session, meter, run, receiptMarker, hostVersion })
+      // 0.13.1（F2）：一条回执只覆盖**本 run**（相邻段）。整批成员数由
+      // `batchMembers` 单独携带，段内成员数由 run.length 决定——两个数在回执里
+      // 分别出现，否则「本批 3/3」会被误印到只含 2 个成员的段上。
+      committed = commitSurfaceRun({
+        session,
+        meter,
+        run,
+        receiptMarker,
+        hostVersion,
+        batchThreshold: Number.isInteger(batchThreshold) ? batchThreshold : units.length,
+        batchMembers: Number.isInteger(batchMembers) ? batchMembers : units.length,
+        releaseCapped: releaseCapped === true,
+      })
     } catch (error) {
       if (signal?.aborted) throw error
       committed = {
@@ -1649,7 +1680,9 @@ export async function restoreReceipts({ session, client, receipts, onOutcome, re
   const outcomes = []
   const groups = []
   for (const receipt of receipts ?? []) {
-    const batch = receipt?.receiptFormat === RECEIPT_FORMAT_BATCH
+    // 0.13.1（F2）：format 3 与 8 都是批次摘要，必须走同一条分组路径。
+    // 只认 3 会让新写入的 format 8 行被当成单条回执，永远对不上摘要正文。
+    const batch = receipt?.receiptFormat === RECEIPT_FORMAT_BATCH || receipt?.receiptFormat === RECEIPT_FORMAT_BATCH_V2
     const last = groups[groups.length - 1]
     if (batch && last?.batch && last.rows[0].replacementSeq === receipt.replacementSeq) last.rows.push(receipt)
     else groups.push({ batch, rows: [receipt] })
@@ -1714,10 +1747,10 @@ async function rebuildOrphanReceipt({ session, client, receipt }) {
     try {
       readBack = await client.getNode(nodeId)
     } catch (error) {
-      return { ...base, state: 'skipped', reason: '冷库重建失败：' + nodeId + ' 不可读（' + messageOf(error) + '）；原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读' }
+      return { ...base, state: 'skipped', reason: '冷库重建失败：' + nodeId + ' 不可读（' + messageOf(error) + '）；原文仍在冷库，可用 /memory-lab read ' + receipt.nodeId + ' 回读' }
     }
     if (!readBack || readBack.ok === false || typeof readBack.content !== 'string') {
-      return { ...base, state: 'skipped', reason: '冷库重建失败：' + nodeId + ' 缺失；原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读' }
+      return { ...base, state: 'skipped', reason: '冷库重建失败：' + nodeId + ' 缺失；原文仍在冷库，可用 /memory-lab read ' + receipt.nodeId + ' 回读' }
     }
     parts.push(normalizeColdBody(coldRecordBody(readBack.content)))
   }
@@ -1740,7 +1773,7 @@ async function rebuildOrphanReceipt({ session, client, receipt }) {
       rebuilt: true,
     }
   } catch (error) {
-    return { ...base, state: 'skipped', reason: '冷库重建写回失败：' + messageOf(error) + '；原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读' }
+    return { ...base, state: 'skipped', reason: '冷库重建写回失败：' + messageOf(error) + '；原文仍在冷库，可用 /memory-lab read ' + receipt.nodeId + ' 回读' }
   }
 }
 
@@ -1787,7 +1820,7 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
       outcomes.push({
         ...base,
         state: 'skipped',
-        reason: `旧 span 回执（format 4）没有可重建的标签，无法逐字节核对；原文仍在冷库，可用 /memory-lab2 read ${receipt.nodeId} 回读`,
+        reason: `旧 span 回执（format 4）没有可重建的标签，无法逐字节核对；原文仍在冷库，可用 /memory-lab read ${receipt.nodeId} 回读`,
       })
       continue
     }
@@ -1827,15 +1860,25 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
         releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
         errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
       })
-    } else if (formatVersion === RECEIPT_FORMAT_BATCH) {
+    } else if (formatVersion === RECEIPT_FORMAT_BATCH || formatVersion === RECEIPT_FORMAT_BATCH_V2) {
       // BUG-010：批摘要成员被逐条剔除后可能只剩这一行；按单成员摘要重建，
       // 与表面一致就恢复，不一致如实 skip——绝不用 buildReceipt(3) 抛错中止整次 restore。
-      expected = buildBatchReceipt({ marker: receiptMarker, members: [batchMemberOf(receipt)] })
+      // 0.13.1（F2）：format 8 与 3 的文案不同，必须按行内版本渲染，
+      // 否则新写入的批次回执永远判「未知格式」而不可恢复。
+      expected = buildBatchReceipt({
+        marker: receiptMarker,
+        formatVersion,
+        runLength: Number.isInteger(receipt.batchSize) ? receipt.batchSize : 1,
+        batchThreshold: Number.isInteger(receipt.batchThreshold) ? receipt.batchThreshold : null,
+        batchMembers: Number.isInteger(receipt.batchMembers) ? receipt.batchMembers : null,
+        releaseCapped: receipt.releaseCapped === true,
+        members: [batchMemberOf(receipt)],
+      })
     } else {
       outcomes.push({
         ...base,
         state: 'skipped',
-        reason: `未知回执格式 ${formatVersion}（行内 receiptFormat）；原文仍在冷库，可用 /memory-lab2 read ${receipt.nodeId} 回读`,
+        reason: `未知回执格式 ${formatVersion}（行内 receiptFormat）；原文仍在冷库，可用 /memory-lab read ${receipt.nodeId} 回读`,
       })
       continue
     }
@@ -1843,8 +1886,8 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
       outcomes.push({
         ...base,
         state: 'skipped',
-        reason: formatVersion === RECEIPT_FORMAT_BATCH
-          ? '批摘要成员不完整（部分成员可能已软遗忘或已被清理），无法逐字节重建摘要；该成员原文仍在冷库，可用 /memory-lab2 read ' + receipt.nodeId + ' 回读'
+        reason: (formatVersion === RECEIPT_FORMAT_BATCH || formatVersion === RECEIPT_FORMAT_BATCH_V2)
+          ? '批摘要成员不完整（部分成员可能已软遗忘或已被清理），无法逐字节重建摘要；该成员原文仍在冷库，可用 /memory-lab read ' + receipt.nodeId + ' 回读'
           : '回执正文已变化，拒绝覆盖',
       })
       continue
@@ -1992,8 +2035,17 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
   }
   if (current?.type !== 'user/message') return skipAll('回执节点不再是预期类型（surface 冲突）')
 
+  // 0.13.1（F2）：按归档行里记下的同一组批次口径重建，否则改过文案的回执
+  // 永远对不上（「回执正文已变化，拒绝覆盖」），原文永久不可恢复。
   const expected = buildBatchReceipt({
     marker: receiptMarker,
+    formatVersion: receipts[0]?.receiptFormat === RECEIPT_FORMAT_BATCH ? RECEIPT_FORMAT_BATCH : RECEIPT_FORMAT_BATCH_V2,
+    // 段长取**原文写入时的值**（batchSize），不是当前恢复集合的长度——
+    // 部分恢复时后者会小于原文，直接渲染必然对不上。
+    runLength: Number.isInteger(receipts[0]?.batchSize) ? receipts[0].batchSize : receipts.length,
+    batchThreshold: receipts.find((row) => Number.isInteger(row.batchThreshold))?.batchThreshold ?? null,
+    batchMembers: receipts.find((row) => Number.isInteger(row.batchMembers))?.batchMembers ?? null,
+    releaseCapped: receipts.some((row) => row.releaseCapped === true),
     members: receipts.map(batchMemberOf),
   })
   const currentText = textFromContent(current.data?.content)

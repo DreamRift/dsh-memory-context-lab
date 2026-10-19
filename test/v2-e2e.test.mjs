@@ -32,7 +32,7 @@ import { readRecordById } from '../src/v2/readback.mjs'
 import { pairingRecordsFor } from '../src/v2/client-adapter.mjs'
 import { readV2SessionState } from '../src/v2/state.mjs'
 
-const COMMAND = 'memory-lab2'
+const COMMAND = 'memory-lab'
 const SESSION_ID = 'e2e000000000000000000001'
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────

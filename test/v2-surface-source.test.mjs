@@ -480,9 +480,9 @@ test('P0-3 权威状态记录：命令被拒绝时视图不翻转，成功时才
 
   // 1) 命令被维护窗口拒绝：持久状态一个字节没动，权威记录写的是「仍然开着」。
   const session = buildSession({ operations: 1, id: 'session-p0-3-refused' })
-  session.append('command/run', { name: 'memory-lab2', args: 'on' }, {})
+  session.append('command/run', { name: 'memory-lab', args: 'on' }, {})
   appendStateRecord(session, { enabled: true, engine: 'v2' })
-  session.append('command/run', { name: 'memory-lab2', args: 'off' }, {})
+  session.append('command/run', { name: 'memory-lab', args: 'off' }, {})
   // 命令被拒绝 → 真实状态仍是 enabled/v2，权威记录如实写回。
   appendStateRecord(session, { enabled: true, engine: 'v2' })
 
@@ -491,7 +491,7 @@ test('P0-3 权威状态记录：命令被拒绝时视图不翻转，成功时才
   assert.equal(refusedView.engine, 'v2', '被拒绝的 off 不得清掉引擎归属')
 
   // 2) 命令成功：真实状态已停用，权威记录跟着写。
-  session.append('command/run', { name: 'memory-lab2', args: 'off' }, {})
+  session.append('command/run', { name: 'memory-lab', args: 'off' }, {})
   appendStateRecord(session, { enabled: false, engine: '' })
   const okView = await viewAfter(session.events)
   assert.equal(okView.enabled, false)
@@ -507,7 +507,7 @@ test('P0-3 权威状态记录：命令被拒绝时视图不翻转，成功时才
 
 test('P0-3 拒绝路径不写记录时，视图按命令行折叠会翻转——这正是本修复要堵的洞', async () => {
   // 对照实验：只有 command/run、没有权威记录时，被拒绝的 off 确实会翻成已关闭。
-  const withoutRecord = await viewAfter([commandRun('memory-lab2', 'on'), commandRun('memory-lab2', 'off')])
+  const withoutRecord = await viewAfter([commandRun('memory-lab', 'on'), commandRun('memory-lab', 'off')])
   assert.equal(withoutRecord.enabled, false, '没有权威记录时命令行折叠会误判（记录现状，不是期望）')
   assert.equal(withoutRecord.engine, '', '没有权威记录时引擎归属也会被清空')
 })

@@ -97,7 +97,7 @@ export async function planForkClosure({ labRoot, parentSessionId, parentStore = 
     }
     const warnings = [...store.warnings]
     if (store.disabled) {
-      warnings.push('父会话 v2 账本处于停用（只读）状态；闭包本身完整，仍可 fork，子会话启用后需自行 /memory-lab2 on')
+      warnings.push('父会话 v2 账本处于停用（只读）状态；闭包本身完整，仍可 fork，子会话启用后需自行 /memory-lab on')
     }
     const pending = await countPendingTransactions(store.directory)
     if (pending > 0) {
@@ -156,13 +156,13 @@ export async function executeForkClosure({ labRoot, parentSessionId, childSessio
     } else if (stuck?.unreadable) {
       throw new EngineV2Error(
         `子会话 ${childSessionId} 的 needs-migration 标记不可读（${stuck.error}）；无法判定它是否 fork 半成品，拒绝自动清理。`
-        + ' 请人工检查该子会话目录后，用 `/memory-lab2 fork-reset ' + childSessionId + '` 显式重试（标记仍需可读）。',
+        + ' 请人工检查该子会话目录后，用 `/memory-lab fork-reset ' + childSessionId + '` 显式重试（标记仍需可读）。',
         { code: 'EFORKMARKERCORRUPT', details: { childSessionId, error: stuck.error } },
       )
     } else {
       throw new EngineV2Error(
         `子会话 ${childSessionId} 已存在 v2 账本（${count ?? '未知'} 条记录）；fork 只允许写入尚未建档的新会话。`
-        + ' 若确认这是上次 fork 的半成品，请先用 `/memory-lab2 fork-reset ' + childSessionId + '` 清掉再重试。',
+        + ' 若确认这是上次 fork 的半成品，请先用 `/memory-lab fork-reset ' + childSessionId + '` 清掉再重试。',
         { code: 'EINVAL', details: { childSessionId, recordCount: count } },
       )
     }
@@ -272,7 +272,7 @@ export async function executeForkClosure({ labRoot, parentSessionId, childSessio
     })
     // 子库建成 ≠ 子会话已启用 v2。`init` 建的 engine.json 默认是「已持有投影」，
     // 而这里只是把冷库搬过来，子会话还没有声明过所有权；若照原样留着，
-    // 子会话里 `/memory-lab2 on` 会撞 EENGINEACTIVE（明明没启用却说已激活），
+    // 子会话里 `/memory-lab on` 会撞 EENGINEACTIVE（明明没启用却说已激活），
     // 用户被迫先 off 再 on——一条未文档化的弯路。所以落盘为「未激活」，
     // 由子会话自己 on 决定是否接管投影。
     await childStore.disable('fork-child-pending-activation')
@@ -353,8 +353,8 @@ export async function markNeedsMigration(labRoot, sessionId, { parentSessionId, 
     reason,
     at: new Date().toISOString(),
     steps: [
-      `1. 在父会话执行 /memory-lab2 fork ${sessionId}（或 /memory-lab2 fork-status 查看父会话闭包预览）。`,
-      `2. 若上一次 fork 留下半成品，先执行 /memory-lab2 fork-reset ${sessionId} 清掉再重试。`,
+      `1. 在父会话执行 /memory-lab fork ${sessionId}（或 /memory-lab fork-status 查看父会话闭包预览）。`,
+      `2. 若上一次 fork 留下半成品，先执行 /memory-lab fork-reset ${sessionId} 清掉再重试。`,
       '3. 确认父会话已完成对账、没有未提交事务、没有停用中的只读账本。',
       '4. 迁移成功后本标记由 fork 流程自动清除；迁移失败请保留父冷库，不要删除。',
       '5. 若宿主无法提供 fork 来源事件，请改用导出/人工迁移，不要用空库继续任务。',

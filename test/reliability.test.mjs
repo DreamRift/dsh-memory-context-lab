@@ -14,22 +14,14 @@ import {
   MIN_OPERATION_CHARS,
   NUMERIC_SETTINGS,
   RECEIPT_FORMAT_BATCH,
+  RECEIPT_FORMAT_BATCH_V2,
   RECEIPT_FORMAT_VERSION,
-  STATE_FILE,
   displayPreview,
   normalizeSettings,
   restoreGrowth,
   truncateCodePoints,
 } from '../src/core.mjs'
-import {
-  SessionStateDamagedError,
-  createSessionState,
-  ensureLabRoot,
-  listSessionStates,
-  readSessionState,
-  sessionDirectoryFor,
-  writeJsonAtomic,
-} from '../src/storage.mjs'
+import { ensureLabRoot, writeJsonAtomic } from '../src/storage.mjs'
 import { createSuppressionCoordinator } from '../src/dsh-memory-suppression.mjs'
 import { createEngine, pendingReceipts } from '../src/apply-engine.mjs'
 import {
@@ -91,49 +83,6 @@ test('ensureLabRoot still initialises a fresh directory', async () => {
   })
 })
 
-test('readSessionState reports a damaged root marker as session damage', async () => {
-  await withRoot(async (root) => {
-    await writeFile(path.join(root, LAB_ROOT_MARKER_FILE), 'not json at all', 'utf8')
-    await assert.rejects(
-      () => readSessionState(root, 'session-a'),
-      (error) => error instanceof SessionStateDamagedError,
-    )
-  })
-})
-
-// --- listing: a damaged session must not vanish -------------------------
-
-test('listSessionStates reports a damaged session instead of hiding it', async () => {
-  await withRoot(async (root) => {
-    await ensureLabRoot(root)
-    const directory = sessionDirectoryFor(root, 'session-a')
-    await mkdir(directory, { recursive: true })
-    await writeFile(path.join(directory, STATE_FILE), '{ broken', 'utf8')
-    const result = await listSessionStates(root)
-    assert.equal(Array.isArray(result.rows), true)
-    assert.equal(Array.isArray(result.damaged), true)
-    assert.equal(result.rows.length, 0)
-    assert.equal(result.damaged.length, 1, 'the damaged session must be reported')
-    assert.equal(result.damaged[0].directory, directory)
-  })
-})
-
-test('listSessionStates returns healthy sessions in rows', async () => {
-  await withRoot(async (root) => {
-    await createSessionState(root, 'session-b', DEFAULT_SETTINGS)
-    const result = await listSessionStates(root)
-    assert.equal(result.rows.length, 1)
-    assert.equal(result.rows[0].state.sessionId, 'session-b')
-    assert.equal(result.damaged.length, 0)
-  })
-})
-
-test('listSessionStates returns empty buckets for a root that is not ours', async () => {
-  await withRoot(async (root) => {
-    const result = await listSessionStates(root)
-    assert.deepEqual(result, { rows: [], damaged: [] })
-  })
-})
 
 // --- settings: an out-of-range value is unusable, not clamped ----------
 
@@ -344,33 +293,6 @@ test('writeJsonAtomic leaves no temp residue and fully replaces prior content', 
   })
 })
 
-// --- listing: a session that vanishes mid-scan is not damage -------------
-// B2/C7：并发清理（`/memory-lab clean`、另一会话、用户手动删）会让目录消失在
-// `readdir` 与逐项检查之间。那不是损坏，不该掀掉整次扫描。窗口本身无法确定性
-// 复现，所以行为侧断言同一终态（状态文件已消失的会话目录被跳过、不算损坏），
-// 源码侧钉住 ENOENT 容忍分支确实存在。
-
-test('listSessionStates skips a vanished session instead of reporting damage', async () => {
-  const source = await readFile(new URL('../src/storage.mjs', import.meta.url), 'utf8')
-  const start = source.indexOf('export async function listSessionStates')
-  const body = source.slice(start, source.indexOf('\nexport ', start + 10) === -1 ? undefined : source.indexOf('\nexport ', start + 10))
-  assert.ok(start >= 0, 'the source layout this contract pins has changed')
-  assert.equal((body.match(/'ENOENT'/g) || []).length >= 2, true,
-    'listSessionStates must tolerate ENOENT from the lstat fallbacks (the concurrent-removal race)')
-
-  await withRoot(async (root) => {
-    await ensureLabRoot(root)
-    // 终态一：目录还在、状态文件已被并发清掉（readJsonStrict → null → 跳过）。
-    const directory = sessionDirectoryFor(root, 'session-vanish')
-    await mkdir(directory, { recursive: true })
-    // 终态二：目录被同名普通文件顶替（ENOTDIR 同源竞态）。
-    await writeFile(path.join(root, 'sessions', 'a'.repeat(24)), 'not a session', 'utf8')
-    const result = await listSessionStates(root)
-    assert.equal(result.rows.length, 0)
-    assert.equal(result.damaged.length, 0, 'a vanished session is a race, not damage')
-  })
-})
-
 // --- verify-failed: the shadowed original must stay restorable -----------
 // B3/B6/C1：替换已提交、原文已被回执遮蔽之后校验才失败。此时冷库分块是原文
 // 唯一的副本，归档行必须带着与实际写入一致的回执重建元数据——否则 restore
@@ -415,6 +337,9 @@ function archiveRowFromOutcome(outcome) {
     statuses: outcome.statuses ?? [],
     receiptFormat: outcome.receiptFormat,
     batchSize: outcome.batchSize,
+    batchThreshold: outcome.batchThreshold,
+    batchMembers: outcome.batchMembers,
+    releaseCapped: outcome.releaseCapped,
     chunkCount: outcome.chunkCount ?? 1,
   }
 }
@@ -441,7 +366,7 @@ test('a verify-failed batch keeps full receipt metadata and restores every origi
     assert.equal(typeof outcome.shadowedTokenCount, 'number')
     assert.equal(typeof outcome.surfaceGeneration, 'number')
     assert.equal(outcome.hostVersion, 'test')
-    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_BATCH)
+    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_BATCH_V2)
     assert.equal(outcome.batchSize, 4)
     for (const seq of [outcome.rangeStart, outcome.rangeEnd]) {
       assert.equal(session.surface.nodes.includes(seq), false, `seq ${seq} is shadowed even though verification failed`)

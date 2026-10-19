@@ -16,7 +16,7 @@ import path from 'node:path'
 import { V2SessionStore, MAX_TRANSACTION_NUMBER, ENGINE_FILE } from '../src/v2/store.mjs'
 import { draftRecord, RECORD_KINDS } from '../src/v2/records.mjs'
 import { executeForkClosure, resetForkChild, readForkMap, readNeedsMigration } from '../src/v2/fork.mjs'
-import { assertV2AllowsV1, getEngineRegistry } from '../src/v2/engine.mjs'
+import { getEngineRegistry } from '../src/v2/engine.mjs'
 import { buildWorkingState, renderWorkingStateCard } from '../src/v2/working-state.mjs'
 import { classifyRange, GUARD_CODES } from '../src/v2/guard.mjs'
 import { v2SessionDirectoryFor } from '../src/v2/state.mjs'
@@ -370,9 +370,8 @@ test('fork 后的子会话是「未激活」而不是「已激活」，可直接
     const registry = getEngineRegistry(labRoot, childId)
     assert.equal(registry.v2Active, false, 'fork 只是搬冷库，子会话尚未声明所有权')
     assert.equal(registry.damaged, false)
-    // 未激活时 v1 允许接管（没人在改投影），这是对称且正确的。
-    const verdict = await assertV2AllowsV1(labRoot, childId)
-    assert.equal(verdict.allowed, true)
+    // fork 只搬冷库，子会话尚未声明所有权——holder 必须是 null。
+    assert.equal(registry.holder, null)
   })
 })
 
@@ -468,7 +467,7 @@ test('冷库账本与活动面合并去重：同一个 callId 只算一次', () 
   assert.equal(state.openActions[0].source, 'surface:unpaired-tool-call')
 })
 
-test('v2 状态损坏时拒绝 v1 接管（未知不得被当作未启用）', async () => {
+test('v2 状态损坏时如实报 damaged 且不报告持有者', async () => {
   await withTempLab('damaged', async (labRoot) => {
     const sessionId = 's-damaged'
     const store = await V2SessionStore.init({ labRoot, sessionId })
@@ -479,10 +478,7 @@ test('v2 状态损坏时拒绝 v1 接管（未知不得被当作未启用）', a
 
     const registry = getEngineRegistry(labRoot, sessionId)
     assert.equal(registry.damaged, true, '损坏必须与缺失区分开')
-    await assert.rejects(
-      () => assertV2AllowsV1(labRoot, sessionId),
-      (error) => error.code === 'EENGINEDAMAGED',
-    )
+    assert.equal(registry.holder, null, '损坏时不得报告任何持有者')
   })
 })
 
@@ -536,8 +532,6 @@ test('普通历史跨度不被当成「空范围」拒绝，而工具操作仍�
 
 test('v2 状态缺失时才允许 v1 接管（缺失 ≠ 损坏）', async () => {
   await withTempLab('missing', async (labRoot) => {
-    const verdict = await assertV2AllowsV1(labRoot, 's-never-enabled')
-    assert.equal(verdict.allowed, true)
     const registry = getEngineRegistry(labRoot, 's-never-enabled')
     assert.equal(registry.damaged, false)
     assert.equal(registry.holder, null)

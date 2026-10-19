@@ -38,7 +38,7 @@ export const COST_COUNTER_KEYS = Object.freeze([
    * 于是插件以为自己「回读 0 次」——真实会话 303 步里工具回读 0 次、文件重读 55 次，
    * 账本却只有一个含混的数。三路**互不覆盖**：
    * - `toolRecallReads`：模型可见工具 `memory_lab_recall` 的回读；
-   * - `commandRecallReads`：命令面 `/memory-lab2 read` 的回读（人用的那条）；
+   * - `commandRecallReads`：命令面 `/memory-lab read` 的回读（人用的那条）；
    * - `fileReReads`：同键文件重读（同一个 path|offset 被再次归档）。
    */
   'toolRecallReads',

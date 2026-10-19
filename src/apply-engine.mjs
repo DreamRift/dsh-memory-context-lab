@@ -29,6 +29,7 @@ import {
   digestRecall,
   isHumanAuthoredMessage,
   MAX_BATCH_RELEASE_TOKENS,
+  batchReleaseCeilingOf,
   MAX_OPERATIONS_PER_BATCH,
   MAX_RECALL_HITS,
   MIN_NET_RELEASE_TOKENS,
@@ -608,7 +609,8 @@ export function createEngine(dependencies) {
       minNetReleaseTokens: MIN_NET_RELEASE_TOKENS,
       // C-12/C-07 sizing: one batch cannot release more than this many
       // estimated tokens; the rest waits for the next measure.
-      maxReleaseTokens: MAX_BATCH_RELEASE_TOKENS,
+      // 0.13.1：单批释放上限按窗口比例算（默认 6.25%，1M 窗口下等于旧常量）。
+      maxReleaseTokens: batchReleaseCeilingOf(host.contextWindow),
       receiptMarker: dependencies.receiptMarker ?? RECEIPT_MARKER,
       // 活跃证据保护守卫：被保护的候选在租用冷节点 id 之前就被拒，绝不留下声明。
       // v2 传入曝光/配对守卫（guardUnit）时两道门都要过：保护层挡「证据能否安全
@@ -734,6 +736,11 @@ export function createEngine(dependencies) {
       meter: occupancy.meter,
       hostVersion,
       signal,
+      // 0.13.1（F2/F3）：批次口径随本批一起落进回执与账本行——
+      // 阈值来自配置，成员数是本批实际提交数，releaseCapped 说明是否被上限截断。
+      batchThreshold: occupancy.plan.batchSize ?? null,
+      batchMembers: occupancy.plan.units.length,
+      releaseCapped: occupancy.plan.releaseCapped === true,
       guard: (unit) => protection.registry.guard(unit),
       // v2 用跨度种类各自的正文重建做漂移检查；v1 不传，保持原行为。
       bodyOf: dependencies.spanBodyOf ?? null,
@@ -986,7 +993,7 @@ export function createEngine(dependencies) {
             rangeEnd: row.rangeEnd,
             nodeId: row.nodeId,
             state: 'forgotten',
-            reason: '软遗忘生效中：先 /memory-lab2 forget undo 撤销遗忘，再 restore 回注原文',
+            reason: '软遗忘生效中：先 /memory-lab forget undo 撤销遗忘，再 restore 回注原文',
           })
         } else {
           aliveRows.push(row)
@@ -1035,7 +1042,7 @@ export function createEngine(dependencies) {
     }
     const accounted = tally.restored + tally.skipped + tally.forgotten
     if (accounted !== rows.length) {
-      logger?.warn?.('memory-lab2: restore accounting mismatch — input ' + rows.length
+      logger?.warn?.('memory-context-lab: restore accounting mismatch — input ' + rows.length
         + ' rows, tallied ' + accounted + ' (restored=' + tally.restored
         + ' skipped=' + tally.skipped + ' forgotten=' + tally.forgotten + ')')
     }
@@ -1156,13 +1163,47 @@ export function createEngine(dependencies) {
       await rememberMeasurement(record, occupancy, { action: 'noop', reason })
       return { action: 'noop', reason, held, shortfall: occupancy.plan.shortfall }
     }
-    const result = await runBatch(record, occupancy, signal)
+    // ── 0.13.1（F6）：单步内合并多批 ────────────────────────────────────────
+    // 每次表面替换都会让「替换点之后」的前缀缓存失效。旧实现一步只提交一批，
+    // 剩下的候选等到下一步——实测会话 c1787f24 在 05:12:11 与 05:12:16 相隔
+    // 5 秒提交了两批，等于刚失效完又失效一次。
+    //
+    // 现在同一步内继续处理，直到：没有可归档候选、闸门关闭、或达到单步上限。
+    // 上限不是性能考量，而是防止一次降温把整段历史清空——留一个可观测的边界。
+    const MAX_BATCHES_PER_STEP = 4
+    let result = await runBatch(record, occupancy, signal)
+    let batches = 1
+    let appliedTotal = result.applied
+    let releasedTotal = result.releasedTokens
+    let failedTotal = result.failed?.length ?? 0
+    let recordsTotal = result.recordsWritten
     if (!result.applied) {
       // 全失败必须如实报告：此前这里无条件记 `applied`，于是一次都没成功的批次
       // 会在 status／面板里显示成"已归档一批"，而实际正文仍在上下文里。
       const reason = result.failureReason ?? 'no-unit-applied'
       await rememberMeasurement(record, occupancy, { action: 'failed', reason })
       return { action: 'failed', applied: 0, reason, releasedTokens: 0, cacheStats: occupancy.cacheStats }
+    }
+    while (batches < MAX_BATCHES_PER_STEP) {
+      let next
+      try {
+        next = await measureOccupancy(record, signal)
+      } catch {
+        break
+      }
+      // 闸门可能因为占用下降而关闭：那就停手，别为凑批继续替换。
+      const verdict = pressureVerdictOf(record, next, settings)
+      if (!verdict.open) break
+      if (!next.plan.units.length) break
+      const more = await runBatch(record, next, signal)
+      batches += 1
+      if (!more.applied) break
+      result = more
+      appliedTotal += more.applied
+      releasedTotal += more.releasedTokens
+      failedTotal += more.failed?.length ?? 0
+      recordsTotal += more.recordsWritten
+      occupancy = next
     }
     // The occupancy captured before the batch describes a surface that no longer
     // exists: the batch archived units and put receipts in their place. Recording
@@ -1179,10 +1220,11 @@ export function createEngine(dependencies) {
     await rememberMeasurement(record, afterBatch, { action: 'applied', reason: '' })
     return {
       action: 'applied',
-      applied: result.applied,
-      failed: result.failed?.length ?? 0,
-      recordsWritten: result.recordsWritten,
-      releasedTokens: result.releasedTokens,
+      applied: appliedTotal,
+      failed: failedTotal,
+      recordsWritten: recordsTotal,
+      releasedTokens: releasedTotal,
+      batches,
       cacheStats: occupancy.cacheStats,
     }
   }

@@ -5,7 +5,7 @@
  *
  * 存储、内部召回接口、规划器与门禁都已在没有它的情况下完成并验证；
  * 这个文件是**唯一**为「模型主动读取」新增的模型可见面。它按设计规范
- * 固定注册：不随 `/memory-lab2 on|off` 增删 schema——工具集一增一减会作废
+ * 固定注册：不随 `/memory-lab on|off` 增删 schema——工具集一增一减会作废
  * 整段前缀缓存，而且让「模型能读历史」变成模式依赖的行为。
  *
  * ## 边界（比功能更重要）
@@ -210,7 +210,7 @@ export function renderToolOutput(sessionId, value) {
   if (!value.engine_enabled) {
     return [
       '记忆上下文 v2 在本会话未启用，没有可读的冷库。',
-      '（本工具只读；启用与否由用户用 `/memory-lab2 on` 决定，模型无法自行启用。）',
+      '（本工具只读；启用与否由用户用 `/memory-lab on` 决定，模型无法自行启用。）',
     ].join('\n')
   }
 
@@ -265,7 +265,7 @@ export function renderToolOutput(sessionId, value) {
     lines.push(`cursor: ${value.next_cursor}`)
   }
   if (value.warnings.length > 0) lines.push(`告警：${value.warnings.join('；')}`)
-  lines.push('未列出的内容不等于不存在：可用 record_ids 精确回读，或用 /memory-lab2 history 翻页浏览。')
+  lines.push('未列出的内容不等于不存在：可用 record_ids 精确回读，或用 /memory-lab history 翻页浏览。')
   return lines.join('\n')
 }
 

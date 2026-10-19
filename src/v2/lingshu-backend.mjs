@@ -231,7 +231,7 @@ export function createLingshuBackendProvider({
    * 启动（或复用）某会话的隔离灵枢客户端并返回后端。
    *
    * 与 `backendFor` 分开：`backendFor` 是**同步、零副作用**的取用（给检索热路径），
-   * 真正的启动只在 `/memory-lab2 index` 这类显式动作里发生。这样只读检索不会
+   * 真正的启动只在 `/memory-lab index` 这类显式动作里发生。这样只读检索不会
    * 隐式起进程、隐式建库。
    */
   async function ensureBackend({ sessionId, storeRoot, signal }) {

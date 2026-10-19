@@ -22,6 +22,7 @@ import {
   MAX_OPERATION_BYTES,
   MIN_OPERATION_CHARS,
   RECEIPT_FORMAT_BATCH,
+  RECEIPT_FORMAT_BATCH_V2,
   RECEIPT_FORMAT_VERSION,
 } from '../src/core.mjs'
 import { buildSession, FakeColdStore, fakeMeter, operation, SurfaceError } from './helpers/fake-host.mjs'
@@ -1174,13 +1175,13 @@ test('P1-5：相邻单元共用一条批次摘要回执，成员行带冷记录�
   const replacementSeqs = new Set(applied.map((outcome) => outcome.replacementSeq))
   assert.equal(replacementSeqs.size, 1, '相邻单元必须共用一条批次摘要回执（否则回执数没降下来）')
   for (const outcome of applied) {
-    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_BATCH, '合并回执必须按 format-3 记账')
+    assert.equal(outcome.receiptFormat, RECEIPT_FORMAT_BATCH_V2, '合并回执按 format-8 记账（0.13.1 批次口径拆分）')
     assert.equal(outcome.batchSize, 4, '成员数随行落盘，恢复分组靠它')
   }
 
   // 摘要正文：样板只付一次，成员行逐条带冷记录与 hash。
   const receiptText = session.eventAt(applied[0].replacementSeq).data.content.map((block) => block.text).join('')
-  assert.match(receiptText, /批次归档：4 个相邻操作/)
+  assert.match(receiptText, /批次归档：本批 4\/4 个操作/)
   assert.match(receiptText, /^V2-RECEIPT/m, '批次摘要沿用引擎的 marker')
   assert.ok(!receiptText.includes('工具：read'), '逐条样板（「工具：」头）不得再重复')
   for (const outcome of applied) {
@@ -1209,6 +1210,9 @@ test('P1-5：相邻单元共用一条批次摘要回执，成员行带冷记录�
     statuses: outcome.statuses ?? [],
     receiptFormat: outcome.receiptFormat,
     batchSize: outcome.batchSize,
+    batchThreshold: outcome.batchThreshold,
+    batchMembers: outcome.batchMembers,
+    releaseCapped: outcome.releaseCapped,
     chunkCount: outcome.chunkCount ?? 1,
   }))
   const restored = await restoreReceipts({ session, client: store, receipts: rows, receiptMarker: 'V2-RECEIPT' })
@@ -1251,7 +1255,7 @@ test('P1-5：单元不相邻时断开成两条回执；单单元 run 保持逐�
   const merged = applied.filter((outcome) => outcome.batchSize === 2)
   assert.equal(merged.length, 2, '其余两个相邻单元合并')
   const mergedText = session.eventAt(merged[0].replacementSeq).data.content.map((block) => block.text).join('')
-  assert.match(mergedText, /批次归档：2 个相邻操作/)
+  assert.match(mergedText, /本条回执覆盖其中相邻的 2 个/)
 
   // 混合恢复：单条走旧路径、摘要走分组路径，互不干扰。
   const rows = applied.map((outcome) => ({
@@ -1267,6 +1271,10 @@ test('P1-5：单元不相邻时断开成两条回执；单单元 run 保持逐�
     locators: outcome.locators ?? [],
     statuses: outcome.statuses ?? [],
     receiptFormat: outcome.receiptFormat,
+    batchSize: outcome.batchSize,
+    batchThreshold: outcome.batchThreshold,
+    batchMembers: outcome.batchMembers,
+    releaseCapped: outcome.releaseCapped,
     chunkCount: outcome.chunkCount ?? 1,
   }))
   const restored = await restoreReceipts({ session, client: store, receipts: rows, receiptMarker: 'V2-RECEIPT' })

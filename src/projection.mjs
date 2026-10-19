@@ -28,11 +28,11 @@ const SURFACE_TYPES = new Set(['system/message', 'developer/message', 'user/mess
 /**
  * Command names whose runs this projection folds.
  *
- * `memory-lab` is the v1 engine, `memory-lab2` the v2 engine. Both write their
- * settings into the same fold shape, so the panel keeps working across an
- * engine switch; `engine` in the view records which one is currently enabled.
+ * 0.13.1 起只有一个引擎，因此也只有一条命令。旧日志里的 `/memory-lab2` 仍要被
+ * 折叠——否则 0.13.0 及更早写下的设置会从投影里消失（面板回到默认值）。两者
+ * 都折叠进同一形状，`engine` 恒为 `'v2'`。
  */
-const COMMAND_ENGINE = new Map([['memory-lab', 'v1'], ['memory-lab2', 'v2']])
+const COMMAND_ENGINE = new Map([['memory-lab', 'v2'], ['memory-lab2', 'v2']])
 
 /** The projection registry only requires a `.parse`; values are already plain JSON. */
 export const PASSTHROUGH_SCHEMA = Object.freeze({ parse: (value) => value })

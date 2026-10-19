@@ -27,7 +27,7 @@ import { V2SessionStore } from '../src/v2/store.mjs'
 import { RECORD_KINDS, draftRecord } from '../src/v2/records.mjs'
 import { getForgetIndex, isForgotten } from '../src/v2/disposition.mjs'
 
-const COMMAND = 'memory-lab2'
+const COMMAND = 'memory-lab'
 
 function createStubContext() {
   const listeners = new Map()

@@ -503,7 +503,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
                 ? `范围 ${rangeText}；工具 ${toolsText}`
                 : `范围 ${rangeText}`
               return {
-                // id 取稳定记录 ID：回注里的每一条都能被精确回读（`/memory-lab2 read <id>`）。
+                // id 取稳定记录 ID：回注里的每一条都能被精确回读（`/memory-lab read <id>`）。
                 id: entry.id,
                 nodeId: entry.inline.nodeId,
                 createdAt: entry.createdAt,

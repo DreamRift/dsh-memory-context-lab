@@ -27,7 +27,7 @@ import { planCooling } from '../src/apply.mjs'
 import { createV2SessionState, writeV2SessionState } from '../src/v2/state.mjs'
 import { RECORD_KINDS } from '../src/v2/records.mjs'
 
-const COMMAND = 'memory-lab2'
+const COMMAND = 'memory-lab'
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
 
@@ -674,7 +674,7 @@ test('要求5：全部单元失败时不得报成「已归档一批」（零成�
   assert.equal(record.state.lastMeasurement?.kind, 'failed')
 })
 
-test('要求5：`/memory-lab2 now` 的失败关闭不得被包装成 success', async () => {
+test('要求5：`/memory-lab now` 的失败关闭不得被包装成 success', async () => {
   await withTempLab('nowfail', async (labRoot) => {
     const sessionId = 'guard-nowfail-01'
     const ctx = createStubContext({ withMeter: false })

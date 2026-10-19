@@ -31,16 +31,16 @@ test('Config exposes the standard-schema interface the host requires', { skip: s
   assert.equal(typeof Config?.['~standard']?.validate, 'function')
 })
 
-test('fresh install resolves defaults/presets as volatile refs', { skip: skipReason }, () => {
+test('fresh install resolves defaults as a volatile ref', { skip: skipReason }, () => {
   const resolved = Config['~standard'].validate({})
   assert.equal(resolved.issues, undefined)
-  for (const key of ['defaults', 'presets']) {
-    const raw = resolved.value?.[key]
-    assert.ok(raw && typeof raw === 'object' && typeof raw.get === 'function', `${key} is a volatile ref`)
-    assert.equal(kit.isVolatile(raw), true, `${key} recognized by cosmokit.isVolatile`)
-  }
+  // 0.13.1 删除了 presets：预设是 v1 的概念，全历史模式下「保留最近操作」失效，
+  // 预设行没有可切换的内容。defaults 仍是 volatile 引用。
+  const raw = resolved.value?.defaults
+  assert.ok(raw && typeof raw === 'object' && typeof raw.get === 'function', 'defaults is a volatile ref')
+  assert.equal(kit.isVolatile(raw), true, 'defaults recognized by cosmokit.isVolatile')
+  assert.equal(resolved.value?.presets, undefined, '0.13.1 不再提供 presets')
   const defaults = resolved.value.defaults.get()
-  assert.equal(defaults?.retainOperations, 5)
   assert.equal(defaults?.auto, true)
   // 0.13.1（报告 C）：闸门阈值必须出现在 schema 的 defaults 里，否则设置页
   // 根本没有第二个入口，而唯一的入口（会话面板）当时正坏着。
@@ -49,9 +49,6 @@ test('fresh install resolves defaults/presets as volatile refs', { skip: skipRea
     DEFAULT_SETTINGS.pressureGate,
     'defaults.pressureGate 必须与 core 的默认值同源',
   )
-  const presets = resolved.value.presets.get()
-  assert.ok(Array.isArray(presets) && presets.length > 0)
-  assert.equal(typeof presets[0]?.name, 'string')
 })
 
 

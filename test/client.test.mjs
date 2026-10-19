@@ -558,7 +558,7 @@ test('0.13.0: the pressure gate switch sends 0 when off and the threshold when o
   onSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(
-    sent.includes('/memory-lab2 set pressure 0'),
+    sent.includes('/memory-lab set pressure 0'),
     `turning the gate off must write 0, sent: ${JSON.stringify(sent)}`,
   )
 
@@ -571,14 +571,14 @@ test('0.13.0: the pressure gate switch sends 0 when off and the threshold when o
   offSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(
-    sent.includes('/memory-lab2 set pressure 20'),
+    sent.includes('/memory-lab set pressure 20'),
     `turning the gate on must restore the default threshold, sent: ${JSON.stringify(sent)}`,
   )
 })
 
 test('0.13.1: v1 会话的闸门命令走 /memory-lab 前缀', async () => {
   // 报告 D：闸门是 v1/v2 共用的引擎判据（apply-engine.runAutoCooling），
-  // 硬编码 /memory-lab2 会让 v1 会话的闸门开关必然失败。
+  // 硬编码 /memory-lab 会让 v1 会话的闸门开关必然失败。
   const { entry, shim } = await loadClient()
   const sent = []
   const { context, slots } = createClientContext()
@@ -590,18 +590,15 @@ test('0.13.1: v1 会话的闸门命令走 /memory-lab 前缀', async () => {
   chipButton(shim.mount(chip.component, chipProps(base, { run }))).props.onClick({ preventDefault() {}, stopPropagation() {} })
   const opened = shim.mount(chip.component, chipProps(base, { run }))
   const gateSwitch = collect(opened, (row) => row.props && labels.includes(row.props['aria-label']))[0]
-  assert.ok(gateSwitch, 'v1 会话也必须渲染闸门开关')
+  assert.ok(gateSwitch, '会话必须渲染闸门开关')
   gateSwitch.props.onClick({ preventDefault() {}, stopPropagation() {} })
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(
     sent.includes('/memory-lab set pressure 20'),
-    `v1 必须用 /memory-lab 前缀，实际发出：${JSON.stringify(sent)}`,
+    `必须用 /memory-lab 前缀，实际发出：${JSON.stringify(sent)}`,
   )
-  assert.equal(
-    sent.some((line) => line.startsWith('/memory-lab2')),
-    false,
-    'v1 会话不得发出 v2 命令',
-  )
+  // 0.13.1 只有一条命令：所有动作都发 /memory-lab，不再按引擎分流。
+  assert.ok(sent.every((line) => line.startsWith('/memory-lab ')), `不得发出其它命令：${JSON.stringify(sent)}`)
 })
 
 test('B2: maintenance actions route to the v2 engine when it owns the projection', async () => {
@@ -622,7 +619,7 @@ test('B2: maintenance actions route to the v2 engine when it owns the projection
   const restoreLabels = ['恢复原文', 'Restore text']
   const nowLabels = ['立即降温', 'Cool now']
   const dryRunLabels = ['预演', 'Dry run']
-  for (const [labels, line] of [[restoreLabels, '/memory-lab2 restore'], [nowLabels, '/memory-lab2 now'], [dryRunLabels, '/memory-lab2 dry-run']]) {
+  for (const [labels, line] of [[restoreLabels, '/memory-lab restore'], [nowLabels, '/memory-lab now'], [dryRunLabels, '/memory-lab dry-run']]) {
     const node = byText(labels)
     assert.ok(node, `the panel must expose ${labels[0]}`)
     node.props.onClick({ preventDefault() {}, stopPropagation() {} })

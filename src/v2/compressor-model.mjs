@@ -13,7 +13,7 @@
  * 绝不借程序兜底继续提交。
  */
 import { createHash } from 'node:crypto'
-import { setTimeout as delay, setImmediate } from 'node:timers/promises'
+import { setTimeout as delay } from 'node:timers/promises'
 
 /** 阶段模型调用超时（拍板区间 30–60s，默认 45s）。 */
 export const MODEL_PHASE_TIMEOUT_MS_MIN = 30_000
@@ -142,7 +142,7 @@ export function renderModelPhaseCard({ summaryId, phaseLabel, memberCount, tools
   for (const line of lines) out.push('· ' + line.text + '（' + (line.refs ?? []).join('/') + '）')
   if (Number(rejectedCount) > 0) out.push('（' + String(rejectedCount) + ' 条未通过对回 L0 的机械校验，已剔除）')
   out.push('工具：' + (tools ?? []).join('、'))
-  out.push('来源清单 manifest ' + String(manifestId ?? '') + '，凭证 ' + String(voucherId ?? '') + '；/memory-lab2 expand ' + String(voucherId ?? ''))
+  out.push('来源清单 manifest ' + String(manifestId ?? '') + '，凭证 ' + String(voucherId ?? '') + '；/memory-lab expand ' + String(voucherId ?? ''))
   out.push('模型摘要模式：以上结论逐条对回 L0 精确值，未通过者已剔除。')
   return out.join('\n')
 }
