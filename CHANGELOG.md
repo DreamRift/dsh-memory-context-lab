@@ -1,5 +1,183 @@
 # 变更记录
 
+## 0.13.2-beta.2（2026-10-21）**测试版，未发布**
+
+**缺陷排查批的收口：修掉 beta.1 遗留的 4 条必修项（W-01…W-04）、3 条 PR #8 审计剩余项，
+外加实施时静态发现的两处同族缺口。不新增功能，不改产品边界。**
+
+本版仍是**测试版**：源码树已改、测试全绿，但**未**打 tag、**未**推送 GitHub、**未**重出 tgz、
+profile 依赖仍指向 `#v0.13.1`。发布动作见 发布流程。
+
+### 互斥（P0）
+
+- **W-01 同进程 `withWriteLock` 不互斥（issue #9 没修的那一半）。** beta.1 加的
+  `acquiringLocks` 排的是「**获取**」不是「**持有**」：后来者在前一个回调执行期间就拿到
+  重入句柄，两个 async 分支同时在临界区。实测 8 路并发 × 25 轮「读 → 写回 +1」只落
+  25 条（丢 87.5%），层级账本写出两条 `entrySeq: 1` 并都报 `revision: 1`——
+  `expectedRevision` 的 CAS 保护同时失效。
+  现在 `withWriteLock` 按目录**串行**：后来者等前一个回调执行完才进入临界区；
+  同调用栈的嵌套调用（`applyForgetUnlocked` → `loadDisposition` → `repairLedgerTail`
+  这类真实形态）靠 `AsyncLocalStorage` 识别后直接执行，不会自锁。
+  **跨进程那一半逐字未动**（198/198 无丢更新、ELOCKIO=0）。
+- **W-01b 层级账本读路径仍在「读一次就删完整条目」。** `parseLedgerText` 是 D-01
+  修复前的口径：文件末尾缺 `\n` 即判半行，完整合法条目被 `loadHierarchy` 在**读取动作里**
+  物理删除（层级卡丢失、revision 回退、entrySeq 重号），且截断发生在写锁之外。
+  现在与 disposition 同口径：先试解析再判半行，截断移进写锁、只对解析失败的尾巴生效。
+- **W-01c 聚合凭证计划的读-改-写在锁外。** `saveVoucherPlan` / `dropVoucherPlan` /
+  `dropVoucherPlansForRecords` 只给最后的整文件替换加锁，两个并发调用都基于同一份旧
+  `plans` 计算，后写者整文件覆盖先写者（丢计划 = 那批凭证再也展开不回来）。现在整段进锁。
+
+### 可用性（P1）
+
+- **W-02 接管持续失败时无界自旋。** D-10 把 `takeOver` 的瞬态失败从「抛 ELOCKIO」改成
+  「静默 return」，但外层 `continue` 之前既没有 sleep 也没有重查 deadline：只要目录
+  rename 持续失败（Windows 上打开的句柄 / 杀软 / 另一进程 readdir），`acquireWriteLock`
+  就是纯微任务空转——不返回、不抛错、CPU 打满，连 `AbortSignal` 都插不进去。
+  这是修复引入的回归（旧行为难看但**会返回**）。现在 `takeOver` 如实返回 boolean，
+  两个接管分支统一「查 deadline → 退避 50ms」，用尽抛 `ELOCKED`
+  （`details.reason = 'takeover-failed'`），**不回落 ELOCKIO**。
+
+### 资源与上界（P2）
+
+- **W-03 两阶段建锁的中间物永久泄漏。** 进程在 `mkdir(stage)` 与 `rename` 之间崩溃，
+  会话根下就永久留下 `.write-lock.<uuid>.tmp/owner.json`；接管用的 `.stale.*` 墓碑同理。
+  现在拿到锁之后清扫一次：删「**早于本次获取开始时刻**」的 stage / 墓碑（按年龄会漏掉
+  同刻出现的残留，按「早于我开始」则不会误删正在建锁的竞争者——它 rename 只会得
+  ENOENT 瞬态 → 重试）。尽力而为，失败不影响加锁。
+- **W-04 增量卡的字符上限被尾行突破。** `boundDeltaLines` 的尾行「另有 N 行变化未在本卡
+  列出…」是无条件 push 的，长度不计入预算：24 行 × 80 字符填充实测 1644 字符 >
+  `CARD_DELTA_MAX_CHARS`(1600)。现在尾行宽度按最坏 `rest` 预留、装完再兜底回退，
+  `text.length <= maxChars` **严格**成立。增量卡是每步固定税，上界名不副实就等于没有上界。
+
+### 诚实标注（PR #8 审计剩余三项）
+
+- **`readRange` 内部 clamp**：`offset` 归一为非负整数、`maxBytes` 非法直接 `EINVAL`。
+  `readRecord` 入口校验不变，这是给将来新调用方的兜底（`maxBytes=0` 会抛 RangeError、
+  `offset=1.5` 会抛 ERR_OUT_OF_RANGE，两者都会被上层 catch 归成「数据损坏」）。
+- **删掉死代码 `store.readJson`**：会折叠三态（`null`/`undefined`/抛错）的旧实现，
+  全仓无调用点；在用的全是 `readJsonStrict`。
+- **`integrity` 不再把「没校验」报成 `'ok'`**：全文读通、尺寸一致但 `verifyHash: false`
+  时返回 `'unverified'`（`verified` 仍是独立一维）。消费者已按两维读取
+  （`assertIntegrityAcceptable` 在 `!verifyHash` 时提前返回、fork 走 `verifyHash: true`），
+  **无行为回归**。
+- **拿不到记录 kind 时标 `'unknown'`**，不再冒充 `'tool-output'`——否则「读不到」与
+  「确实是工具输出」在卡片上完全同形。
+
+### 验证
+
+**112 套 / 全绿、0 跳过**（Node v24.19.0）。新增 6 个守卫，全部接进 `npm test`：
+`v2-write-lock-same-process`（8 路并发不丢更新 / 嵌套重入不死锁 / 跨目录不阻塞）、
+`v2-write-lock-takeover`（接管持续失败必须在 deadline 内抛 ELOCKED）、
+`v2-lock-stage-sweep`（崩溃残留被清、竞争者目录保留）、
+`v2-hierarchy-concurrency`（并发 entrySeq 不撞号 + 完整条目无尾 LF 不被删）、
+`v2-card-delta-cap`（尾行计入预算）、`v2-store-integrity-label`（没校验报 `unverified`）。
+6 条都做过「改回旧实现 → 用例变红 → 复原 → 绿」（`scripts/revert-probe.mjs` 新增 6 个场景，6/6 全红）。
+全矩阵读数为 **30 OK / 4 夹具脱节**——脱节的 4 条在本批之前就已失效（已用 `git show HEAD:` 核对，
+本批未触碰那 4 处源码），脚本对脱节显式报错、不静默算通过。
+
+### 诚实边界
+
+- **W-01 的修复要小心重入**：改错会从「不互斥」变成「自锁」。同调用栈靠 ALS 帧区分，
+  锁帧带 `active` 标志（锁结束后迟到的游离任务回到正常排队）；但**锁内 `void asyncFn()`
+  起、且在外层锁仍持有时运行**的后台任务会被当作重入并发执行——不引入任务跟踪就无法区分，
+  这是明确边界，不是待修缺陷。
+- **跨目录锁序**：当前无任何代码路径同时持有两把锁；将来出现时仍需人工保证加锁顺序一致。
+- **W-02 的触发条件是「目录 rename 持续失败」**：Windows 上是真实形态，Linux 上少见。
+- **sweep 的竞态**：极端情况下删掉别的进程正在建的 stage → 它的 rename 得 ENOENT（瞬态）
+  → 重试。安全性由「竞争失败走重试」保证，不引入新的失败模式。
+- **`head + tail` 单独超限**是唯一例外（配置荒谬时），此时如实返回并保留 `truncated: true`。
+- **未做**：GitHub 侧动作（合并 PR #7/#8、issue #5/#9 回帖、tag/push/Release）需另行授权；
+  真实 985 段会话上的回注质量验证仍未做（改进文档 §7.4）。
+
+## 0.13.2-beta.1（2026-10-21）**测试版，未发布**
+
+**缺陷排查批：26 项真实缺陷的修复 + 8 条能跑红的守卫。不新增功能，不改产品边界。**
+
+本版是**测试版**：源码树已改、测试全绿，但**未**打 tag、**未**推送 GitHub、**未**重出 tgz、
+profile 依赖仍指向 `#v0.13.1`。发布动作见 发布流程。
+
+### 数据与隐私（P0）
+
+- **D-01 读一次账本就删掉完整合法的遗忘条目。** 旧实现把「文件末尾缺 `\n`」当成「崩溃残留
+  的半行」，于是任何不走 `appendFile('…\n')` 的写入路径留下的完整条目，都被
+  `loadDisposition` 在**读取动作里**物理删除：遗忘失效（此前遗忘的全部记录重新可见）、
+  revision 回退、操作号从 `f000001` 重发。现在先试解析再判半行，且截断修复移进写锁、
+  只对解析失败的尾巴生效。
+- **D-02 `clean confirm delete-session` 重启后绕过「引擎仍启用」守卫。** 守卫只查进程内
+  `records`；重启后它为空，而磁盘上 `state.json` 仍 `enabled:true`、`engine.json` 仍 active、
+  日志里的 v2 回执仍指向这批记录。现在三源合一（任一成立或**无法判定**即拒绝），
+  并在删除前把 `state.json`/`engine.json` 备份到 `v2/quarantine/deleted-session-*`。
+- **D-03 commit 与在途 stage 交错会把已提交事务回写成「未提交」。** commit 不参与 stage 的
+  串行队列，少 await 一个 stage 就会在 commit 之后把 `committedAt` 覆盖成 null，重启对账把
+  整事务移进隔离区（commit 却返回成功）。现在 commit/abandon 先排空队列并标记句柄 closed，
+  stage 在 push 前复查（失败关闭）。**诚实边界：现有两个调用点都是顺序 await，今天不自发触发。**
+- **D-04 抑制静默关闭，`on` 回执照样宣称「已抑制」。** 版本闸门失败 → 协调器为 null →
+  抑制根本没装上，而回执写死「已抑制」，`status` 里也没有那一行。现在 record 上记
+  `suppression: { available, reason }`，回执按实况分支，`status` 增一行「真实灵枢抑制」。
+
+### 互斥与门禁（P1）
+
+- **D-05 写锁创建窗口被当场接管。** `readOwner` 在 `ENOENT` 时返回 `null`，而
+  `isWriteLockStale(null)` 恒为 true。改为**两阶段创建**（临时目录写好凭证再 rename），
+  「目录在而凭证不在」这个状态从根上不存在；旧版本残留的空目录按目录年龄（1.5s 宽限）
+  才接管。
+- **D-06 被接管者的心跳覆盖新持有者凭证**，导致新持有者 `release()` 静默失效、锁目录残留。
+  心跳先读回校验 token，不符即停表并标 `lost`；`release()` 如实返回 false。
+- **D-10 Windows 瞬态 `EPERM/EBUSY/ENOENT` 被打成 `ELOCKIO`。** 目录 rename 在「有打开句柄 /
+  杀软扫描」下必然瞬态失败，旧实现把它变成「数据损坏」信号。现在按竞争/瞬态分流重试，
+  用尽只抛 `ELOCKED`（可重试语义）。
+- **D-07 后台 job 硬保护在真实形态下从未建立。** 正则把引号写在冒号之后，认不出
+  `{"job_id":"h_x"}`（工具参数的正常形态）；终态判定又只要「正文含 id + 一个终态词」就解除。
+  现在先 `JSON.parse` 递归取 `job_id/jobId`、正则只兜底非 JSON 文本；终态证据必须**同工具族**
+  （`hive_spawn` 提交、`hive_poll` 报告终态），工具身份按 callId 反查，拿不到时只认结构化
+  终态字段。
+- **D-08 增量卡去重闸门让模型永久保留已撤回状态。** 键命中历史只说明「注入过这张卡」，
+  不说明「模型手上就是它」。现在基线不是这张卡时落到增量分支，把差异说清。
+- **D-09 guard 日志专用清单漏 3 个宿主真实事件**（`job/registered`、`job/settled`、
+  `working-directory/change`）→ 含它们的操作区间永久 `unknown-event-type`、永不退热。
+  已补齐，并新增与宿主清单做差集的守卫。
+
+### 口径与边界（P2）
+
+- **D-11** claim 配额 0 反而输出全部（`slice(-0) === slice(0)`）→ 现在配额 0 真的一条不给。
+- **D-12** 预算 `null`/`''`/`[]` 被 `Number()` 归一成 0 → 与 `budget.mjs` 同源，未提供走默认值。
+- **D-13** 在途调用与有效约束超配额时丢最新留最旧 → 改 `newestTake`，溢出计数改用同一把尺子。
+- **D-14** grep 键 `<tool>|<pattern>|<path>` 无转义 → 键改成 JSON 数组，账本 version 升 2
+  （v1 账本按 schema 不符失败关闭）。
+- **D-15/D-16** `maxBytes` 非法值静默读全文、`offsetBytes` 非整数被伪装成 `payload-unreadable`
+  → 入口校验直接 `EINVAL`，`#readPayload` 只映射 `ENOENT/EACCES/EPERM/EISDIR`，其余重新抛出。
+- **D-17** 隐式事务号无上界 → 9 位文件名不被识别 → 该会话写路径永久不可用。现在显式/隐式
+  共用上界校验，`recordId` 越界抛带 code 的 `EngineV2Error`（不再是裸 `RangeError`）。
+- **D-18** abandon / 空提交 `rm` 掉意图文件后事务号跨重启复用 → 改为 rename 进隔离区，
+  号继续占用（对账本来就把隔离文件名里的号算进 `maxSeenTxn`）。
+- **D-19** 浮点配额把 `另有 1.2999999999999998 条` 印进模型可见卡片 → 与正文同一把尺子并取整。
+- **D-20** 按 UTF-16 单元截断切在代理对中间 → 孤立代理、落盘成 U+FFFD。改为按码点切。
+- **D-21** `ambiguousCalls` 检查排在「空范围」分支之后（`allowPlainText=true` 时**放行在途调用**）；
+  活动面无助手消息时栅栏整段不判 → 前者上移，后者 `fenceAll: true`。
+
+### 工程面
+
+- **E-01（发布面，**本版未执行**）**：`release/` 工作树里 0.9.8 支持的 3 个改动仍未提交，
+  tgz/tag 的版本闸门只认 0.8.1。**本版只改源码线**；提交/tag/pack/推送按发布流程另行执行。
+- **E-02** 发布包的 `test`/`probe:host` 指向未随包分发的 `test/`：新增 `pretest` /
+  `preprobe:host` 前置检查，在安装目录里给出「测试属于仓库、不属于包」的明确结论，
+  而不是 `Cannot find module`。
+- **E-03** 日志前缀残留 `memory-context-lab2:` 1 处已改，并新增静态守卫（此前**无任何测试**
+  覆盖前缀，release notes 那句「已统一」没人验证过）。
+- **E-04** `disposeAutoCooling()` 连续调用两次已删一处。
+- **E-05** 死代码：`storage.mjs` 两个未使用 import 已删；`parseLedgerText` 三元两支相同已修。
+
+### 验证
+
+- **105 套件全绿、0 跳过**（2026-10-21，Node v24.19.0；源码树 `node scripts/test-all.mjs`）。
+  0.13.1 是 97 套；本版新增 8 个守卫：
+  `v2-disposition-integrity`（D-01）· `v2-clean-guard`（D-02）· `v2-store-guard`（D-03/15/16/17/18）·
+  `v2-suppression-receipt`（D-04）· `v2-write-lock-guard`（D-05/06/10）· `v2-card-guards`（D-08/11/12/13/19/20）·
+  `v2-key-and-order-guards`（D-07/14/21）· `guard-event-coverage`（D-09）· `log-prefix`（E-03）。
+- **8 条做过「临时改回旧实现 → 用例变红 → 复原 → 绿」**（D-01、D-05、D-07、D-08、D-11、D-12、
+  D-21a、D-21b）；其余守卫的判据是「参数非法必须 `EINVAL`」「差集必须为空」这类直接断言。
+- **未做**：真实 A/B（同任务开/关插件）与收益量化；0.13.2 的发布动作。
+
 ## 0.13.1（2026-10-19）
 
 **单引擎重构：彻底移除 v1，修复实测缺陷，收敛指令面。**
@@ -359,7 +537,7 @@ case、现行文档不得再教 `/memory-lab2`）。
 - **一条遗忘不再废掉整组**：此前任一成员被遗忘即整组 `member-forgotten` blocked，同组其余成员永远压不掉。现在只把被遗忘成员**排除出参与集**：不读其正文、不进 L1/L2/`sourceRecordIds`/`leafIds`，其余成员照常蒸馏；全部成员被排除时仍整组失败关闭（没有安全子集）。
 - **计划 schema 2**：`recordIds` 语义收紧为「参与蒸馏的子集」，新增 `excludedRecordIds`/`excludedMembers`（`{recordId, seq, reason}`）/`memberDigest`（sha256 前 12 位）；`memberSeqs`/`memberTexts` 仍是表面全集，区间身份与 `voucherId` 因此不变。v1 计划（无 `planSchema`）保持整条作废语义。
 - **披露有边界**：凭证文本与 L2 卡头只在真的排除了成员时追加一行（「M 段成员因遗忘未参与聚合」）；无排除时输出与 0.10.x **逐字节一致**，既有断言不被被动。
-- 设计定稿：0.11.0-压缩成员级排除设计-20261018.md（工作区 docs/历史归档/版本计划与提示词/，不在发布包内）。
+- 设计定稿：0.11.0-压缩成员级排除设计-20261018.md。
 
 ### 检索置信度（T3 / F-09）
 

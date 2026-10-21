@@ -263,7 +263,15 @@ export function createCardDomain({
       injectedKeys: cardState.keys,
       limit: WORKING_SET_DEDUP_HISTORY_LIMIT,
     })
-    if (!verdict.inject) return null
+    if (!verdict.inject) {
+      // 键命中历史只说明「这张卡本会话注入过」，**不**说明「模型手上现在就是它」
+      // （0.13.2 D-08）。全量卡时代两者等价；增量卡时代模型手上是「上一张全量卡 +
+      // 后续增量」。状态回退到某个旧全量卡形态时，增量卡宣告过的行（未曝光结果、
+      // 进度）在新状态里已不存在，却没有任何卡撤回它们——模型继续按不存在的事实
+      // 行动。所以只有基线**就是**这张卡时才真的无需重复注入；否则落到下面的
+      // 增量分支，把差异说清。
+      if (cardState.text === card.text) return null
+    }
 
     const fullCard = shouldInjectFullWorkingStateCard({
       previousText: cardState.text,

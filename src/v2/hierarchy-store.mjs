@@ -58,9 +58,27 @@ export function hierarchyPath(sessionDir) {
 
 function parseLedgerText(text) {
   const lines = text.split('\n')
+  // 文本以 \n 结尾时 split 会留一个空尾元素，所以完整行恒为 slice(0, -1)。
   const trailingNewline = /\n$/.test(text)
-  const completeLines = trailingNewline ? lines.slice(0, -1) : lines.slice(0, -1)
-  const partialLine = trailingNewline ? '' : lines[lines.length - 1]
+  const completeLines = lines.slice(0, -1)
+  // 尾部没有 LF 时**先试解析**再判半行（0.13.2-beta.2 W-01b，与 disposition 的 D-01 同口径）。
+  //
+  // 旧实现把「文件末尾缺 \n」直接当成「崩溃残留的半行」，于是任何不走
+  // appendFile('…\n') 的写入路径留下的**完整合法条目**都被 loadHierarchy 在读取
+  // 动作里物理删除：层级账本少一条卡、revision 回退、entrySeq 重号。完整条目的
+  // 判定依据必须是「这一行能否解析成 JSON」，不是「文件末尾有没有换行」。
+  let partialLine = ''
+  if (!trailingNewline && lines.length > 0) {
+    const tail = lines[lines.length - 1]
+    if (tail.length > 0) {
+      try {
+        JSON.parse(tail)
+        completeLines.push(tail) // 合法 → 就是最后一条完整行，不进 partialLine
+      } catch {
+        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
+      }
+    }
+  }
   const entries = []
   let damaged = false
   let damageDetail = null
@@ -102,6 +120,30 @@ function parseLedgerText(text) {
 }
 
 /**
+ * 截掉账本尾部那条解析失败的半行（崩溃残留）。
+ *
+ * 必须在写锁内做：读-改-写不是原子的，而账本的并发追加者是别的进程。锁内重读一次、
+ * 以锁内内容为准，才能保证「只截掉坏尾巴」而不是把别人刚追加的完整条目一起丢掉。
+ * 返回被截掉的字节数。
+ */
+async function repairHierarchyTail(sessionDir, file) {
+  return withWriteLock(sessionDir, async () => {
+    let current
+    try {
+      current = await readFile(file, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT') return 0
+      throw error
+    }
+    const parsed = parseLedgerText(current)
+    if (!parsed.partialLine || parsed.partialLine.length === 0) return 0
+    const keep = current.slice(0, current.length - parsed.partialLine.length)
+    await writeFile(file, Buffer.from(keep, 'utf8'))
+    return Buffer.byteLength(parsed.partialLine, 'utf8')
+  })
+}
+
+/**
  * 读取账本。语义与 loadDisposition 一致：absent / ok / damaged 三态，
  * 尾部半行物理截断修复（repairedBytes），中部损坏只报不修。
  */
@@ -118,13 +160,13 @@ export async function loadHierarchy(sessionDir) {
     return { state: 'absent', entries: [], revision: 0, damaged: false, damageDetail: null, repairedBytes: 0, ...emptyFold() }
   }
   const parsed = parseLedgerText(text)
-  let repairedBytes = 0
-  if (parsed.partialLine && parsed.partialLine.length > 0) {
-    const keep = text.slice(0, text.length - parsed.partialLine.length)
-    await writeFile(file, Buffer.from(keep, 'utf8'))
-    repairedBytes = Buffer.byteLength(parsed.partialLine, 'utf8')
-    void parsed.rawByteLength
-  }
+  // 崩溃注入点：半行截断修复。必须在写锁内重读后再截断——读-改-写不是原子的，
+  // 而账本的并发追加者是别的进程/别的 async 分支；拿读到的旧内容去截，会把别人
+  // 刚追加的完整条目一起丢掉（0.13.2-beta.2 W-01b）。修复失败不阻断读取：读面仍按
+  // 已解析前缀返回，下一次可写打开再修。
+  const repairedBytes = parsed.partialLine && parsed.partialLine.length > 0
+    ? await repairHierarchyTail(sessionDir, file).catch(() => 0)
+    : 0
   const fold = foldHierarchy(parsed.entries)
   return {
     // BUG-013：损坏优先于 absent（首行坏 JSON 时 entries=[]、header=null）。

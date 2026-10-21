@@ -75,15 +75,6 @@ function isEngineFile(value) {
     && typeof value.sessionId === 'string'
 }
 
-async function readJson(file) {
-  try {
-    return JSON.parse(await readFile(file, 'utf8'))
-  } catch (error) {
-    if (error?.code === 'ENOENT') return null
-    return undefined // present but unreadable
-  }
-}
-
 /** 区分「不存在」（null）与「存在但损坏」（抛 EDAMAGED）。 */
 async function readJsonStrict(file, { label }) {
   let text
@@ -162,10 +153,22 @@ async function readPrefix(file, maxBytes) {
  * P1-7 分块索引：从 `offsetBytes` 起读一段有界区间（同 readPrefix 的句柄纪律）。
  */
 async function readRange(file, offsetBytes, maxBytes) {
+  // 落点自兜（0.13.2-beta.2）：readRecord 已在入口校验过参数，但这里是所有有界读的
+  // 唯一落点。将来新增调用方时，`maxBytes = 0`/`负数` 会让 Buffer.allocUnsafe 抛
+  // RangeError、`offsetBytes = 1.5` 会让 handle.read 抛 ERR_OUT_OF_RANGE——两者都会
+  // 被上层 catch 归成「数据损坏」，把参数错误伪装成坏数据、把排查方向带偏。
+  // 所以在落点再收一层：offset 归一为非负整数，maxBytes 非法直接失败关闭。
+  const offset = Number.isFinite(offsetBytes) ? Math.max(0, Math.trunc(offsetBytes)) : 0
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new EngineV2Error(`有界读取的 maxBytes 必须是正整数（收到 ${String(maxBytes)}）`, {
+      code: 'EINVAL',
+      details: { maxBytes },
+    })
+  }
   const handle = await open(file, 'r')
   try {
     const buffer = Buffer.allocUnsafe(maxBytes)
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes, offsetBytes)
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, offset)
     return buffer.subarray(0, bytesRead)
   } finally {
     await handle.close().catch(() => {})
@@ -626,6 +629,28 @@ export class V2SessionStore {
     await this.#quarantine(transactionsDirectory, quarantineDirectory, name, reason)
   }
 
+  /**
+   * 把一个**不再参与目录**的事务文件退役进隔离区（0.13.2 D-18）。
+   *
+   * 空提交与主动放弃以前直接 `rm`，号只在**本进程**里被跳过；重启后对账看不到
+   * 它，`maxSeenTxn` 回落，号被重新分配——同一个 `t00000001-r0000` 重启后指向
+   * 另一条正文。隔离区里的号本来就被算进 `maxSeenTxn`，所以 rename 是零额外逻辑
+   * 的正解，还顺带留下取证痕迹。只读打开不动任何文件。
+   */
+  async #retireTransactionFile(txn, reason) {
+    if (this.#readOnly) return
+    const name = transactionFileName(txn)
+    const source = path.join(this.directory, TRANSACTIONS_DIRECTORY, name)
+    const target = path.join(this.#quarantineDirectory(), `${name}.${reason}.${Date.now()}.json`)
+    try {
+      await mkdir(this.#quarantineDirectory(), { recursive: true })
+      await rename(source, target)
+    } catch (error) {
+      // 文件已不在：无需退役。其余错误如实抛出（不能静默丢一个仍占号的意图文件）。
+      if (error?.code !== 'ENOENT') throw error
+    }
+  }
+
   async #quarantine(transactionsDirectory, quarantineDirectory, name, reason) {
     await mkdir(quarantineDirectory, { recursive: true })
     const target = path.join(quarantineDirectory, `${name}.${reason}.${Date.now()}.json`)
@@ -722,6 +747,17 @@ export class V2SessionStore {
       }
     }
     const txn = explicitTxn ?? this.#nextTxn
+    // 隐式路径也必须校验上界（0.13.2 D-17）：显式路径查了 1..MAX，隐式路径一个校验
+    // 都没有。一旦计数器越过 99_999_999，文件名变成 9 位——`parseTransactionFileName`
+    // 认不出来，重启只报「未知文件，已忽略」，`recordId()` 抛裸 RangeError（没有 code），
+    // 而且每次开事务都落到同一个坏号：该会话**永久无法 stage 任何记录**。
+    // 失败关闭：宁可在这一笔拒绝，也不写一个重启后不被承认的形状。
+    if (!Number.isSafeInteger(txn) || txn < 1 || txn > MAX_TRANSACTION_NUMBER) {
+      throw new EngineV2Error(
+        `事务号耗尽：${txn} 超出 1..${MAX_TRANSACTION_NUMBER}（记录 ID 定宽 8 位）`,
+        { code: 'ELIMIT', details: { txn } },
+      )
+    }
     this.#nextTxn = Math.max(this.#nextTxn, txn + 1)
     const handle = {
       txn,
@@ -806,7 +842,7 @@ export class V2SessionStore {
 
   async #stageRecordLocked(handle, draft) {
     this.#assertWritable(`事务 ${handle.txn} 写入`)
-    if (!this.#openTransactions.has(handle.txn)) {
+    if (handle.closed === true || !this.#openTransactions.has(handle.txn)) {
       throw new EngineV2Error(`事务 ${handle.txn} 未在本库打开`, { code: 'EINVAL' })
     }
     if (handle.records.length >= 10_000) {
@@ -848,6 +884,13 @@ export class V2SessionStore {
       throw new EngineV2Error(`记录 ${id} 声明了载荷但没有内容`, { code: 'ESCHEMA' })
     }
 
+    // 落载荷是真正的 await 点：醒来后事务可能已经被提交/放弃（0.13.2 D-03）。
+    // 此时再无条件把 `committedAt: null` 整文件重写一遍，会把 commit 刚写下的
+    // 提交标记覆盖掉——commit 返回成功，重启对账却按「未提交（崩溃遗留）」把
+    // 整个事务移进 quarantine，已提交记录静默消失。所以 push 之前必须复查。
+    if (handle.closed === true || !this.#openTransactions.has(handle.txn)) {
+      throw new EngineV2Error(`事务 ${handle.txn} 已提交或已放弃，拒绝追加记录`, { code: 'EINVAL' })
+    }
     handle.records.push(validated)
     await writeJsonFileAtomic(path.join(this.directory, TRANSACTIONS_DIRECTORY, transactionFileName(handle.txn)), {
       kind: TRANSACTION_KIND,
@@ -894,12 +937,23 @@ export class V2SessionStore {
   /** 提交：先落 committedAt，再推进 manifest 检查点。 */
   async commitTransaction(handle) {
     this.#assertWritable(`事务 ${handle.txn} 提交`)
-    if (!this.#openTransactions.has(handle.txn)) {
+    if (handle.closed === true || !this.#openTransactions.has(handle.txn)) {
       throw new EngineV2Error(`事务 ${handle.txn} 未在本库打开`, { code: 'EINVAL' })
     }
+    // 0.13.2 D-03：先把在途 stage 排空再提交。
+    //
+    // stageRecord 有串行队列（一步里多个并行工具结果同时落库是必须支持的场景），
+    // 而 commit 以前完全不参与这个队列：调用方少 await 一个 stage 时，commit 落完
+    // committedAt，那个 stage 醒来又把整文件重写成 committedAt: null——已提交事务被
+    // 回写为「未提交」，重启对账整事务进隔离区。这里等队列排空，并把句柄标记 closed，
+    // 让之后到达的 stage 失败关闭（而不是悄悄改写）。
+    await this.#stageQueue.catch(() => {})
+    handle.closed = true
     if (handle.records.length === 0) {
-      // 空事务没有可提交内容：删除意图文件，回收事务号无必要（号已跳过）。
-      await rm(path.join(this.directory, TRANSACTIONS_DIRECTORY, transactionFileName(handle.txn)), { force: true })
+      // 空事务没有可提交内容。不 rm：事务号必须继续占用，否则重启对账的
+      // maxSeenTxn 看不到它，号会被重新分配（0.13.2 D-18）。rename 进隔离区，
+      // 对账本来就会把隔离文件名里的号算进 maxSeenTxn。
+      await this.#retireTransactionFile(handle.txn, 'abandoned')
       this.#openTransactions.delete(handle.txn)
       return { committedTxn: null, recordCount: 0 }
     }
@@ -967,6 +1021,9 @@ export class V2SessionStore {
    * 孤儿载荷留置（内容寻址、可共享，不回收）。
    */
   async abandonTransaction(handle) {
+    // 同 commit：先排空在途 stage，再动文件（0.13.2 D-03）。
+    await this.#stageQueue.catch(() => {})
+    handle.closed = true
     if (!this.#openTransactions.has(handle.txn)) {
       return { abandoned: false }
     }
@@ -993,7 +1050,10 @@ export class V2SessionStore {
       this.#openTransactions.delete(handle.txn)
       return { abandoned: false, reason: 'readonly' }
     }
-    await rm(file, { force: true })
+    // 不 rm 而 rename 进隔离区：事务号必须继续被占用（0.13.2 D-18）。
+    // 文件一删，重启对账的 maxSeenTxn 就看不到它，号会被重新分配——同一个
+    // `t00000001-r0000` 在重启后指向另一条正文，违反「ID 在崩溃对账后依然成立」。
+    await this.#retireTransactionFile(handle.txn, 'abandoned')
     this.#openTransactions.delete(handle.txn)
     return { abandoned: true }
   }
@@ -1163,6 +1223,20 @@ export class V2SessionStore {
   async readRecord(id, { verifyHash = true, maxBytes = null, offsetBytes = 0 } = {}) {
     const parsed = parseRecordId(id)
     if (!parsed) throw new EngineV2Error(`非法记录 ID：${id}`, { code: 'EINVAL' })
+    // 参数校验必须**失败关闭**（0.13.2 D-15/D-16）：
+    //  - maxBytes=0 / 负数 / NaN / "10" 会让有界判据恒 false，落到全量 readFile 分支，
+    //    返回 integrity:'ok'、truncated:false——预算栅栏静默失效，一次回读可以把整篇
+    //    载荷塞进热上下文，正是「有界读取」要防的事；
+    //  - offsetBytes=1.5 让 handle.read() 抛 ERR_OUT_OF_RANGE，被 catch 归成
+    //    'payload-unreadable'，把参数错误伪装成数据损坏，排查方向被带偏。
+    if (maxBytes !== null && maxBytes !== undefined) {
+      if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+        throw new EngineV2Error(`maxBytes 必须是 null 或正整数（收到 ${String(maxBytes)}）`, { code: 'EINVAL', details: { maxBytes } })
+      }
+    }
+    if (!Number.isSafeInteger(offsetBytes) || offsetBytes < 0) {
+      throw new EngineV2Error(`offsetBytes 必须是非负整数（收到 ${String(offsetBytes)}）`, { code: 'EINVAL', details: { offsetBytes } })
+    }
     const entry = this.#catalog.get(id)
     if (!entry) return { ok: false, error: 'not_in_catalog', id }
     const file = path.join(this.directory, TRANSACTIONS_DIRECTORY, transactionFileName(parsed.txn))
@@ -1182,9 +1256,10 @@ export class V2SessionStore {
     let integrity = 'no-payload'
     let truncated = false
     let fullBytes = record.payload?.size ?? 0
-    // BUG-012：把「读取形态」（integrity）与「是否真的做过哈希校验」（verified）
-    // 拆成两维。verifyHash=false 时 integrity 仍是 'ok'（尺寸一致），但它**不是**
-    // 「已验证」；调用方不能再把 'ok' 读成完整校验通过。
+    // BUG-012 / 0.13.2-beta.2：把「读取形态」（integrity）与「是否真的做过哈希校验」
+    // （verified）拆成两维，并且**每一维都如实**。verifyHash=false 时尺寸一致不等于
+    // 校验通过，integrity 报 'unverified'（旧实现报 'ok'，调用方很容易把 'ok' 读成
+    // 「校验通过」——那正是本项要消除的误读）。
     let verified = record.payload ? false : true
     if (record.payload) {
       const loaded = await this.#readPayload(record.payload, { verifyHash, maxBytes, offsetBytes })
@@ -1218,8 +1293,14 @@ export class V2SessionStore {
         buffer = start > 0 ? await readRange(file, start, fullBytes - start) : await readFile(file)
       }
     } catch (error) {
+      // 只把**权限/缺失**映射成读态，其余重新抛出（0.13.2 D-16）。
+      // 旧实现是 catch-all：参数型 TypeError/RangeError 被伪装成 'payload-unreadable'，
+      // 与真正的 IO 损坏不可区分。读不到就是读不到，读错了要说清是读错了。
       if (error?.code === 'ENOENT') return { integrity: 'payload-missing', text: null, fullBytes, verified: false }
-      return { integrity: 'payload-unreadable', text: null, fullBytes, verified: false }
+      if (error?.code === 'EACCES' || error?.code === 'EPERM' || error?.code === 'EISDIR') {
+        return { integrity: 'payload-unreadable', text: null, fullBytes, verified: false }
+      }
+      throw error
     }
     if (bounded || start > 0) {
       // 只读了片段：不对全文做哈希断言，如实标 'prefix'（不是 'ok'）。
@@ -1252,7 +1333,8 @@ export class V2SessionStore {
       verified = true
     }
     const text = payload.encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf8')
-    return { integrity: 'ok', text, truncated: false, fullBytes, verified }
+    // 全文读通、尺寸一致，但**没做哈希校验**时不许报 'ok'（0.13.2-beta.2）。
+    return { integrity: verifyHash ? 'ok' : 'unverified', text, truncated: false, fullBytes, verified }
   }
 
   /** 观测统计（成本观测入口）。 */

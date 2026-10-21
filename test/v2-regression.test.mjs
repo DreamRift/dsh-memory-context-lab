@@ -616,7 +616,18 @@ test('隔离区事务号继续占用：重开后不得复用已隔离事务的�
     third.close()
 
     const quarantined = await readdir(path.join(directory, 'quarantine'))
-    assert.equal(quarantined.length, 1, '崩溃遗留事务必须留在隔离区（保全取证）')
+    // 0.13.2 D-18：空提交不再 `rm` 意图文件，而是同样退役进隔离区——号必须继续占用，
+    // 否则重启对账看不到它，号会被重新分配（同一 ID 指向另一条正文）。
+    // 所以这里应当有两条：崩溃遗留 + 本次空事务退役。
+    assert.equal(quarantined.length, 2, '崩溃遗留事务必须留在隔离区（保全取证）')
+    assert.ok(
+      quarantined.some((name) => name.startsWith('txn-00000002.json.')),
+      `崩溃遗留事务必须在隔离区：${quarantined.join(', ')}`,
+    )
+    assert.ok(
+      quarantined.some((name) => name.includes('abandoned')),
+      `空事务退役文件必须在隔离区（号不复用）：${quarantined.join(', ')}`,
+    )
   })
 })
 

@@ -26,15 +26,17 @@
  * 本域不持有跨会话缓存：`reconciledAt` 只是本进程内的对账去重表，进程重启即
  * 重建（这是有意的——重启后的第一次 adopt 必须重新对账）。
  */
-import { rm } from 'node:fs/promises'
+import { copyFile, mkdir, rm } from 'node:fs/promises'
+import path from 'node:path'
 
 import { V2_RECEIPT_MARKER, normalizeSettings, restoreGrowth } from '../core.mjs'
 import { EngineV2Error } from './errors.mjs'
 import { createCostLedger } from './cost.mjs'
 import { readRecordById } from './readback.mjs'
-import { claimV2Engine, disableV2Engine, releaseV2Engine } from './engine.mjs'
+import { claimV2Engine, disableV2Engine, getEngineRegistry, releaseV2Engine } from './engine.mjs'
 import { createV2SessionState, disabledV2State, readV2SessionState, v2SessionDirectoryFor, writeV2SessionState } from './state.mjs'
 import { getForgetIndex } from './disposition.mjs'
+import { sessionKeyFor } from '../storage.mjs'
 import { readNeedsMigration } from './fork.mjs'
 import { reconcileVouchers } from './hierarchy-coordinator.mjs'
 
@@ -50,6 +52,7 @@ export function createLifecycleDomain({
   logger,
   sessionIdOf,
   coordinator,
+  suppressionUnavailableReason,
   factoryFor,
   receiptTextOf,
   backendPrecheck,
@@ -80,11 +83,25 @@ export function createLifecycleDomain({
   const reconciledAt = new Map()
 
   function makeRecord({ agent, sessionId, directory, state }) {
+    // 抑制状态必须**如实记录**，不能只在拿不到租约时静默（0.13.2 D-04）。
+    // 旧实现把 startupError 只打一条 logger.warn，此后全仓无人读取：闸门失败 →
+    // coordinator=null → suppressionLease=null → 抑制根本没装上，而 `on` 回执照旧
+    // 写死「已抑制」。「抑制 0 次」与「抑制没装上」在用户面前完全无法区分。
     let suppressionLease = null
-    try {
-      suppressionLease = coordinator?.acquire(sessionId) ?? null
-    } catch (error) {
-      logger?.warn?.(`memory-context-lab: 灵枢抑制租约获取失败：${error instanceof Error ? error.message : String(error)}`)
+    let suppressionReason = null
+    if (!coordinator) {
+      suppressionReason = suppressionUnavailableReason
+        ?? '灵枢抑制协调器未装配（dsh-memory 兼容性闸门未通过）'
+    } else {
+      try {
+        suppressionLease = coordinator.acquire(sessionId) ?? null
+      } catch (error) {
+        suppressionReason = `灵枢抑制租约获取失败：${error instanceof Error ? error.message : String(error)}`
+        logger?.warn?.(`memory-context-lab: ${suppressionReason}`)
+      }
+      if (!suppressionLease && !suppressionReason) {
+        suppressionReason = '协调器未授予租约（真实灵枢的自动读写未被拦截）'
+      }
     }
     return {
       engineName: 'v2',
@@ -93,6 +110,9 @@ export function createLifecycleDomain({
       directory,
       state: { ...state, settings: normalizeSettings(state.settings) },
       suppressionLease,
+      // 抑制实况：{ available, reason }。命令面、status 与面板都读这一份，
+      // 不再各自假设「已经抑制了」。
+      suppression: { available: suppressionLease !== null, reason: suppressionReason },
       client: null,
       clientError: null,
       occupancy: null,
@@ -390,7 +410,9 @@ export function createLifecycleDomain({
     return {
       kind: 'success',
       text: `已启用 v2 引擎（全历史按需记忆化）。\n隔离根：${created.directory}\n`
-        + `本会话对真实灵枢的自动读写已抑制；v1 引擎在本会话不可同时启用。\n`
+        + (record.suppression.available
+          ? '本会话对真实灵枢的自动读写已抑制。\n'
+          : `抑制未启用（${record.suppression.reason}）：真实灵枢的自动读写**未被拦截**，实验文本可能写入正式 dsh-memory 根。\n`)
         + (warnings.length ? `告警：${warnings.join('；')}` : '')
         + (planNote ? `\n${planNote.text}` : '')
         + (planNoteFailed ? '\n计划先行未生效：联动回调抛错（引擎已启用，降温照常；可稍后 `/memory-lab status` 复核）。' : ''),
@@ -432,7 +454,7 @@ export function createLifecycleDomain({
             }
           }
         } catch (error) {
-          logger?.warn?.(`memory-context-lab2: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+          logger?.warn?.(`memory-context-lab: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
 
@@ -556,6 +578,52 @@ export function createLifecycleDomain({
    *   - 引擎仍启用时**拒绝**（先 `off`）——活动账本被删会让投影里的回执指向空冷库；
    *   - 只删本会话自己的隔离根，不碰 DSH 会话日志、命令审计与真实灵枢根。
    */
+  /**
+   * 「引擎是否仍启用」的三源判定（0.13.2 D-02）：进程内记录 ∨ 磁盘 enabled ∨ engine.json 激活。
+   *
+   * 任一成立即拒绝；任何一处**无法判定**也拒绝（失败关闭）——「证明不了已停用」不等于
+   * 「已停用」，而这一步的代价是永久删除原文。
+   */
+  async function cleanGuardOf(sessionId) {
+    if (records.get(sessionId)) return { cleared: false, reason: '本进程内仍有活动的 v2 记录' }
+    try {
+      const onDisk = await readV2SessionState(labRoot, sessionId)
+      if (onDisk?.state?.enabled === true) return { cleared: false, reason: '磁盘账本（state.json）仍写着 enabled=true' }
+    } catch (error) {
+      return { cleared: false, reason: `状态文件不可读（${error instanceof Error ? error.message : String(error)}），无法证明已停用` }
+    }
+    try {
+      const registry = getEngineRegistry(labRoot, sessionId)
+      if (registry.damaged) return { cleared: false, reason: 'engine.json 不可读，无法确认引擎所有权' }
+      if (registry.holder === 'v2') return { cleared: false, reason: 'engine.json 仍处于激活状态（disabled 为空）' }
+    } catch (error) {
+      return { cleared: false, reason: `引擎声明不可判定（${error instanceof Error ? error.message : String(error)}）` }
+    }
+    return { cleared: true, reason: '' }
+  }
+
+  /**
+   * 删除隔离根之前，把 state.json / engine.json 备份到 `<labRoot>/v2/quarantine/` 下。
+   *
+   * 备份必须放在**被删目录之外**：放在会话根里会被同一次 `rm -rf` 一起删掉，等于没留。
+   * 返回备份目录（无可备份文件时返回 null）。
+   */
+  async function backupSessionMeta(sessionId, directory) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const target = path.join(path.resolve(labRoot), 'v2', 'quarantine', `deleted-session-${sessionKeyFor(sessionId)}-${stamp}`)
+    let copied = 0
+    for (const name of ['state.json', 'engine.json']) {
+      try {
+        await mkdir(target, { recursive: true })
+        await copyFile(path.join(directory, name), path.join(target, name))
+        copied += 1
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+    }
+    return copied > 0 ? target : null
+  }
+
   async function cleanSession(invocation, args) {
     const sessionId = sessionIdOf(invocation.agent.session)
     if (!sessionId) return { kind: 'error', text: '无法确定会话 ID，拒绝清理。' }
@@ -566,15 +634,23 @@ export function createLifecycleDomain({
           + '这会**永久删除**本会话的隔离冷库（已归档原文随之丢失），不可撤销。',
       }
     }
-    const record = records.get(sessionId)
-    if (record) {
+    // 守卫必须查**三处**（0.13.2 D-02）：只查进程内 `records` 时，DSH 重启后
+    // `records` 为空而磁盘上 state.json 仍 enabled=true、engine.json 仍 disabled:null、
+    // 会话日志里的 v2 回执仍指向这批记录——三者都在，守卫却看不到任何一个，于是
+    // `rm -rf` 整个隔离根：原文永久不可读，连「这里曾经启用过」都查不出来。
+    const guard = await cleanGuardOf(sessionId)
+    if (!guard.cleared) {
       return {
         kind: 'error',
-        text: '本会话的记忆上下文仍处于启用状态，拒绝删除冷库。\n'
+        text: `本会话的记忆上下文仍处于启用状态，拒绝删除冷库。\n`
+          + `依据：${guard.reason}\n`
           + '先 `/memory-lab off` 停用（它会尽量恢复原文），再执行本命令。',
       }
     }
     const directory = v2SessionDirectoryFor(labRoot, sessionId)
+    // 删除前把状态与引擎声明备份到隔离区：即使误删，也留下一条取证痕迹
+    // （「这里曾经启用过、设置是什么、何时停用」）。备份失败不阻断删除。
+    const backup = await backupSessionMeta(sessionId, directory).catch(() => null)
     try {
       await rm(directory, { recursive: true, force: true })
     } catch (error) {
@@ -587,6 +663,7 @@ export function createLifecycleDomain({
       kind: 'success',
       text: [
         '已删除本会话的隔离冷库：' + directory,
+        backup ? `状态与引擎声明已备份：${backup}` : '（状态文件备份失败，未留取证副本）',
         '会话日志与命令审计未改动；插件从不删除它们（那是宿主的 append-only 记录）。',
       ].join('\n'),
     }

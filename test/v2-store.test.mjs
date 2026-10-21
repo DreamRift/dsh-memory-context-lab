@@ -516,8 +516,10 @@ test('稳定 ID 定宽全序与解析', async () => {
   assert.equal(recordId(12, 40), 't00000012-r0040')
   const sorted = [recordId(2, 0), recordId(10, 0), recordId(2, 1)].sort()
   assert.deepEqual(sorted, [recordId(2, 0), recordId(2, 1), recordId(10, 0)])
-  assert.throws(() => recordId(0, 1), RangeError)
-  assert.throws(() => recordId(1, 10_000), RangeError)
+  // 0.13.2 D-17：越界抛带 code 的 EngineV2Error，不抛裸 RangeError——调用方按
+  // `error.code` 分支，裸 RangeError 的 code 是 undefined，所有分支都会落空。
+  assert.throws(() => recordId(0, 1), (error) => error instanceof EngineV2Error && error.code === 'ELIMIT')
+  assert.throws(() => recordId(1, 10_000), (error) => error instanceof EngineV2Error && error.code === 'ELIMIT')
 })
 
 let failed = 0

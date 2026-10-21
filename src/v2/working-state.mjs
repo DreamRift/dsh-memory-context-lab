@@ -780,10 +780,25 @@ function textOfBlocks(content) {
     .trim()
 }
 
+/**
+ * 按**码点**截断（0.13.2 D-20）。
+ *
+ * `String#length`/`slice` 是 UTF-16 单元口径：emoji 之类代理对跨在边界上会被切成
+ * 两半，产出孤立代理，落盘再读就变成 U+FFFD——模型看到的是一段被写坏的正文。
+ * `core.mjs` 的 `chunkArchiveBody` 早就按码点切（「never inside a multi-byte
+ * character」），这里对齐同一口径。
+ */
+function truncateAtCodePoints(text, limit, ellipsis = '…') {
+  const source = String(text ?? '')
+  const points = Array.from(source)
+  if (points.length <= limit) return { text: source, truncated: false }
+  const keep = Math.max(0, limit - ellipsis.length)
+  return { text: points.slice(0, keep).join('') + ellipsis, truncated: true }
+}
+
 function excerpt(text, limit) {
   const flat = String(text ?? '').replace(/\s+/g, ' ').trim()
-  if (flat.length <= limit) return { text: flat, truncated: false }
-  return { text: `${flat.slice(0, limit)}…`, truncated: true }
+  return truncateAtCodePoints(flat, limit)
 }
 
 /** 造一个保护项：reason / source / releaseCondition 三项永远有值。 */
@@ -842,6 +857,10 @@ function retentionItem({ retentionClass, itemId, lines = [], reason = null, sour
 function selectClaims(claims, cap) {
   const items = Array.isArray(claims) ? claims : []
   const limit = Number.isFinite(Number(cap)) ? Math.max(0, Math.floor(Number(cap))) : items.length
+  // `slice(-0)` 等价于 `slice(0)`：配额 0 会把**整张表**留下（0.13.2 D-11）。
+  // 「一条都不要」必须真的一条都不给，否则「全局有界」的声明在 maxAssistantClaims=0
+  // 时直接失效，页脚还会写「另有 N 条未展开」与正文自相矛盾。
+  if (limit === 0) return []
   const indexed = items.map((raw, index) => ({ raw, index }))
   const negative = (entry) => {
     const polarity = (typeof entry.raw === 'string' ? 'positive' : (entry.raw?.polarity ?? 'positive'))
@@ -1137,7 +1156,9 @@ export function buildWorkingState({
     mergedOpenCalls.push(entry)
   }
 
-  const openActions = take(mergedOpenCalls, config.maxOpenActions).items.map((entry) => ({
+  // 保留**最新**的在途调用（0.13.2 D-13）：列表按出现次序旧在前，`take` 留头部等于
+  // 丢掉「我刚发出的那个调用」——那恰恰是模型最需要知道「我在等哪个结果」的一行。
+  const openActions = newestTake(mergedOpenCalls, config.maxOpenActions).map((entry) => ({
     callId: entry.callId ?? null,
     recordRef: entry.callRecordId ?? null,
     recordRefKind: entry.recordRefKind ?? (entry.callRecordId ? 'record-id' : 'host-seq'),
@@ -1195,7 +1216,9 @@ export function buildWorkingState({
     if (entry.stillValid) validConstraints.push(entry)
     else revokedConstraints.push(entry)
   }
-  for (const item of take(validConstraints, config.maxConstraints).items) {
+  // 约束同样旧在前：超配额时必须留**最新**的（0.13.2 D-13）。
+  const constraintCap = capLimitOf(config.maxConstraints, validConstraints.length)
+  for (const item of newestTake(validConstraints, config.maxConstraints)) {
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.HUMAN_REQUEST,
       itemId: `constraint:${item.sourceRef}`,
@@ -1204,11 +1227,11 @@ export function buildWorkingState({
       sourceRef: item.sourceRef,
     }))
   }
-  if (validConstraints.length > config.maxConstraints) {
+  if (validConstraints.length > constraintCap) {
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.HUMAN_REQUEST,
       itemId: 'constraint:overflow',
-      lines: [`另有 ${validConstraints.length - config.maxConstraints} 条有效约束未展开（同样不可丢弃，需按记录 ID 回读）`],
+      lines: [`另有 ${validConstraints.length - constraintCap} 条有效约束未展开（同样不可丢弃，需按记录 ID 回读）`],
       source: 'constraint:overflow',
     }))
   }
@@ -1451,6 +1474,8 @@ export function buildWorkingState({
   }
 
   // --- 软保留 ---
+  // claim 配额只算一次：正文（selectClaims）与页脚（溢出计数）必须用同一把尺子。
+  const claimCap = capLimitOf(config.maxAssistantClaims, Array.isArray(claims) ? claims.length : 0)
   const retention = {
     [RETENTION_CLASSES.OPTIONAL_PREFETCH]: take(prefetch, config.maxPrefetch).items.map((raw, index) => {
       const item = typeof raw === 'string' ? { text: raw } : (raw ?? {})
@@ -1555,11 +1580,14 @@ export function buildWorkingState({
           required: negativeVisible === true,
         })
       }),
-      ...(Array.isArray(claims) && claims.length > config.maxAssistantClaims
+      ...(Array.isArray(claims) && claims.length > claimCap
         ? [retentionItem({
           retentionClass: RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
           itemId: 'assistant-claim:overflow',
-          lines: [`另有 ${claims.length - config.maxAssistantClaims} 条助手结论未展开（只报数量，unverified）`],
+          // 与 selectClaims 同一把尺子（capLimitOf + floor），差值必为整数：
+          // 直接用原始配额做减法会把 `另有 1.2999999999999998 条` 印进模型可见卡片
+          // （0.13.2 D-19），而正文只列了 floor 后的条数——页脚与正文自相矛盾。
+          lines: [`另有 ${claims.length - claimCap} 条助手结论未展开（只报数量，unverified）`],
           source: 'claim:overflow',
         })]
         : []),
@@ -1613,7 +1641,7 @@ export function buildWorkingState({
     generatedAt: new Date(clock).toISOString(),
     // --- 原有字段（保持形状，消费方不用改）---
     activeHumanRequest,
-    essentialConstraints: validConstraints.slice(0, config.maxConstraints).map((item) => ({
+    essentialConstraints: newestTake(validConstraints, config.maxConstraints).map((item) => ({
       text: item.text,
       sourceRef: item.sourceRef,
       stillValid: true,
@@ -1832,7 +1860,7 @@ export function readbackSectionOf(readback) {
     const tokenCount = typeof item.tokens === 'number' && Number.isFinite(item.tokens) ? item.tokens : null
     const cost = tokenCount !== null ? '｜取回 ≈' + Math.trunc(tokenCount) + ' token' : ''
     const line = item.recordId + '｜' + tools + '｜' + range + locator + cost
-    lines.push(line.length <= CARD_READBACK_MAX_LINE_CHARS ? line : line.slice(0, CARD_READBACK_MAX_LINE_CHARS - 1) + '…')
+    lines.push(truncateAtCodePoints(line, CARD_READBACK_MAX_LINE_CHARS).text)
   }
   if (items.length > CARD_READBACK_MAX_LINES) {
     lines.push('另有 ' + (items.length - CARD_READBACK_MAX_LINES) + ' 条可回读未列出')
@@ -1983,9 +2011,18 @@ export function renderWorkingStateCard(state, {
   retrievalHits = null,
 } = {}) {
   const input = state ?? {}
-  const rawBudget = Number(budgetTokens)
-  const budgetInvalid = !Number.isFinite(rawBudget)
-  const budgetFloorApplied = Number.isFinite(rawBudget) && rawBudget < 0
+  // 「未提供」与「零」必须分开（0.13.2 D-12）：`Number(null)===0`、`Number('')===0`、
+  // `Number([])===0`，于是 `null`/`''`/`[]` 被归一成预算 0 → hardOverflow=true、
+  // 软保留一条不装、卡片尾部写「已超过预算 0 token」——把「没设预算」呈现成
+  // 「预算严重不足」。同子系统的 budget.mjs 明确把 null 当「未提供 → 默认值」，
+  // 两个预算入口必须同源。
+  // 「提供了什么」只认数字与非空字符串：`[]`、`true`、`{}` 之类都不是预算声明，
+  // `Number([]) === 0` 会把它们变成「预算 0」（同上一条缺陷）。
+  const budgetProvided = typeof budgetTokens === 'number'
+    || (typeof budgetTokens === 'string' && budgetTokens.trim() !== '')
+  const rawBudget = budgetProvided ? Number(budgetTokens) : Number.NaN
+  const budgetInvalid = !budgetProvided || !Number.isFinite(rawBudget)
+  const budgetFloorApplied = budgetProvided && Number.isFinite(rawBudget) && rawBudget < 0
   const budget = budgetInvalid ? WORKING_SET_DEFAULTS.cardTokens : Math.max(0, Math.floor(rawBudget))
 
   const hardSections = hardSectionsOf(input)
@@ -2241,25 +2278,42 @@ export const CARD_DELTA_MAX_CHARS = 1600
  * 增量卡上界：头部两行必须保留（它说明这张卡引用哪张全量卡），其余按行截断，
  * 截断时追加一行如实说明「还有 N 行变化未列出，可按记录 ID 回读」。
  */
+function deltaTailOf(rest) {
+  // 措辞必须成立：模型手里的「最近一张全量卡」是**上一张**，它不含这些新行——
+  // 旧文案「完整内容以最近一张全量卡为准」是一句假话。截断的增量卡由调用方
+  // 改发全量卡（见 runtime-card 的 delta 分支），这里只如实说明本卡不全。
+  return `（另有 ${rest} 行变化未在本卡列出：增量卡有上界；这些行没有进入本卡，可按记录 ID 回读）`
+}
+
 function boundDeltaLines(lines, { maxLines, maxChars }) {
   const text = lines.join('\n')
   if (lines.length <= maxLines && text.length <= maxChars) return { text, truncated: false }
   const head = lines.slice(0, 2)
   const body = []
   let used = head.join('\n').length
+  // 尾行宽度必须计入预算（0.13.2-beta.2 W-04）。旧实现把尾行最后**无条件 push**，
+  // 于是「上界」只是正文的上界：24 行 × 80 字符填充实测产出 1644 字符 >
+  // CARD_DELTA_MAX_CHARS(1600)。增量卡是每步固定税，上界名不副实就等于没有上界。
+  //
+  // 预留按**最坏 rest**（一条正文都没装进去）算：正文装得越多 rest 越小，尾行只可能
+  // 更短，所以「预留 + 实际尾行」不会超。这个「≤」不是估计，是构造出来的。
+  const reserved = deltaTailOf(lines.length - head.length).length + 1
   for (const line of lines.slice(2)) {
     const next = used + 1 + line.length
     // 行数预算 = 头部 2 行 + 正文 + 尾行 1 行；越界即停（尾行必须留得出位置）。
-    if (body.length + 3 >= maxLines || next > maxChars) break
+    if (body.length + 3 >= maxLines || next > maxChars - reserved) break
     body.push(line)
     used = next
   }
+  // 兜底：头部两行本身异常宽时，逐行回退到装得下为止。正常情况下不会触发。
+  // 唯一例外是 head + tail 单独就超 maxChars（配置荒谬），此时如实返回并保留
+  // truncated=true，不假装装下了。
+  while (body.length > 0
+    && [...head, ...body, deltaTailOf(lines.length - head.length - body.length)].join('\n').length > maxChars) {
+    body.pop()
+  }
   const rest = lines.length - head.length - body.length
-  // 措辞必须成立：模型手里的「最近一张全量卡」是**上一张**，它不含这些新行——
-  // 旧文案「完整内容以最近一张全量卡为准」是一句假话。截断的增量卡由调用方
-  // 改发全量卡（见 runtime-card 的 delta 分支），这里只如实说明本卡不全。
-  const tail = `（另有 ${rest} 行变化未在本卡列出：增量卡有上界；这些行没有进入本卡，可按记录 ID 回读）`
-  return { text: [...head, ...body, tail].join('\n'), truncated: true }
+  return { text: [...head, ...body, deltaTailOf(rest)].join('\n'), truncated: true }
 }
 
 const CARD_DELTA_CHANGE_TITLE = '■ 相对上一张全量卡的变化（只列变化行；未列出的行以最近一张全量卡为准）'

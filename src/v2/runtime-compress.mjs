@@ -119,8 +119,8 @@ export function createCompressDomain({
         return parts.length > 0 ? parts.join('\n\n') : null
       },
       getRecordKind: (recordId) => {
-        // kind 只用于渲染标签；读不到就按 tool-output 呈现，不猜。
-        return kindById.get(recordId) ?? 'tool-output'
+        // kind 只用于渲染标签；读不到就如实标「未知」，不猜（0.13.2-beta.2）。
+        return kindById.get(recordId) ?? 'unknown'
       },
       isRecordVisible: (recordId) => {
         if (forgotten.has(recordId)) return false

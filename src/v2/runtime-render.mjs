@@ -45,6 +45,11 @@ export function renderV2Status(record, extra = {}) {
       + `batch=${settings.archiveBatchSize} retain=${record.state.fullHistory === true ? `${settings.retainOperations}（全历史模式下失效）` : settings.retainOperations}`,
     `账本：已归档 ${applied} 段，已恢复 ${restored} 段`
       + (verifyFailed ? `，校验未通过 ${verifyFailed} 段（原文只在冷库，可 restore 取回）` : ''),
+    // 抑制实况必须出现在 status 里（0.13.2 D-04）：删 v1 时「真实灵枢抑制」那一行
+    // 一起没了，于是「抑制 0 次」与「抑制根本没装上」在用户面前无法区分。
+    `真实灵枢抑制：${record.suppression?.available === true
+      ? '已启用（本会话对真实灵枢的自动读写被拦截）'
+      : `未启用（${record.suppression?.reason ?? '原因未知'}）；真实灵枢的自动读写未被拦截`}`,
   ]
   if (record.state.lastMeasurement) {
     const m = record.state.lastMeasurement

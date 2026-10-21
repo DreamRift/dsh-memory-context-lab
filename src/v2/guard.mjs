@@ -75,7 +75,7 @@ export const GUARD_REASONS = Object.freeze({
  * （`lib/known-event-types.js` 的 `MESSAGE_PROJECTION_EVENT_TYPES`）。
  * `tool/call`、`turn/end` 一类是宿主审计事件，不构成主模型可见的上下文。
  */
-const SURFACE_VISIBLE_TYPES = Object.freeze(new Set([
+export const SURFACE_VISIBLE_TYPES = Object.freeze(new Set([
   'system/message',
   'developer/message',
   'user/message',
@@ -92,7 +92,9 @@ const SURFACE_VISIBLE_TYPES = Object.freeze(new Set([
  * 穿插。清单外的类型一律按未知处理并拒绝：宿主升级新增了日志专用类型时，退热会
  * 明确失败（计划里能看到原因），而不是悄悄跨过没见过的投影。
  */
-const LOG_ONLY_EVENT_TYPES = new Set([
+// 导出只为守卫核对（test/guard-event-coverage.test.mjs 与宿主 KNOWN_SESSION_EVENT_TYPES 做差集）：
+// 「清单漏一项」的失败模式是静默的——该操作永远退不了热，没有任何告警。
+export const LOG_ONLY_EVENT_TYPES = new Set([
   'agent-preset/selected',
   'agent/inbox/spliced',
   'approval/asked',
@@ -112,6 +114,13 @@ const LOG_ONLY_EVENT_TYPES = new Set([
   'goal/change',
   'hook/invoked',
   'hook/result',
+  // 0.13.2 D-09：这三个宿主事件在**工具执行期间**写入，正好落在操作区间内，
+  // 而旧清单漏了它们——含这些事件的操作区间永久判 `unknown-event-type`，
+  // 该操作**永不退热**（全历史退热在这些操作上恒为 no-op）。
+  // 发射点：job/registered、job/settled 在 dsh-jobs-local/lib/index.js；
+  // working-directory/change 在 dsh-working-directory/lib/index.js。
+  'job/registered',
+  'job/settled',
   'llm/retry',
   'llm/retry-started',
   'model/selection',
@@ -145,6 +154,7 @@ const LOG_ONLY_EVENT_TYPES = new Set([
   'turn/end',
   'turn/start',
   'web/deepseek-search-llm-request',
+  'working-directory/change',
   'workspace/changes',
 ])
 
@@ -444,13 +454,17 @@ export function resolveExposureBoundary({ eventAt, surfaceSeqs = [], claimedSeq 
   }
 
   if (base === null) {
+    // 活动面上一条助手消息都没有（也没有可核验的声明）：**没有任何曝光证据**。
+    // 旧实现返回 `fenceAll: false, boundarySeq: null`，于是 classifyRange 里的边界
+    // 判断整段被跳过——不是保守拒绝，是**不判**（0.13.2 D-21b）。可达路径：第一批
+    // 归档把助手消息连同结果换成回执之后。没有证据就不许退热。
     return {
       boundarySeq: null,
-      fenceAll: false,
+      fenceAll: true,
       verified: false,
       evidence: null,
       vetoed: [],
-      reason: '活动面上没有助手消息节点，也没有可核验的曝光边界',
+      reason: '活动面上没有助手消息节点，也没有可核验的曝光边界：没有任何曝光证据，不解除保护',
     }
   }
 
@@ -547,6 +561,13 @@ export function classifyRange({
   if (scan.offSurface.length > 0) {
     return { safe: false, code: GUARD_CODES.NOT_IN_SURFACE, reason: GUARD_REASONS[GUARD_CODES.NOT_IN_SURFACE], scan, exposure }
   }
+  // 读不到 id 的调用块只进 `ambiguousCalls`、不进 `calls`，所以它必须在「空范围」分支
+  // **之前**判（0.13.2 D-21a）。旧顺序下先命中空范围分支，这条检查永远轮不到：
+  // `allowPlainText=false` 时只表现为原因码错（报 empty-range，真相是在途动作无法
+  // 配对）；`allowPlainText=true` 的调用方会拿到 `safe:true`——**放行在途调用**。
+  if (scan.ambiguousCalls.length > 0) {
+    return { safe: false, code: GUARD_CODES.AMBIGUOUS_PAIR, reason: GUARD_REASONS[GUARD_CODES.AMBIGUOUS_PAIR], scan, exposure }
+  }
   if (scan.calls.length === 0 && scan.results.length === 0) {
     // 只有工具调用/结果的旧口径：v1 的候选范围里必须有调用。`allowPlainText` 由
     // 调用方（v2 全历史候选）按跨度种类显式声明：纯文本跨度本来就没有任何调用，
@@ -578,9 +599,6 @@ export function classifyRange({
     }
     // 纯文本跨度：配对（不存在）、曝光边界（上面已判）、端点归属都已确认，放行。
     return { safe: true, code: null, reason: '', scan, exposure }
-  }
-  if (scan.ambiguousCalls.length > 0) {
-    return { safe: false, code: GUARD_CODES.AMBIGUOUS_PAIR, reason: GUARD_REASONS[GUARD_CODES.AMBIGUOUS_PAIR], scan, exposure }
   }
   if (scan.unclosed.length > 0) {
     return { safe: false, code: GUARD_CODES.UNCLOSED_PAIR, reason: GUARD_REASONS[GUARD_CODES.UNCLOSED_PAIR], scan, exposure }

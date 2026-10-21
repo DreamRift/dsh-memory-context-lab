@@ -288,6 +288,85 @@ const CASES = {
       '      // backend 返回外部 ID 时用记账表换回本会话记录 ID',
     ]],
   },
+  // 0.13.2-beta.2 W-01：同进程写锁串行化（改回「直接 acquire + run」必红）
+  'lock-same-process': {
+    test: 'test/v2-write-lock-same-process.test.mjs',
+    file: 'src/v2/write-lock.mjs',
+    edits: [[
+      `  const directory = path.resolve(sessionDir)
+  // 已经在同一个临界区里（同一 async 调用链）：直接执行，绝不二次排队。
+  if (insideHeldLock(directory)) return run()`,
+      `  const directory = path.resolve(sessionDir)
+  if (true) {
+    const handle = await acquireWriteLock(directory, options)
+    try {
+      return await run()
+    } finally {
+      handle.release()
+    }
+  }`,
+    ]],
+  },
+  // 0.13.2-beta.2 W-01b：hierarchy 读路径的 D-01 口径（改回「缺 LF 即半行」必红）
+  'hierarchy-tail-parse': {
+    test: 'test/v2-hierarchy-concurrency.test.mjs',
+    file: 'src/v2/hierarchy-store.mjs',
+    edits: [[
+      `      try {
+        JSON.parse(tail)
+        completeLines.push(tail) // 合法 → 就是最后一条完整行，不进 partialLine
+      } catch {
+        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
+      }`,
+      `      partialLine = tail`,
+    ]],
+  },
+  // 0.13.2-beta.2 W-02：接管失败必须退避（改回静默 return 必红）
+  'lock-takeover-backoff': {
+    test: 'test/v2-write-lock-takeover.test.mjs',
+    file: 'src/v2/write-lock.mjs',
+    edits: [[
+      `      if (!(await takeOver(lockDir, io))) {
+        await retryAfterFailedTakeOver({ lockDir, now, deadline, owner: current })
+      }
+      continue`,
+      `      await takeOver(lockDir, io)
+      continue`,
+    ]],
+  },
+  // 0.13.2-beta.2 W-03：崩溃残留清扫（删掉 sweep 调用必红）
+  'lock-stage-sweep': {
+    test: 'test/v2-lock-stage-sweep.test.mjs',
+    file: 'src/v2/write-lock.mjs',
+    edits: [[
+      '      await sweepLockDebris(lockDir, { beforeMs: acquisitionStartedAt }).catch(() => {})',
+      '',
+    ]],
+  },
+  // 0.13.2-beta.2 W-04：尾行计入增量卡预算（改回无条件 push 必红）
+  'delta-tail-budget': {
+    test: 'test/v2-card-delta-cap.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [[
+      `    if (body.length + 3 >= maxLines || next > maxChars - reserved) break`,
+      `    if (body.length + 3 >= maxLines || next > maxChars) break`,
+    ], [
+      `  while (body.length > 0
+    && [...head, ...body, deltaTailOf(lines.length - head.length - body.length)].join('\\n').length > maxChars) {
+    body.pop()
+  }`,
+      '',
+    ]],
+  },
+  // 0.13.2-beta.2：没做哈希校验不得报 integrity 'ok'
+  'integrity-unverified-label': {
+    test: 'test/v2-store-integrity-label.test.mjs',
+    file: 'src/v2/store.mjs',
+    edits: [[
+      "    return { integrity: verifyHash ? 'ok' : 'unverified', text, truncated: false, fullBytes, verified }",
+      "    return { integrity: 'ok', text, truncated: false, fullBytes, verified }",
+    ]],
+  },
   'byte-as-token': {
     test: 'test/v2-regression.test.mjs',
     file: 'src/v2/budget.mjs',

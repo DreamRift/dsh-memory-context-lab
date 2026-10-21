@@ -112,8 +112,29 @@ const NON_PROTECTIVE_SKIP_REASONS = new Set([
  * 匹配仍能碰巧找到终态，但报告里显示的 id 是错的——保护理由必须能被人工核对。
  */
 const JOB_ID_PATTERNS = Object.freeze([
+  // ① 带引号的键值形态（JSON 是工具参数的**正常形态**）：`{"job_id":"h_x"}`、
+  //    `{"job_id": "h_x"}`、`'jobId': 'h_x'`。闭合引号在冒号**之前**——旧正则把
+  //    引号写在冒号之后，于是 JSON 形态一个都认不出（0.13.2 D-07）。
+  /["'`]?job[_\s-]?id["'`]?\s*[:=]\s*["'`]([A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9_.:\u4e00-\u9fff-]{2,63})["'`]/gi,
+  // ② 纯文本 / 命令行 flag：`job_id: h_x`、`--job-id h_x`、`jobId=h_x`。
   /\bjob[_\s-]?id\b\s*[:=]?\s*["'`]?([A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9_.:\u4e00-\u9fff-]{2,63})/gi,
 ])
+
+/** 递归收集 JSON 里所有 `job_id` / `jobId` / `job-id` 的字符串值（任意深度）。 */
+function jobIdsFromJson(value, found, depth = 0) {
+  if (depth > 12 || value === null || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    for (const item of value) jobIdsFromJson(item, found, depth + 1)
+    return
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (/^job[_\s-]?id$/i.test(key) && (typeof item === 'string' || typeof item === 'number')) {
+      const id = String(item).trim()
+      if (id && !/\s/.test(id)) found.add(id)
+    }
+    if (item && typeof item === 'object') jobIdsFromJson(item, found, depth + 1)
+  }
+}
 
 /** 终态证据标记：同一事件里同时出现 job 标识与本模式才算"job 已结束"。 */
 const TERMINAL_EVIDENCE_PATTERN = /(已结束|已完成|已终止|已取消|已杀掉|退出码|结束|失败|completed|finished|exited|exit code|failed|killed|cancelled|canceled|terminated)/i
@@ -152,6 +173,13 @@ const EFFECT_CONFIRMED_PATTERN = /(已提交|已确认|已批准|已生效|commi
 export function jobReferencesOf(text) {
   const source = String(text ?? '')
   const found = new Set()
+  // JSON 优先：工具参数的正常形态就是 JSON 字符串。
+  try {
+    const parsed = JSON.parse(source)
+    jobIdsFromJson(parsed, found)
+  } catch {
+    // 不是纯 JSON（命令行文本、混合输出）：正则兜底。
+  }
   for (const pattern of JOB_ID_PATTERNS) {
     pattern.lastIndex = 0
     let match
@@ -247,6 +275,9 @@ export function scanOperation(surfaceNodes, eventAt, headSeq) {
  */
 export function collectStructuralProtections({ view, surfaceNodes = [], eventAt, operationEpoch = 0 }) {
   const entries = []
+  // 终态证据要绑定 job 身份，而宿主的结果事件不一定带 toolName：
+  // 一次解析、按 seq 记忆，避免在长活动面上重复反查。
+  const resolveResultToolName = makeResultToolNameResolver(surfaceNodes, eventAt)
   const push = (entry) => {
     if (!entries.some((row) => row.id === entry.id)) entries.push(entry)
   }
@@ -275,7 +306,7 @@ export function collectStructuralProtections({ view, surfaceNodes = [], eventAt,
     if (!scan) continue
     const ownText = [scan.callArguments, ...scan.resultTexts].join('\n')
     for (const jobId of jobReferencesOf(ownText)) {
-      const terminal = terminalEvidenceFor(surfaceNodes, eventAt, scan.rangeEnd, jobId)
+      const terminal = terminalEvidenceFor(surfaceNodes, eventAt, scan.rangeEnd, jobId, scan.tools, resolveResultToolName)
       // 本操作自己的结果若已经报告该 job 的终态，它就是终态证据本身。继续硬保护会
       // 让这段证据永远退不出去——长会话里每轮 poll 都新增一段永不解除的硬保护，
       // 保护集只增不减，最终把整条任务历史钉死在投影里。受理回执由
@@ -313,16 +344,97 @@ export function collectStructuralProtections({ view, surfaceNodes = [], eventAt,
  * "后台任务已完成" 是模型的陈述，不是宿主状态。若把模型的话也算证据，硬保护就会
  * 被旧文本（甚至推测）解除——这正是"不得凭旧文本或推测恢复授权"要防的事。
  */
-function terminalEvidenceFor(surfaceNodes, eventAt, afterSeq, jobId) {
+/**
+ * 结果事件声明的工具名。
+ *
+ * 宿主不保证 `tool/result` 带 `toolName`（本机 app.asar 的 `ToolResultSource` 只有
+ * `kind`/`callId`），所以拿不到时回落到「按 callId 反查发起这次调用的 tool-call 块」。
+ * 只依赖活动面事实，不猜。
+ */
+function makeResultToolNameResolver(surfaceNodes, eventAt) {
+  const cache = new Map()
+  return function resolveToolName(seq, event) {
+    const direct = toolNameOf(event)
+    if (direct !== '') return direct
+    if (cache.has(seq)) return cache.get(seq)
+    const callId = event?.data?.message?.source?.callId
+    let name = ''
+    if (typeof callId === 'string' && callId !== '') {
+      for (const node of surfaceNodes) {
+        if (node > seq) break
+        const candidate = eventAt(node)
+        if (candidate?.type !== 'assistant/message') continue
+        const blocks = candidate?.data?.message?.content
+        if (!Array.isArray(blocks)) continue
+        const hit = blocks.find((block) => block?.type === 'tool-call' && block?.id === callId)
+        if (hit && typeof hit.name === 'string') {
+          name = hit.name
+          break
+        }
+      }
+    }
+    cache.set(seq, name)
+    return name
+  }
+}
+
+function terminalEvidenceFor(surfaceNodes, eventAt, afterSeq, jobId, tools = [], resolveToolName = null) {
+  const wanted = new Set((tools ?? []).filter(Boolean))
   for (const seq of surfaceNodes) {
     if (seq <= afterSeq) continue
     const event = eventAt(seq)
     if (event?.type !== 'tool/result') continue
     const text = textOfEvent(event)
     if (!text.includes(jobId)) continue
-    if (terminalEvidenceIn(text)) return { seq }
+    if (!terminalEvidenceIn(text)) continue
+    // 终态证据必须**绑定 job 身份**（0.13.2 D-07）：旧实现只要「正文含 id + 一个终态
+    // 词」就解除保护，于是任何无关结果（一次 `read` 恰好把该 id 和「失败」写在同一段
+    // 日志里）都能解除一条硬保护。现在要求同一工具族；工具身份不可得时只认结构化
+    // 终态字段（`state: done`），不认自然语言里的「失败」二字。
+    const name = resolveToolName ? resolveToolName(seq, event) : toolNameOf(event)
+    if (wanted.size > 0 && name !== '') {
+      if (!toolFamiliesOverlap(wanted, name)) continue
+    } else if (!structuredTerminalFor(text)) {
+      continue
+    }
+    return { seq }
   }
   return null
+}
+
+/** 结果事件声明的工具名（宿主两种形状都认）。 */
+function toolNameOf(event) {
+  const name = event?.data?.message?.source?.toolName ?? event?.data?.message?.toolName ?? event?.data?.toolName ?? ''
+  return typeof name === 'string' ? name : ''
+}
+
+/**
+ * 工具「族」：`hive_spawn` / `hive_poll` / `hive kill` 同族（首段相同）。
+ *
+ * 绑定身份不能用精确工具名：一个后台 job 往往由 `hive_spawn` 提交、由 `hive_poll`
+ * 报告终态。按族比较既挡住「无关的 `read` 恰好把 id 与『失败』写在一段日志里」，
+ * 又不至于把正常的 poll 报告判成无关证据。
+ */
+function toolFamilyOf(name) {
+  const source = String(name ?? '').trim().toLowerCase()
+  if (source === '') return ''
+  const cut = source.search(/[_\-\s]/)
+  return cut > 0 ? source.slice(0, cut) : source
+}
+
+function toolFamiliesOverlap(wanted, name) {
+  const family = toolFamilyOf(name)
+  if (family === '') return false
+  for (const candidate of wanted) {
+    if (toolFamilyOf(candidate) === family) return true
+  }
+  return false
+}
+
+/** 结构化终态字段：`"state": "done"` / `status=completed` 一类，不认自然语言。 */
+function structuredTerminalFor(text) {
+  return /["']?\b(state|status|outcome)\b["']?\s*[:=]\s*["']?(done|completed|finished|failed|cancelled|canceled|killed|exited|error)\b/i
+    .test(String(text ?? ''))
 }
 
 /** 在 `afterSeq` 之后找同一工具的"已确认"证据。 */
@@ -332,7 +444,7 @@ function confirmedEffectFor(surfaceNodes, eventAt, afterSeq, tools) {
     if (seq <= afterSeq) continue
     const event = eventAt(seq)
     if (event?.type !== 'tool/result') continue
-    const name = event?.data?.message?.source?.toolName ?? event?.data?.message?.toolName ?? ''
+    const name = toolNameOf(event)
     if (wanted.size && name && !wanted.has(name)) continue
     if (hasConfirmedEffect(textOfEvent(event))) return { seq }
   }

@@ -95,11 +95,12 @@ function skipMapOf(result) {
   return Object.fromEntries(result.skipped.map((row) => [row.seq, row.reason]))
 }
 
-test('P0-3a readKeyOf：read 的键是 path|offset，不同 offset 不合并，写类工具没有键', () => {
-  assert.equal(readKeyOf('read', '{"file_path":"src/core.mjs","offset":0}'), 'src/core.mjs|0')
-  assert.equal(readKeyOf('read', '{"file_path":"src/core.mjs","offset":120}'), 'src/core.mjs|120')
+test('P0-3a readKeyOf：read 的键含 path 与 offset（不同 offset 不合并），写类工具没有键', () => {
+  // 0.13.2 D-14：键从 `a|b|c` 拼接改成 JSON 数组，字段里含 `|` 不再撞键。
+  assert.equal(readKeyOf('read', '{"file_path":"src/core.mjs","offset":0}'), JSON.stringify(['read', 'src/core.mjs', 0]))
+  assert.equal(readKeyOf('read', '{"file_path":"src/core.mjs","offset":120}'), JSON.stringify(['read', 'src/core.mjs', 120]))
   assert.notEqual(readKeyOf('read', '{"file_path":"src/core.mjs","offset":0}'), readKeyOf('read', '{"file_path":"src/core.mjs","offset":120}'))
-  assert.equal(readKeyOf('grep', '{"pattern":"foo","path":"src"}'), 'grep|foo|src')
+  assert.equal(readKeyOf('grep', '{"pattern":"foo","path":"src"}'), JSON.stringify(['grep', 'foo', 'src']))
   assert.equal(readKeyOf('edit', '{"file_path":"src/a.mjs"}'), null)
   assert.equal(readKeyOf('pwsh', '{"command":"ls"}'), null)
 })

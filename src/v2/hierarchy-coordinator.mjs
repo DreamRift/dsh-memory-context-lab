@@ -186,7 +186,10 @@ async function memberViewOf(deps, plan) {
     // 权威摘要（P3 无 LLM 管线），退化用它作证据基底，保来源不丢组。
     members.push({
       recordId,
-      kind: typeof deps.getRecordKind === 'function' ? deps.getRecordKind(recordId) : 'tool-output',
+      // kind 只用于渲染标签。拿不到就如实标「未知」，不冒充某个具体类别
+      // （0.13.2-beta.2）：旧兜底 'tool-output' 会让「读不到」与「确实是工具输出」
+      // 在卡片上完全同形，排查时分不清。
+      kind: typeof deps.getRecordKind === 'function' ? (deps.getRecordKind(recordId) ?? 'unknown') : 'unknown',
       body: body ?? receiptText,
       receiptText,
       receiptTokens: estimateTokensOf(receiptText),

@@ -170,7 +170,7 @@ test('P0-2j 部分条目不可解析也算损坏（蜂巢复审 F1）：失败�
     const good = { key: 'a|0', seq: 1, coldRecordId: 'mcl2-aaaabbbbcccc-000001', hash: 'h', chars: 10, firstSeenAt: 1, reads: 1, lastReadStep: 1 }
     await writeFile(readLedgerPath(dir), JSON.stringify({
       kind: 'dsh-memory-context-lab/v2/read-ledger',
-      version: 1,
+      version: 2,
       entries: [good, { bad: 1 }, null],
     }), 'utf8')
     const loaded = await loadReadLedger(dir)

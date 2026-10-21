@@ -170,6 +170,9 @@ export function createV2Runtime(dependencies) {
     // 计划先行开关切换回调（agent, value) => note|null）：on 时尝试进入计划模式。
     onPlanFirstToggle = null,
     coordinator = null,
+    // 抑制闸门失败的原因（index.mjs 注入）：装配不到抑制协调器时，`on` 回执与
+    // `status` 必须如实写「抑制未启用 + 原因」，不得无条件宣称「已抑制」（0.13.2 D-04）。
+    suppressionUnavailableReason = null,
     // 可注入的语义检索后端（灵枢）。缺省为 null：只用内置字面索引，并在
     // 结果里如实标注 `matchedBy: 'literal'`，不假装做过语义检索。
     // 注入方负责 backend 自己的会话隔离（独立隔离根 + 独立子进程）。
@@ -308,6 +311,7 @@ export function createV2Runtime(dependencies) {
     logger,
     sessionIdOf,
     coordinator,
+    suppressionUnavailableReason,
     factoryFor,
     receiptTextOf,
     backendPrecheck,

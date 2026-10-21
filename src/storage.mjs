@@ -4,8 +4,6 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import {
-  isSessionDirectoryName,
-  isStrictDescendant,
   LAB_ROOT_MARKER_FILE,
   LAB_ROOT_MARKER_KIND,
   LAB_ROOT_NAME,

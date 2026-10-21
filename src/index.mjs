@@ -250,6 +250,11 @@ export async function apply(ctx, config) {
     onEnabled: (agent) => (readProjectionPlanFirst(agent.session) ? planFirst.enterIfFresh(agent) : null),
     onPlanFirstToggle: (agent, value) => (value ? planFirst.enterIfFresh(agent) : planFirst.exitIfActive(agent)),
     coordinator: dependencies.coordinator,
+    // 闸门失败的原因要一路带到 `on` 回执与 `status`：抑制没装上必须说「未启用 + 原因」，
+    // 而不是继续宣称「已抑制」（0.13.2 D-04）。
+    suppressionUnavailableReason: dependencies.startupError instanceof Error
+      ? `dsh-memory 兼容性闸门未通过：${dependencies.startupError.message}`
+      : null,
     // 同步取用：检索热路径不会隐式起子进程（只在 `/memory-lab index sync` 时启动）。
     semanticBackendFor: ({ sessionId, storeRoot }) => retrievalBackend.backendFor({ sessionId, storeRoot }),
     semanticBackendEnsure: ({ sessionId, storeRoot, signal }) => retrievalBackend.ensureBackend({ sessionId, storeRoot, signal }),
@@ -526,7 +531,6 @@ export async function apply(ctx, config) {
     yield async () => {
       await Promise.allSettled([...activeOperations])
       disposePlanFirstAutomation()
-      disposeAutoCooling()
       disposeAutoCooling()
       disposeRecall()
       disposeWorkingSet()

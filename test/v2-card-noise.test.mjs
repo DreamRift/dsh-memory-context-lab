@@ -72,7 +72,8 @@ test('P1-6c 增量卡有硬上限（行数 + 字节），超出只留「变化�
   assert.ok(delta, '必须有变化')
   assert.equal(delta.truncated, true, '超长增量必须被截断并显式标记')
   assert.ok(delta.text.split('\n').length <= CARD_DELTA_MAX_LINES, '行数上限生效：' + delta.text.split('\n').length)
-  assert.ok(delta.text.length <= CARD_DELTA_MAX_CHARS + 200, '字符上限生效（含尾行说明）')
+  // 0.13.2-beta.2（W-04）：尾行也必须计入预算，上界是**严格**的，不再留 +200 的余量。
+  assert.ok(delta.text.length <= CARD_DELTA_MAX_CHARS, '字符上限生效（尾行计入预算）：' + delta.text.length)
   // 措辞在 0.13.1 更正：旧文案「完整内容以最近一张全量卡为准」是假话——模型手里的
   // 最近一张全量卡是**上一张**，它不含这些新行。现在只说「没进本卡」并指路回读，
   // 由 runtime-card 在截断时改发全量卡（见 v2-workingset-hardening 的同名用例）。

@@ -56,13 +56,19 @@ export const REF_KEYS_BY_KIND = Object.freeze({
 const ID_PATTERN = /^t(\d{8})-r(\d{4})$/
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/
 
-/** 事务号/序号 → 稳定记录 ID。 */
+/**
+ * 事务号/序号 → 稳定记录 ID。
+ *
+ * 越界抛 `EngineV2Error`（带 code）而不是裸 `RangeError`（0.13.2 D-17）：调用方按
+ * `error.code` 分支（`ELIMIT`/`EINVAL`/…），裸 RangeError 的 code 是 undefined，
+ * 所有分支都会落空，表现成「写不进去但没人知道为什么」。
+ */
 export function recordId(txn, index) {
   if (!Number.isSafeInteger(txn) || txn < 1 || txn > 99_999_999) {
-    throw new RangeError(`txn 越界：${txn}`)
+    throw new EngineV2Error(`事务号越界（${txn}）：记录 ID 定宽 8 位，最多 99_999_999`, { code: 'ELIMIT', details: { txn } })
   }
   if (!Number.isSafeInteger(index) || index < 0 || index > 9999) {
-    throw new RangeError(`记录序号越界：${index}`)
+    throw new EngineV2Error(`记录序号越界（${index}）：单事务最多 10000 条`, { code: 'ELIMIT', details: { index } })
   }
   return `t${String(txn).padStart(8, '0')}-r${String(index).padStart(4, '0')}`
 }

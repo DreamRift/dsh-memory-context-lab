@@ -221,7 +221,12 @@ test('the installed dsh-memory resolves to a real package root with MdcgClient',
     // check below is what matters on this machine.
     return t.skip(`dsh-memory is not resolvable here: ${error.message}`)
   }
-  assert.equal(found.version, '0.8.1')
+  // 断言「落在已核验范围内」，而不是钉死某一个版本号——灵枢升级时这个用例
+  // 只该因「兼容性真的变了」而红，不该因版本号前进而红（0.8.1→0.9.8 即一例）。
+  assert.ok(
+    ['0.8.1', '0.9.8'].includes(found.version),
+    `dsh-memory=${found.version} 不在已核验范围（0.8.1 / 0.9.8）内`,
+  )
   // 不按路径子串断言：junction / 符号链接安装时 realpath 的实体目录名
   // 与包名不同（0.10.1 的 install 用例曾因此误红）。包身份以 manifest 为准。
   const manifest = JSON.parse(await readFile(path.join(found.packageRoot, 'package.json'), 'utf8'))

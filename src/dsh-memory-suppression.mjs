@@ -20,7 +20,17 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const SUPPRESSION_KEY = Symbol.for('dsh-memory-context-lab/suppression-v1')
-const EXPECTED_DSH_MEMORY_VERSION = '0.8.1'
+/**
+ * Versions whose automatic-hook calls were audited against the patch below.
+ * 0.9.8 was verified individually (2026-10-20): all five prototype methods
+ * still exist, both suppressed readers return the same fallback shape, and
+ * restore() leaves the prototype with the same own-property count. The hook
+ * call shapes are unchanged as well -- `read/2` still takes `{ session }` as
+ * its second argument, `remember/2` as `{ ...sessionTag }`, and
+ * `sessionRecall/1`/`timeline/1` still carry the session first.
+ */
+const EXPECTED_DSH_MEMORY_VERSIONS = ['0.8.1', '0.9.8']
+const EXPECTED_DSH_MEMORY_VERSION = EXPECTED_DSH_MEMORY_VERSIONS[EXPECTED_DSH_MEMORY_VERSIONS.length - 1]
 const PACKAGE_NAME = '@furongjun1999/dsh-memory'
 
 function normalizedSession(value) {
@@ -83,7 +93,7 @@ export function createSuppressionCoordinator(MdcgClient) {
     const plan = []
     for (const method of methods) {
       const original = prototype[method]
-      if (typeof original !== 'function') throw new Error(`dsh-memory 0.8.1 缺少 MdcgClient.${method}，已拒绝启用抑制。`)
+      if (typeof original !== 'function') throw new Error(`已核验的 dsh-memory 缺少 MdcgClient.${method}，已拒绝启用抑制。`)
       plan.push({ method, original, descriptor: Object.getOwnPropertyDescriptor(prototype, method) })
     }
     for (const { method, original, descriptor } of plan) {
@@ -222,7 +232,10 @@ async function defaultListProfiles(dshHome) {
  *   the `MdcgClient` export — the caller degrades rather than guessing.
  */
 export async function locatePinnedDshMemory(requireFromPlugin, options = {}) {
-  const { expectedVersion = EXPECTED_DSH_MEMORY_VERSION, ...lookup } = options
+  const { expectedVersion, ...lookup } = options
+  const acceptedVersions = expectedVersion === undefined
+    ? EXPECTED_DSH_MEMORY_VERSIONS
+    : [expectedVersion]
   const roots = await dshMemoryLookupRoots({ requireFromPlugin, ...lookup })
 
   let packageRoot = null
@@ -240,8 +253,8 @@ export async function locatePinnedDshMemory(requireFromPlugin, options = {}) {
   } catch {
     throw new Error('无法读取已安装 dsh-memory 的版本信息，已拒绝启用抑制。')
   }
-  if (manifest?.name !== PACKAGE_NAME || manifest.version !== expectedVersion) {
-    throw new Error(`当前 dsh-memory=${String(manifest?.version ?? 'unknown')}，隔离只经 ${expectedVersion} 核验，已拒绝启用。`)
+  if (manifest?.name !== PACKAGE_NAME || !acceptedVersions.includes(manifest.version)) {
+    throw new Error(`当前 dsh-memory=${String(manifest?.version ?? 'unknown')}，隔离只经 ${acceptedVersions.join(' / ')} 核验，已拒绝启用。`)
   }
   const clientModule = await import(pathToFileURL(path.join(packageRoot, 'lib', 'lib', 'mdcg_client.js')).href)
   if (typeof clientModule.MdcgClient !== 'function') {

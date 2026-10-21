@@ -21,7 +21,16 @@ import path from 'node:path'
 
 export const READ_LEDGER_FILE = 'read-ledger.json'
 export const READ_LEDGER_KIND = 'dsh-memory-context-lab/v2/read-ledger'
-export const READ_LEDGER_VERSION = 1
+/**
+ * 账本格式版本。2 起键是 JSON 数组（见 `readKeyOf`）。
+ *
+ * 旧版本（1）的键用 `|` 拼接，而 pattern/path 都可能含 `|`：
+ * `grep(pattern="TODO|FIXME", path="src/a.mjs")` 与
+ * `grep(pattern="TODO", path="FIXME|src/a.mjs")` 会得到同一个键（0.13.2 D-14），
+ * 于是「假重读」被记进成本账本，回执还会谎报「该区间已于 seq N 归档」，
+ * 回读指向别的区间。v1 账本一律按 schema 不符失败关闭（不静默重建为空）。
+ */
+export const READ_LEDGER_VERSION = 2
 /** 单会话上限：只记键不记正文，4,000 条足够覆盖长会话，超出按 lastReadStep 淘汰。 */
 export const READ_LEDGER_MAX_ENTRIES = 4000
 
@@ -53,9 +62,12 @@ function stringOf(value) {
 /**
  * 一次工具调用的「读取键」；不是读取类工具时返回 null。
  *
- * `read` 的键是 `<path>|<offset>`（方案 P0-2 口径：不同 offset 不合并）；
- * `grep`/`glob` 的键是 `<tool>|<pattern>|<path>`。路径只保留原样字符串，
- * 不做规范化——规范化会把两个真实不同的路径合成一个键，那是在编造重读。
+ * 键一律是 **JSON 数组**（`read` 为 `[tool, path, offset]`，其余为
+ * `[tool, pattern, where]`），不做字符串拼接：分隔符拼接在字段本身含分隔符时会
+ * 撞键（0.13.2 D-14），JSON 编码让每个字段的边界无歧义。
+ *
+ * 路径只保留原样字符串，不做规范化——规范化会把两个真实不同的路径合成一个键，
+ * 那是在编造重读。
  */
 export function readKeyOf(toolName, rawArguments) {
   const name = typeof toolName === 'string' ? toolName.trim().toLowerCase() : ''
@@ -66,12 +78,12 @@ export function readKeyOf(toolName, rawArguments) {
     const file = stringOf(args.file_path) || stringOf(args.path) || stringOf(args.file)
     if (!file) return null
     const offset = Number.isFinite(Number(args.offset)) ? Math.max(0, Math.trunc(Number(args.offset))) : 0
-    return file + '|' + offset
+    return JSON.stringify([name, file, offset])
   }
   const pattern = stringOf(args.pattern) || stringOf(args.query) || stringOf(args.glob) || ''
   const where = stringOf(args.path) || stringOf(args.file_path) || ''
   if (!pattern && !where) return null
-  return name + '|' + pattern + '|' + where
+  return JSON.stringify([name, pattern, where])
 }
 
 export function readLedgerPath(sessionDir) {

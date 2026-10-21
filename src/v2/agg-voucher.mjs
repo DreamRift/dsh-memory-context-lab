@@ -337,7 +337,19 @@ export function voucherPlansPath(sessionDir) {
 }
 
 /** 保存一张凭证计划（重放窗口，非权威账本；超限丢最旧）。 */
+/**
+ * 保存一条聚合凭证计划。
+ *
+ * 0.13.2-beta.2（W-01c）：整段「读 JSON → 计算 → 写 temp → rename」必须在写锁内。
+ * 旧实现把读放在锁外、只给最后的整文件替换加锁，于是两个并发的
+ * `saveVoucherPlan` 都基于同一份旧 `plans` 计算，后写者整文件覆盖先写者——
+ * 计划是重放窗口，丢一条就等于那批凭证再也展开不回来。
+ */
 export async function saveVoucherPlan(sessionDir, plan) {
+  return withWriteLock(sessionDir, () => saveVoucherPlanUnlocked(sessionDir, plan))
+}
+
+async function saveVoucherPlanUnlocked(sessionDir, plan) {
   const file = voucherPlansPath(sessionDir)
   let current = { plans: [] }
   try {
@@ -367,10 +379,6 @@ export async function loadVoucherPlans(sessionDir) {
   }
 }
 
-async function writeVoucherPlans(sessionDir, plans) {
-  return withWriteLock(sessionDir, () => writeVoucherPlansUnlocked(sessionDir, plans))
-}
-
 async function writeVoucherPlansUnlocked(sessionDir, plans) {
   const file = voucherPlansPath(sessionDir)
   const payload = canonicalLine({ plans }) + '\n'
@@ -381,11 +389,14 @@ async function writeVoucherPlansUnlocked(sessionDir, plans) {
 }
 
 export async function dropVoucherPlan(sessionDir, voucherId) {
-  const plans = await loadVoucherPlans(sessionDir)
-  const next = plans.filter((item) => item?.voucherId !== voucherId)
-  if (next.length === plans.length) return { dropped: false, kept: next.length }
-  await writeVoucherPlans(sessionDir, next)
-  return { dropped: true, kept: next.length }
+  // 读-改-写整段进锁（W-01c）：锁只包住最后的 rename 时，并发删除会互相覆盖。
+  return withWriteLock(sessionDir, async () => {
+    const plans = await loadVoucherPlans(sessionDir)
+    const next = plans.filter((item) => item?.voucherId !== voucherId)
+    if (next.length === plans.length) return { dropped: false, kept: next.length }
+    await writeVoucherPlansUnlocked(sessionDir, next)
+    return { dropped: true, kept: next.length }
+  })
 }
 
 /**
@@ -394,6 +405,11 @@ export async function dropVoucherPlan(sessionDir, voucherId) {
  * 留着它则会在崩溃窗口里把已遗忘成员的事实重新写成 L1/L2。
  */
 export async function dropVoucherPlansForRecords(sessionDir, recordIds) {
+  // 同 dropVoucherPlan：读-改-写整段进锁（W-01c）。
+  return withWriteLock(sessionDir, () => dropVoucherPlansForRecordsUnlocked(sessionDir, recordIds))
+}
+
+async function dropVoucherPlansForRecordsUnlocked(sessionDir, recordIds) {
   const wanted = new Set((Array.isArray(recordIds) ? recordIds : []).filter((id) => typeof id === 'string' && id))
   const plans = await loadVoucherPlans(sessionDir)
   if (wanted.size === 0) return { dropped: [], kept: plans.length }
@@ -420,7 +436,7 @@ export async function dropVoucherPlansForRecords(sessionDir, recordIds) {
     dropped.push(plan.voucherId)
   }
   if (dropped.length === 0) return { dropped, kept: plans.length }
-  await writeVoucherPlans(sessionDir, kept)
+  await writeVoucherPlansUnlocked(sessionDir, kept)
   return { dropped, kept: kept.length }
 }
 

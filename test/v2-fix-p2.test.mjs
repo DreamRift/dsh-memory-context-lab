@@ -91,7 +91,9 @@ test('BUG-012: verifyHash:false payloads carry no verified semantics', async () 
 
       const unverified = await store.readRecord(staged.id, { verifyHash: false })
       assert.equal(unverified.ok, true)
-      assert.equal(unverified.integrity, 'ok')
+      // 0.13.2-beta.2：没做哈希校验就报 'unverified'，不再报 'ok'——'ok' 会被调用方
+      // 读成「校验通过」，而这条路径恰恰连哈希都没算。
+      assert.equal(unverified.integrity, 'unverified')
       assert.equal(unverified.verified, false, 'unverified read must not claim verified')
       const checked = await store.readRecord(staged.id, { verifyHash: true })
       assert.equal(checked.integrity, 'hash-mismatch')

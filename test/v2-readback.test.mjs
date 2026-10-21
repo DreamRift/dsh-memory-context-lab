@@ -119,10 +119,10 @@ test('回读：载荷被篡改时抛 EPAYLOADHASH，不静默返回坏内容', a
       async () => readRecordById(root, SESSION_ID, ids[1]),
       (error) => error.code === 'EPAYLOADHASH',
     )
-    // 不校验哈希时返回内容：integrity 'ok' 仅表示尺寸一致、哈希未检查；
-    // verified 必须为 false——「没验过」不得冒充「验过」。
+    // 不校验哈希时返回内容：integrity 必须报 'unverified'（0.13.2-beta.2 起不再报
+    // 'ok'——尺寸一致不等于校验通过），verified 必须为 false：两维都如实。
     const raw = await readRecordById(root, SESSION_ID, ids[1], { verifyHash: false })
-    assert.equal(raw.integrity, 'ok')
+    assert.equal(raw.integrity, 'unverified')
     assert.equal(raw.verified, false)
   } finally {
     await rm(root, { recursive: true, force: true })
