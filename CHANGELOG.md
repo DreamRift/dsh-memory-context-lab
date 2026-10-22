@@ -6,7 +6,7 @@
 不新增功能，不改产品边界。**
 
 本版仍是**测试版**：源码树与 `release/` 均 **113 套全绿 / 0 跳过**，回归集探针 **43/43 全绿**，
-`release/` 已提交并打 tag `v0.13.2-beta.3`（`af6a6db`）、已 `npm pack` 并装到本机 profile。
+`release/` 已提交并打 tag `v0.13.2-beta.3`、已 `npm pack` 并装到本机 profile。
 **未推送 GitHub**（推送按 另行执行）。
 逐条处置见。
 
