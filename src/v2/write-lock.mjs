@@ -314,7 +314,13 @@ async function sweepLockDebris(lockDir, { beforeMs } = {}) {
     } catch {
       continue // 竞争者刚删掉它：不是错误
     }
-    if (!(info.mtimeMs <= beforeMs)) continue
+    // N-05（0.13.2-beta.3）：两把尺子必须同精度。`beforeMs` 来自 `now()`（默认
+    // `Date.now()`，**整数**毫秒），`stat().mtimeMs` 是**带小数**的毫秒。直接比较时
+    // 「T.7ms 建好的残留 + T.9ms 开始获取」这种同一毫秒的情形 `T.7 <= T` 为假 →
+    // 残留漏清，守卫 audit/a 变成随机红绿灯。判据仍是「早于本次获取开始时刻」，
+    // 只把两侧统一到同一毫秒刻度（向下取整）。同毫秒的竞争者 stage 可能被一起清掉，
+    // 那只会让它 rename 得到 ENOENT（瞬态）→ 重试，不会引入新的失败模式。
+    if (!(Math.floor(info.mtimeMs) <= Math.floor(beforeMs))) continue
     try {
       await rm(target, { recursive: true, force: true })
       removed += 1

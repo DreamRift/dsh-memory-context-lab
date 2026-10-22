@@ -90,6 +90,27 @@ function nonEmptyString(value) {
 }
 
 /**
+ * 回注命中项的**正文摘录**（0.13.2-beta.3 N-03）。
+ *
+ * 回注包首行一直写着「以下为冷记录摘要预览，非原文全文」，而命中项里从来没有
+ * 摘要——只有一句自描述的指针。模型读不出相关性，只能跳过或再付一次完整回读。
+ *
+ * 边界：这是**确定性首部切片**（定长、无摘要生成、无重排），不是注入全文；
+ * 「复述正文等于撤销归档」约束的是把原文整段搬回活动面，不是拒绝给出可判读的
+ * 开头。切片长度固定，重复渲染逐字节一致，不扰动前缀缓存。
+ */
+export const RECALL_PREVIEW_CHARS = 160
+
+export function recallPreviewOf(text, limit = RECALL_PREVIEW_CHARS) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (flat === '') return ''
+  const points = Array.from(flat)
+  const max = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : RECALL_PREVIEW_CHARS
+  if (points.length <= max) return flat
+  return points.slice(0, Math.max(0, max - 1)).join('') + '…'
+}
+
+/**
  * 由真实来源坐标生成工具配对索引记录草案（纯函数，不写盘）。
  *
  * refs 严格照 `records.mjs` 的封闭集与必填规则填写：
@@ -317,6 +338,11 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
           const spanEntries = []
           const excludedSpans = []
           const forgottenSpans = []
+          // N-03：判定插件来源时**已经把正文读进内存**，读完就丢——于是回注命中项
+          // 只有指针、没有正文摘录，模型读不出「这条和当前问题有没有关系」，只能
+          // 当噪声跳过或再付一次完整回读。这里把这段正文的**确定性首部切片**留住，
+          // 随命中项作为 preview 带出（回注包首行本来就声明「摘要预览，非原文全文」）。
+          const previewById = new Map()
           const forgetIndex = await currentForgetIndex()
           for (const entry of entries) {
             if (!isArchivedSpan(entry)) continue
@@ -335,6 +361,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
               excludedSpans.push(entry.id)
               continue
             }
+            if (body !== null) previewById.set(entry.id, recallPreviewOf(body))
             spanEntries.push(entry)
           }
           const spans = spanEntries
@@ -488,7 +515,10 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
             // 0.12.0 P1-3：回注信息量门槛。命中项必须至少有一条**结构事实**可讲
             // （范围 / 工具 / 片段种类 / 插件来源标签）。三样都取不到的纯壳不注入——
             // 它只会占预算，而模型从「已归档 xxx」里读不出任何可行动的信息。
-            .filter((entry) => hasInformativeStructure(entry))
+            // N-03：结构事实或**正文摘录**任一条成立即算有信息量。归档操作必然带
+            // 范围/工具（结构门槛恒真），旧口径挡不住纯壳；现在补上「确实有正文可
+            // 判读」这条，同时让没有结构字段但确有正文的命中也能进回注。
+            .filter((entry) => hasInformativeStructure(entry) || (previewById.get(entry.id) ?? '') !== '')
             .map((entry) => {
               // range 是 `{start,end}` 对象：直接插值会渲染成 [object Object]。
               const range = entry.inline.range
@@ -502,6 +532,10 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
               const detail = entry.refs?.spanKind === SPAN_KINDS.OPERATION
                 ? `范围 ${rangeText}；工具 ${toolsText}`
                 : `范围 ${rangeText}`
+              // N-03：带一段**确定性正文摘录**。没有它，模型只能看到「有一条 run_code
+              // 在 seq 54–60」，读不出与当前问题是否相关——回注包首行的「摘要预览」
+              // 声明也就成了空话。摘录只在有正文时出现，且明确标注是开头而非全文。
+              const preview = previewById.get(entry.id) ?? ''
               return {
                 // id 取稳定记录 ID：回注里的每一条都能被精确回读（`/memory-lab read <id>`）。
                 id: entry.id,
@@ -510,7 +544,8 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
                 range: entry.inline.range ?? null,
                 tools: entry.inline.tools ?? null,
                 tags: [ARCHIVED_TAG],
-                content: `已归档${label} ${entry.inline.nodeId}（${detail}）。原文可用记录 ID ${entry.id} 精确回读。`,
+                preview,
+                content: `已归档${label} ${entry.inline.nodeId}（${detail}）。${preview === '' ? '' : `开头摘录：${preview}\n    `}原文可用记录 ID ${entry.id} 精确回读。`,
               }
             })
           if (hits.length > 0 && basisNote) {

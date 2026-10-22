@@ -59,6 +59,8 @@ import {
   textFromContent,
 } from './core.mjs'
 import { contentHasPlanToolCall } from './plan-first.mjs'
+// N-06 旧行迁移：缺 spanLabel 的归档行按行内 spanKind 反推标签，与生产侧同一张表。
+import { spanLabelOf } from './v2/history.mjs'
 
 /** Human-readable reasons a surface node or range is not archivable, keyed by code. */
 export const SKIP_REASONS = Object.freeze({
@@ -1519,6 +1521,24 @@ export function formatRestoreReport(result) {
 }
 
 /**
+ * 把「跳过的逐行原因」压成「N 段：原因」的短清单（0.13.2-beta.3 N-07）。
+ *
+ * `off` 回执曾经写「仍有 58 段原文未恢复（restore 跳过，原因见上）」，而上面
+ * **没有任何原因**——`engine.runRestore()` 的逐行报告整段被丢掉了。字段缺失被
+ * 说成用户改了正文，用户唯一能看到的解释就是「原因见上」。
+ */
+export function describeRestoreSkipReasons(skippedReasons, { maxReasons = 3 } = {}) {
+  const rows = Array.isArray(skippedReasons) ? skippedReasons : []
+  const items = rows
+    .filter((row) => row && typeof row.reason === 'string' && row.reason !== '')
+    .map((row) => `${Number(row.count) || 0} 段：${row.reason}`)
+  if (items.length === 0) return ''
+  const shown = items.slice(0, Math.max(1, maxReasons))
+  const more = items.length - shown.length
+  return `${shown.join('；')}${more > 0 ? `；另有 ${more} 类原因未列出（见 /memory-lab restore）` : ''}。`
+}
+
+/**
  * Decide whether `clean` may delete a session directory.
  *
  * A directory holding receipts that still shadow the active surface must
@@ -1784,6 +1804,144 @@ async function restoreSingleReceipt({ session, client, receipt, onOutcome, recei
   if (onOutcome) for (const outcome of local) await onOutcome(outcome)
 }
 
+/**
+ * 从表面批次回执里读回「本批 N/M 个操作」与「相邻的 K 个」（0.13.2-beta.3 N-06 迁移）。
+ *
+ * 只解析**回执自己**写下的结构化数字，解析不到就返回 null（不猜）。采用条件是
+ * 用这些数字重建出的正文与表面**逐字节相等**——迁移不是放宽校验，而是把行内
+ * 缺失的字段从唯一权威副本（表面回执）里找回来。
+ */
+export function parseBatchHeaderNumbers(text) {
+  const source = typeof text === 'string' ? text : ''
+  const head = /批次归档：本批 (\d+)\/(\d+) 个操作(（单批释放上限截断，其余留待下批）)?/.exec(source)
+  if (!head) return null
+  const batchMembers = Number(head[1])
+  const batchThreshold = Number(head[2])
+  if (!Number.isInteger(batchMembers) || batchMembers <= 0) return null
+  if (!Number.isInteger(batchThreshold) || batchThreshold <= 0) return null
+  const adjacent = /本条回执覆盖其中相邻的 (\d+) 个/.exec(source)
+  const runLength = adjacent ? Number(adjacent[1]) : null
+  return {
+    batchMembers,
+    batchThreshold,
+    releaseCapped: typeof head[3] === 'string' && head[3] !== '',
+    runLength: Number.isInteger(runLength) && runLength > 0 ? runLength : null,
+  }
+}
+
+/**
+ * 归档行的**重建候选**（0.13.2-beta.3 N-06）。
+ *
+ * 恢复的判据是「按行内字段重建出的正文 == 表面正文」。旧行缺字段时重建必然不等，
+ * 于是 58/60 段被判成「回执正文已变化，拒绝覆盖」——把**字段缺失**说成**用户改了
+ * 正文**，并把责任指向用户。这里给出有界的候选集合：先用行内值（严格），
+ * 再用「行内信息可反推的值」兜底；只有逐字节相等的那一个被采用，且采用的
+ * 差异会作为 `migrated` 写回归档行，下一次恢复不必再迁移。
+ */
+function receiptReconstructionCandidates({ receipt, receiptMarker, formatVersion, surfaceText = null }) {
+  const out = []
+  const push = (text, migrated = null) => {
+    if (typeof text === 'string' && text.length > 0) out.push({ text, migrated })
+  }
+  const spanKind = typeof receipt.spanKind === 'string' && receipt.spanKind !== '' ? receipt.spanKind : null
+  const spanLike = formatVersion === RECEIPT_FORMAT_SPAN
+    || formatVersion === RECEIPT_FORMAT_SPAN_V2
+    // BUG-001 的旧行把 span 正文记成了 format 4；spanKind 非 operation 时按 span 重建。
+    || (formatVersion === RECEIPT_FORMAT_VERSION && spanKind !== null && spanKind !== 'operation')
+  if (spanLike) {
+    const formats = []
+    for (const candidate of [formatVersion, RECEIPT_FORMAT_SPAN_V2, RECEIPT_FORMAT_SPAN]) {
+      if (!formats.includes(candidate)) formats.push(candidate)
+    }
+    const labels = []
+    if (typeof receipt.spanLabel === 'string' && receipt.spanLabel !== '') {
+      labels.push(receipt.spanLabel)
+    } else {
+      // 迁移：行里没有标签 → 按 spanKind 反推（生产侧就是这张表）；插件自己注入的
+      // 跨度标签是固定文案，也作为候选，但只有逐字节相等才被采用。
+      if (spanKind !== null) labels.push(spanLabelOf(spanKind))
+      labels.push('插件工作资料', '历史片段')
+    }
+    for (const candidateFormat of formats) {
+      for (const label of labels) {
+        const migrated = {}
+        if (candidateFormat !== formatVersion) migrated.receiptFormat = candidateFormat
+        if (label !== receipt.spanLabel) migrated.spanLabel = label
+        push(buildSpanReceipt({
+          label,
+          range: { start: receipt.rangeStart, end: receipt.rangeEnd },
+          nodeId: receipt.nodeId,
+          hash: receipt.hash,
+          chars: receipt.chars ?? 0,
+          tokens: receipt.originalTokens ?? 0,
+          chunks: receipt.chunkCount ?? 1,
+          marker: receiptMarker,
+          formatVersion: candidateFormat,
+          releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
+          errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
+        }), Object.keys(migrated).length > 0 ? migrated : null)
+      }
+    }
+    return out
+  }
+  if (formatVersion === RECEIPT_FORMAT_BATCH || formatVersion === RECEIPT_FORMAT_BATCH_V2) {
+    const build = ({ batchThreshold, batchMembers, releaseCapped, runLength }) => buildBatchReceipt({
+      marker: receiptMarker,
+      formatVersion,
+      runLength: Number.isInteger(runLength) ? runLength : (Number.isInteger(receipt.batchSize) ? receipt.batchSize : 1),
+      batchThreshold,
+      batchMembers,
+      releaseCapped,
+      members: [batchMemberOf(receipt)],
+    })
+    // 新行：行内字段齐全，直接重建。
+    push(build({
+      batchThreshold: Number.isInteger(receipt.batchThreshold) ? receipt.batchThreshold : null,
+      batchMembers: Number.isInteger(receipt.batchMembers) ? receipt.batchMembers : null,
+      releaseCapped: receipt.releaseCapped === true,
+      runLength: Number.isInteger(receipt.batchSize) ? receipt.batchSize : null,
+    }))
+    // 旧行：缺批次口径 → 从表面回执自己的数字反推，仅在逐字节相等时采用。
+    if (formatVersion === RECEIPT_FORMAT_BATCH_V2
+      && (!Number.isInteger(receipt.batchThreshold) || !Number.isInteger(receipt.batchMembers))) {
+      const parsed = parseBatchHeaderNumbers(surfaceText)
+      if (parsed) {
+        push(build({
+          batchThreshold: parsed.batchThreshold,
+          batchMembers: parsed.batchMembers,
+          releaseCapped: parsed.releaseCapped,
+          runLength: parsed.runLength ?? (Number.isInteger(receipt.batchSize) ? receipt.batchSize : null),
+        }), {
+          batchThreshold: parsed.batchThreshold,
+          batchMembers: parsed.batchMembers,
+          ...(parsed.releaseCapped ? { releaseCapped: true } : {}),
+          ...(parsed.runLength ? { batchSize: parsed.runLength } : {}),
+        })
+      }
+    }
+    return out
+  }
+  push(buildReceipt({
+    tools: receipt.tools ?? [],
+    range: { start: receipt.rangeStart, end: receipt.rangeEnd },
+    callIds: receipt.callIds ?? [],
+    nodeId: receipt.nodeId,
+    hash: receipt.hash,
+    chars: receipt.chars ?? 0,
+    tokens: receipt.originalTokens ?? 0,
+    chunks: receipt.chunkCount ?? 1,
+    marker: receiptMarker,
+    formatVersion,
+    locators: Array.isArray(receipt.locators) ? receipt.locators : [],
+    statuses: Array.isArray(receipt.statuses) ? receipt.statuses : [],
+    // format 6 的投影头与 status 行依赖这两个**已落盘**的字段；缺了就按行内
+    // 值重建，绝不拿默认值猜一个「释放 ≈0」。
+    releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
+    errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
+  }))
+  return out
+}
+
 async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }) {
   const outcomes = []
   for (const receipt of receipts) {
@@ -1810,71 +1968,11 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
     // byte-reproducible, so an old receipt still restores instead of being
     // rejected as "changed".
     const formatVersion = Number.isInteger(receipt.receiptFormat) ? receipt.receiptFormat : RECEIPT_FORMAT_LEGACY
-    // BUG-001：0.10.1 旧 span 行把 buildSpanReceipt 正文记成了 receiptFormat=4，
-    // 行里没有可重建的标签。无法逐字节核对时不猜测覆写，如实指出冷库回读出路。
-    if (
-      (formatVersion === RECEIPT_FORMAT_VERSION || formatVersion === RECEIPT_FORMAT_SPAN_V2)
-      && typeof receipt.spanKind === 'string' && receipt.spanKind.length > 0 && receipt.spanKind !== 'operation'
-      && (typeof receipt.spanLabel !== 'string' || receipt.spanLabel.length === 0)
-    ) {
-      outcomes.push({
-        ...base,
-        state: 'skipped',
-        reason: `旧 span 回执（format 4）没有可重建的标签，无法逐字节核对；原文仍在冷库，可用 /memory-lab read ${receipt.nodeId} 回读`,
-      })
-      continue
-    }
-    let expected
-    if (formatVersion === RECEIPT_FORMAT_LEGACY || formatVersion === 2
-      || formatVersion === RECEIPT_FORMAT_VERSION || formatVersion === RECEIPT_FORMAT_OPERATION) {
-      expected = buildReceipt({
-        tools: receipt.tools ?? [],
-        range: { start: receipt.rangeStart, end: receipt.rangeEnd },
-        callIds: receipt.callIds ?? [],
-        nodeId: receipt.nodeId,
-        hash: receipt.hash,
-        chars: receipt.chars ?? 0,
-        tokens: receipt.originalTokens ?? 0,
-        chunks: receipt.chunkCount ?? 1,
-        marker: receiptMarker,
-        formatVersion,
-        locators: Array.isArray(receipt.locators) ? receipt.locators : [],
-        statuses: Array.isArray(receipt.statuses) ? receipt.statuses : [],
-        // format 6 的投影头与 status 行依赖这两个**已落盘**的字段；缺了就按行内
-        // 值重建，绝不拿默认值猜一个「释放 ≈0」。
-        releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
-        errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
-      })
-    } else if (formatVersion === RECEIPT_FORMAT_SPAN || formatVersion === RECEIPT_FORMAT_SPAN_V2) {
-      // 普通历史段：提交侧用 buildSpanReceipt 渲染，恢复侧必须用同一渲染器。
-      expected = buildSpanReceipt({
-        label: typeof receipt.spanLabel === 'string' ? receipt.spanLabel : '历史片段',
-        range: { start: receipt.rangeStart, end: receipt.rangeEnd },
-        nodeId: receipt.nodeId,
-        hash: receipt.hash,
-        chars: receipt.chars ?? 0,
-        tokens: receipt.originalTokens ?? 0,
-        chunks: receipt.chunkCount ?? 1,
-        marker: receiptMarker,
-        formatVersion,
-        releasedTokens: Number.isFinite(Number(receipt.releasedTokens)) ? Number(receipt.releasedTokens) : null,
-        errorLine: typeof receipt.firstErrorLine === 'string' ? receipt.firstErrorLine : null,
-      })
-    } else if (formatVersion === RECEIPT_FORMAT_BATCH || formatVersion === RECEIPT_FORMAT_BATCH_V2) {
-      // BUG-010：批摘要成员被逐条剔除后可能只剩这一行；按单成员摘要重建，
-      // 与表面一致就恢复，不一致如实 skip——绝不用 buildReceipt(3) 抛错中止整次 restore。
-      // 0.13.1（F2）：format 8 与 3 的文案不同，必须按行内版本渲染，
-      // 否则新写入的批次回执永远判「未知格式」而不可恢复。
-      expected = buildBatchReceipt({
-        marker: receiptMarker,
-        formatVersion,
-        runLength: Number.isInteger(receipt.batchSize) ? receipt.batchSize : 1,
-        batchThreshold: Number.isInteger(receipt.batchThreshold) ? receipt.batchThreshold : null,
-        batchMembers: Number.isInteger(receipt.batchMembers) ? receipt.batchMembers : null,
-        releaseCapped: receipt.releaseCapped === true,
-        members: [batchMemberOf(receipt)],
-      })
-    } else {
+    const knownFormats = new Set([
+      RECEIPT_FORMAT_LEGACY, 2, RECEIPT_FORMAT_VERSION, RECEIPT_FORMAT_OPERATION,
+      RECEIPT_FORMAT_SPAN, RECEIPT_FORMAT_SPAN_V2, RECEIPT_FORMAT_BATCH, RECEIPT_FORMAT_BATCH_V2,
+    ])
+    if (!knownFormats.has(formatVersion)) {
       outcomes.push({
         ...base,
         state: 'skipped',
@@ -1882,7 +1980,15 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
       })
       continue
     }
-    if (textFromContent(current.data?.content) !== expected) {
+    // 0.13.2-beta.3（N-06）：期望正文改为**有界候选集**。第一候选严格按行内字段
+    // 重建（新行的行为逐字不变）；旧行缺字段时按行内可反推的信息兜底（span 标签
+    // 由 spanKind 反推、批次口径由表面回执自己的数字反推）。只有**逐字节相等**的
+    // 候选被采用，采用后把差异写回归档行——迁移不放宽校验，只是把行内缺失的字段
+    // 从唯一权威副本里找回来。
+    const surfaceText = textFromContent(current.data?.content)
+    const candidates = receiptReconstructionCandidates({ receipt, receiptMarker, formatVersion, surfaceText })
+    const matched = candidates.find((candidate) => candidate.text === surfaceText) ?? null
+    if (matched === null) {
       outcomes.push({
         ...base,
         state: 'skipped',
@@ -1891,6 +1997,10 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
           : '回执正文已变化，拒绝覆盖',
       })
       continue
+    }
+    if (matched.migrated !== null) {
+      // 迁移痕迹随结局上抛，由 restoreAll 写回持久行：下次恢复不必再走兜底候选。
+      base.migrated = matched.migrated
     }
     // Read every chunk in order and reassemble. The whole-body hash is checked
     // after joining, so a missing or reordered chunk cannot be mistaken for the
@@ -2037,23 +2147,55 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
 
   // 0.13.1（F2）：按归档行里记下的同一组批次口径重建，否则改过文案的回执
   // 永远对不上（「回执正文已变化，拒绝覆盖」），原文永久不可恢复。
-  const expected = buildBatchReceipt({
+  const batchFormat = receipts[0]?.receiptFormat === RECEIPT_FORMAT_BATCH ? RECEIPT_FORMAT_BATCH : RECEIPT_FORMAT_BATCH_V2
+  const buildExpectedBatch = ({ batchThreshold = null, batchMembers = null, releaseCapped = false, runLength = null } = {}) => buildBatchReceipt({
     marker: receiptMarker,
-    formatVersion: receipts[0]?.receiptFormat === RECEIPT_FORMAT_BATCH ? RECEIPT_FORMAT_BATCH : RECEIPT_FORMAT_BATCH_V2,
+    formatVersion: batchFormat,
     // 段长取**原文写入时的值**（batchSize），不是当前恢复集合的长度——
     // 部分恢复时后者会小于原文，直接渲染必然对不上。
-    runLength: Number.isInteger(receipts[0]?.batchSize) ? receipts[0].batchSize : receipts.length,
-    batchThreshold: receipts.find((row) => Number.isInteger(row.batchThreshold))?.batchThreshold ?? null,
-    batchMembers: receipts.find((row) => Number.isInteger(row.batchMembers))?.batchMembers ?? null,
-    releaseCapped: receipts.some((row) => row.releaseCapped === true),
+    runLength: Number.isInteger(runLength)
+      ? runLength
+      : (Number.isInteger(receipts[0]?.batchSize) ? receipts[0].batchSize : receipts.length),
+    batchThreshold,
+    batchMembers,
+    releaseCapped,
     members: receipts.map(batchMemberOf),
   })
+  const rowThreshold = receipts.find((row) => Number.isInteger(row.batchThreshold))?.batchThreshold ?? null
+  const rowMembers = receipts.find((row) => Number.isInteger(row.batchMembers))?.batchMembers ?? null
+  const rowCapped = receipts.some((row) => row.releaseCapped === true)
+  const expected = buildExpectedBatch({ batchThreshold: rowThreshold, batchMembers: rowMembers, releaseCapped: rowCapped })
   const currentText = textFromContent(current.data?.content)
+  // 0.13.2-beta.3（N-06c 迁移）：旧行缺批次口径时重建只能回落成「N 个相邻操作
+  // 已合并替换」，与表面（「本批 10/10 个操作；本条回执覆盖其中相邻的 8 个」）
+  // 逐字节不同 → 整组被判「回执正文已变化」。这里从**表面回执自己**的数字反推
+  // 口径重试一次；只有逐字节相等才采用，并把反推值写回行。
+  let batchMigrated = null
+  if (currentText !== expected && batchFormat === RECEIPT_FORMAT_BATCH_V2
+    && (!Number.isInteger(rowThreshold) || !Number.isInteger(rowMembers))) {
+    const parsed = parseBatchHeaderNumbers(currentText)
+    if (parsed !== null) {
+      const retried = buildExpectedBatch({
+        batchThreshold: parsed.batchThreshold,
+        batchMembers: parsed.batchMembers,
+        releaseCapped: parsed.releaseCapped,
+        runLength: parsed.runLength ?? undefined,
+      })
+      if (retried === currentText) {
+        batchMigrated = {
+          batchThreshold: parsed.batchThreshold,
+          batchMembers: parsed.batchMembers,
+          ...(parsed.releaseCapped ? { releaseCapped: true } : {}),
+          ...(parsed.runLength ? { batchSize: parsed.runLength } : {}),
+        }
+      }
+    }
+  }
   // BUG-010：完整重建对不上时，检查表面是否仍是这条批摘要、且逐条列出了
   // 当前恢复集合里的成员（其余成员可能已被软遗忘剔除）。只恢复能核对上的
   // 成员正文；遗忘成员的内容绝不回来。对不上仍 fail-closed。
   const partial = partialTombstone || (currentText !== expected && partialBatchMatches(currentText, receipts))
-  if (currentText !== expected && !partial) return skipAll('回执正文已变化，拒绝覆盖')
+  if (currentText !== expected && batchMigrated === null && !partial) return skipAll('回执正文已变化，拒绝覆盖')
 
   // 逐成员读冷节点并核对各自 hash；任何成员失败整组跳过。
   const bodies = []
@@ -2097,7 +2239,14 @@ async function restoreBatchGroup({ session, client, receipts, onOutcome, receipt
     const reason = partial
       ? '批摘要中有成员不在本次恢复集合（已软遗忘或已清理），只恢复可见成员的原文'
       : ''
-    const restoredRows = receipts.map((receipt) => ({ ...baseOf(receipt), state: 'restored', reason, restoredSeq: restored.seq }))
+    const restoredRows = receipts.map((receipt) => ({
+      ...baseOf(receipt),
+      state: 'restored',
+      reason,
+      restoredSeq: restored.seq,
+      // 迁移痕迹随结局上抛（N-06c）：restoreAll 把它写回持久行。
+      ...(batchMigrated !== null ? { migrated: batchMigrated } : {}),
+    }))
     outcomes.push(...restoredRows)
     if (onOutcome) for (const outcome of restoredRows) await onOutcome(outcome)
   } catch (error) {

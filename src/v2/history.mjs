@@ -22,7 +22,6 @@ import {
   isHumanAuthoredMessage,
   isPluginAuthoredMessage,
   RECEIPT_FORMAT_OPERATION,
-  RECEIPT_FORMAT_SPAN,
   RECEIPT_FORMAT_SPAN_V2,
   RECEIPT_MARKER,
   V2_RECEIPT_MARKER,
@@ -426,7 +425,10 @@ export function collectHistoryCandidates(view) {
       endIndex: index,
       // BUG-001：普通历史段的归档行必须记下专用回执版本与标签，恢复侧才能按
       // buildSpanReceipt 重建同一字节。标签与回执渲染共用一份判定（作者区分）。
-      receiptFormat: RECEIPT_FORMAT_SPAN,
+      // N-06a：必须记**生产渲染器**用的格式（SPAN_V2=7）。旧实现记 SPAN=5，
+      // 而 runtime.mjs 的 receiptOf 渲染的是 format 7 → 恢复侧按 5 重建，永远对不上
+      // 「投影 / 可回读 / 命令面」那三行，于是这类行 100% restore-skipped。
+      receiptFormat: RECEIPT_FORMAT_SPAN_V2,
       spanLabel: pluginAuthored ? '插件工作资料' : spanLabelOf(kind),
       spanKind: kind,
       body,

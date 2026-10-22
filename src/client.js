@@ -864,6 +864,14 @@ window.__ModuleLoader__.load({
     function settingsValueOf(entry) {
       var source = entry && typeof entry === 'object' ? entry : {};
       var inner = source.settings && typeof source.settings === 'object' ? source.settings : source;
+      // N-08a：宿主把 `.volatile()` 字段以**引用对象**交出（只有 get()），直接读属性
+      // 一律 undefined → 每个字段都回落到硬编码兜底值。于是设置页显示的是默认值，
+      // 「改了的那一项」看起来自己跳回；而保存写回的也是这份兜底值，会把用户改过的
+      // 其它项静默抹掉。读取侧与保存侧都走本函数，解引用一次即可两边同时修好。
+      if (inner != null && typeof inner.get === 'function') {
+        var unwrapped = inner.get();
+        if (unwrapped && typeof unwrapped === 'object') inner = unwrapped;
+      }
       // 兜底字面量与 src/core.mjs 的 DEFAULT_SETTINGS 对齐（独立 bundle 无法 import
       // 后端模块，由 config-contract 测试守卫防止两处漂移）：retain=5，batch=10。
       return {

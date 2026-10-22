@@ -268,7 +268,10 @@ export function createV2Runtime(dependencies) {
         tokens: candidate.originalTokens,
         chunks: candidate.chunkCount ?? 1,
         marker,
-        formatVersion: RECEIPT_FORMAT_SPAN_V2,
+        // N-06a：格式以**候选自己携带的值**为唯一真源——候选是归档行的来源，
+        // 渲染器另写一个常量就是两份清单，一旦漂移，恢复侧按行内版本重建的正文
+        // 与表面逐字节不同，这类回执全部不可恢复（真实会话 58/60）。
+        formatVersion: Number.isInteger(candidate.receiptFormat) ? candidate.receiptFormat : RECEIPT_FORMAT_SPAN_V2,
         releasedTokens: candidate.originalTokens,
         errorLine: candidate.firstErrorLine ?? null,
       })),

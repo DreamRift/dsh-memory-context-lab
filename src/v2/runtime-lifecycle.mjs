@@ -30,6 +30,7 @@ import { copyFile, mkdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 
 import { V2_RECEIPT_MARKER, normalizeSettings, restoreGrowth } from '../core.mjs'
+import { describeRestoreSkipReasons } from '../apply.mjs'
 import { EngineV2Error } from './errors.mjs'
 import { createCostLedger } from './cost.mjs'
 import { readRecordById } from './readback.mjs'
@@ -470,7 +471,11 @@ export function createLifecycleDomain({
           // 停用后冷库按只读保留，旧记录 ID 仍可回读，但不能宣称「全部恢复」。
           const stillSkipped = outcome?.stillSkipped ?? 0
           if (stillSkipped > 0) {
-            lines.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过，原因见上）：它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
+            // N-07：回执必须**给出原因**。旧文案「原因见上」的上面什么都没有，
+            // 用户唯一能看到的解释是一句空指向——这正是「恢复不完全是什么情况」
+            // 必须来问人的原因。
+            const why = describeRestoreSkipReasons(outcome?.skippedReasons)
+            lines.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过）${why ? `，原因：${why}` : '（原因未取得，可 /memory-lab status 复核）。'}它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
           }
           // P2：软遗忘的行不会随 off 恢复（可见性由 disposition 账本持有，
           // 与引擎开关解耦）；停用回执必须如实披露这段「不在恢复范围内」。

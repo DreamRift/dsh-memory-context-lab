@@ -791,6 +791,15 @@ export function createEngine(dependencies) {
           locators: Array.isArray(outcome.locators) ? [...outcome.locators] : [],
           statuses: Array.isArray(outcome.statuses) ? [...outcome.statuses] : [],
           receiptFormat: Number.isInteger(outcome.receiptFormat) ? outcome.receiptFormat : undefined,
+          // N-06b：span 行必须落标签，否则恢复侧只能回落成「历史片段」，而表面写的是
+          // 「片段：用户消息」——重建正文逐字节不同，于是被误报成「回执正文已变化」。
+          ...(typeof outcome.spanLabel === 'string' && outcome.spanLabel ? { spanLabel: outcome.spanLabel } : {}),
+          // N-06c：批次口径三个字段同样必须落盘（commitSurfaceRun 已经算出来了，
+          // 只是没进 outcome → 没进行）。缺了它们，恢复侧只能回落成「8 个相邻操作
+          // 已合并替换」，而表面写的是「本批 10/10 个操作」。
+          ...(Number.isInteger(outcome.batchThreshold) ? { batchThreshold: outcome.batchThreshold } : {}),
+          ...(Number.isInteger(outcome.batchMembers) ? { batchMembers: outcome.batchMembers } : {}),
+          ...(outcome.releaseCapped === true ? { releaseCapped: true } : {}),
           // 0.12.0：format 6/7 的投影头与 status 行要能从行内重建；读取键让
           // 「同键重读」的账在重启后仍可对账（只记键，不记正文）。
           ...(Number.isFinite(Number(outcome.releasedTokens)) ? { releasedTokens: Number(outcome.releasedTokens) } : {}),
@@ -1027,6 +1036,15 @@ export function createEngine(dependencies) {
       if (!stored) continue
       stored.status = outcome.state === 'restored' ? 'restored' : `restore-skipped: ${outcome.reason}`
       if (outcome.state === 'restored') stored.restoredSeq = outcome.restoredSeq
+      // N-06 迁移落盘：恢复时从行内信息反推出的字段写回持久行，下一次恢复
+      // 不必再走兜底候选（也让审计能看到「这一行当时缺了什么」）。
+      if (outcome.migrated && typeof outcome.migrated === 'object') {
+        for (const [key, value] of Object.entries(outcome.migrated)) {
+          if (value === undefined || value === null) continue
+          stored[key] = value
+        }
+        stored.migratedAt = new Date().toISOString()
+      }
     }
     await persist(record)
     const stillSkippedSet = new Set(restoreSkippedReceipts(record).map((row) => row.rangeStart))
@@ -1422,6 +1440,16 @@ export function createEngine(dependencies) {
       record.clientError = null
       result = await restoreAll(record)
     }
+    // N-07：逐行原因按「原因 × 段数」聚合后随结果返回。停用回执只拿到计数时
+    // 只能写「原因见上」，而上面没有原因；这里给出结构化清单，回执就能写清原因。
+    const reasonCounts = new Map()
+    for (const outcome of result.outcomes ?? []) {
+      if (!outcome || outcome.state === 'restored' || outcome.state === 'forgotten') continue
+      const reason = typeof outcome.reason === 'string' && outcome.reason !== ''
+        ? outcome.reason
+        : `跳过(${outcome.state})`
+      reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1)
+    }
     return {
       kind: 'success',
       text: formatRestoreReport(result),
@@ -1429,6 +1457,7 @@ export function createEngine(dependencies) {
       // 不该去解析人类可读文本。
       restored: result.restored,
       before: result.outcomes.length,
+      skippedReasons: [...reasonCounts.entries()].map(([reason, count]) => ({ reason, count })),
       // P0-2 观测：本次重试了多少个上次跳过的行、其中多少行仍跳过。
       retriedSkipped: result.retriedSkipped ?? 0,
       stillSkipped: result.stillSkipped ?? 0,

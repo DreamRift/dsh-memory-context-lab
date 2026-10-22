@@ -98,8 +98,14 @@ function buildConfigSchema() {
   if (!SCHEMAS) return undefined
   return SCHEMAS.object({
     defaults: SCHEMAS.object({
-      // 降温开关与批量阈值。0.13.1 起「保留最近操作」在全历史模式下失效，
-      // 因此不再暴露 retainOperations —— 它只作为引擎内部常量存在。
+      // 降温开关与批量阈值。
+      // N-08：设置页一直在编辑 retainOperations 与 fullHistory，但两者**从未声明进
+      // schema**——靠 schemastery 对未知键的宽容才活下来。一旦宿主收紧校验或走
+      // simplify() 回写，用户勾选的「全历史记忆上下文」会直接消失。这里显式声明。
+      retainOperations: SCHEMAS.natural().max(200).default(DEFAULT_SETTINGS.retainOperations)
+        .i18n({ 'zh-CN': '保留最近操作数', en: 'Retain recent operations' }),
+      fullHistory: SCHEMAS.boolean().default(false)
+        .i18n({ 'zh-CN': '全历史记忆上下文', en: 'Full-history memory context' }),
       archiveBatchSize: SCHEMAS.natural().max(200).default(DEFAULT_SETTINGS.archiveBatchSize)
         .i18n({ 'zh-CN': '归档批量阈值', en: 'Archive batch size' }),
       auto: SCHEMAS.boolean().default(true)
@@ -167,6 +173,11 @@ export async function apply(ctx, config) {
 
   function resolvePlanFirstDefault() {
     return unwrapVolatile(config?.defaults)?.planFirst === true
+  }
+
+  /** 设置页的「全历史记忆上下文」全局默认（N-08b）：新会话账本按它播种。 */
+  function resolveFullHistoryDefault() {
+    return unwrapVolatile(config?.defaults)?.fullHistory === true
   }
 
   function resolveCompressModelDefault() {
@@ -242,6 +253,9 @@ export async function apply(ctx, config) {
     sessionIdOf: (session) => sessionIdOf(session),
     recallQueryFrom,
     defaultSettings: resolveDefaultsSettings,
+    // N-08b：这条全局默认此前从未注入 → 恒走 runtime 的缺省 `() => false`，
+    // 「全历史记忆上下文」对**新会话**完全无效（设置从头到尾是个空开关）。
+    defaultFullHistory: resolveFullHistoryDefault,
     defaultCompressModel: resolveCompressModelDefault,
     defaultShareL2Content: resolveShareL2ContentDefault,
     // 宿主没有已核验的插件侧 LLM 调用契约 → 解析点恒返回 null，

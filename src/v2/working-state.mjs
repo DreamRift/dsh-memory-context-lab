@@ -2056,13 +2056,46 @@ export function renderWorkingStateCard(state, {
 
   const dropped = []
   const kept = []
-  // 0.12.0 P1-6：软段头只留「怎么装包」一句话，不再重复整条类目次序——类目次序
-  // 由 DROP_ORDER 常量定义，写进每张卡只是每步固定税。
-  const softHeader = '■ 软保留（按重要度分值降序装包，低分先丢；类目兜底次序见全量卡）'
+  // 0.12.0 P1-6：软段头只留「怎么装包」一句话。
+  // N-04：全量卡里不能写「类目兜底次序见全量卡」——它**自己就是**全量卡，而那个
+  // 次序在整条渲染路径上从未被打印过。这里去掉自指，并把 DROP_ORDER 真的印一行
+  // （8 个类目 ≈ 70 字符，只付一次）；增量卡里「见全量卡」是成立的，由增量卡头说。
+  const softHeader = '■ 软保留（按重要度分值降序装包，低分先丢）'
+  const dropOrderLine = '- 类目兜底次序（先丢 → 后丢）：' + DROP_ORDER.join(' → ')
+
+  /**
+   * N-01：把**同一软类目**的多个段合并成「一个标题 + 全部内容行」再渲染。
+   *
+   * 装包与丢弃仍按**每项一段**进行（预算、required、逐项丢弃报告都靠它），只有
+   * 渲染这一步合并——同一类目的标题在卡里只出现一次，而不是每项印一次
+   * （真实会话 seq 1053 里同一标题重复 11 次，白付 440 字符/步）。
+   * 合并按**首次出现次序**分组，装包顺序（分值降序）在视觉上不变。
+   */
+  const mergeSoftSections = (sections) => {
+    const order = []
+    const byTitle = new Map()
+    for (const item of sections) {
+      const entry = byTitle.get(item.title)
+      if (entry === undefined) {
+        const merged = { ...item, lines: [...item.lines] }
+        byTitle.set(item.title, merged)
+        order.push(merged)
+        continue
+      }
+      entry.lines.push(...item.lines)
+      // 任一项必选 → 合并段必选（required 的可见性不能被合并吃掉）。
+      if (item.required === true) entry.required = true
+      if (typeof item.importance === 'number'
+        && (typeof entry.importance !== 'number' || item.importance > entry.importance)) {
+        entry.importance = item.importance
+      }
+    }
+    return order
+  }
 
   const composeSoft = (sections) => {
     if (sections.length === 0) return ''
-    return `${softHeader}\n${renderSections(sections)}`
+    return `${softHeader}\n${dropOrderLine}\n${renderSections(mergeSoftSections(sections))}`
   }
 
   const footerFor = (droppedItems) => {
@@ -2317,6 +2350,30 @@ function boundDeltaLines(lines, { maxLines, maxChars }) {
 }
 
 const CARD_DELTA_CHANGE_TITLE = '■ 相对上一张全量卡的变化（只列变化行；未列出的行以最近一张全量卡为准）'
+/** 增量卡尾行前缀（截断说明）：它不是内容行，不能把标题「撑」成非空。 */
+const CARD_DELTA_TAIL_PREFIX = '（另有 '
+
+/**
+ * N-02：剔除「后面没有任何内容行」的段标题。
+ *
+ * 前两行（增量卡头与「相对上一张全量卡的变化」）是固定协议行，即使暂无内容行
+ * 也保留；其余以 `■ ` 开头的行是段标题，必须紧跟至少一行 `- ` 内容，
+ * 否则它只是占预算的空壳（真实会话 seq 1395 里出现过相邻两行同标题、且都是空段）。
+ */
+function pruneEmptyTitles(lines) {
+  const rows = Array.isArray(lines) ? lines : []
+  const out = []
+  for (let index = 0; index < rows.length; index += 1) {
+    const line = rows[index]
+    if (index >= 2 && line.startsWith('■ ')) {
+      const next = rows[index + 1] ?? ''
+      const hasContent = next.startsWith('- ')
+      if (!hasContent || next.startsWith(CARD_DELTA_TAIL_PREFIX)) continue
+    }
+    out.push(line)
+  }
+  return out
+}
 const CARD_DELTA_REMOVED_PREFIX = '- 已不再列出 '
 
 /**
@@ -2414,7 +2471,9 @@ export function workingStateCardDelta({ previousText, nextText } = {}) {
     for (let back = index - 1; back >= 0; back -= 1) {
       if (nextLines[back].startsWith('■ ')) { title = nextLines[back]; break }
     }
-    if (title !== null && !emittedTitle.has(title)) {
+    // N-02：新增行**本身就是段标题**时不再补标题——否则同一个标题相邻印两次
+    // （一次是上下文标题、一次是变化行本身），中间没有任何内容行。
+    if (title !== null && title !== line && !emittedTitle.has(title)) {
       out.push(title)
       emittedTitle.add(title)
     }
@@ -2424,6 +2483,10 @@ export function workingStateCardDelta({ previousText, nextText } = {}) {
   if (removedCount > 0) {
     out.push(`${CARD_DELTA_REMOVED_PREFIX}${removedCount} 行（上一张全量卡有、本步无；丢弃不等于不存在，可按记录 ID 回读）`)
   }
-  const bounded = boundDeltaLines(out, { maxLines: CARD_DELTA_MAX_LINES, maxChars: CARD_DELTA_MAX_CHARS })
-  return { text: bounded.text, addedLines: addedTotal, removedLines: removedCount, truncated: bounded.truncated }
+  // N-02：输出前剔除「后面没有任何内容行」的标题（截断也可能留下孤标题）。
+  const pruned = pruneEmptyTitles(out)
+  const bounded = boundDeltaLines(pruned, { maxLines: CARD_DELTA_MAX_LINES, maxChars: CARD_DELTA_MAX_CHARS })
+  // 截断后再剔一次：切在标题与内容之间时，末行标题不该单独留在卡里。
+  const finalLines = pruneEmptyTitles(bounded.text.split('\n'))
+  return { text: finalLines.join('\n'), addedLines: addedTotal, removedLines: removedCount, truncated: bounded.truncated }
 }

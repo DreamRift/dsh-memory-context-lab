@@ -47,7 +47,14 @@ const skip = existsSync(DOCS) && existsSync(path.join(PROJECT, 'README.md'))
   : '安装包内没有上层文档（只在开发树里跑）'
 
 const src = (rel) => readFile(path.join(SRC, rel), 'utf8')
-const doc = (rel) => readFile(path.join(PROJECT, rel), 'utf8')
+/**
+ * 读上层文档并**把 CRLF 归一成 LF**。
+ *
+ * 本守卫比对的是文档内容，不是行尾形态；而发布仓（`release/`）在 Windows 上以
+ * `core.autocrlf=true` 检出，README 是 CRLF——不归一就会让 ```text\n 这类锚点匹配失败，
+ * 于是「文档没问题」也判红（2026-10-22 在 release 自测里实测）。
+ */
+const doc = (rel) => readFile(path.join(PROJECT, rel), 'utf8').then((text) => text.replace(/\r\n/g, '\n'))
 
 function settingKeys(source) {
   const m = /export const SETTING_KEYS = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(source)
@@ -57,7 +64,9 @@ function settingKeys(source) {
 
 /** 解析 plugin/README.md 的第一个 text 代码块：子命令名与 set 键位。 */
 function readmeSurface(markdown) {
-  const block = /```text\n([\s\S]*?)```/.exec(markdown)
+  // 行尾归一：发布包里的 README 可能是 CRLF（见 `doc` 的注释）。
+  const text = String(markdown).replace(/\r\n/g, '\n')
+  const block = /```text\n([\s\S]*?)```/.exec(text)
   assert.ok(block, 'plugin/README.md 必须仍有一个 text 代码块列出命令（本守卫依赖该形态）')
   const ops = new Set()
   const keys = new Set()

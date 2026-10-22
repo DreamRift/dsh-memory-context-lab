@@ -17,6 +17,7 @@
  * 那个开关点下去会被回「未知设置项」，而提示里列出的键位又不含它。
  */
 import { NUMERIC_SETTINGS, normalizeSettings, restoreGrowth } from '../core.mjs'
+import { describeRestoreSkipReasons } from '../apply.mjs'
 import { writeV2SessionState } from './state.mjs'
 
 /**
@@ -146,7 +147,12 @@ export function createSettingsDomain({
             const before = outcome?.before ?? 0
             if (before > 0) restoreNotes.push(`已恢复 ${restored}/${before} 段原文。`)
             const stillSkipped = outcome?.stillSkipped ?? 0
-            if (stillSkipped > 0) restoreNotes.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过，原因见逐条结局）：它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
+            if (stillSkipped > 0) {
+              // N-07：同 `off` 回执——「原因见逐条结局」而本回执并没有逐条结局，
+              // 等于把原因丢掉。这里给出「原因 × 段数」的聚合清单。
+              const why = describeRestoreSkipReasons(outcome?.skippedReasons)
+              restoreNotes.push(`仍有 ${stillSkipped} 段原文未恢复（restore 跳过）${why ? `，原因：${why}` : '（原因未取得，可 /memory-lab status 复核）。'}它们的正文仍在冷库里，历史与载荷按只读保留，旧记录 ID 仍可回读。`)
+            }
           } catch (error) {
             restoreNotes.push(`恢复未完成：${error instanceof Error ? error.message : String(error)}；` +
               '可稍后用 /memory-lab restore 重试（历史按只读保留，旧记录 ID 仍可回读）。')

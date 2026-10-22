@@ -375,6 +375,66 @@ const CASES = {
       'export function estimateTokensOfBytes(bytes) {\n  if (Number.isFinite(bytes)) return Math.max(1, Math.ceil(bytes / 100000)) // 修复前口径：把字节当文本再编码\n  // eslint-disable-next-line no-unreachable',
     ]],
   },
+  // ── 0.13.2-beta.3（第 2 轮真机排查 N-01…N-08）────────────────────────────
+  // N-05：清扫判据必须与 mtimeMs 同精度（改回直接比较必红）
+  'lock-sweep-clock-precision': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/v2/write-lock.mjs',
+    edits: [['    if (!(Math.floor(info.mtimeMs) <= Math.floor(beforeMs))) continue', '    if (!(info.mtimeMs <= beforeMs)) continue']],
+  },
+  // N-06a：span 候选必须记生产渲染格式 7（改回 5 必红）
+  'span-receipt-format': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/v2/history.mjs',
+    edits: [['      receiptFormat: RECEIPT_FORMAT_SPAN_V2,', '      receiptFormat: 5,']],
+  },
+  // N-06b：归档行必须落 spanLabel（不落 → 恢复只能回落成「历史片段」）
+  'span-label-row': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/apply-engine.mjs',
+    edits: [["          ...(typeof outcome.spanLabel === 'string' && outcome.spanLabel ? { spanLabel: outcome.spanLabel } : {}),\n", '']],
+  },
+  // N-06c：归档行必须落批次口径（不落 → 批次头只能回落成「N 个相邻操作已合并替换」）
+  'batch-fields-row': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/apply-engine.mjs',
+    edits: [["          ...(Number.isInteger(outcome.batchThreshold) ? { batchThreshold: outcome.batchThreshold } : {}),\n          ...(Number.isInteger(outcome.batchMembers) ? { batchMembers: outcome.batchMembers } : {}),\n", '']],
+  },
+  // N-06 迁移：缺标签时按 spanKind 反推（去掉这条候选 → 旧行永远恢复不了）
+  'span-label-migration': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/apply.mjs',
+    edits: [['      if (spanKind !== null) labels.push(spanLabelOf(spanKind))\n', '']],
+  },
+  // N-01：同类目只在渲染时合并（改回逐项一段必红）
+  'soft-header-merge': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [['${renderSections(mergeSoftSections(sections))}', '${renderSections(sections)}']],
+  },
+  // N-02：增量卡不得留下「后面没有内容行」的标题（去掉两处裁剪必红）。
+  // 诚实边界：N-02 由「不重复补标题」与「裁剪空标题」两层共同保证，单独还原任一层
+  // 都会被另一层遮住（不可观测），所以这里按**整条修复**还原。
+  'delta-title-dup': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [
+      ['  const pruned = pruneEmptyTitles(out)', '  const pruned = out'],
+      ['  const finalLines = pruneEmptyTitles(bounded.text.split(\'\\n\'))', "  const finalLines = bounded.text.split('\\n')"],
+    ],
+  },
+  // N-04：全量卡不得自指「见全量卡」（改回旧段头必红）
+  'drop-order-selfref': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [["  const softHeader = '■ 软保留（按重要度分值降序装包，低分先丢）'", "  const softHeader = '■ 软保留（按重要度分值降序装包，低分先丢；类目兜底次序见全量卡）'"]],
+  },
+  // N-07：停用回执必须给出跳过原因（改回「原因见上」必红）
+  'restore-skip-reason': {
+    test: 'test/v2-beta3-regressions.test.mjs',
+    file: 'src/v2/runtime-lifecycle.mjs',
+    edits: [['            const why = describeRestoreSkipReasons(outcome?.skippedReasons)', "            const why = '' // 修复前：原因见上"]],
+  },
 }
 
 /**

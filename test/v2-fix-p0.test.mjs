@@ -14,7 +14,7 @@ import path from 'node:path'
 import { FakeSession, FakeColdStore, fakeMeter, operation } from './helpers/fake-host.mjs'
 import { createV2Runtime } from '../src/v2/runtime.mjs'
 import { readV2SessionState } from '../src/v2/state.mjs'
-import { RECEIPT_FORMAT_SPAN, RECEIPT_FORMAT_VERSION, buildSpanReceipt, V2_RECEIPT_MARKER } from '../src/core.mjs'
+import { RECEIPT_FORMAT_SPAN, RECEIPT_FORMAT_SPAN_V2, RECEIPT_FORMAT_VERSION, buildSpanReceipt, V2_RECEIPT_MARKER } from '../src/core.mjs'
 import { applyOperations, planCooling, restoreReceipts } from '../src/apply.mjs'
 import { bodyOfSpan, collectHistoryCandidates, spanLabelOf } from '../src/v2/history.mjs'
 import { evaluateForgetProtection, resolveForgetTargets } from '../src/v2/disposition.mjs'
@@ -166,7 +166,11 @@ test('BUG-001: archived v2 span restores byte-identically via span receipt forma
     })
     const candidate = view.candidates.find((row) => row.spanKind !== 'operation')
     assert.ok(candidate)
-    assert.equal(candidate.receiptFormat, RECEIPT_FORMAT_SPAN)
+    // N-06a（0.13.2-beta.3）：候选必须记**生产渲染器**用的格式（SPAN_V2=7）。
+    // 旧断言写的是 SPAN=5，与 runtime.receiptOf 实际渲染的 7 不一致——夹具用同一个
+    // 常量替被测代码做了决定，于是测试里 round-trip 恒真、生产里恒假（真实会话
+    // 58/60 段因此不可恢复）。
+    assert.equal(candidate.receiptFormat, RECEIPT_FORMAT_SPAN_V2)
     assert.equal(candidate.spanLabel, spanLabelOf(candidate.spanKind))
 
     const plan = planCooling({
@@ -177,6 +181,7 @@ test('BUG-001: archived v2 span restores byte-identically via span receipt forma
       batchSize: 1,
       minNetReleaseTokens: 1,
       receiptMarker: V2_RECEIPT_MARKER,
+      // 与生产 runtime.receiptOf 同口径：格式取**候选自己携带的值**。
       receiptOf: (row, { nodeId, hash, marker }) => buildSpanReceipt({
         label: row.spanLabel,
         range: { start: row.rangeStart, end: row.rangeEnd },
@@ -186,6 +191,7 @@ test('BUG-001: archived v2 span restores byte-identically via span receipt forma
         tokens: row.originalTokens,
         chunks: row.chunkCount ?? 1,
         marker,
+        formatVersion: row.receiptFormat,
       }),
     })
     assert.equal(plan.units.length, 1, JSON.stringify(plan.rejected))
@@ -201,7 +207,7 @@ test('BUG-001: archived v2 span restores byte-identically via span receipt forma
       receiptMarker: V2_RECEIPT_MARKER,
     })
     assert.equal(outcomes[0].state, 'applied', outcomes[0].reason)
-    assert.equal(outcomes[0].receiptFormat, RECEIPT_FORMAT_SPAN)
+    assert.equal(outcomes[0].receiptFormat, RECEIPT_FORMAT_SPAN_V2)
 
     const restored = await restoreReceipts({
       session,
