@@ -16,7 +16,7 @@
  * 之前错误提示是**手写的字符串**，删 v1 命令面时漏了 `autorestore`，于是面板
  * 那个开关点下去会被回「未知设置项」，而提示里列出的键位又不含它。
  */
-import { NUMERIC_SETTINGS, normalizeSettings, restoreGrowth } from '../core.mjs'
+import { NUMERIC_SETTINGS, normalizeSettings, parseStrictInteger, restoreGrowth } from '../core.mjs'
 import { describeRestoreSkipReasons } from '../apply.mjs'
 import { writeV2SessionState } from './state.mjs'
 
@@ -49,6 +49,9 @@ export function createSettingsDomain({
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
     const [key, rawValue] = args
     const settings = record.state.settings
+    // N-10（beta.4）：回执里照抄的必须是**落盘的那个值**（以前照抄原始字符串：
+    // 12.7 被写成 12，回执却回「已设置 batch=12.7」）。
+    let echo = rawValue
     if (key === 'auto' || key === 'recall') {
       const target = key === 'auto' ? 'auto' : 'autoRecall'
       if (rawValue !== 'on' && rawValue !== 'off') {
@@ -65,35 +68,44 @@ export function createSettingsDomain({
       settings.autoRestore = rawValue === 'on'
     } else if (key === 'batch' || key === 'retain') {
       const target = key === 'batch' ? 'archiveBatchSize' : 'retainOperations'
-      const value = Number.parseInt(rawValue ?? '', 10)
-      if (!Number.isInteger(value) || value < 1 || value > NUMERIC_SETTINGS[key].max) {
-        return { kind: 'error', text: `用法：\`/memory-lab set ${key} <1..${NUMERIC_SETTINGS[key].max} 的整数>\`` }
+      // N-10（beta.4）：严格十进制整数，下界取 core 的同一份 spec——retain 的 0
+      // 是合法值（不保留最近操作，全量立即进归档），命令面曾把它当错误拒掉。
+      const value = parseStrictInteger(rawValue)
+      if (value === null || value < NUMERIC_SETTINGS[key].min || value > NUMERIC_SETTINGS[key].max) {
+        return {
+          kind: 'error',
+          text: `用法：\`/memory-lab set ${key} <${NUMERIC_SETTINGS[key].min}..${NUMERIC_SETTINGS[key].max} 的整数>\`（不接受小数、指数或非数字）`,
+        }
       }
       settings[target] = value
+      echo = String(value)
     } else if (key === 'readlease') {
       // 0.12.0 P0-3：读取租约长度（0 = 关闭）。0 必须可用——它是「退回旧行为」的
       // 唯一入口；上界与 NUMERIC_SETTINGS.readlease 一致（50），越界不静默夹取。
-      const value = Number.parseInt(rawValue ?? '', 10)
-      if (!Number.isInteger(value) || value < 0 || value > 50) {
-        return { kind: 'error', text: '用法：`/memory-lab set readlease <0..50 的整数>`（0 = 关闭读取租约）' }
+      const value = parseStrictInteger(rawValue)
+      if (value === null || value < NUMERIC_SETTINGS.readlease.min || value > NUMERIC_SETTINGS.readlease.max) {
+        return { kind: 'error', text: '用法：`/memory-lab set readlease <0..50 的整数>`（0 = 关闭读取租约；不接受小数或非数字）' }
       }
       settings.retainReads = value
+      echo = String(value)
     } else if (key === 'protect') {
       // 软保护预算（估算 token）：0 = 只保留硬保护。上界与 NUMERIC_SETTINGS.protect
       // 一致（2,000,000），越界不静默夹取。
-      const value = Number.parseInt(rawValue ?? '', 10)
-      if (!Number.isInteger(value) || value < 0 || value > 2_000_000) {
-        return { kind: 'error', text: '用法：`/memory-lab set protect <0..2000000 的整数>`（软保护预算，估算 token）' }
+      const value = parseStrictInteger(rawValue)
+      if (value === null || value < NUMERIC_SETTINGS.protect.min || value > NUMERIC_SETTINGS.protect.max) {
+        return { kind: 'error', text: '用法：`/memory-lab set protect <0..2000000 的整数>`（软保护预算，估算 token；不接受小数或指数）' }
       }
       settings.protectBudgetTokens = value
+      echo = String(value)
     } else if (key === 'pressure') {
       // 0.13.0 压力闸门：0 = 无压力也降温（旧行为），1..95 = 占用率达到该百分比才归档。
       // 0 必须可用——它是「退回旧行为」的唯一入口。
-      const value = Number.parseInt(rawValue ?? '', 10)
-      if (!Number.isInteger(value) || value < 0 || value > 95) {
-        return { kind: 'error', text: '用法：`/memory-lab set pressure <0..95 的整数>`（0 = 无压力也降温）' }
+      const value = parseStrictInteger(rawValue)
+      if (value === null || value < NUMERIC_SETTINGS.pressure.min || value > NUMERIC_SETTINGS.pressure.max) {
+        return { kind: 'error', text: '用法：`/memory-lab set pressure <0..95 的整数>`（0 = 无压力也降温；不接受小数或非数字）' }
       }
       settings.pressureGate = value
+      echo = String(value)
       // 改阈值即重置滞回状态：否则旧状态会让新阈值的第一步按旧窗口裁决。
       record.state.pressureCoolingOn = false
       record.state.pressureSamples = []
@@ -228,7 +240,7 @@ export function createSettingsDomain({
     record.state.settings = normalizeSettings(settings)
     // 设置必须落盘：只改内存会让「设置成功」在重启后失效，而 v1 的 set 是持久的。
     await writeV2SessionState(record.directory, record.state)
-    return { kind: 'success', text: `已设置 ${key}=${rawValue}（写入 v2 账本，重启后仍生效）。` }
+    return { kind: 'success', text: `已设置 ${key}=${echo}（写入 v2 账本，重启后仍生效）。` }
   }
 
   return {

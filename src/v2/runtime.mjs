@@ -76,7 +76,7 @@ export const V2_HELP = [
   '/memory-lab read <记录ID...>   按稳定 ID 精确回读原文（可多个，逗号或空格分隔）',
   '/memory-lab recall <查询词>    字面检索（ID/kind/工具名/callId/范围）；只读，不返回分数',
   '/memory-lab recall id <记录ID...> [预算]   与模型可见只读工具同一条路径的精确回读',
-  '/memory-lab history [页大小] [记录ID之后]   分页列出已落库记录（只读，不含正文）',
+  '/memory-lab history [页大小 1..2000] [记录ID之后]  分页列出已落库记录（只读，不含正文）',
   '/memory-lab working-set [token预算]         按预算装包当前工作集（含在途配对与显式 ID）',
   '/memory-lab card [token预算]   渲染有界工作状态卡（就是注入主模型的那份文本）',
   '/memory-lab index [sync]       语义检索后端的增量索引状态/同步（未注入后端时如实报告）',
@@ -115,6 +115,8 @@ export const V2_HELP = [
   '全历史记忆上下文（set fullhistory on）：除系统头、人类消息、凭证、计划工件外全部退热；',
   '「保留最近操作」随之失效（面板变灰），保留由证据保护层裁决。',
   '读取租约（set readlease N）：最近 N 个含读取结果的操作保留 M=2N 步（0=关闭），是带 TTL 的租约。',
+  '停用时恢复原文（set autorestore on|off）：off = 停用只关引擎、原文留在冷库；',
+  '  窗口守卫照常生效（它保护模型窗口，与这个开关无关）。恢复用 restore 或先 on 再 restore。',
   '软保护预算（set protect N）：活跃证据保护层每轮可用的估算 token 上界，0 = 只保留硬保护。',
 ].join('\n')
 

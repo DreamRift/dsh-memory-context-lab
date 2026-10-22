@@ -522,8 +522,15 @@ test('v2 设置：set 写入账本，进程重启后接管仍生效；非法取�
     const set = await run(first, agentA, 'set batch 9')
     assert.equal(set.kind, 'success')
     // 非法取值不得静默写成 NaN / 0。
-    const bad = await run(first, agentA, 'set retain 0')
-    assert.equal(bad.kind, 'error')
+    // N-10（0.13.2-beta.4）：retain 的**下界是 0**（schema natural().max(200) 与设置页
+    // clampInt(…, 0, 200, 5) 都允许 0 = 不保留最近操作，全量立即进归档）。这条旧断言
+    // 把合法值当错误，正是三个入口三个取值域的那处缺陷；越界仍必须显式拒绝。
+    const zero = await run(first, agentA, 'set retain 0')
+    assert.equal(zero.kind, 'success', 'retain 0 是合法值（与 schema 同域）')
+    const bad = await run(first, agentA, 'set retain 201')
+    assert.equal(bad.kind, 'error', '越界必须显式拒绝')
+    const fractional = await run(first, agentA, 'set batch 12.7')
+    assert.equal(fractional.kind, 'error', '小数必须显式拒绝，不得静默截断')
     const unknown = await run(first, agentA, 'set nope 1')
     assert.equal(unknown.kind, 'error')
     await first._dispose()

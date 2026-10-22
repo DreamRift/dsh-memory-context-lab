@@ -449,6 +449,28 @@ export function parseNumericSetting(raw, spec) {
   return value
 }
 
+/**
+ * 严格十进制整数（N-10，0.13.2-beta.4）。
+ *
+ * `Number.parseInt` 会把 12.7 截成 12、把 1e6 读成 1、把 10abc 当成 10——用户
+ * 要的值、落盘的值与回执里照抄的值三者不一致。项目自己的规矩是「0/负数/小数/
+ * 字符串/NaN 都不接受，不静默换值」（见 v2/budget.mjs 的 parseBudgetTokens），
+ * 面板的 parseCount 也明确拒绝小数；命令面必须是同一把尺子。
+ *
+ * 只认 /^\d+$/：前后空格允许，正负号、小数点、指数、单位、其它字符一律拒绝。
+ * 返回 null 表示「不是合法整数」，调用方必须回用法错误，不得回落默认值。
+ *
+ * 与 parseNumericSetting 的分工：后者是百分比口径（接受 0.6 / 60%，Number() 也会
+ * 接受指数写法），命令面的计数/预算参数一律用这个。
+ */
+export function parseStrictInteger(raw) {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return null
+  const text = String(raw).trim()
+  if (!/^\d+$/.test(text)) return null
+  const value = Number(text)
+  return Number.isSafeInteger(value) ? value : null
+}
+
 /** Render a 0-1 fraction as a percentage for humans. */
 export function formatRatio(value) {
   return typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(0)}%` : '未设置'

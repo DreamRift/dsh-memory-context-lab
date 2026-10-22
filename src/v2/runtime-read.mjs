@@ -25,7 +25,7 @@ import { formatRange, renderReadResults, renderV2Status } from './runtime-render
 import { readV2SessionState } from './state.mjs'
 import { V2SessionStore } from './store.mjs'
 import { parseRecordId } from './records.mjs'
-import { readRecordById, listRecordsPage, packWorkingSet } from './readback.mjs'
+import { MAX_PAGE_SIZE, readRecordById, listRecordsPage, packWorkingSet, resolvePageSize } from './readback.mjs'
 import { resolveReadTargets } from './identity-index.mjs'
 import { nodeUnitBase } from './disposition.mjs'
 import { estimateTokensOf, estimateTokensOfBytes, WORKING_SET_MAX_BUDGET_TOKENS } from './budget.mjs'
@@ -36,6 +36,9 @@ import { readRetrievalIndex, describeRecordRelations } from './retrieval.mjs'
 import { getForgetIndex } from './disposition.mjs'
 import { syncVerification, checkRecords, markRecordsStale, annotateStale } from './verification.mjs'
 import { WORKING_SET_DEFAULTS } from './working-state.mjs'
+
+/** `/memory-lab history` 未给每页条数时的默认值（原语层的默认是 200，命令面更小）。 */
+const HISTORY_DEFAULT_PAGE_SIZE = 20
 
 /**
  * 别名回读（0.10.1 S2a/S2b）：把回执/工具面可见的 nodeId（基名/分块名）与 callId
@@ -334,11 +337,25 @@ export function createReadDomain({
     return { kind: 'success', text: renderReadResults(results) }
   }
 
-  async function history(invocation, args) {    const sessionId = sessionIdOf(invocation.agent.session)
-    const pageSize = Number.parseInt(args[0] ?? '', 10)
+  async function history(invocation, args) {
+    const sessionId = sessionIdOf(invocation.agent.session)
+    // R-02（beta.4）：页码与 /memory-lab set 的数字键同一把尺子——严格十进制整数。
+    // 以前是 Number.parseInt（3.7 读成 3、3abc 读成 3）：用户以为换了页，实际拿到
+    // 的是被悄悄改过的页码。给了参数但不合法就回用法错误，不回落默认值。
     const afterId = args[1] ?? null
+    // O-01（0.13.2-beta.5）：每页条数走 readback 的**同一把尺子**，上下界都显式判——
+    // 旧实现下界报错、上界静默夹到 2000，用户不知道自己要的数字被改过。项目规矩
+    // 见 budget.mjs 的 parseBudgetTokens：「超过上限必须显式报错」。
+    const sizePlan = resolvePageSize(args[0], { fallback: HISTORY_DEFAULT_PAGE_SIZE })
+    if (!sizePlan.ok) {
+      return {
+        kind: 'error',
+        text: `${sizePlan.error}\n用法：\`/memory-lab history [每页条数（1..${MAX_PAGE_SIZE} 的整数）] [起始记录 ID]\``,
+      }
+    }
+    const pageSize = sizePlan.value
     const page = await withReadableStore(sessionId, (store) => listRecordsPage(labRoot, sessionId, {
-      pageSize: Number.isInteger(pageSize) && pageSize > 0 ? pageSize : 20,
+      pageSize,
       afterId,
       store,
     }))
@@ -363,7 +380,7 @@ export function createReadDomain({
         : ''
       return `${entry.id}  ${entry.kind}  保真=${entry.fidelity}${range}${tools}${extra}`
     })
-    lines.push(`共 ${page.total} 条；本页 ${page.entries.length} 条`
+    lines.push(`共 ${page.total} 条；本页 ${page.entries.length} 条（每页 ${page.pageSize} 条）`
       + (page.hasNextPage ? `；下一页从 ${page.nextAfter} 之后开始` : '；已到末页'))
     return { kind: 'success', text: lines.join('\n') }
   }

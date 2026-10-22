@@ -431,6 +431,9 @@ export function createLifecycleDomain({
     let restored = 0
     let before = 0
     let windowGuardRefusal = null
+    // Q-01：两个值在 `if (record)` 内算出、在回执首行（块外）还要用，故提到顶层。
+    let autoRestore = true
+    let pendingCount = 0
 
     if (record) {
       // 0) 窗口守卫（rc.5，与 v1 normalizeAndStop 同口径）：恢复会让组装输入
@@ -438,11 +441,20 @@ export function createLifecycleDomain({
       // 「无测量不设闸」——测量不可用时照常恢复（与 v1 一致），不静默扣留。
       // P0-2：restore-skipped 的行同样「原文只在冷库」，停用前同样要走窗口守卫，
       // 否则跳过行在恢复时突然全部回来会击穿模型窗口。
-      const pendingCount = engine.pendingReceipts(record).length + engine.restoreSkippedReceipts(record).length
-      if (pendingCount > 0 && engine.settingsOf(record).autoRestore) {
+      //
+      // Q-01（0.13.2-beta.5）：`autoRestore` 只决定**要不要恢复**，不决定要不要做
+      // 窗口守卫。旧实现把两者并进同一个条件，于是关掉「停用时恢复原文」时守卫被
+      // 一起关掉、恢复却照做——这个开关的实际作用与字面意思相反（按回执指引操作
+      // 反而更容易顶穿模型窗口）。守卫保护的是模型窗口，不是恢复策略。
+      const settings = engine.settingsOf(record)
+      // 缺失视为开（与 normalizeSettings 的默认一致）：旧账本没有这个字段时按默认恢复。
+      autoRestore = settings?.autoRestore !== false
+      const pendingRows = [...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)]
+      pendingCount = pendingRows.length
+      if (pendingCount > 0) {
         try {
           const occupancy = await engine.measureOccupancy(record, undefined)
-          const growth = restoreGrowth([...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)], {
+          const growth = restoreGrowth(pendingRows, {
             assembledTokens: occupancy.host.assembledTokens,
             contextWindow: occupancy.host.contextWindow,
           })
@@ -459,8 +471,24 @@ export function createLifecycleDomain({
         }
       }
 
-      // 1) 先恢复所有已替换区间：投影回到原文，再停用。
-      if (!windowGuardRefusal) {
+      // 1) 按设置决定是否恢复（Q-01）：`autoRestore` 关时**只停用、不恢复**，
+      //    原文留在冷库并给出两条出路。文档（docs/降温模式.md 的「停止」节）一直
+      //    这么写，代码此前没照做。
+      if (!autoRestore) {
+        if (pendingCount > 0) {
+          lines.push(
+            `按设置「停用时恢复原文」为关：本次只停用、不恢复，${pendingCount} 段原文仍留在冷库里（历史与载荷按只读保留，旧记录 ID 仍可回读）。`,
+            '要取回原文：先 `/memory-lab on` 重新启用，再 `/memory-lab restore` 整批恢复；或直接丢弃冷库：`/memory-lab clean confirm delete-session`。',
+          )
+        } else {
+          lines.push('按设置「停用时恢复原文」为关：本次只停用。本会话没有待恢复的原文。')
+        }
+        // 守卫的结论照样披露：用户随后打开开关（或直接 restore）时会撞上同一个上限。
+        if (windowGuardRefusal) {
+          const growth = windowGuardRefusal.total - (windowGuardRefusal.heldByReceipts ?? 0)
+          lines.push(`注意：现在恢复会让组装输入超出模型窗口（当前约 ${windowGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${windowGuardRefusal.window}），恢复前请先缩小上下文。`)
+        }
+      } else if (!windowGuardRefusal) {
         try {
           const outcome = await engine.runRestore(record)
           restored = outcome?.restored ?? 0
@@ -508,11 +536,17 @@ export function createLifecycleDomain({
     const outcome = await disableV2Engine(labRoot, sessionId, reason)
     if (outcome.warnings?.length) lines.push(...outcome.warnings)
 
+    // 首行必须与**实际发生的事**一致（Q-01）：三种结局各有各的写法，
+    // 不得在「按设置未恢复」时照样印「恢复 N/M 段」。
     lines.unshift(
-      windowGuardRefusal
-        ? `已停用 v2 引擎，未恢复原文（窗口守卫拒绝，见下）。历史与载荷按只读保留，旧记录 ID 仍可回读。`
-        : `已停用 v2 引擎。恢复 ${restored}/${before} 段原文；`
-          + '历史与载荷按只读保留，旧记录 ID 仍可回读。',
+      !autoRestore
+        ? (pendingCount > 0
+          ? `已停用 v2 引擎，按设置未恢复原文（${pendingCount} 段仍在冷库，见下）。历史与载荷按只读保留，旧记录 ID 仍可回读。`
+          : '已停用 v2 引擎，按设置未恢复原文（本会话没有待恢复的原文）。')
+        : windowGuardRefusal
+          ? '已停用 v2 引擎，未恢复原文（窗口守卫拒绝，见下）。历史与载荷按只读保留，旧记录 ID 仍可回读。'
+          : `已停用 v2 引擎。恢复 ${restored}/${before} 段原文；`
+            + '历史与载荷按只读保留，旧记录 ID 仍可回读。',
     )
     return { kind: 'success', text: lines.join('\n'), restored, before }
   }

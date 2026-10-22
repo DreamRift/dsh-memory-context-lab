@@ -23,6 +23,7 @@ import {
   COMMAND_NAME,
   DEFAULT_SETTINGS,
   escapePromptBraces,
+  NUMERIC_SETTINGS,
   PACKAGE_NAME,
   parseOperation,
 } from './core.mjs'
@@ -102,11 +103,22 @@ function buildConfigSchema() {
       // N-08：设置页一直在编辑 retainOperations 与 fullHistory，但两者**从未声明进
       // schema**——靠 schemastery 对未知键的宽容才活下来。一旦宿主收紧校验或走
       // simplify() 回写，用户勾选的「全历史记忆上下文」会直接消失。这里显式声明。
-      retainOperations: SCHEMAS.natural().max(200).default(DEFAULT_SETTINGS.retainOperations)
+      //
+      // N-12（0.13.2-beta.5）：数字字段的**上下界只有一个真源**——core.mjs 的
+      // `NUMERIC_SETTINGS`。旧写法 `natural().max(200)` 的下界是 0，而
+      // `NUMERIC_SETTINGS.batch.min` 是 1：同一个「归档批量 = 0」在 schema 里合法、
+      // 在 normalizeSettings 里被换成 10、在命令面被拒、在设置页夹成 1——四个入口
+      // 四种结论，用户看到的三个值没有一个是自己写的。
+      // 现在两侧同域，且由 config-contract 守卫「每个数字字段的 schema 域 == NUMERIC_SETTINGS」。
+      retainOperations: SCHEMAS.natural()
+        .min(NUMERIC_SETTINGS.retain.min).max(NUMERIC_SETTINGS.retain.max)
+        .default(DEFAULT_SETTINGS.retainOperations)
         .i18n({ 'zh-CN': '保留最近操作数', en: 'Retain recent operations' }),
       fullHistory: SCHEMAS.boolean().default(false)
         .i18n({ 'zh-CN': '全历史记忆上下文', en: 'Full-history memory context' }),
-      archiveBatchSize: SCHEMAS.natural().max(200).default(DEFAULT_SETTINGS.archiveBatchSize)
+      archiveBatchSize: SCHEMAS.natural()
+        .min(NUMERIC_SETTINGS.batch.min).max(NUMERIC_SETTINGS.batch.max)
+        .default(DEFAULT_SETTINGS.archiveBatchSize)
         .i18n({ 'zh-CN': '归档批量阈值', en: 'Archive batch size' }),
       auto: SCHEMAS.boolean().default(true)
         .i18n({ 'zh-CN': '自动降温', en: 'Auto cooling' }),
@@ -114,13 +126,17 @@ function buildConfigSchema() {
         .i18n({ 'zh-CN': '命中回注', en: 'Recall on hit' }),
       autoRestore: SCHEMAS.boolean().default(true)
         .i18n({ 'zh-CN': '停用时恢复原文', en: 'Restore originals on disable' }),
-      protectBudgetTokens: SCHEMAS.natural().max(2000000).default(32768)
+      protectBudgetTokens: SCHEMAS.natural()
+        .min(NUMERIC_SETTINGS.protect.min).max(NUMERIC_SETTINGS.protect.max)
+        .default(DEFAULT_SETTINGS.protectBudgetTokens)
         .i18n({ 'zh-CN': '软保护预算（估算 token）', en: 'Soft protection budget (estimated tokens)' }),
       planFirst: SCHEMAS.boolean().default(false)
         .i18n({ 'zh-CN': '新会话计划先行', en: 'Plan first in new sessions' }),
       // 压力闸门阈值。**不进 settingFields**——它是阈值不是档位。
       // 范围与 core 的 NUMERIC_SETTINGS.pressure（0..95）同域，由 config-contract 守卫。
-      pressureGate: SCHEMAS.natural().max(95).default(DEFAULT_SETTINGS.pressureGate)
+      pressureGate: SCHEMAS.natural()
+        .min(NUMERIC_SETTINGS.pressure.min).max(NUMERIC_SETTINGS.pressure.max)
+        .default(DEFAULT_SETTINGS.pressureGate)
         .i18n({
           'zh-CN': '压力闸门阈值（占用率 %，0 = 无压力也降温）',
           en: 'Pressure gate threshold (% occupancy; 0 = no gate)',

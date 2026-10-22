@@ -320,13 +320,21 @@ window.__ModuleLoader__.load({
       return n > 0 ? Math.round(n) : 0;
     }
 
-    /** 非负整数；非法输入返回 null。 */
+    /**
+     * 严格十进制非负整数；非法输入返回 null（M-01 / R-08，0.13.2-beta.5）。
+     *
+     * 只认 `/^\d+$/`——与命令面的 `parseStrictInteger` 是**同一把尺子**。旧实现用
+     * `Number()`：`Number('')`===0、`Number('2.5')`===2.5、`Number('0x10')`===16、
+     * `Number('2e1')`===20，全都 isFinite，于是设置页成了唯一一个「把非法输入变成
+     * 另一个合法值」的入口——最危险的那一种（清空输入框 = 把阈值改成最激进的值）。
+     */
     function parseCount(text) {
       if (typeof text !== 'string') return null;
       var raw = text.trim();
       if (raw.length === 0) return null;
+      if (!/^\d+$/.test(raw)) return null;
       var value = Number(raw);
-      if (!isFinite(value) || Math.floor(value) !== value || value < 0) return null;
+      if (!isFinite(value) || Math.floor(value) !== value) return null;
       return value;
     }
 
@@ -872,25 +880,33 @@ window.__ModuleLoader__.load({
         var unwrapped = inner.get();
         if (unwrapped && typeof unwrapped === 'object') inner = unwrapped;
       }
+      // N-09（beta.4）：以 inner 为底，只覆盖认识的字段——未知/未来字段原样透传。
+      // 以前这里是白名单构造：schema 里加了字段而这里没同步，用户只要在设置页动
+      // 任何一项并保存，那个字段就被静默抹回默认值（protectBudgetTokens 与
+      // retrievalBackend 就这么丢过，而设置页根本不显示它们）。宿主用这份对象
+      // 整体替换 defaults，所以「读得到」还不够，必须「写得回」。
+      var base = inner != null && typeof inner === 'object' ? inner : {};
+      var out = {};
+      for (var key in base) {
+        if (Object.prototype.hasOwnProperty.call(base, key)) out[key] = base[key];
+      }
       // 兜底字面量与 src/core.mjs 的 DEFAULT_SETTINGS 对齐（独立 bundle 无法 import
       // 后端模块，由 config-contract 测试守卫防止两处漂移）：retain=5，batch=10。
-      return {
-        retainOperations: clampInt(inner.retainOperations, 0, 200, 5),
-        archiveBatchSize: clampInt(inner.archiveBatchSize, 1, 200, 10),
-        // 0.13.1：闸门阈值也在设置里（schema 有 default）。这里是**白名单构造**，
-        // 漏一个字段，用户保存其他设置时就会把它整块抹掉——必须与 schema 同步。
-        pressureGate: clampInt(inner.pressureGate, 0, 95, DEFAULT_PRESSURE),
-        auto: inner.auto !== false,
-        autoRecall: inner.autoRecall !== false,
-        autoRestore: inner.autoRestore !== false,
-        // 开关位：缺省 false（与投影初始值一致，避免「卡片显示开、会话显示关」）。
-        fullHistory: inner.fullHistory === true,
-        planFirst: inner.planFirst === true,
-        // 层级压缩模型模式默认（P4）：只作 v2 新账本播种值，会话内开关以命令为准。
-        compressModelDefault: inner.compressModelDefault === true,
-        // T1/F-03：层级卡共享正文摘录的全局默认（失败关闭：缺省 false）。
-        shareL2Content: inner.shareL2Content === true
-      };
+      out.retainOperations = clampInt(base.retainOperations, 0, 200, 5);
+      out.archiveBatchSize = clampInt(base.archiveBatchSize, 1, 200, 10);
+      // 0.13.1：闸门阈值也在设置里（schema 有 default）。
+      out.pressureGate = clampInt(base.pressureGate, 0, 95, DEFAULT_PRESSURE);
+      out.auto = base.auto !== false;
+      out.autoRecall = base.autoRecall !== false;
+      out.autoRestore = base.autoRestore !== false;
+      // 开关位：缺省 false（与投影初始值一致，避免「卡片显示开、会话显示关」）。
+      out.fullHistory = base.fullHistory === true;
+      out.planFirst = base.planFirst === true;
+      // 层级压缩模型模式默认（P4）：只作 v2 新账本播种值，会话内开关以命令为准。
+      out.compressModelDefault = base.compressModelDefault === true;
+      // T1/F-03：层级卡共享正文摘录的全局默认（失败关闭：缺省 false）。
+      out.shareL2Content = base.shareL2Content === true;
+      return out;
     }
 
     /** 把 Config 值收敛成卡片草稿：{ defaults }。预设已删除（0.13.1），schema 里没有 presets。 */
@@ -923,10 +939,21 @@ window.__ModuleLoader__.load({
       var pair = React.useState(String(value));
       var text = pair[0];
       var setText = pair[1];
+      // M-01（0.13.2-beta.5）：commit 与 parseCount 同一把尺子——只认 /^\d+$/。
+      // 旧实现是 Math.round(Number(text))：清空输入框被当成 0（再夹到下界，等于把
+      // 阈值改成最激进的值）、2.5 静默变 3、0x10 变 16、2e1 变 20。非法输入一律
+      // **回落原值且不提交**；越界仍按 clampInt 夹取（既有设计，不是缺陷）。
       var commit = function () {
-        var n = Math.round(Number(text));
-        if (isFinite(n)) props.onCommit(clampInt(n, min, max, value));
-        else setText(String(value));
+        var n = parseCount(text);
+        if (n === null) {
+          setText(String(value));
+          if (typeof props.onReject === 'function') props.onReject(text);
+          return;
+        }
+        var next = clampInt(n, min, max, value);
+        // 输入框显示收敛后的值：用户看到的就是落盘的那个数，不留「显示 999、存的 200」。
+        setText(String(next));
+        if (next !== value) props.onCommit(next);
       };
       return h('input', {
         className: 'mcl-input',
@@ -942,8 +969,15 @@ window.__ModuleLoader__.load({
       });
     }
 
-    function numberInputNode(value, min, max, disabled, onCommit) {
-      return h(NumberInput, { value: value, min: min, max: max, disabled: disabled, onCommit: onCommit });
+    function numberInputNode(value, min, max, disabled, onCommit, onReject) {
+      return h(NumberInput, {
+        value: value,
+        min: min,
+        max: max,
+        disabled: disabled,
+        onCommit: onCommit,
+        onReject: onReject
+      });
     }
 
     /** 开关：checkbox + 文案。 */
@@ -1066,6 +1100,16 @@ window.__ModuleLoader__.load({
 
       var discard = function () { setDraft(null); setError(''); };
 
+      /**
+       * 数字框拒绝非法输入时的提示（M-01）：旧实现静默回落原值，用户看不出自己
+       * 的输入没被接受。提示必须说清「接受了什么形态」与「值没变」。
+       */
+      var rejectCount = function (label, min, max) {
+        return function (raw) {
+          setError(label + '只接受 ' + min + '..' + max + ' 的整数（收到 "' + String(raw) + '"），已保留原值。');
+        };
+      };
+
       var wrapSet = function (updater) {
         setDraft(function (prev) {
           var base = prev || server;
@@ -1085,20 +1129,20 @@ window.__ModuleLoader__.load({
               wrapSet(function (prev) {
                 return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { retainOperations: v }) });
               });
-            }),
+            }, rejectCount('保留最近操作', 0, 200)),
             h('span', { className: 'mcl-card-hint' }, '归档批量'),
             numberInputNode(current.defaults.archiveBatchSize, 1, 200, busy, function (v) {
               wrapSet(function (prev) {
                 return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { archiveBatchSize: v }) });
               });
-            }),
+            }, rejectCount('归档批量', 1, 200)),
             // 0.13.1：闸门阈值的第二个入口（面板之外）——只坏面板时这里仍可配。
             h('span', { className: 'mcl-card-hint' }, '压力闸门 %'),
             numberInputNode(current.defaults.pressureGate, 0, 95, busy, function (v) {
               wrapSet(function (prev) {
                 return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { pressureGate: v }) });
               });
-            }),
+            }, rejectCount('压力闸门', 0, 95)),
             checkNode(current.defaults.auto, '自动降温', busy, function (v) {
               wrapSet(function (prev) {
                 return Object.assign({}, prev, { defaults: Object.assign({}, prev.defaults, { auto: v }) });

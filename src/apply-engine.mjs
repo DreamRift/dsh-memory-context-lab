@@ -1517,7 +1517,8 @@ export function createEngine(dependencies) {
       `上下文降温：已启用（session=${record.sessionId}）`,
       `保留最近操作：${settings.retainOperations} 个（唯一触发线，一直生效）`,
       `归档节奏：保留窗口外攒够 ${settings.archiveBatchSize} 个操作提交一批`,
-      `自动降温：${settings.auto ? '开' : '关'}；自动回注：${settings.autoRecall ? '开' : '关'}`,
+      // R-03：三个开关都在面板上，状态行必须三个都印（autoRestore 决定停用时是否恢复原文）。
+      `自动降温：${settings.auto ? '开' : '关'}；自动回注：${settings.autoRecall ? '开' : '关'}；自动恢复：${settings.autoRestore ? '开' : '关'}`,
       // verify-failed 单列：它与 applied 一样遮蔽了原文（原文只在冷库），
       // 并进「已归档操作」会把校验未通过的段数虚报成成功归档。
       `已归档操作：${pending.length - verifyFailed} 个${verifyFailed ? `；校验未通过 ${verifyFailed} 个（原文只在冷库，可 restore 取回）` : ''}；已恢复：${restored} 个`,

@@ -4,6 +4,7 @@ import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { BYTES_PER_TOKEN } from './budget.mjs'
 import { readForkMap } from './fork.mjs'
 import { RECORD_KINDS } from './records.mjs'
+import { parseStrictInteger } from '../core.mjs'
 
 /**
  * 默认附带载荷的记录种类。
@@ -38,6 +39,16 @@ function estimateTokens(bytes) {
  */
 export async function readRecordById(labRoot, sessionId, id, { verifyHash = true, store: borrowed = null, maxBytes = null } = {}) {
   const store = borrowed ?? await V2SessionStore.open({ labRoot, sessionId, readOnly: true })
+  // P-01（0.13.2-beta.5）：`open()` 的契约是「从未初始化过返回 null」。旧实现在
+  // finally 里直接 `store.close()`，于是边界上抛的是一条内部 TypeError，
+  // **盖住**了本该走到的「没有库」分支。这里如实抛业务错误（带 code），
+  // 与 runtime-read 的 withReadableStore 同一种「没有库」语义。
+  if (!store) {
+    throw new EngineV2Error(`本会话没有 v2 库（从未启用），无法回读记录 ${id}。`, {
+      code: 'ENOSTORE',
+      details: { id, sessionId },
+    })
+  }
   try {
     // 主动遗忘守卫：遗忘记录不再按 ID 回读正文。账本是唯一权威；损坏的账本
     // 仍按已解析前缀过滤（读侧不因旁车损坏而硬失败），损坏披露由状态面负责。
@@ -82,7 +93,7 @@ export async function readRecordById(labRoot, sessionId, id, { verifyHash = true
     return { ...loaded, verified }
   } finally {
     // 借来的句柄由出借方关闭：同一会话目录在本进程内只允许一个句柄。
-    if (!borrowed) store.close()
+    if (!borrowed && store) store.close()
   }
 }
 
@@ -118,13 +129,51 @@ async function resolveViaForkMap(labRoot, sessionId, id) {
   return typeof mapped === 'string' ? mapped : null
 }
 
+/** 每页条数的上界（`listRecordsPage` 与 `/memory-lab history` 共用这一份）。 */
+export const MAX_PAGE_SIZE = 2000
+
+/**
+ * 每页条数的**单一尺子**（O-01，0.13.2-beta.5）。
+ *
+ * 旧实现是 `Math.min(Math.max(Number(pageSize) || 200, 1), 2000)`——静默夹取，
+ * 于是 `history 999999` 得到 2000 条，回执却只说「本页 N 条」，用户永远不知道
+ * 自己要的数字被改过。项目自己的规矩写在 `budget.mjs` 的 `parseBudgetTokens` 里：
+ * **超过上限必须显式报错；夹到上限会让调用方以为自己的参数生效了**。
+ *
+ * 这里同样只认严格十进制整数：小数、指数、非数字一律拒绝，不回落默认值。
+ * 调用方拿到 `ok:false` 必须回用法错误，不得改成「用默认值继续」。
+ */
+export function resolvePageSize(raw, { fallback = 200 } = {}) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return { ok: true, value: fallback, clamped: false }
+  const parsed = parseStrictInteger(raw)
+  if (parsed === null || parsed < 1) {
+    return {
+      ok: false,
+      error: `每页条数必须是 1..${MAX_PAGE_SIZE} 的整数（不接受小数、指数或非数字），收到 "${String(raw).trim()}"。`,
+    }
+  }
+  if (parsed > MAX_PAGE_SIZE) {
+    return {
+      ok: false,
+      error: `每页条数最多 ${MAX_PAGE_SIZE}，收到 ${parsed}。超过上限不会自动夹取——请显式给一个 ≤${MAX_PAGE_SIZE} 的值。`,
+    }
+  }
+  return { ok: true, value: parsed, clamped: false }
+}
+
 /**
  * 稳定 ID 全序分页。afterId 传上一页 nextAfter；返回空页即翻完。
- * pageSize 截断在 [1, 2000]。
+ * pageSize 走 {@link resolvePageSize} 的同一把尺子；非法值退回默认值而不是静默夹取。
  */
 export async function listRecordsPage(labRoot, sessionId, { pageSize = 200, afterId = null, kinds = null, store: borrowed = null } = {}) {
-  const size = Math.min(Math.max(Number(pageSize) || 200, 1), 2000)
+  const sizePlan = resolvePageSize(pageSize)
+  // 原语层保持「总能翻页」的既有契约（翻页调用不因一个坏参数整条失败），但**必须披露**：
+  // 被拒的请求如实写进 `pageSizeRejected`，绝不让调用方以为自己的数字生效了。
+  // 「非法即回用法错误」的那一层是命令面（runtime-read 的 history 用同一个函数判定）。
+  const size = sizePlan.ok ? sizePlan.value : 200
   const store = borrowed ?? await V2SessionStore.open({ labRoot, sessionId, readOnly: true })
+  // P-01：没有库时返回 null（与 `open()` 契约一致），由调用方如实说明。
+  if (!store) return null
   try {
     // 遗忘记录不进列表：原始分页逐页拉取、过滤后补足一页可见条目；
     // forgottenCount 只计本页补页过程中被过滤的条数（逐页累计，非全库总数）。
@@ -168,7 +217,12 @@ export async function listRecordsPage(labRoot, sessionId, { pageSize = 200, afte
       }
       cursor = nextAfter
     }
-    return { entries: visible, pageSize: size, nextAfter: cursor, hasNextPage: cursor !== null, total: rawTotal ?? 0, forgottenCount }
+    const page = { entries: visible, pageSize: size, nextAfter: cursor, hasNextPage: cursor !== null, total: rawTotal ?? 0, forgottenCount }
+    if (!sizePlan.ok) {
+      page.pageSizeRejected = sizePlan.error
+      page.requestedPageSize = String(pageSize)
+    }
+    return page
   } finally {
     if (!borrowed) store.close()
   }
@@ -192,6 +246,8 @@ export async function packWorkingSet(labRoot, sessionId, {
   store: borrowed = null,
 } = {}) {
   const store = borrowed ?? await V2SessionStore.open({ labRoot, sessionId, readOnly: true })
+  // P-01：同上——没有库返回 null，不抛内部 TypeError。
+  if (!store) return null
   try {
     const warnings = []
     const entries = []

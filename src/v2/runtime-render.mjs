@@ -41,7 +41,10 @@ export function renderV2Status(record, extra = {}) {
     `v2 引擎：${record.state.enabled ? '已启用' : '已停用'}${record.state.fullHistory === true ? '（全历史记忆上下文）' : ''}`,
     `会话：${record.sessionId}`,
     `隔离根：${record.directory}`,
+    // R-03（beta.4）：三个开关都在面板上，状态行必须三个都印——只印 auto/recall 时，
+    // 「off 到底会不会恢复原文」用户只能去猜（autoRestore 决定停用时是否把原文放回）。
     `设置：auto=${settings.auto ? 'on' : 'off'} recall=${settings.autoRecall ? 'on' : 'off'} `
+      + `restore=${settings.autoRestore ? 'on' : 'off'} `
       + `batch=${settings.archiveBatchSize} retain=${record.state.fullHistory === true ? `${settings.retainOperations}（全历史模式下失效）` : settings.retainOperations}`,
     `账本：已归档 ${applied} 段，已恢复 ${restored} 段`
       + (verifyFailed ? `，校验未通过 ${verifyFailed} 段（原文只在冷库，可 restore 取回）` : ''),

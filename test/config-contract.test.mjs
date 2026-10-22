@@ -114,7 +114,10 @@ test('默认值单一真源：schema default、投影兜底、客户端 fallback
   // （改 core 默认时忘了同步 client.js 会让设置页显示旧值）。
   const pluginDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
   const source = readFileSync(path.join(pluginDir, 'src', 'client.js'), 'utf8')
-  const match = /archiveBatchSize:\s*clampInt\(inner\.archiveBatchSize,\s*1,\s*200,\s*(\d+)\)/.exec(source)
+  // N-09 起 settingsValueOf 以 `inner` 为底复制成 `base` 再覆盖（未知字段透传），
+  // 所以兜底字面量的宿主对象名可能是 inner 或 base——守卫只钉「哪个兜底值」，
+  // 不钉局部变量名（钉死了就会在纯重构时假红）。
+  const match = /archiveBatchSize\s*[:=]\s*clampInt\((?:inner|base)\.archiveBatchSize,\s*1,\s*200,\s*(\d+)\)/.exec(source)
   assert.ok(match, 'client.js 必须保留 archiveBatchSize 的 clampInt 兜底形态（守卫的正则与实现耦合，改动时同步）')
   assert.equal(Number(match[1]), DEFAULT_SETTINGS.archiveBatchSize,
     'client.js 兜底字面量必须与 core 的 DEFAULT_SETTINGS.archiveBatchSize 一致')

@@ -435,6 +435,105 @@ const CASES = {
     file: 'src/v2/runtime-lifecycle.mjs',
     edits: [['            const why = describeRestoreSkipReasons(outcome?.skippedReasons)', "            const why = '' // 修复前：原因见上"]],
   },
+  // ── 0.13.2-beta.4（第 3 轮真机排查 N-09 / N-10 / N-11 + R-03）──────────────
+  // N-09：设置值必须以 inner 为底透传（改回白名单构造 → schema 里的
+  // protectBudgetTokens / retrievalBackend 在保存时被静默抹掉，必红）
+  'settings-whitelist-drift': {
+    test: 'test/v2-beta4-regressions.test.mjs',
+    file: 'src/client.js',
+    edits: [['      for (var key in base) {\n        if (Object.prototype.hasOwnProperty.call(base, key)) out[key] = base[key];\n      }\n', '']],
+  },
+  // N-10：数字参数必须严格十进制整数（改回 parseInt → 12.7 被截成 12、1e6 被读成 1，必红）
+  'set-parseint-truncation': {
+    test: 'test/v2-beta4-regressions.test.mjs',
+    file: 'src/core.mjs',
+    edits: [['  const text = String(raw).trim()\n  if (!/^\\d+$/.test(text)) return null\n  const value = Number(text)\n  return Number.isSafeInteger(value) ? value : null', "  const value = Number.parseInt(String(raw ?? ''), 10)\n  return Number.isFinite(value) ? value : null"]],
+  },
+  // N-10 下界：retain 的 0 是合法值（改回写死 1 → 合法值被当错误拒掉，必红）
+  'retain-lower-bound': {
+    test: 'test/v2-beta4-regressions.test.mjs',
+    file: 'src/v2/runtime-settings.mjs',
+    edits: [['      if (value === null || value < NUMERIC_SETTINGS[key].min || value > NUMERIC_SETTINGS[key].max) {', '      if (value === null || value < 1 || value > NUMERIC_SETTINGS[key].max) {']],
+  },
+  // N-11：format 4 的旧 span 行必须如实 skip（把专属分支关掉 → 落进通用的
+  // 「回执正文已变化」，把字段缺失说成用户改了正文，必红）
+  'legacy-format4-span': {
+    test: 'test/v2-beta4-regressions.test.mjs',
+    file: 'src/apply.mjs',
+    edits: [['    if (formatVersion === RECEIPT_FORMAT_VERSION && legacySpanKind !== null && legacySpanKind !== \'operation\') {\n', '    if (false) {\n']],
+  },
+  // N-11 兜底：单行异常只让该行落 skipped（去掉 try/catch → 一条坏行连坐整批，必红）
+  'restore-per-row-guard': {
+    test: 'test/v2-beta4-regressions.test.mjs',
+    file: 'src/apply.mjs',
+    edits: [['      try {\n        await restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes })\n      } catch (error) {\n        await reportInternalFailure(receipt, error)\n      }', '      await restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes })']],
+  },
+  // R-03：status 行必须印出 autoRestore（删掉 → 「off 会不会恢复原文」只能靠猜，必红）
+  'status-auto-restore': {
+    test: 'test/v2-beta4-regressions.test.mjs',
+    file: 'src/v2/runtime-render.mjs',
+    edits: [['      + `restore=${settings.autoRestore ? \'on\' : \'off\'} `\n', '']],
+  },
+  // ── 0.13.2-beta.5（第 4 轮真机排查 Q-01 / P-01 / M-01 / N-12 / O-01）──────────
+  // Q-01：autoRestore 必须决定「要不要恢复」（把判断还原成只影响守卫 → off 照样
+  // 全量恢复，必红）
+  'autorestore-switch-noop': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/v2/runtime-lifecycle.mjs',
+    edits: [['      if (!autoRestore) {', '      if (false) {']],
+  },
+  // Q-01b：窗口守卫不得受开关影响（把守卫并回 autoRestore 条件 → 关掉开关时守卫
+  // 一起消失，必红）
+  'autorestore-guard-always': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/v2/runtime-lifecycle.mjs',
+    edits: [['      if (pendingCount > 0) {', '      if (pendingCount > 0 && autoRestore) {']],
+  },
+  // P-01：没有库时必须交 null（删掉 listRecordsPage 的 null 分支 → finally 里
+  // store.close() 抛 TypeError，必红）
+  'readback-null-store': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/v2/readback.mjs',
+    edits: [['  if (!store) return null\n  try {\n    // 遗忘记录不进列表', '  try {\n    // 遗忘记录不进列表']],
+  },
+  // P-01b：精确回读必须抛业务错误（删掉 ENOSTORE 分支 → 内部 TypeError 盖住
+  // 「没有库」，必红）
+  'readback-nostore-error': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/v2/readback.mjs',
+    edits: [['  if (!store) {\n    throw new EngineV2Error(', '  if (false) {\n    throw new EngineV2Error(']],
+  },
+  // M-01：设置页数字框必须与命令面同一把尺子（改回 Math.round(Number(text)) →
+  // 清空变下界、2.5 变 3、0x10 变 16，必红）
+  'numberinput-silent-coerce': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/client.js',
+    edits: [['        var n = parseCount(text);\n        if (n === null) {', '        var n = Math.round(Number(text));\n        if (!isFinite(n)) {']],
+  },
+  // M-01b：parseCount 本身也必须是严格十进制（改回 Number() → 0x10/2e1/空串
+  // 全部 isFinite，必红）
+  'parse-count-strict': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/client.js',
+    edits: [["      if (!/^\\d+$/.test(raw)) return null;\n", '']],
+  },
+  // N-12：schema 的数字域必须从 NUMERIC_SETTINGS 派生（改回 natural().max(200) →
+  // 归档批量 0 在 schema 里合法、在别处被换值，必红）
+  'batch-schema-domain': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/index.mjs',
+    edits: [[
+      '      archiveBatchSize: SCHEMAS.natural()\n        .min(NUMERIC_SETTINGS.batch.min).max(NUMERIC_SETTINGS.batch.max)',
+      '      archiveBatchSize: SCHEMAS.natural().min(0).max(NUMERIC_SETTINGS.batch.max)',
+    ]],
+  },
+  // O-01：每页条数不得静默夹到上限（把 resolvePageSize 的上界判断删掉 → 999999
+  // 变成 2000，必红）
+  'history-pagesize-clamp': {
+    test: 'test/v2-beta5-regressions.test.mjs',
+    file: 'src/v2/readback.mjs',
+    edits: [['  if (parsed > MAX_PAGE_SIZE) {', '  if (false) {']],
+  },
 }
 
 /**

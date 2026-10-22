@@ -17,7 +17,7 @@ import { access, readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { dshMemoryLookupRoots, locatePinnedDshMemory } from '../src/dsh-memory-suppression.mjs'
+import { EXPECTED_DSH_MEMORY_VERSIONS, dshMemoryLookupRoots, locatePinnedDshMemory } from '../src/dsh-memory-suppression.mjs'
 import { memoryContextLabProjection } from '../src/projection.mjs'
 
 const DSH_HOME = process.env.DSH_HOME ?? path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
@@ -48,6 +48,15 @@ const SOURCE_ENTRY = path.join(path.dirname(fileURLToPath(import.meta.url)), '..
  */
 async function installedMatchesSource() {
   try {
+    // 版本号先比：只比 src/index.mjs 是不够的（beta.4 实测踩过）——安装副本的
+    // index.mjs 没变、其它 src 文件变了时，判据仍然为真，于是「安装面」断言拿着
+    // 新源码的期望去验旧副本，红得莫名其妙。版本不同 = 升级前，按设计 SKIP。
+    const [installedManifest, sourceManifest] = await Promise.all([
+      readFile(path.join(path.dirname(installedEntry), '..', 'package.json'), 'utf8'),
+      readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    ])
+    const versionOf = (text) => JSON.parse(text)?.version
+    if (versionOf(installedManifest) !== versionOf(sourceManifest)) return false
     const [installed, source] = await Promise.all([
       readFile(installedEntry, 'utf8'),
       readFile(SOURCE_ENTRY, 'utf8'),
@@ -224,8 +233,8 @@ test('the installed dsh-memory resolves to a real package root with MdcgClient',
   // 断言「落在已核验范围内」，而不是钉死某一个版本号——灵枢升级时这个用例
   // 只该因「兼容性真的变了」而红，不该因版本号前进而红（0.8.1→0.9.8 即一例）。
   assert.ok(
-    ['0.8.1', '0.9.8'].includes(found.version),
-    `dsh-memory=${found.version} 不在已核验范围（0.8.1 / 0.9.8）内`,
+    EXPECTED_DSH_MEMORY_VERSIONS.includes(found.version),
+    `dsh-memory=${found.version} 不在已核验范围（${EXPECTED_DSH_MEMORY_VERSIONS.join(' / ')}）内`,
   )
   // 不按路径子串断言：junction / 符号链接安装时 realpath 的实体目录名
   // 与包名不同（0.10.1 的 install 用例曾因此误红）。包身份以 manifest 为准。

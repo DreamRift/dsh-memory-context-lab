@@ -28,8 +28,23 @@ const SUPPRESSION_KEY = Symbol.for('dsh-memory-context-lab/suppression-v1')
  * call shapes are unchanged as well -- `read/2` still takes `{ session }` as
  * its second argument, `remember/2` as `{ ...sessionTag }`, and
  * `sessionRecall/1`/`timeline/1` still carry the session first.
+ *
+ * 0.9.10 was verified individually (2026-10-22, the version installed in this
+ * machine's profile -- 0.9.8 was already gone from it, so the guard failed
+ * closed on every load and the isolation was silently unavailable):
+ *   - all five prototype methods still exist with the same arity and order:
+ *     remember(content, extra), recentAdd(role, text, meta, tags),
+ *     read(query, extra), timeline(limit, extra), sessionRecall(session, ...);
+ *   - lib/hooks.js still passes the exact-session tag where the patch looks:
+ *     remember(safe, { ...sessionTag }), read(text, { k: 3, ...sessionTag }),
+ *     recentAdd(role, text, { ...sessionTag }, ['dsh', 'recent-window']),
+ *     timeline(limit, { session: sid }), sessionRecall(sid, ...);
+ *   - md_cg/ still sits at the package root and lib/lib/mdcg_client.js still
+ *     exports MdcgClient.
+ * Anything outside this list keeps failing closed: the guard is about the
+ * private prototype contract, not about semver optimism.
  */
-const EXPECTED_DSH_MEMORY_VERSIONS = ['0.8.1', '0.9.8']
+export const EXPECTED_DSH_MEMORY_VERSIONS = ['0.8.1', '0.9.8', '0.9.10']
 const EXPECTED_DSH_MEMORY_VERSION = EXPECTED_DSH_MEMORY_VERSIONS[EXPECTED_DSH_MEMORY_VERSIONS.length - 1]
 const PACKAGE_NAME = '@furongjun1999/dsh-memory'
 

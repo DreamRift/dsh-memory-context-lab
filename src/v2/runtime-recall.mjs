@@ -110,10 +110,11 @@ export function createRecallDomain({
       }
     }
     const budget = budgetPlan.value
+    // R-01（beta.4）：这里曾有一个 `if (budgetPlan.clamped)` 死分支——parseBudgetTokens
+    // 在超上限时返回 ok:false（上面已经返回结构化错误），从不会产出 clamped:true，
+    // 也没有 requested 字段。删掉，免得「按上限执行」这条从未发生过的披露继续
+    // 留在读路径上误导下一个改这里的人。
     const budgetNotes = []
-    if (budgetPlan.clamped) {
-      budgetNotes.push(`请求的 budget_tokens=${budgetPlan.requested} 超过上限 ${RECALL_MAX_BUDGET_TOKENS}，已按上限执行`)
-    }
     if (resume) {
       if (resume.mode === CURSOR_MODES.IDS) {
         recordIds = resume.ids

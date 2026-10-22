@@ -77,9 +77,12 @@ test('数字键的取值域与 core 的 NUMERIC_SETTINGS 一致', async () => {
     const max = String(spec.max).replace(/_/g, '')
     const normalize = (text) => text.replace(/_/g, '')
     // 上界可以写死字面量，也可以从 core 的同一份 spec 派生（更强：不会漂移）。
-    const derived = block.includes('NUMERIC_SETTINGS[') && block.includes('].max')
-    if (!normalize(block).includes('< ' + min) && spec.min !== 0) problems.push(name + ' 下界 ' + min + ' 未出现在分支里')
-    if (!derived && !normalize(block).includes(max)) problems.push(name + ' 上界 ' + max + ' 未出现在分支里，也没有从 NUMERIC_SETTINGS 派生')
+    // 下界同理（N-10 起 batch/retain 与 readlease/protect/pressure 都从 NUMERIC_SETTINGS
+    // 取 min/max：三处取值域不再各写一份，也就不会再各自漂移）。
+    const derivedMax = block.includes('NUMERIC_SETTINGS[') && block.includes('].max')
+    const derivedMin = block.includes('NUMERIC_SETTINGS[') && block.includes('].min')
+    if (!derivedMin && !normalize(block).includes('< ' + min) && spec.min !== 0) problems.push(name + ' 下界 ' + min + ' 未出现在分支里，也没有从 NUMERIC_SETTINGS 派生')
+    if (!derivedMax && !normalize(block).includes(max)) problems.push(name + ' 上界 ' + max + ' 未出现在分支里，也没有从 NUMERIC_SETTINGS 派生')
   }
   assert.deepEqual(problems, [], '数字键的校验区间与 core 不一致：' + problems.join('；'))
 })

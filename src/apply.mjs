@@ -1707,17 +1707,54 @@ export async function restoreReceipts({ session, client, receipts, onOutcome, re
     if (batch && last?.batch && last.rows[0].replacementSeq === receipt.replacementSeq) last.rows.push(receipt)
     else groups.push({ batch, rows: [receipt] })
   }
+  /**
+   * 单行异常兜底（N-11，beta.4）。
+   *
+   * 恢复的会计不变量是「每一行都有结局」：restored + skipped + forgotten 必须
+   * 等于输入行数。一条行的格式/字段问题只该让这一行落 skipped，不能把整批的
+   * 结局一起带走——beta.3 的候选集对 format 4 的旧 span 行抛错，就是整批一条不
+   * 落地中止（探针里同批的正常 format 6 行也一条没恢复）。
+   *
+   * 已经报过结局的行不再重复上报（onOutcome 抛错时组路径可能已经写了一半）。
+   */
+  const reportInternalFailure = async (receipt, error) => {
+    const failed = {
+      rangeStart: receipt?.rangeStart,
+      rangeEnd: receipt?.rangeEnd,
+      nodeId: receipt?.nodeId,
+      replacementSeq: receipt?.replacementSeq,
+      hash: receipt?.hash,
+    }
+    const already = outcomes.some((row) => row.nodeId === failed.nodeId && row.rangeStart === failed.rangeStart)
+    if (already) return
+    const skipped = {
+      ...failed,
+      state: 'skipped',
+      reason: '恢复时发生内部错误：' + messageOf(error) + '；原文仍在冷库，可用 /memory-lab read '
+        + failed.nodeId + ' 回读',
+    }
+    outcomes.push(skipped)
+    if (onOutcome) await onOutcome(skipped)
+  }
   for (const group of groups) {
     const receiptsInGroup = group.rows
     // BUG-010：批摘要组无论剩下几个成员都走组路径。成员被 forget 逐条剔除后，
     // 单成员残余若落进 restoreLegacyReceipt 会拿 buildReceipt(3) 抛错；组路径
     // 至少能「部分恢复」或如实 skip，不会中止整次 restore。
     if (group.batch) {
-      await restoreBatchGroup({ session, client, receipts: receiptsInGroup, onOutcome, receiptMarker, outcomes })
+      try {
+        await restoreBatchGroup({ session, client, receipts: receiptsInGroup, onOutcome, receiptMarker, outcomes })
+      } catch (error) {
+        for (const receipt of receiptsInGroup) await reportInternalFailure(receipt, error)
+      }
       continue
     }
     for (const receipt of receiptsInGroup) {
-      await restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes })
+      try {
+        await restoreSingleReceipt({ session, client, receipt, onOutcome, receiptMarker, outcomes })
+      } catch (error) {
+        await reportInternalFailure(receipt, error)
+      }
     }
   }
   // 0.13.0 F0 第二通道：回执节点已不在活动面时，上面两条路径都会 skip。
@@ -1849,8 +1886,13 @@ function receiptReconstructionCandidates({ receipt, receiptMarker, formatVersion
     // BUG-001 的旧行把 span 正文记成了 format 4；spanKind 非 operation 时按 span 重建。
     || (formatVersion === RECEIPT_FORMAT_VERSION && spanKind !== null && spanKind !== 'operation')
   if (spanLike) {
+    // N-11（beta.4）：候选格式**只能**是 buildSpanReceipt 接受的版本（5/7）。
+    // 行内的 formatVersion 可能是 4（BUG-001 的旧 span 行把 span 正文记成了
+    // 操作格式），把它塞进候选会让**第一个**候选就抛「未知的片段回执格式版本：
+    // 4」——一条坏行连坐整批恢复。
     const formats = []
     for (const candidate of [formatVersion, RECEIPT_FORMAT_SPAN_V2, RECEIPT_FORMAT_SPAN]) {
+      if (candidate !== RECEIPT_FORMAT_SPAN && candidate !== RECEIPT_FORMAT_SPAN_V2) continue
       if (!formats.includes(candidate)) formats.push(candidate)
     }
     const labels = []
@@ -1977,6 +2019,21 @@ async function restoreLegacyReceipt({ session, client, receipts, receiptMarker }
         ...base,
         state: 'skipped',
         reason: `未知回执格式 ${formatVersion}（行内 receiptFormat）；原文仍在冷库，可用 /memory-lab read ${receipt.nodeId} 回读`,
+      })
+      continue
+    }
+    // N-11（beta.4）：0.10.1 的旧 span 行把 span 正文记成了 format 4（见
+    // apply.mjs 里 BUG-001 的注释），而 buildSpanReceipt 只认 5/7。这类行既
+    // 没有可信的格式号、也没有 spanLabel 可核对，任何「重建出来正好相等」都只能
+    // 是巧合——如实跳过，并给出**专属**原因（不能落进通用的「回执正文已变化」，
+    // 那正是 N-06 要消灭的误报：把字段缺失说成用户改了正文）。
+    const legacySpanKind = typeof receipt.spanKind === 'string' && receipt.spanKind !== '' ? receipt.spanKind : null
+    if (formatVersion === RECEIPT_FORMAT_VERSION && legacySpanKind !== null && legacySpanKind !== 'operation') {
+      outcomes.push({
+        ...base,
+        state: 'skipped',
+        reason: '旧 span 回执（format 4）没有可重建的标签，无法逐字节核对；原文仍在冷库，可用 /memory-lab read '
+          + receipt.nodeId + ' 回读',
       })
       continue
     }

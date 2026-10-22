@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 
-import { V2_RECEIPT_MARKER } from '../core.mjs'
+import { V2_RECEIPT_MARKER, parseStrictInteger } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
 import {
   AGG_VOUCHER_MARKER,
@@ -667,7 +667,15 @@ export async function compressStatus(deps) {
 export async function expandVoucher(deps, voucherId, pageArg) {
   const ledger = await loadHierarchy(deps.sessionDir)
   const entry = ledger.vouchers.get(voucherId)
-  const page = Math.max(1, Number.parseInt(String(pageArg ?? '1'), 10) || 1)
+  // R-02 同族（beta.4）：页码参数只认严格十进制整数——`3.7` 曾被 parseInt 悄悄读成
+  // 3，用户以为换了页，实际拿到的是被改过的页码。越界仍按页数钳制（那是展示策略，
+  // 不是取值域），非法则如实回一句用法。
+  const rawPage = pageArg === undefined || pageArg === null || String(pageArg).trim() === '' ? null : pageArg
+  const parsedPage = rawPage === null ? 1 : parseStrictInteger(rawPage)
+  if (parsedPage === null) {
+    return { text: `页码必须是正整数（收到 ${JSON.stringify(String(rawPage))}）；不接受小数或非数字。用法：/memory-lab expand ${voucherId} [页码]` }
+  }
+  const page = Math.max(1, parsedPage)
   if (!entry) {
     const plan = await getVoucherPlan(deps.sessionDir, voucherId)
     if (!plan) return { text: `凭证 ${voucherId} 不存在（账本与计划文件都没有）。可用 compress status 查看现有凭证。` }
