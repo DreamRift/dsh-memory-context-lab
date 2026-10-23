@@ -115,7 +115,7 @@ npm run probe:revert  # 回退场景，确认对应测试会失败（57 个场�
 npm run probe:lingshu # 隔离灵枢写入健康探测；不可用如实报环境原因
 ```
 
-**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。0.13.2-beta.5 全套 **115 套**（0 跳过；Node v26.12.1）。
+**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。0.13.2-beta.7 全套 **118 套**（0 跳过；Node v26.12.1）。
 
 > `probe:revert` 的 57 个场景中 53 个「还原后必红」成立；4 个场景的锚点在早期源码重构中已失效（脚本显式打印「夹具脱节」并计为未覆盖，不会静默算通过）。
 
