@@ -19,6 +19,8 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { InvalidArgumentError, EngineV2Error } from './errors.mjs'
+
 const SUPPRESSION_KEY = Symbol.for('dsh-memory-context-lab/suppression-v1')
 /**
  * Versions whose automatic-hook calls were audited against the patch below.
@@ -80,7 +82,7 @@ function fallbackFor(method) {
  * session cannot be affected by this plugin.
  */
 export function createSuppressionCoordinator(MdcgClient) {
-  if (!MdcgClient?.prototype) throw new Error('dsh-memory 未导出可兼容的 MdcgClient。')
+  if (!MdcgClient?.prototype) throw new InvalidArgumentError('dsh-memory 未导出可兼容的 MdcgClient。', { code: 'EBACKENDUNAVAILABLE' })
   const prototype = MdcgClient.prototype
   const methods = ['remember', 'recentAdd', 'read', 'timeline', 'sessionRecall']
   const originals = new Map()
@@ -108,7 +110,7 @@ export function createSuppressionCoordinator(MdcgClient) {
     const plan = []
     for (const method of methods) {
       const original = prototype[method]
-      if (typeof original !== 'function') throw new Error(`已核验的 dsh-memory 缺少 MdcgClient.${method}，已拒绝启用抑制。`)
+      if (typeof original !== 'function') throw new InvalidArgumentError(`已核验的 dsh-memory 缺少 MdcgClient.${method}，已拒绝启用抑制。`, { code: 'EBACKENDUNAVAILABLE' })
       plan.push({ method, original, descriptor: Object.getOwnPropertyDescriptor(prototype, method) })
     }
     for (const { method, original, descriptor } of plan) {
@@ -151,7 +153,7 @@ export function createSuppressionCoordinator(MdcgClient) {
 
   function acquire(sessionId) {
     const sid = normalizedSession(sessionId)
-    if (!sid) throw new Error('会话没有可用标识，已拒绝启用抑制。')
+    if (!sid) throw new InvalidArgumentError('会话没有可用标识，已拒绝启用抑制。', { code: 'ENOSESSION' })
     install()
     active.set(sid, (active.get(sid) ?? 0) + 1)
     let released = false
@@ -259,21 +261,21 @@ export async function locatePinnedDshMemory(requireFromPlugin, options = {}) {
     if (packageRoot) break
   }
   if (!packageRoot) {
-    throw new Error(`未找到已安装的 ${PACKAGE_NAME}；已搜索 ${roots.length} 个 node_modules 根。`)
+    throw new InvalidArgumentError(`未找到已安装的 ${PACKAGE_NAME}；已搜索 ${roots.length} 个 node_modules 根。`, { code: 'ENOTINSTALLED' })
   }
 
   let manifest
   try {
     manifest = JSON.parse(await readFile(path.join(packageRoot, 'package.json'), 'utf8'))
   } catch {
-    throw new Error('无法读取已安装 dsh-memory 的版本信息，已拒绝启用抑制。')
+    throw new InvalidArgumentError('无法读取已安装 dsh-memory 的版本信息，已拒绝启用抑制。', { code: 'EBACKENDUNAVAILABLE' })
   }
   if (manifest?.name !== PACKAGE_NAME || !acceptedVersions.includes(manifest.version)) {
-    throw new Error(`当前 dsh-memory=${String(manifest?.version ?? 'unknown')}，隔离只经 ${acceptedVersions.join(' / ')} 核验，已拒绝启用。`)
+    throw new InvalidArgumentError(`当前 dsh-memory=${String(manifest?.version ?? 'unknown')}，隔离只经 ${acceptedVersions.join(' / ')} 核验，已拒绝启用。`, { code: 'EVERSIONUNVERIFIED' })
   }
   const clientModule = await import(pathToFileURL(path.join(packageRoot, 'lib', 'lib', 'mdcg_client.js')).href)
   if (typeof clientModule.MdcgClient !== 'function') {
-    throw new Error('dsh-memory 未导出 MdcgClient，已拒绝启用抑制。')
+    throw new InvalidArgumentError('dsh-memory 未导出 MdcgClient，已拒绝启用抑制。', { code: 'EBACKENDUNAVAILABLE' })
   }
   return { packageRoot, MdcgClient: clientModule.MdcgClient, version: manifest.version }
 }
@@ -287,7 +289,7 @@ export function globalSuppressionCoordinator(MdcgClient) {
   const current = globalThis[SUPPRESSION_KEY]
   if (current?.MdcgClient === MdcgClient) return current.coordinator
   if (current?.coordinator?.activeCount?.() > 0) {
-    throw new Error('已有不同版本的隔离抑制仍在运行，已拒绝混用。')
+    throw new EngineV2Error('已有不同版本的隔离抑制仍在运行，已拒绝混用。', { code: 'ECONFLICT' })
   }
   current?.coordinator?.dispose?.()
   const coordinator = createSuppressionCoordinator(MdcgClient)

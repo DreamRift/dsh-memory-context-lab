@@ -20,6 +20,7 @@ import { INDEX_TEXT_MAX_BYTES, exactPostfilterHit, isPluginAuthoredEntry, plugin
 import { planQuery } from './query-plan.mjs'
 import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { coldRecordContent } from '../core.mjs'
+import { EngineV2Error } from './errors.mjs'
 
 const ARCHIVED_TAG = 'archived'
 
@@ -231,9 +232,9 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
       const store = await acquireStore()
       return {
         async rememberArchived({ nodeId, text, range, tools, callIds, sources = null, spanKind = null, contentHash = null, chunk = null, chunkCount = null, pluginAuthored = false, signal }) {
-          if (signal?.aborted) throw new Error('aborted')
+          if (signal?.aborted) throw new EngineV2Error('aborted', { code: 'EABORTED' })
           if (typeof text !== 'string' || text.length === 0) {
-            throw new Error('v2 冷写需要非空正文')
+            throw new EngineV2Error('v2 冷写需要非空正文', { code: 'EINVAL' })
           }
           const kind = nonEmptyString(spanKind) ?? SPAN_KINDS.OPERATION
           // 写一次（write-once）：同一 nodeId 已有同哈希载荷则复用（重试幂等）；
@@ -245,10 +246,10 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
             // 后原有载荷原样可用，不需要新冷写。
             const forgetIndex = await currentForgetIndex()
             if (isForgotten(forgetIndex, existing.id)) {
-              throw new Error(`v2 冷写拒绝：node ${nodeId} 已被软遗忘（forget undo 后可恢复）`)
+              throw new EngineV2Error(`v2 冷写拒绝：node ${nodeId} 已被软遗忘（forget undo 后可恢复）`, { code: 'EFORGOTTEN', details: { nodeId } })
             }
             if (existing.inline?.contentHash && contentHash && existing.inline.contentHash !== contentHash) {
-              throw new Error(`v2 冷写冲突：node ${nodeId} 已持有不同内容（write-once 保护）`)
+              throw new EngineV2Error(`v2 冷写冲突：node ${nodeId} 已持有不同内容（write-once 保护）`, { code: 'ECOLDWRITECONFLICT', details: { nodeId } })
             }
             return { ok: true, committed: false, reused: true, recordId: existing.id, nodeId }
           }
@@ -298,7 +299,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
         },
 
         async getNode(nodeId, signal) {
-          if (signal?.aborted) throw new Error('aborted')
+          if (signal?.aborted) throw new EngineV2Error('aborted', { code: 'EABORTED' })
           const match = findSpanEntry(store, nodeId)
           if (!match) {
             return { ok: false, error: 'not-found' }
@@ -329,7 +330,7 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
         },
 
         async recall(query, signal, limit = 5) {
-          if (signal?.aborted) throw new Error('aborted')
+          if (signal?.aborted) throw new EngineV2Error('aborted', { code: 'EABORTED' })
           const { entries } = store.listEntries({ limit: store.recordCount + 1 })
           // D4：插件来源的归档跨度（工作状态卡/回注包/回执沉入冷库的记录）不进回注
           // 候选面——它们是插件自己的工作资料，回注给模型等于把插件输出说成历史证据；

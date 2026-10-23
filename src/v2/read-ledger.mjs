@@ -16,8 +16,10 @@
  * 生命周期：账本在 `restore` 后失效（原文已回活动面，再记「已归档」就是谎报）；
  * 进程重启**不清零**（与 `runtime.mjs` 的 `lastAction` 既有口径一致）。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { withWriteLock } from './write-lock.mjs'
+import { writeFileAtomic } from './appendable-ledger.mjs'
 
 export const READ_LEDGER_FILE = 'read-ledger.json'
 export const READ_LEDGER_KIND = 'dsh-memory-context-lab/v2/read-ledger'
@@ -153,12 +155,21 @@ export async function loadReadLedger(sessionDir) {
   return { ok: true, exists: true, file, entries, error: null }
 }
 
+/**
+ * 落盘读取账本。
+ *
+ * 临时名必须唯一：此前用 `file + '.' + process.pid + '.tmp'`——同进程的并发写者
+ * **共享同一个临时名**，后写者把先写者正在写的临时文件截断，rename 之后账本只剩
+ * 后一个写者的条目（store/p-15 X36：3 路并发登记，最终只剩 1 条，静默丢 2 条）。
+ * 现在统一走 appendable-ledger.mjs 的 writeFileAtomic（randomUUID）。
+ *
+ * 但**唯一临时名只解决「不互相截断」**：读-改-写本身仍然要串行，否则两个写者
+ * 各自读到同一份旧账本、各自写回自己那份，后写者覆盖先写者——所以调用方
+ * 必须整段持写锁（见 registerReads / invalidateReadLedger）。
+ */
 async function writeLedger(file, entries) {
   const payload = JSON.stringify({ kind: READ_LEDGER_KIND, version: READ_LEDGER_VERSION, entries }, null, 0) + '\n'
-  await mkdir(path.dirname(file), { recursive: true })
-  const temp = file + '.' + process.pid + '.tmp'
-  await writeFile(temp, payload, 'utf8')
-  await rename(temp, file)
+  await writeFileAtomic(file, payload)
 }
 
 /**
@@ -173,6 +184,12 @@ export async function registerReads(sessionDir, { reads = [], step = null, now =
   const wanted = (Array.isArray(reads) ? reads : [])
     .filter((read) => read && typeof read.key === 'string' && read.key !== '')
   if (wanted.length === 0) return { ok: true, registered: 0, repeats: 0, repeatChars: 0, entries: [] }
+  // 读-改-写整段进锁：否则并发登记各自基于同一份旧账本写回，后写者覆盖先写者
+  // （store/p-15 X36）。锁只覆盖本模块的读改写，不涉及冷库写路径。
+  return withWriteLock(sessionDir, () => registerReadsUnlocked(sessionDir, { wanted, step, now }))
+}
+
+async function registerReadsUnlocked(sessionDir, { wanted, step, now }) {
   const ledger = await loadReadLedger(sessionDir)
   if (!ledger.ok) return { ok: false, registered: 0, repeats: 0, repeatChars: 0, entries: [], error: ledger.error }
   const byKey = new Map(ledger.entries.map((entry) => [entry.key, entry]))
@@ -230,6 +247,10 @@ export async function registerReads(sessionDir, { reads = [], step = null, now =
  * 只删命中条目，其余保留（其它区间仍在冷库）。
  */
 export async function invalidateReadLedger(sessionDir, { recordIds = [], nodeIds = [], seqs = [] } = {}) {
+  return withWriteLock(sessionDir, () => invalidateReadLedgerUnlocked(sessionDir, { recordIds, nodeIds, seqs }))
+}
+
+async function invalidateReadLedgerUnlocked(sessionDir, { recordIds = [], nodeIds = [], seqs = [] } = {}) {
   const ledger = await loadReadLedger(sessionDir)
   if (!ledger.ok) return { ok: false, removed: 0, error: ledger.error }
   const ids = new Set((Array.isArray(recordIds) ? recordIds : []).filter((id) => typeof id === 'string' && id))

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import { V2_RECEIPT_MARKER, parseStrictInteger } from '../core.mjs'
+import { EngineV2Error } from './errors.mjs'
 import { estimateTokensOf } from './budget.mjs'
 import {
   AGG_VOUCHER_MARKER,
@@ -476,7 +477,7 @@ async function applyVoucher(deps, { plan, evaluation, memberTexts, l2CardText })
     text: evaluation.voucherText,
   })
   if (!replacement || typeof replacement.seq !== 'number' || !Number.isFinite(replacement.seq)) {
-    throw new Error('表面替换未返回事件 seq')
+    throw new EngineV2Error('表面替换未返回事件 seq', { code: 'ESURFACESEQ' })
   }
   const ledger = await loadHierarchy(deps.sessionDir)
   if (ledger.vouchers.has(plan.voucherId)) {

@@ -23,6 +23,7 @@
  *   **「灵枢词法/结构检索」**，不冒充向量语义召回。
  */
 import { RECEIPT_VIEW, TemporaryLingshuClient } from '../lingshu-lab-client.mjs'
+import { EngineV2Error } from './errors.mjs'
 
 export const LINGSHU_BACKEND_NAME = 'lingshu-mdcg-receipt'
 
@@ -66,12 +67,12 @@ export function indexBodyOf(record) {
 /** 灵枢返回的命中形状 → 记录 ID 数组。形状不认识就抛，不静默当成「没有命中」。 */
 export function recordIdsFromRecall(view) {
   if (!view || typeof view !== 'object') {
-    throw new Error(`灵枢检索返回了非对象结果：${typeof view}`)
+    throw new EngineV2Error(`灵枢检索返回了非对象结果：${typeof view}`, { code: 'EBACKENDSHAPE' })
   }
   const results = view.results
   if (!Array.isArray(results)) {
     const reason = view.meta?.reason ?? view.error ?? 'unknown'
-    throw new Error(`灵枢检索返回缺少 results 数组（reason=${reason}）`)
+    throw new EngineV2Error(`灵枢检索返回缺少 results 数组（reason=${reason}）`, { code: 'EBACKENDSHAPE' })
   }
   const ids = []
   for (const item of results) {
@@ -90,7 +91,7 @@ export function recordIdsFromRecall(view) {
  */
 export function createLingshuSemanticBackend({ client, logger = null, name = LINGSHU_BACKEND_NAME }) {
   if (!client || typeof client.callTool !== 'function') {
-    throw new Error('灵枢后端需要已启动的隔离客户端（提供 callTool）。')
+    throw new EngineV2Error('灵枢后端需要已启动的隔离客户端（提供 callTool）。', { code: 'EBACKENDUNAVAILABLE' })
   }
 
   async function rememberOne(record) {
@@ -111,7 +112,7 @@ export function createLingshuSemanticBackend({ client, logger = null, name = LIN
       on_conflict: 'record',
     })
     if (result && typeof result === 'object' && result.ok === false) {
-      throw new Error(`灵枢拒收派生索引（${result.error ?? 'unknown'}）：${result.hint ?? 'no hint'}`)
+      throw new EngineV2Error(`灵枢拒收派生索引（${result.error ?? 'unknown'}）：${result.hint ?? 'no hint'}`, { code: 'EBACKENDREJECTED' })
     }
     if (result && typeof result === 'object' && result.committed === false) {
       // 同 ID 已存在不同正文时灵枢排入复核队列而非覆写。派生索引是幂等重写，
@@ -124,7 +125,7 @@ export function createLingshuSemanticBackend({ client, logger = null, name = LIN
       const same = existing?.ok !== false && typeof existing?.content === 'string'
         && existing.content.includes(record.id)
       if (!same) {
-        throw new Error(`灵枢未提交派生索引且回读不符（${record.id}）：同 ID 已持有不同正文`)
+        throw new EngineV2Error(`灵枢未提交派生索引且回读不符（${record.id}）：同 ID 已持有不同正文`, { code: 'ECOLDWRITECONFLICT' })
       }
       return { reused: true }
     }

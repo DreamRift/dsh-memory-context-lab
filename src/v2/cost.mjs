@@ -11,6 +11,8 @@
  * 不允许用「没有记录」冒充「没有成本」。
  */
 
+import { InvalidArgumentError } from '../errors.mjs'
+
 export const COST_COUNTER_KEYS = Object.freeze([
   /** 辅助模型调用次数（v2 首版必须为 0）。 */
   'extraModelCalls',
@@ -153,9 +155,9 @@ export function createCostLedger(initial = {}) {
   const counters = normalizeCostCounters(initial)
   return {
     bump(key, by = 1) {
-      if (!COST_COUNTER_KEYS.includes(key)) throw new Error(`未知成本计数键：${key}`)
+      if (!COST_COUNTER_KEYS.includes(key)) throw new InvalidArgumentError(`未知成本计数键：${key}`, { code: 'EINVAL', details: { key } })
       const amount = Number(by)
-      if (!Number.isFinite(amount) || amount < 0) throw new Error(`成本计数增量非法：${by}`)
+      if (!Number.isFinite(amount) || amount < 0) throw new InvalidArgumentError(`成本计数增量非法：${by}`, { code: 'EINVAL', details: { by } })
       counters[key] += Math.floor(amount)
       return counters[key]
     },

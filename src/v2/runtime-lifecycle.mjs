@@ -29,8 +29,10 @@
 import { copyFile, mkdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 
-import { V2_RECEIPT_MARKER, normalizeSettings, restoreGrowth } from '../core.mjs'
+import { V2_RECEIPT_MARKER, normalizeSettings, restoreGrowth, windowGuardRefuses } from '../core.mjs'
 import { describeRestoreSkipReasons } from '../apply.mjs'
+import { describeWindowGuardRefusal } from './window-guard-text.mjs'
+
 import { EngineV2Error } from './errors.mjs'
 import { createCostLedger } from './cost.mjs'
 import { readRecordById } from './readback.mjs'
@@ -190,6 +192,15 @@ export function createLifecycleDomain({
     try {
       loaded = await readV2SessionState(labRoot, sessionId)
     } catch (error) {
+      // 0.13.2-beta.6 G4（store/p-16 X40）：**损坏不等于未启用**。
+      //
+      // 旧实现把任何读取异常都吞成 `return null`（＝「本会话没启用」），于是
+      // 一个坏掉的状态文件会让 adopt 说「未启用」、`on` 随后在它上面重新初始化，
+      // 把既有账本覆盖掉——而 `status` 对同一个文件报的是「损坏，失败关闭」。
+      // 同一条事实在两个入口给出相反答案，是这条缺陷的实质。
+      // 现在只有「未启用」返回 null；损坏继续向上抛（带 ESTATEDAMAGED），
+      // 由命令面按失败关闭报给用户。
+      if (error?.code === 'ESTATEDAMAGED') throw error
       logger?.warn?.(`memory-context-lab: 状态文件不可读，本会话按未启用处理：${error instanceof Error ? error.message : String(error)}`)
       return null
     }
@@ -458,16 +469,35 @@ export function createLifecycleDomain({
             assembledTokens: occupancy.host.assembledTokens,
             contextWindow: occupancy.host.contextWindow,
           })
-          if (growth.overflow) {
+          // 0.13.2-beta.6 G3：判据收成 windowGuardRefuses——`overflow === 'unknown'`
+          // 与 `true` 一样**拒绝**。旧写法 `if (growth.overflow)` 之所以「碰巧」
+          // 也拒绝 unknown，是因为 'unknown' 是非空字符串、在 JS 里为真——那是
+          // 字符串真值性的巧合，不是设计：换任何一个假值哨兵（0/null/''）就会静默
+          // 放行。集中判据让这个决定显式，且调用点不可能各自理解成不同的东西。
+          if (windowGuardRefuses(growth)) {
             windowGuardRefusal = {
               total: growth.total,
               heldByReceipts: growth.heldByReceipts,
               assembled: occupancy.host.assembledTokens,
               window: occupancy.host.contextWindow,
+              // 判定不了时如实说「判不了」，不要让回执读起来像「确实超了」。
+              undetermined: growth.overflow === 'unknown',
+              unknownReasons: growth.unknownReasons,
             }
           }
         } catch (error) {
+          // G3（对抗审查 finding 1）：测量失败**不能**等于「没有守卫」。
+          // 旧写法只 warn 一句，随后 `else if (!windowGuardRefusal)` 判真，
+          // 恢复照做——这正是本组要消灭的「判不了就放行」。现在失败落成
+          // 一个 undetermined 的拒绝结论，与 overflow==='unknown' 走同一条路径。
           logger?.warn?.(`memory-context-lab: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+          windowGuardRefusal = {
+            total: Number.NaN,
+            heldByReceipts: 0,
+            assembled: null, window: null,
+            undetermined: true,
+            unknownReasons: [`占用不可判定：${error instanceof Error ? error.message : String(error)}`],
+          }
         }
       }
 
@@ -486,7 +516,7 @@ export function createLifecycleDomain({
         // 守卫的结论照样披露：用户随后打开开关（或直接 restore）时会撞上同一个上限。
         if (windowGuardRefusal) {
           const growth = windowGuardRefusal.total - (windowGuardRefusal.heldByReceipts ?? 0)
-          lines.push(`注意：现在恢复会让组装输入超出模型窗口（当前约 ${windowGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${windowGuardRefusal.window}），恢复前请先缩小上下文。`)
+          lines.push(`注意：${describeWindowGuardRefusal(windowGuardRefusal, growth)}，恢复前请先缩小上下文。`)
         }
       } else if (!windowGuardRefusal) {
         try {
@@ -518,7 +548,7 @@ export function createLifecycleDomain({
       } else {
         const growth = windowGuardRefusal.total - (windowGuardRefusal.heldByReceipts ?? 0)
         lines.push(
-          `停用了降温，但恢复会让组装输入超出模型窗口（当前约 ${windowGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${windowGuardRefusal.window}），`,
+          `停用了降温，但${describeWindowGuardRefusal(windowGuardRefusal, growth)}，`,
           '因此**没有**恢复，原文仍在冷库里。要取回原文，请先缩小上下文，或直接丢弃冷库：',
           '  /memory-lab clean confirm delete-session',
         )
@@ -594,6 +624,52 @@ export function createLifecycleDomain({
         kind: 'error',
         text: 'v2 引擎在本会话未启用，没有可整批恢复的 v2 回执。\n'
           + '若此前启用过又停用：回执仍在会话日志里，单段原文可用 /memory-lab read <ID> 回读（停用后旧 ID 仍可解析）。',
+      }
+    }
+    // G3（对抗审查 finding 2）：整批 restore 是用户最直接的取回路径，此前**完全
+    // 不走窗口守卫**——off 与 set fullhistory off 两条路径都会拒绝，唯独这条不会，
+    // 于是三态守卫可以被绕过（恢复一堆原文直接顶穿模型窗口）。这里复用同一套
+    // windowGuardRefuses 判据：拒绝时如实说「没恢复」并给出缩上下文的路。
+    const pendingRows = [...engine.pendingReceipts(record), ...engine.restoreSkippedReceipts(record)]
+    let refusal = null
+    if (pendingRows.length > 0) {
+      try {
+        const occupancy = await engine.measureOccupancy(record, undefined)
+        const growth = restoreGrowth(pendingRows, {
+          assembledTokens: occupancy.host.assembledTokens,
+          contextWindow: occupancy.host.contextWindow,
+        })
+        if (windowGuardRefuses(growth)) {
+          refusal = {
+            total: growth.total,
+            heldByReceipts: growth.heldByReceipts,
+            assembled: occupancy.host.assembledTokens,
+            window: occupancy.host.contextWindow,
+            undetermined: growth.overflow === 'unknown',
+            unknownReasons: growth.unknownReasons,
+          }
+        }
+      } catch (error) {
+        // 与 disableRecord 同口径：测量失败 = 判不了 = 拒绝，不是「没有守卫」。
+        logger?.warn?.(`memory-context-lab: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+        refusal = {
+          total: Number.NaN,
+          heldByReceipts: 0,
+          assembled: null,
+          window: null,
+          undetermined: true,
+          unknownReasons: [`占用不可判定：${error instanceof Error ? error.message : String(error)}`],
+        }
+      }
+    }
+    if (refusal) {
+      const growth = refusal.total - (refusal.heldByReceipts ?? 0)
+      return {
+        kind: 'error',
+        text: `没有恢复：${describeWindowGuardRefusal(refusal, growth)}。`
+          + `\n${pendingRows.length} 段原文仍在冷库（引擎保持启用）。要取回：先缩小上下文再重试 /memory-lab restore，或直接丢弃冷库：/memory-lab clean confirm delete-session。`,
+        restored: 0,
+        before: pendingRows.length,
       }
     }
     const outcome = await engine.runRestore(record)

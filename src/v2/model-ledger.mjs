@@ -16,12 +16,14 @@
 import { mkdir, appendFile, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import { InvalidArgumentError } from '../errors.mjs'
+
 export const MODEL_CACHE_FILE = 'model-summary-cache.jsonl'
 export const MODEL_USAGE_FILE = 'model-usage.jsonl'
 
 /** 追加一行 JSONL（LF 结尾；目录不存在则创建）。 */
 async function appendLedgerLine(sessionDir, fileName, payload) {
-  if (!sessionDir || typeof sessionDir !== 'string') throw new Error('model-ledger：缺少 sessionDir')
+  if (!sessionDir || typeof sessionDir !== 'string') throw new InvalidArgumentError('model-ledger：缺少 sessionDir')
   await mkdir(sessionDir, { recursive: true })
   await appendFile(join(sessionDir, fileName), JSON.stringify(payload) + '\n', 'utf8')
 }

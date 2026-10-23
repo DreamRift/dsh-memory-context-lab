@@ -10,7 +10,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { EngineV2Error } from './errors.mjs'
+import { EngineV2Error, InvalidArgumentError } from './errors.mjs'
 import { isPluginAuthoredMessage } from '../core.mjs'
 
 export const RECORDS_SCHEMA_VERSION = 2
@@ -79,11 +79,19 @@ export function parseRecordId(id) {
   return { txn: Number(match[1]), index: Number(match[2]) }
 }
 
-/** 记录 ID 全序：先事务号后序号，纯字符串比较亦成立（定宽）。 */
+/**
+ * 记录 ID 全序：先事务号后序号，纯字符串比较亦成立（定宽）。
+ *
+ * 非法 ID 抛 `EINVAL`（0.13.2-beta.6 G2）：此前是裸 `TypeError`，`code` 是
+ * `undefined`——而这条路径直接对着用户输入（`history` 的起始 ID、分页游标），
+ * 于是「你给的 ID 不对」在命令面表现成一条宿主级崩溃（store/p-05 V1/V2b）。
+ */
 export function compareRecordIds(a, b) {
   const left = parseRecordId(a)
   const right = parseRecordId(b)
-  if (!left || !right) throw new TypeError(`非法记录 ID：${!left ? a : b}`)
+  if (!left || !right) {
+    throw new InvalidArgumentError(`非法记录 ID：${!left ? a : b}`, { code: 'EINVAL', details: { invalid: !left ? a : b } })
+  }
   return left.txn - right.txn || left.index - right.index
 }
 
@@ -129,7 +137,7 @@ export function draftRecord({ kind, seq, fidelity = 'verbatim', inline = {}, ref
 function normalizeInline(value) {
   if (value === undefined || value === null) return {}
   if (typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError('inline 必须是对象')
+    throw new InvalidArgumentError('inline 必须是对象')
   }
   const out = {}
   for (const key of Object.keys(value).sort()) out[key] = value[key]
@@ -139,7 +147,7 @@ function normalizeInline(value) {
 function normalizeRefs(value) {
   if (value === undefined || value === null) return {}
   if (typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError('refs 必须是对象')
+    throw new InvalidArgumentError('refs 必须是对象')
   }
   const out = {}
   for (const key of Object.keys(value).sort()) out[key] = value[key]

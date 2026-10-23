@@ -11,6 +11,7 @@
  * - **增量索引**：已索引的记录 ID 记账在会话目录，重复同步只处理新增，避免每次全量。
  */
 
+import { randomUUID } from 'node:crypto'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -140,7 +141,10 @@ export async function writeRetrievalIndex(directory, { backend, indexed, generat
     visibilityRevision,
   }
   const target = indexFileFor(directory)
-  const temporary = `${target}.tmp-${process.pid}-${Date.now()}`
+  // G8 同族（对抗审查 finding 5）：`tmp-<pid>-<Date.now()>` 在同进程同毫秒的两个
+  // 写者上会撞名，后写者截断先写者——这与读账本 P0 是同一个根因。
+  // randomUUID 让每次写的临时名唯一，原子性才真正成立。
+  const temporary = `${target}.tmp-${randomUUID()}`
   await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
   await rename(temporary, target)
   return payload

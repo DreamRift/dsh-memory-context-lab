@@ -26,6 +26,7 @@ import { v2SessionDirectoryFor } from './state.mjs'
 import { DispositionError, applyForget, applyUndo, buildForgetPreview, describeForgetStatus, getForgetPlan, resolveForgetTargets, saveForgetPlan } from './disposition.mjs'
 import { dropVoucherPlansForRecords } from './agg-voucher.mjs'
 import { invalidateProvenance, registerProvenanceEdge } from './provenance-index.mjs'
+import { withHostContract } from './command-result.mjs'
 
 export function createForgetDomain({
   factoryFor,
@@ -435,5 +436,7 @@ async function forgetCommand(invocation, args) {
   return { kind: 'success', text: lines.join('\n') }
 }
 
-  return { forgetCommand }
+  // G5：命令域工厂返回时统一套上宿主契约（`{kind:'error',code,message}` 补 `text`）。
+  // 包在工厂出口而不是逐处补 text：域内部继续用 code/message，新加的错误分支自动合规。
+  return withHostContract({ forgetCommand })
 }

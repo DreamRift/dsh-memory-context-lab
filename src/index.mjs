@@ -25,6 +25,7 @@ import {
   escapePromptBraces,
   NUMERIC_SETTINGS,
   PACKAGE_NAME,
+  PLUGIN_SOURCE_FORMS,
   parseOperation,
 } from './core.mjs'
 import { recallQueryFrom } from './apply.mjs'
@@ -38,6 +39,7 @@ import { createPlanFirst } from './plan-first.mjs'
 import { createV2RecallTool } from './v2/tool.mjs'
 import { labRootFor } from './storage.mjs'
 import { globalSuppressionCoordinator, locatePinnedDshMemory } from './dsh-memory-suppression.mjs'
+import { InvalidArgumentError } from './errors.mjs'
 
 export const name = 'memory-context-lab'
 
@@ -174,7 +176,7 @@ const HOST_VERSION = probeHostVersion()
 
 function sessionIdOf(session) {
   const raw = session?.id
-  if (typeof raw !== 'string' || !raw.trim()) throw new Error('DSH 未提供当前会话标识，已拒绝启用降温。')
+  if (typeof raw !== 'string' || !raw.trim()) throw new InvalidArgumentError('DSH 未提供当前会话标识，已拒绝启用降温。')
   return raw.trim()
 }
 

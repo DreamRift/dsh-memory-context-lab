@@ -18,6 +18,7 @@ import { AGG_VOUCHER_MARKER } from './agg-voucher.mjs'
 import { v2SessionDirectoryFor } from './state.mjs'
 import { getForgetIndex } from './disposition.mjs'
 import { resolveReadTargets } from './identity-index.mjs'
+import { withHostContract } from './command-result.mjs'
 
 export function createCompressDomain({
   adopt,
@@ -198,9 +199,9 @@ export function createCompressDomain({
     }
   }
 
+  // G5：命令域导出统一套上宿主契约（见 v2/command-result.mjs）。
   return {
-    compressCommand,
-    expandCommand,
+    ...withHostContract({ compressCommand, expandCommand }),
     compressDepsOf,
   }
 }

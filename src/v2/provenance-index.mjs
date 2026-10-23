@@ -17,8 +17,9 @@
  * 防止 A←B←A 的循环派生把 BFS 变成死循环。
  */
 
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { withWriteLock } from './write-lock.mjs'
+import { canonicalLine as sharedCanonicalLine, createAppendableLedger } from './appendable-ledger.mjs'
 
 export const PROVENANCE_FILE = 'provenance.jsonl'
 export const PROVENANCE_HEADER_KIND = 'dsh-memory-context-lab/v2/provenance'
@@ -42,25 +43,33 @@ export function provenancePath(sessionDir) {
   return path.join(sessionDir, PROVENANCE_FILE)
 }
 
-function canonicalJson(value) {
-  if (Array.isArray(value)) return value.map(canonicalJson)
-  if (value !== null && typeof value === 'object') {
-    const out = {}
-    for (const key of Object.keys(value).sort()) out[key] = canonicalJson(value[key])
-    return out
-  }
-  return value
-}
-
-function canonicalLine(value) {
-  return JSON.stringify(canonicalJson(value))
-}
+// 规范序列化只有一份实现（appendable-ledger.mjs）。本文件此前自己抄了一份，
+// 与 disposition/hierarchy 的同名函数逐字重复——三份账本三份协议，正是 G1 的根因。
+const canonicalLine = sharedCanonicalLine
 
 function parseProvenanceText(text) {
   const lines = text.split('\n')
   const trailingNewline = /\n$/.test(text)
-  const completeLines = trailingNewline ? lines.slice(0, -1) : lines.slice(0, -1)
-  const partialLine = trailingNewline ? '' : lines[lines.length - 1]
+  const completeLines = lines.slice(0, -1)
+  // 尾部没有 LF 时**先试解析**再判半行（0.13.2-beta.2 W-01b / D-01 口径）。
+  //
+  // 旧实现（本文件）写的是「没有 LF 就整条尾巴都是半行」，那是 D-01 修复**之前**
+  // 的口径：任何不走 appendFile('…\n') 的写入路径留下的**完整合法边**都被
+  // loadProvenance 在读取动作里物理删除——来源图少一条边、遗忘级联报告少一段。
+  // 同一个 bug 在 disposition 与 hierarchy 都修过，唯独这第三份账本没跟上，
+  // 因为它自己抄了一份 parse。完整条目的判据是「这一行能否解析成 JSON」。
+  let partialLine = ''
+  if (!trailingNewline && lines.length > 0) {
+    const tail = lines[lines.length - 1]
+    if (tail.length > 0) {
+      try {
+        JSON.parse(tail)
+        completeLines.push(tail) // 合法 → 最后一条完整行，不进 partialLine
+      } catch {
+        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
+      }
+    }
+  }
   const entries = []
   let damaged = false
   let damageDetail = null
@@ -96,30 +105,38 @@ function parseProvenanceText(text) {
 }
 
 /**
+ * provenance 账本的句柄（0.13.2-beta.6 G1）。
+ *
+ * 收口前这里有两个缺陷，都是「第三份账本没跟上前两份的修复」：
+ * 1. `loadProvenance` 的尾部修复**直接 writeFile 截断**，不在写锁内、不重读——
+ *    W-01b 在 disposition/hierarchy 都修过，唯独这里没修；
+ * 2. `registerProvenanceEdge(s)` 与 `invalidateProvenance` **整段没有写锁**，
+ *    两个并发注册都看到「没有文件」→ 各写一行 header → 账本永久 damaged，
+ *    所有边都读不出来（store/p-10 的 X1/X2/X2b）。
+ *
+ * 协议本体在 appendable-ledger.mjs；本文件只提供 header 内容与行解析。
+ */
+function ledgerFor(sessionDir) {
+  return createAppendableLedger({
+    file: provenancePath(sessionDir),
+    sessionDir,
+    header: { kind: PROVENANCE_HEADER_KIND, schemaVersion: PROVENANCE_SCHEMA_VERSION },
+    parse: parseProvenanceText,
+  })
+}
+
+/**
  * 读取来源图。尾部半行截断修复（repairedBytes 记账）；中部损坏 →
  * `damaged: true` + 已解析前缀，读侧告警、写侧拒绝。
  */
 export async function loadProvenance(sessionDir) {
-  let text
-  try {
-    text = await readFile(provenancePath(sessionDir), 'utf8')
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { state: 'absent', entries: [], damaged: false, repairedBytes: 0 }
-    throw error
-  }
-  if (text.length === 0) return { state: 'absent', entries: [], damaged: false, repairedBytes: 0 }
-  const parsed = parseProvenanceText(text)
-  let repairedBytes = 0
-  if (parsed.partialLine && parsed.partialLine.length > 0) {
-    await writeFile(provenancePath(sessionDir), Buffer.from(text.slice(0, text.length - parsed.partialLine.length), 'utf8'))
-    repairedBytes = Buffer.byteLength(parsed.partialLine, 'utf8')
-  }
+  const ledger = await ledgerFor(sessionDir).load()
   return {
-    state: parsed.damaged ? 'damaged' : 'ok',
-    entries: parsed.entries,
-    damaged: parsed.damaged,
-    damageDetail: parsed.damageDetail ?? null,
-    repairedBytes,
+    state: ledger.state === 'absent' ? 'absent' : (ledger.damaged ? 'damaged' : 'ok'),
+    entries: ledger.entries,
+    damaged: ledger.damaged,
+    damageDetail: ledger.damageDetail ?? null,
+    repairedBytes: ledger.repairedBytes,
   }
 }
 
@@ -174,6 +191,14 @@ function assertWritable(loaded, action) {
  * 注册拒绝——这是结构不可能（A 派生自 B 又是 B 的祖先）而不是策略问题。
  */
 export async function registerProvenanceEdge({ sessionDir, derivedId, derivedKind, sourceIds }) {
+  // 读-改-写必须整段在写锁内：load → 环检测 → 判 hasFile → 追加 header → 追加边。
+  // 无锁时两个并发注册都看到 hasFile=false，各写一行 header → 账本永久 damaged
+  // （store/p-10 X1/X2/X2b）。「判有没有文件」也不再单独做——appendLines 的
+  // prepareUnlocked 在锁内判「0 字节就补 header」，那是同一件事的单一实现。
+  return withWriteLock(sessionDir, () => registerProvenanceEdgeUnlocked({ sessionDir, derivedId, derivedKind, sourceIds }))
+}
+
+async function registerProvenanceEdgeUnlocked({ sessionDir, derivedId, derivedKind, sourceIds }) {
   if (typeof derivedId !== 'string' || derivedId.length === 0) {
     throw new ProvenanceError('derivedId 非法', { code: 'EINVAL' })
   }
@@ -209,22 +234,9 @@ export async function registerProvenanceEdge({ sessionDir, derivedId, derivedKin
     sourceIds: [...new Set(sourceIds)].sort(),
     registeredAt: new Date().toISOString(),
   }
-  await mkdir(sessionDir, { recursive: true })
-  let hasFile = false
-  try {
-    await readFile(provenancePath(sessionDir), 'utf8')
-    hasFile = true
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
-  if (!hasFile) {
-    await appendFile(
-      provenancePath(sessionDir),
-      canonicalLine({ kind: PROVENANCE_HEADER_KIND, schemaVersion: PROVENANCE_SCHEMA_VERSION }) + '\n',
-      'utf8',
-    )
-  }
-  await appendFile(provenancePath(sessionDir), canonicalLine(entry) + '\n', 'utf8')
+  // header 的建立（含「文件存在但 0 字节」这种情形）由账本协议统一负责，
+  // 这里不再自己 readFile 判 hasFile —— 那正是双 header 的来源。
+  await ledgerFor(sessionDir).appendLines([entry])
   return { entry, cycleCheckedNodes: steps }
 }
 
@@ -236,6 +248,10 @@ export async function registerProvenanceEdge({ sessionDir, derivedId, derivedKin
  */
 export async function registerProvenanceEdges({ sessionDir, edges = [] }) {
   if (!Array.isArray(edges) || edges.length === 0) return { registered: 0 }
+  return withWriteLock(sessionDir, () => registerProvenanceEdgesUnlocked({ sessionDir, edges }))
+}
+
+async function registerProvenanceEdgesUnlocked({ sessionDir, edges = [] }) {
   const loaded = await loadProvenance(sessionDir)
   assertWritable(loaded, 'provenance 批量注册')
   const folded = foldProvenance(loaded.entries)
@@ -274,36 +290,25 @@ export async function registerProvenanceEdges({ sessionDir, edges = [] }) {
       )
     }
   }
-  const lines = []
-  let hasFile = false
-  try {
-    await readFile(provenancePath(sessionDir), 'utf8')
-    hasFile = true
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
-  if (!hasFile) {
-    lines.push(canonicalLine({ kind: PROVENANCE_HEADER_KIND, schemaVersion: PROVENANCE_SCHEMA_VERSION }))
-  }
   const registeredAt = new Date().toISOString()
-  for (const edge of deduped.values()) {
-    lines.push(canonicalLine({
-      kind: PROVENANCE_EDGE,
-      derivedId: edge.derivedId,
-      derivedKind: edge.derivedKind,
-      sourceIds: edge.sourceIds,
-      registeredAt,
-    }))
-  }
-  if (lines.length > 0) {
-    await mkdir(sessionDir, { recursive: true })
-    await appendFile(provenancePath(sessionDir), lines.map((line) => line + '\n').join(''), 'utf8')
-  }
+  const rows = [...deduped.values()].map((edge) => ({
+    kind: PROVENANCE_EDGE,
+    derivedId: edge.derivedId,
+    derivedKind: edge.derivedKind,
+    sourceIds: edge.sourceIds,
+    registeredAt,
+  }))
+  // header 的建立同样交给账本协议（0 字节也算「没有 header」）。
+  await ledgerFor(sessionDir).appendLines(rows)
   return { registered: deduped.size, cycleCheckedNodes: steps }
 }
 
 /** 追加失效标记（cause = forget 操作 id 或显式原因）。幂等：同 derived+cause 只记一条生效。 */
 export async function invalidateProvenance({ sessionDir, derivedId, cause }) {
+  return withWriteLock(sessionDir, () => invalidateProvenanceUnlocked({ sessionDir, derivedId, cause }))
+}
+
+async function invalidateProvenanceUnlocked({ sessionDir, derivedId, cause }) {
   const loaded = await loadProvenance(sessionDir)
   assertWritable(loaded, 'provenance 失效')
   const folded = foldProvenance(loaded.entries)
@@ -315,7 +320,7 @@ export async function invalidateProvenance({ sessionDir, derivedId, cause }) {
     cause: String(cause ?? ''),
     at: new Date().toISOString(),
   }
-  await appendFile(provenancePath(sessionDir), canonicalLine(entry) + '\n', 'utf8')
+  await ledgerFor(sessionDir).appendLines([entry])
   return { appended: true, derivedId, cause }
 }
 

@@ -31,6 +31,7 @@
 export { INDEX_TEXT_MAX_BYTES }
 
 import { INDEX_TEXT_MAX_BYTES } from './retrieval.mjs'
+import { InvalidArgumentError } from '../errors.mjs'
 
 /** 工具名：固定、专用、只读。 */
 export const V2_RECALL_TOOL_NAME = 'memory_lab_recall'
@@ -282,8 +283,8 @@ export function renderToolOutput(sessionId, value) {
  * @param {(session: object) => string} deps.sessionIdOf 会话 ID 解析
  */
 export function createV2RecallTool({ runtime, sessionIdOf }) {
-  if (!runtime || typeof runtime.recall !== 'function') throw new Error('createV2RecallTool 需要 runtime.recall。')
-  if (typeof sessionIdOf !== 'function') throw new Error('createV2RecallTool 需要 sessionIdOf。')
+  if (!runtime || typeof runtime.recall !== 'function') throw new InvalidArgumentError('createV2RecallTool 需要 runtime.recall。')
+  if (typeof sessionIdOf !== 'function') throw new InvalidArgumentError('createV2RecallTool 需要 sessionIdOf。')
 
   return {
     name: V2_RECALL_TOOL_NAME,

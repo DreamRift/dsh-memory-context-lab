@@ -44,6 +44,7 @@ import {
   textFromContent,
 } from './core.mjs'
 import { PRESSURE_DEFAULTS, decidePressureGate, occupancyPercentOf } from './v2/pressure.mjs'
+import { InvalidArgumentError } from './errors.mjs'
 import {
   ProtectionRegistry,
   PROTECTION_SOURCE,
@@ -961,7 +962,7 @@ export function createEngine(dependencies) {
   async function ensureClient(record) {
     if (record.client) return record.client
     if (record.clientError) throw record.clientError
-    if (!dependencies.createClient) throw new Error('宿主未提供隔离冷库工厂。')
+    if (!dependencies.createClient) throw new InvalidArgumentError('宿主未提供隔离冷库工厂。', { code: 'EBACKENDUNAVAILABLE' })
     try {
       record.client = await dependencies.createClient(record)
       return record.client
@@ -1010,11 +1011,15 @@ export function createEngine(dependencies) {
       }
     }
     if (!aliveRows.length) {
+      // 全遗忘早退：这里的 stillSkipped **不是 0**——每一条被软遗忘挡下的行都是
+      // 「这一轮没恢复」的行。写 0 会让回执同时印「N 个未恢复」与「全部取回」，
+      // 两条互相矛盾的结论（restore/p-13 X33）。会计不变量 restored+skipped+
+      // forgotten == 输入行数 必须在这里也成立。
       return {
         outcomes: forgottenOutcomes,
         restored: 0,
         retriedSkipped: retriedRows.length,
-        stillSkipped: 0,
+        stillSkipped: forgottenOutcomes.length,
         forgotten: Math.max(forgottenOutcomes.length, forgottenArchived),
       }
     }

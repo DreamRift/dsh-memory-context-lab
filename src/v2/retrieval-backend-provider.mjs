@@ -114,13 +114,41 @@ export function createCompositeRetrievalBackendProvider({ lingshu = null, logger
     },
 
     async close(sessionId) {
+      const local = localEntries.get(sessionId)
       localEntries.delete(sessionId)
       probeCache.delete(sessionId)
+      // G9（对抗审查 finding 4）：T1 后端持有增量日志，dispose() 负责「停机时把
+      // 增量日志并回 base」。此前只 delete 引用、从不 dispose——进程退出时索引
+      // 日志永不压实，只增不减。close 的语义是「这个会话的后端没了」，
+      // 那么它的资源也必须真的被释放。
+      try {
+        await local?.dispose?.()
+      } catch (error) {
+        // 释放失败不得让 close 失败（后端已经不再被引用），但要留痕。
+        logger?.warn?.(`memory-context-lab: backend dispose failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
       await lingshu?.close?.(sessionId)
     },
 
+    /**
+     * 关闭全部后端会话。
+     *
+     * `probeCache` 必须一起清：它是「本会话探测到的后端」的缓存，而 close 的
+     * 语义是「这个会话的后端没了」。此前只清 localEntries，于是 closeAll 之后
+     * `ensureBackend` 仍然返回那个**已经被关掉**的 T2 后端（store/p-14 X27/X28）：
+     * 回注路径拿着一个死句柄继续用，失败信息还挂在「后端正常」的缓存上。
+     */
     async closeAll() {
+      const locals = [...localEntries.values()]
       localEntries.clear()
+      probeCache.clear()
+      for (const local of locals) {
+        try {
+          await local?.dispose?.()
+        } catch (error) {
+          logger?.warn?.(`memory-context-lab: backend dispose failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
       await lingshu?.closeAll?.()
     },
 

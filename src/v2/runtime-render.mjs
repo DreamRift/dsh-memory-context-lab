@@ -9,6 +9,8 @@
  * `runtime.mjs`，不要往这里加。
  */
 
+import { stateWithDefaults } from './state.mjs'
+
 export function rangeTokenOf(range) {
   if (!range || typeof range !== 'object') return null
   const start = Number.isInteger(range.start) ? range.start : null
@@ -31,12 +33,19 @@ export function formatRange(range) {  if (!range || typeof range !== 'object') r
 }
 
 export function renderV2Status(record, extra = {}) {
-  const settings = record.state.settings ?? {}
-  const applied = record.state.archive.filter((row) => row.status === 'applied').length
+  // 0.13.2-beta.6 G4：字段清单只有一份（`REQUIRED_STATE_FIELDS`）。
+  // 收口前这里裸取 `record.state.archive.filter`——缺 archive 或 archive 里
+  // 有 null 元素时抛裸 TypeError（code=undefined），而闸门放它过去了。
+  // `stateWithDefaults` 补的是**旧账本缺字段**（字段是后来才加的），不是掩盖损坏：
+  // 真正损坏的状态在 readV2SessionState 就失败关闭了。
+  const state = stateWithDefaults(record.state)
+  const settings = state.settings
+  const archive = state.archive.filter((row) => row !== null && typeof row === 'object')
+  const applied = archive.filter((row) => row.status === 'applied').length
   // 单列 `verify-failed`：它和 `applied` 一样遮蔽了原文（原文只在冷库），
   // 但替换后的活动面没通过校验。并进 `applied` 会虚报已归档段数。
-  const verifyFailed = record.state.archive.filter((row) => row.status === 'verify-failed').length
-  const restored = record.state.archive.filter((row) => row.status === 'restored').length
+  const verifyFailed = archive.filter((row) => row.status === 'verify-failed').length
+  const restored = archive.filter((row) => row.status === 'restored').length
   const lines = [
     `v2 引擎：${record.state.enabled ? '已启用' : '已停用'}${record.state.fullHistory === true ? '（全历史记忆上下文）' : ''}`,
     `会话：${record.sessionId}`,

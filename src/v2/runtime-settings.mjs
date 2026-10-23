@@ -16,9 +16,10 @@
  * 之前错误提示是**手写的字符串**，删 v1 命令面时漏了 `autorestore`，于是面板
  * 那个开关点下去会被回「未知设置项」，而提示里列出的键位又不含它。
  */
-import { NUMERIC_SETTINGS, normalizeSettings, parseStrictInteger, restoreGrowth } from '../core.mjs'
+import { NUMERIC_SETTINGS, normalizeSettings, parseStrictInteger, restoreGrowth, windowGuardRefuses } from '../core.mjs'
+import { describeWindowGuardRefusal } from './window-guard-text.mjs'
 import { describeRestoreSkipReasons } from '../apply.mjs'
-import { writeV2SessionState } from './state.mjs'
+import { stateWithDefaults, writeV2SessionState } from './state.mjs'
 
 /**
  * `set` 接受的键位（闭集，顺序即帮助文本顺序）。
@@ -48,7 +49,9 @@ export function createSettingsDomain({
     const record = records.get(sessionIdOf(invocation.agent.session)) ?? await adopt(invocation.agent)
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
     const [key, rawValue] = args
-    const settings = record.state.settings
+    // G4：字段清单只有一份。旧账本可能没有 settings（字段是后来才加的），
+    // 直接 `record.state.settings[x] = …` 会抛裸 TypeError（store/p-09 W13/W14）。
+    const settings = stateWithDefaults(record.state).settings
     // N-10（beta.4）：回执里照抄的必须是**落盘的那个值**（以前照抄原始字符串：
     // 12.7 被写成 12，回执却回「已设置 batch=12.7」）。
     let echo = rawValue
@@ -133,12 +136,16 @@ export function createSettingsDomain({
               assembledTokens: occupancy.host.assembledTokens,
               contextWindow: occupancy.host.contextWindow,
             })
-            if (growth.overflow) {
+            // 与 runtime-lifecycle 同口径（G3）：'unknown' 也拒绝，并如实标注
+            // 「判不了」而不是「超了」。
+            if (windowGuardRefuses(growth)) {
               fullHistoryGuardRefusal = {
                 total: growth.total,
                 heldByReceipts: growth.heldByReceipts,
                 assembled: occupancy.host.assembledTokens,
                 window: occupancy.host.contextWindow,
+                undetermined: growth.overflow === 'unknown',
+                unknownReasons: growth.unknownReasons,
               }
             }
           } catch (error) {
@@ -148,7 +155,7 @@ export function createSettingsDomain({
         if (fullHistoryGuardRefusal) {
           const growth = fullHistoryGuardRefusal.total - (fullHistoryGuardRefusal.heldByReceipts ?? 0)
           restoreNotes.push(
-            `已关闭全历史，但恢复会让组装输入超出模型窗口（当前约 ${fullHistoryGuardRefusal.assembled} + 待恢复约 ${growth} > 窗口 ${fullHistoryGuardRefusal.window}），`,
+            `已关闭全历史，但${describeWindowGuardRefusal(fullHistoryGuardRefusal, growth)}，`,
             '因此**没有**恢复，原文仍在冷库里。要取回原文，请先缩小上下文后再 /memory-lab restore，或直接丢弃冷库：',
             '  /memory-lab clean confirm delete-session',
           )

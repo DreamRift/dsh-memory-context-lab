@@ -14,6 +14,7 @@
  * - 词条总量有上限（默认 200k，对应常用上下文量级）：超限后停止增量并**如实报
  *   skipped**——绝不让记账把「没索引」当成「已索引」（盲区 61 的工程回应之一）。
  */
+import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { EngineV2Error } from './errors.mjs'
@@ -197,12 +198,13 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       postings: Object.fromEntries([...current.postings].map(([term, posting]) => [term, posting])),
     }
     await mkdir(directory, { recursive: true })
-    const temporary = path.join(directory, LOCAL_LEXICAL_INDEX_FILE + '.tmp-' + process.pid + '-' + Date.now())
+    // G8 同族：唯一临时名（见 retrieval.mjs 同处注释）。
+    const temporary = path.join(directory, LOCAL_LEXICAL_INDEX_FILE + '.tmp-' + randomUUID())
     await writeFile(temporary, JSON.stringify(payload) + '\n', 'utf8')
     await rename(temporary, indexFile)
     // 顺序是「新 base（gen+1）落地 → 清空日志」。崩在两者之间时旧日志因代次
     // 不匹配被忽略；不存在「日志已清空而 base 未落盘」的窗口。
-    const logTemp = path.join(directory, LOCAL_LEXICAL_LOG_FILE + '.tmp-' + process.pid + '-' + Date.now())
+    const logTemp = path.join(directory, LOCAL_LEXICAL_LOG_FILE + '.tmp-' + randomUUID())
     await writeFile(logTemp, '', 'utf8')
     await rename(logTemp, logFile)
     current.gen = gen

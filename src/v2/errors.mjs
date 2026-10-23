@@ -1,16 +1,8 @@
 /**
- * v2 引擎统一错误类型。
+ * v2 错误类型（再导出）。
  *
- * 独立成模块，records.mjs（纯函数层）与 store.mjs（存储层）都可导入而不成环。
- * 所有对外抛出的 v2 错误都应是 EngineV2Error，code 稳定可判别。
+ * 定义已上提到 `src/errors.mjs`（0.13.2-beta.6 G2：统一错误基类要覆盖全仓，
+ * 不能只覆盖 v2 存储层）。这里保留文件与导出名，是因为 v2 各模块都写
+ * `from './errors.mjs'`；再导出的是**同一个类对象**，instanceof 与 code 都不变。
  */
-export class EngineV2Error extends Error {
-  constructor(message, { code = 'EV2', details = null } = {}) {
-    super(message)
-    this.name = 'EngineV2Error'
-    this.code = code
-    // 结构化细节（0.11.0）：调用方按 code 分支，按 details 定位具体原因；
-    // 之前传进来的 details 被静默丢弃，错误只剩一句人话，测试与工具都无从判别。
-    this.details = details
-  }
-}
+export { EngineV2Error, InvalidArgumentError, DamagedError } from '../errors.mjs'

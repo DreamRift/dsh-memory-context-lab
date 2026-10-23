@@ -1,5 +1,82 @@
 # 变更记录
 
+## 0.13.2-beta.6（2026-10-23）**测试版，未打 tag / 未装到本机 profile，未推送 GitHub**
+
+**第 8 轮审计（`reports/第8轮结论.md`）的按根因修复批。只修缺陷、不改产品边界。**
+本轮不按 18 条红探针逐条排期，而是先归并成 9 个根因组，一组一处抽象改动。
+
+源码树 **117 套全绿、0 套失败**；回归集探针 **71/71 全绿**；
+`revert-probe` 全矩阵 **66 个场景 / 62 OK / 4 遗留脱节**（本批新增 12 条，全部改回去必红）。
+逐条处置见[修复计划（beta.6）](../docs/dev-0.13.2/修复计划-beta.6.md)与
+`测试/记忆上下文插件测试/reports/第9轮-修复结论.md`。
+
+### G1 三份 append-only 账本各写一遍「尾部修复 + 建 header」（P0）
+
+- **P0 disposition 缺 LF 拼行、hierarchy 0 字节无 header、provenance 并发双 header。**
+  同一个协议被实现了三遍，第三次漏了锁、前两次漏了「0 字节补 header」。现在抽出
+  `v2/appendable-ledger.mjs` 的 `createAppendableLedger()`，三份账本共用：
+  header 补齐在写锁内、尾部半行修复只对解析失败的行生效、临时名用 `randomUUID`。
+- 判据从「文件长度为零」放宽到「没有任何有效内容」（`text.trim().length === 0`）——
+  单个 `\n` 的账本同样要补 header，否则首条目落在第 1 行，下次解析判整本 damaged。
+
+### G2 对外错误没有统一类型
+
+- 约 25 处裸 `new Error` / `TypeError`，`code` 恒 `undefined`。现在全仓对外错误都走
+  `EngineV2Error` 家族（`InvalidArgumentError` / `DamagedError`），
+  `V2SessionStateDamagedError` 也补了 code。新增静态守卫禁止 `src/` 下裸抛 `Error`。
+
+### G3「未知量」没有三态
+
+- `restoreGrowth` 在 contextWindow / assembledTokens 缺失时判 `overflow: false`（失败开放），
+  而 `batchReleaseCeilingOf` 对同一个未知量明确失败关闭。现在统一成
+  `TRI_STATE.UNKNOWN` + `windowGuardRefuses()` 单一判据：判不了就拒绝，不放行。
+- 回执文案从三处硬编码字符串收口到 `describeWindowGuardRefusal()`，不再各写一份。
+
+### G4 状态文件的字段清单有两份
+
+- `isV2SessionState` 只校验 4 个字段，而 `runtime-render` / `runtime-settings` 裸取
+  `archive` / `settings` → 缺字段时抛裸 `TypeError`。现在 `REQUIRED_STATE_FIELDS`
+  是唯一真源，`stateWithDefaults()` 供消费者按同一张表取默认值。
+
+### G5 命令结果不满足宿主契约
+
+- 错误结果缺 `text` 时宿主抛 `TypeError`（`forget` 13 处、`compress` 6 处）。
+  现在 `withHostContract()` 在**域工厂出口**统一补齐，而不是逐处补 `text`。
+
+### G6 死代码 / 未接线
+
+- `apply-engine` 的 `rememberRecall` 定义并导出但全仓无调用点（回注去重整条链失效）——
+  已接回 `runtime-recall` 的写端。新增「导出即被使用」的静态守卫。
+
+### G7 注释即规格，但没有守卫
+
+- 约 8 处注释与实现相反（`archiveCleanup` 的窗口守卫、`inShadow` 的死逻辑、
+  `catalog.json` 的「打开加速」、`applyUndo` 的「revision CAS」、
+  `MAX_BUCKET_SIZE` 的「近似比较」、`agg-voucher` 的「丢最旧」、
+  `apply-engine` 的「实际提交数」）。逐处让实现服从注释，并加断言锁住。
+
+### G8 读账本并发写撞临时名
+
+- `read-ledger` 的临时名 `tmp-<pid>-<Date.now()>` 在同进程同毫秒的两个写者上撞名，
+  后写者截断先写者。改用 `randomUUID`，并让整段读改写进写锁。
+  同族的 `retrieval.mjs` / `local-lexical-backend.mjs` 一并改掉。
+
+### G9 句柄关闭后仍可写
+
+- `store.close()` 之后 `disable` / `reenable` / `abandonTransaction` 仍能写盘
+  （写锁已释放 → 无锁写者）。现在五个写入原语统一走 `#assertWritable()`；
+  `retrieval-backend-provider.closeAll()` 一并清 `probeCache`，不再返回已关闭的后端。
+
+### 已知未根治（诚实边界）
+
+- G1 的 `parse` 侧仍三份各写（只收口了写侧）；`model-ledger` / `local-lexical` 的
+  append 未进协议。
+- G3 的 `/memory-lab restore` 主路径仍不过窗口守卫；测量失败时守卫被跳过
+  （`lifecycle:502` 的 catch 只 warn）——两者都属产品口径，需另行裁定。
+- G4 的 `apply-engine` 消费者仍裸取 `record.state.archive`。
+- G5 只包「返回值」不包「抛出」。
+- G9 的 `closeAll` 不扫 `openingDirectories`。
+
 ## 0.13.2-beta.5（2026-10-22）**测试版，未打 tag / 未装到本机 profile，未推送 GitHub**
 
 **第 4 轮真机排查（`reports/第4轮结论.md`，Q-01 / P-01 / M-01 / N-12 / O-01）的修复批。
@@ -7,7 +84,7 @@
 
 源码树 **115 套全绿、0 套失败**；回归集探针 **53/53 全绿**；
 `revert-probe` 全矩阵 **57 个场景 / 53 OK / 4 遗留脱节**（脱节仍是历史维护债）。
-逐条处置见进展卡（beta.5）。
+逐条处置见[进展卡（beta.5）](../docs/dev-0.13.2/进展卡-beta.5.md)。
 
 ### 恢复语义（P1）
 
@@ -56,7 +133,7 @@
 （安装副本仍是 beta.3，版本不同就不拿新源码的期望去验旧副本），其余套件 0 跳过。
 回归集探针 **48/48 全绿**
 （第 3 轮的 3 条红全部转绿）；`revert-probe` 全矩阵 **49 个场景 / 45 OK / 4 遗留脱节**
-（脱节仍是历史维护债，本轮新增的 6 条全部「改回去必红」）。逐条处置见进展卡（beta.4）。
+（脱节仍是历史维护债，本轮新增的 6 条全部「改回去必红」）。逐条处置见[进展卡（beta.4）](../docs/dev-0.13.2/进展卡-beta.4.md)。
 
 ### 数据可恢复性（P1，beta.3 自己引入的回归）
 
@@ -107,8 +184,8 @@
 
 本版仍是**测试版**：源码树与 `release/` 均 **113 套全绿 / 0 跳过**，回归集探针 **43/43 全绿**，
 `release/` 已提交并打 tag `v0.13.2-beta.3`、已 `npm pack` 并装到本机 profile。
-**未推送 GitHub**（推送按 发布流程另行执行）。
-逐条处置见进展卡（beta.3）。
+**未推送 GitHub**（推送按 [发布流程](../docs/发布流程.md)另行执行）。
+逐条处置见[进展卡（beta.3）](../docs/dev-0.13.2/进展卡-beta.3.md)。
 
 **产物**：`dist/dsh-memory-context-lab-0.13.2-beta.3.tgz`（72 文件）；同一份包已复制到
 `测试/记忆上下文插件测试/packages/`（该目录只留当前版本）。**字节数与 sha256 记在**
@@ -192,7 +269,7 @@
 外加实施时静态发现的两处同族缺口。不新增功能，不改产品边界。**
 
 本版仍是**测试版**：源码树已改、测试全绿，但**未**打 tag、**未**推送 GitHub、**未**重出 tgz、
-profile 依赖仍指向 `#v0.13.1`。发布动作见 发布流程。
+profile 依赖仍指向 `#v0.13.1`。发布动作见 [发布流程](../docs/发布流程.md)。
 
 ### 互斥（P0）
 
@@ -280,7 +357,7 @@ profile 依赖仍指向 `#v0.13.1`。发布动作见 发布流程。
 **缺陷排查批：26 项真实缺陷的修复 + 8 条能跑红的守卫。不新增功能，不改产品边界。**
 
 本版是**测试版**：源码树已改、测试全绿，但**未**打 tag、**未**推送 GitHub、**未**重出 tgz、
-profile 依赖仍指向 `#v0.13.1`。发布动作见 发布流程。
+profile 依赖仍指向 `#v0.13.1`。发布动作见 [发布流程](../docs/发布流程.md)。
 
 ### 数据与隐私（P0）
 
@@ -723,7 +800,7 @@ case、现行文档不得再教 `/memory-lab2`）。
 - **一条遗忘不再废掉整组**：此前任一成员被遗忘即整组 `member-forgotten` blocked，同组其余成员永远压不掉。现在只把被遗忘成员**排除出参与集**：不读其正文、不进 L1/L2/`sourceRecordIds`/`leafIds`，其余成员照常蒸馏；全部成员被排除时仍整组失败关闭（没有安全子集）。
 - **计划 schema 2**：`recordIds` 语义收紧为「参与蒸馏的子集」，新增 `excludedRecordIds`/`excludedMembers`（`{recordId, seq, reason}`）/`memberDigest`（sha256 前 12 位）；`memberSeqs`/`memberTexts` 仍是表面全集，区间身份与 `voucherId` 因此不变。v1 计划（无 `planSchema`）保持整条作废语义。
 - **披露有边界**：凭证文本与 L2 卡头只在真的排除了成员时追加一行（「M 段成员因遗忘未参与聚合」）；无排除时输出与 0.10.x **逐字节一致**，既有断言不被被动。
-- 设计定稿：0.11.0-压缩成员级排除设计-20261018.md。
+- 设计定稿：[0.11.0-压缩成员级排除设计-20261018.md](../docs/历史归档/版本计划与提示词/0.11.0-压缩成员级排除设计-20261018.md)。
 
 ### 检索置信度（T3 / F-09）
 

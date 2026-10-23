@@ -268,6 +268,15 @@ export class V2SessionStore {
   #committedTxnFiles = []
   /** @type {null | { release: () => void }} 跨进程写锁（只读句柄为 null）。 */
   #writeLock = null
+  /**
+   * 已关闭标志（0.13.2-beta.6 G9）。
+   *
+   * `close()` 此前只释放写锁与目录登记，**不置位任何标志、也不清 openTransactions**：
+   * 关闭后的句柄仍然能 `stageRecord` 并 `commitTransaction`，而它已经不持有跨进程
+   * 写锁——同进程的另一条路径此时可以 open 拿到锁，于是**两个写者**（store/p-13
+   * X20/X21）。关闭必须是一个可判定的终态，不是「顺手放个锁」。
+   */
+  #closed = false
 
   constructor({ directory, engine, manifest, readOnly = false, writeLock = null }) {
     this.directory = directory
@@ -301,6 +310,10 @@ export class V2SessionStore {
 
   get hasOpenTransactions() {
     return this.#openTransactions.size > 0
+  }
+
+  get closed() {
+    return this.#closed
   }
 
   // ---------------------------------------------------------------- 初始化
@@ -348,7 +361,11 @@ export class V2SessionStore {
     // 当空集合迁移，子库会是 0 条记录而命令报成功——静默丢历史。closeAll() 也会
     // 在这个窗口里关掉它：锁被释放而 reconcile 继续写。
     pendingDirectories.delete(directory)
-    openDirectories.set(directory, store)
+    // G9（对抗审查 finding 3b）：对账窗口里 closeAll() 已经把这个句柄关掉时，
+    // 这里**不能再登记**——登记一个已关闭的句柄会让该目录在本进程内恒 EOPEN
+    // （peekOpen 返回死句柄），直到重启。关闭即终态：返回句柄但不再进可借用表，
+    // 调用方下次 open 会重新走完整流程。
+    if (!store.closed) openDirectories.set(directory, store)
     return store
   }
 
@@ -725,6 +742,11 @@ export class V2SessionStore {
    * 不同含义上重名。显式事务号必须 >= 当前计数器，并推进计数器。
    */
   async openTransaction({ txn: explicitTxn = null } = {}) {
+    if (this.#closed) {
+      // 关闭后开新事务等于「没有写锁的写者」：同进程另一条路径可以 open 拿到
+      // 跨进程写锁，两边同时写同一个会话目录（store/p-13 X20 的同族症状）。
+      throw new EngineV2Error('v2 句柄已关闭，拒绝新事务。', { code: 'ESTORECLOSED' })
+    }
     if (this.readOnly) {
       throw new EngineV2Error(this.disabled ? 'v2 会话已停用，处于只读状态，拒绝新事务。' : 'v2 会话以只读方式打开，拒绝新事务。', { code: 'EREADONLY' })
     }
@@ -829,6 +851,8 @@ export class V2SessionStore {
    * promise 链把同一句柄上的阶段化排成队列（不是锁：出错不阻断后续）。
    */
   async stageRecord(handle, draft) {
+    // 关闭判定放在排队之前：已关闭的句柄不该进入队列，也不该拿到 ID 之后才失败。
+    this.#assertWritable(`事务 ${handle.txn} 写入`)
     const previous = this.#stageQueue
     let release = () => {}
     this.#stageQueue = new Promise((resolve) => { release = resolve })
@@ -924,8 +948,11 @@ export class V2SessionStore {
     await writeFileAtomic(target, buffer)
   }
 
-  /** 写入屏障：只读/已停用的库不得接受任何写入，哪怕事务是停用前打开的。 */
+  /** 写入屏障：已关闭/只读/已停用的库不得接受任何写入，哪怕事务是停用前打开的。 */
   #assertWritable(what) {
+    if (this.#closed) {
+      throw new EngineV2Error(`${what}被拒绝：v2 句柄已关闭（关闭后不再持有写锁）。`, { code: 'ESTORECLOSED' })
+    }
     if (this.#readOnly) {
       throw new EngineV2Error(`${what}被拒绝：v2 会话以只读方式打开。`, { code: 'EREADONLY' })
     }
@@ -1104,19 +1131,35 @@ export class V2SessionStore {
 
   /** 停用：此后拒绝新事务，回读与对账保持可用（只读）。 */
   async disable(reason) {
+    // G9（对抗审查 finding 3）：停用/恢复同样写 engine.json，必须与
+    // openTransaction / stageRecord / commit 一样判关闭——关闭意味着写锁已放，
+    // 此时再写就是「无锁写者」，正是本组要消灭的形态。
+    this.#assertWritable('停用引擎')
     if (this.#readOnly) throw new EngineV2Error('只读句柄不能改变停用状态', { code: 'EREADONLY' })
     this.#engine = { ...this.#engine, disabled: { at: new Date().toISOString(), reason: String(reason ?? '') } }
     await writeJsonFileAtomic(path.join(this.directory, ENGINE_FILE), this.#engine)
   }
 
   async reenable() {
-    if (this.#readOnly) throw new EngineV2Error('只读句柄不能改变停用状态', { code: 'EREADONLY' })
+    // 这里**不能**用 #assertWritable：它同时拒绝「已停用」，而 reenable 的职责
+    // 正是解除停用（v2-store 套件当场红）。本方法只需要关闭判定——关闭意味着
+    // 写锁已放，再写 engine.json 就是「无锁写者」（G9 本组要消灭的形态）。
+    if (this.#closed) {
+      throw new EngineV2Error('恢复引擎被拒绝：v2 句柄已关闭（关闭后不再持有写锁）。', { code: 'ESTORECLOSED' })
+    }
     this.#engine = { ...this.#engine, disabled: null }
     await writeJsonFileAtomic(path.join(this.directory, ENGINE_FILE), this.#engine)
+    this.#readOnly = false
   }
 
   close() {
-    // 先放锁再撤登记：反过来会让下一次 open 在锁还没释放时就看到空位。
+    // 先置终态，再放锁、再撤登记：置位必须最先做，否则两步之间的窗口里
+    // 并发的 stageRecord 仍能通过写入屏障（它检查的就是这个标志）。
+    this.#closed = true
+    // 在途事务一并作废：它们已经不可能被正确提交（写锁没了），留着只会让
+    // hasOpenTransactions 恒 true、同号重试永远 EINVAL（store/p-13 的连带症状）。
+    this.#openTransactions.clear()
+    // 再放锁、再撤登记：反过来会让下一次 open 在锁还没释放时就看到空位。
     this.#writeLock?.release()
     this.#writeLock = null
     openDirectories.delete(this.directory)
@@ -1150,6 +1193,11 @@ export class V2SessionStore {
       }
     }
     pendingDirectories.clear()
+    // 在途 open（已占位、尚未对账完）也必须计入：它们同样握着写锁。
+    // 不能在这里直接 close（句柄还没构造完），改为登记目录让收尾侧跳过登记：
+    // 上面那处 `if (!store.closed)` 就是它的落点。这里只清占位集合，
+    // 让后续 open 不被误判成 EOPEN。
+    openingDirectories.clear()
     return closed
   }
 

@@ -1,5 +1,5 @@
 import { V2SessionStore, v2SessionDirectoryFor } from './store.mjs'
-import { EngineV2Error } from './errors.mjs'
+import { EngineV2Error, InvalidArgumentError } from './errors.mjs'
 import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { BYTES_PER_TOKEN } from './budget.mjs'
 import { readForkMap } from './fork.mjs'
@@ -245,6 +245,24 @@ export async function packWorkingSet(labRoot, sessionId, {
   payloadKinds = DEFAULT_PAYLOAD_KINDS,
   store: borrowed = null,
 } = {}) {
+  // 0.13.2-beta.6 G11（store/p-05b V6）：**原语层的入参契约**。
+  //
+  // 收口前这里只有一行默认值，预算从不校验；而下面的循环判据是
+  // `used + payloadTokens <= budgetTokens` 与 `used >= budgetTokens`。
+  // 两者在 `budgetTokens` 为 NaN 时**恒为 false**——于是 `break` 永不触发，
+  // 头部扫描把库里每一条都塞进 entries：包大小只由库大小决定，不由预算决定，
+  // 「有界热上下文」这条不变量当场失效（失败开放）。
+  //
+  // 命令面（runtime-read.mjs）自己先过 parseBudgetArg，所以这条缺陷只在
+  // **导出原语**被直接调用时可达——但它仍是缺陷：`packWorkingSet` 是公开导出，
+  // 且 budget.mjs 的头注释把「有界」写成硬要求。这里失败关闭（带 code 的业务错误），
+  // 不静默夹值——夹值会让调用方以为自己的预算生效了（N-10 的同一条教训）。
+  if (typeof budgetTokens !== 'number' || !Number.isFinite(budgetTokens) || budgetTokens < 0) {
+    throw new InvalidArgumentError(`packWorkingSet：budgetTokens 必须是有限非负数，收到 ${String(budgetTokens)}。`, {
+      code: 'EINVAL',
+      details: { budgetTokens: String(budgetTokens) },
+    })
+  }
   const store = borrowed ?? await V2SessionStore.open({ labRoot, sessionId, readOnly: true })
   // P-01：同上——没有库返回 null，不抛内部 TypeError。
   if (!store) return null

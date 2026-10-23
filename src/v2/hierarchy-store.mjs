@@ -23,11 +23,11 @@
  * 损坏写侧失败关闭、追加走 revision CAS（EREVISION）、canonicalLine 落盘。
  */
 
-import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
 
-import { canonicalLine } from './disposition.mjs'
+import { canonicalLine, createAppendableLedger } from './appendable-ledger.mjs'
 
 export const HIERARCHY_FILE = 'hierarchy.jsonl'
 export const HIERARCHY_HEADER_KIND = 'dsh-memory-context-lab/v2/hierarchy'
@@ -126,21 +126,10 @@ function parseLedgerText(text) {
  * 以锁内内容为准，才能保证「只截掉坏尾巴」而不是把别人刚追加的完整条目一起丢掉。
  * 返回被截掉的字节数。
  */
-async function repairHierarchyTail(sessionDir, file) {
-  return withWriteLock(sessionDir, async () => {
-    let current
-    try {
-      current = await readFile(file, 'utf8')
-    } catch (error) {
-      if (error?.code === 'ENOENT') return 0
-      throw error
-    }
-    const parsed = parseLedgerText(current)
-    if (!parsed.partialLine || parsed.partialLine.length === 0) return 0
-    const keep = current.slice(0, current.length - parsed.partialLine.length)
-    await writeFile(file, Buffer.from(keep, 'utf8'))
-    return Buffer.byteLength(parsed.partialLine, 'utf8')
-  })
+async function repairHierarchyTail(sessionDir) {
+  // 协议本体在 appendable-ledger.mjs：写锁内重读 → 只截解析失败的尾巴 →
+  // temp+rename 落盘（不原地 writeFile）。
+  return ledgerFor(sessionDir).repairTail()
 }
 
 /**
@@ -148,35 +137,20 @@ async function repairHierarchyTail(sessionDir, file) {
  * 尾部半行物理截断修复（repairedBytes），中部损坏只报不修。
  */
 export async function loadHierarchy(sessionDir) {
-  const file = hierarchyPath(sessionDir)
-  let text
-  try {
-    text = await readFile(file, 'utf8')
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { state: 'absent', entries: [], revision: 0, damaged: false, damageDetail: null, repairedBytes: 0, ...emptyFold() }
-    throw error
-  }
-  if (text.length === 0) {
-    return { state: 'absent', entries: [], revision: 0, damaged: false, damageDetail: null, repairedBytes: 0, ...emptyFold() }
-  }
-  const parsed = parseLedgerText(text)
   // 崩溃注入点：半行截断修复。必须在写锁内重读后再截断——读-改-写不是原子的，
   // 而账本的并发追加者是别的进程/别的 async 分支；拿读到的旧内容去截，会把别人
   // 刚追加的完整条目一起丢掉（0.13.2-beta.2 W-01b）。修复失败不阻断读取：读面仍按
-  // 已解析前缀返回，下一次可写打开再修。
-  const repairedBytes = parsed.partialLine && parsed.partialLine.length > 0
-    ? await repairHierarchyTail(sessionDir, file).catch(() => 0)
-    : 0
-  const fold = foldHierarchy(parsed.entries)
+  // 已解析前缀返回，下一次可写打开再修。协议本体在 appendable-ledger.mjs。
+  const ledger = await ledgerFor(sessionDir).load()
   return {
     // BUG-013：损坏优先于 absent（首行坏 JSON 时 entries=[]、header=null）。
-    state: parsed.damaged ? 'damaged' : (parsed.entries.length === 0 && parsed.header === null ? 'absent' : 'ok'),
-    entries: parsed.entries,
-    revision: parsed.entries.length,
-    damaged: parsed.damaged,
-    damageDetail: parsed.damageDetail,
-    repairedBytes,
-    ...fold,
+    state: ledger.state,
+    entries: ledger.entries,
+    revision: ledger.entries.length,
+    damaged: ledger.damaged,
+    damageDetail: ledger.damageDetail,
+    repairedBytes: ledger.repairedBytes,
+    ...foldHierarchy(ledger.entries),
   }
 }
 
@@ -309,19 +283,21 @@ function assertNoSummaryOfSummary(ledger, entry) {
   }
 }
 
-async function ensureLedgerHeader(sessionDir) {
-  const file = hierarchyPath(sessionDir)
-  await mkdir(sessionDir, { recursive: true })
-  try {
-    await readFile(file, 'utf8')
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      const header = canonicalLine({ kind: HIERARCHY_HEADER_KIND, schemaVersion: HIERARCHY_SCHEMA_VERSION })
-      await writeFile(file, header + '\n', { encoding: 'utf8' })
-      return
-    }
-    throw error
-  }
+/**
+ * hierarchy 账本的句柄（0.13.2-beta.6 G1）。
+ *
+ * 与 disposition 逐字同构的那份 `ensureLedgerHeader` 已删除：「文件存在但 0 字节」
+ * 时 `readFile` 成功、不写 header，于是第一条条目成为第 1 行，下次解析判
+ * 「首行不是合法 hierarchy header」→ 整本层级账 damaged，卡片全部重建。
+ * 现在建 header / 补 LF / 截半行 / 锁内重读全部由 appendable-ledger.mjs 负责。
+ */
+function ledgerFor(sessionDir) {
+  return createAppendableLedger({
+    file: hierarchyPath(sessionDir),
+    sessionDir,
+    header: { kind: HIERARCHY_HEADER_KIND, schemaVersion: HIERARCHY_SCHEMA_VERSION },
+    parse: parseLedgerText,
+  })
 }
 
 /**
@@ -346,8 +322,7 @@ async function appendHierarchyEntryUnlocked(sessionDir, entry, { expectedRevisio
     )
   }
   const withSeq = { ...entry, entrySeq: ledger.entries.length + 1 }
-  await ensureLedgerHeader(sessionDir)
-  await appendFile(hierarchyPath(sessionDir), canonicalLine(withSeq) + '\n', 'utf8')
+  await ledgerFor(sessionDir).appendLines([withSeq])
   invalidateHierarchyIndex(sessionDir)
   return { appended: true, entry: withSeq, revision: ledger.revision + 1 }
 }
@@ -383,9 +358,11 @@ async function appendHierarchyEntriesUnlocked(sessionDir, entries, { expectedRev
       { code: 'EREVISION' },
     )
   }
-  const payload = entries.map((entry, index) => canonicalLine({ ...entry, entrySeq: ledger.entries.length + 1 + index }) + '\n').join('')
-  await ensureLedgerHeader(sessionDir)
-  await appendFile(hierarchyPath(sessionDir), payload, 'utf8')
+  // 批量原子追加：一次 appendLines（单次 write + 单次 fsync），要么全部落盘、
+  // 要么一行都不写——中途崩溃不会留下半个批次。
+  await ledgerFor(sessionDir).appendLines(
+    entries.map((entry, index) => ({ ...entry, entrySeq: ledger.entries.length + 1 + index })),
+  )
   invalidateHierarchyIndex(sessionDir)
   return { appended: true, entries: entries.map((entry, index) => ({ ...entry, entrySeq: ledger.entries.length + 1 + index })), revision: ledger.revision + entries.length }
 }

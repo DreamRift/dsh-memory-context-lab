@@ -31,6 +31,7 @@ import { createHash } from 'node:crypto'
 import { isHumanAuthoredMessage } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
 import { formatImportanceReason, scoreSoftRetention } from './importance.mjs'
+import { InvalidArgumentError } from '../errors.mjs'
 
 export const WORKING_STATE_SCHEMA_VERSION = 3
 
@@ -674,7 +675,7 @@ function stageTextOf(stageId, lines) {
  */
 export function appendProjectionStage(projection, { stageId, lines = [], reason = null, at = null } = {}) {
   if (typeof stageId !== 'string' || stageId.trim() === '') {
-    throw new TypeError('appendProjectionStage 需要非空 stageId')
+    throw new InvalidArgumentError('appendProjectionStage 需要非空 stageId')
   }
   const base = projection && typeof projection === 'object' && Array.isArray(projection.stages)
     ? projection

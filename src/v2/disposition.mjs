@@ -20,9 +20,15 @@
  */
 
 import { createHash } from 'node:crypto'
-import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
+import { canonicalJson, canonicalLine, createAppendableLedger, writeFileAtomic } from './appendable-ledger.mjs'
+
+// 规范序列化的唯一实现在 appendable-ledger.mjs（三份账本共用）。这里重新导出，
+// 是因为 hierarchy-store / agg-voucher 历史上从这里 import —— 保留出口不制造
+// 「同一个函数有两个来源」的漂移机会。
+export { canonicalJson, canonicalLine }
 
 import { applyRecordToPairingLedger, compareRecordIds, openCallsOf, parseRecordId, RECORD_KINDS } from './records.mjs'
 
@@ -45,24 +51,6 @@ export class DispositionError extends Error {
 }
 
 // ---------------------------------------------------------------- 基础工具
-
-/**
- * 键排序的规范 JSON（整个值递归排序）。账本与计划文件落盘一律用它，
- * 保证同一逻辑内容字节稳定，便于逐字节比对与审计。
- */
-export function canonicalJson(value) {
-  if (Array.isArray(value)) return value.map(canonicalJson)
-  if (value !== null && typeof value === 'object') {
-    const out = {}
-    for (const key of Object.keys(value).sort()) out[key] = canonicalJson(value[key])
-    return out
-  }
-  return value
-}
-
-export function canonicalLine(value) {
-  return JSON.stringify(canonicalJson(value))
-}
 
 export function dispositionPath(sessionDir) {
   return path.join(sessionDir, DISPOSITION_FILE)
@@ -152,26 +140,24 @@ function parseLedgerText(text) {
 }
 
 /**
- * 截掉账本尾部那条解析失败的半行（崩溃残留）。
+ * disposition 账本的句柄（0.13.2-beta.6 G1）。
  *
- * 必须在写锁内做：读-改-写不是原子的，而账本的并发追加者是别的进程。锁内重读一次、
- * 以锁内内容为准，才能保证「只截掉坏尾巴」而不是把别人刚追加的完整条目一起丢掉。
- * 返回被截掉的字节数。
+ * 「建 header / 补末尾 LF / 截半行 / 锁内重读 / 追加 + fsync」这一整段协议
+ * 只在 `appendable-ledger.mjs` 里实现一次。本文件只提供两样本账本特有的东西：
+ * 首行 header 的内容、以及「一行长什么样」（`parseLedgerText`）。
+ *
+ * 收口前这里的问题：`ensureLedgerHeader` 只在 `readFile` 抛 ENOENT 时写 header，
+ * 而 0 字节文件 `readFile` 是成功的——于是「文件存在但空」的账本永远没有 header，
+ * 第一条条目成为第 1 行，下次解析判「首行不是 header」→ 整本作废、已遗忘的
+ * 记录全部重新可见。同一个缺陷在 hierarchy-store 里逐字重复了一遍。
  */
-async function repairLedgerTail(sessionDir, file) {
-  return withWriteLock(sessionDir, async () => {
-    let current
-    try {
-      current = await readFile(file, 'utf8')
-    } catch (error) {
-      if (error?.code === 'ENOENT') return 0
-      throw error
-    }
-    const parsed = parseLedgerText(current)
-    if (!parsed.partialLine || parsed.partialLine.length === 0) return 0
-    const keep = current.slice(0, current.length - parsed.partialLine.length)
-    await writeFile(file, Buffer.from(keep, 'utf8'))
-    return Buffer.byteLength(parsed.partialLine, 'utf8')
+/** 按会话目录取（或新建）本账本的句柄。 */
+function ledgerFor(sessionDir) {
+  return createAppendableLedger({
+    file: dispositionPath(sessionDir),
+    sessionDir,
+    header: { kind: DISPOSITION_HEADER_KIND, schemaVersion: DISPOSITION_SCHEMA_VERSION },
+    parse: parseLedgerText,
   })
 }
 
@@ -186,35 +172,20 @@ async function repairLedgerTail(sessionDir, file) {
  * 不算损坏，只记 `repairedBytes`。
  */
 export async function loadDisposition(sessionDir) {
-  const file = dispositionPath(sessionDir)
-  let text
-  try {
-    text = await readFile(file, 'utf8')
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { state: 'absent', entries: [], revision: 0, damaged: false, repairedBytes: 0 }
-    throw error
-  }
-  if (text.length === 0) {
-    return { state: 'absent', entries: [], revision: 0, damaged: false, repairedBytes: 0 }
-  }
-  const parsed = parseLedgerText(text)
   // 崩溃注入点①：半行截断修复——只保留完整行，被截掉的字节数如实上报。
-  // 只有**解析失败**的尾巴会走到这里（见 parseLedgerText）；修复在写锁内重读后
+  // 只有**解析失败**的尾巴会走修复路径（见 parseLedgerText）；修复在写锁内重读后
   // 再截断，避免「读到的旧内容」把并发追加的新条目一起截掉。修复失败不阻断读取：
-  // 读面仍按已解析前缀返回，下一次可写打开再修。
-  const repairedBytes = parsed.partialLine && parsed.partialLine.length > 0
-    ? await repairLedgerTail(sessionDir, file).catch(() => 0)
-    : 0
-  const revision = parsed.entries.length
+  // 读面仍按已解析前缀返回，下一次可写打开再修。协议本体在 appendable-ledger.mjs。
+  const ledger = await ledgerFor(sessionDir).load()
   return {
     // BUG-013：损坏优先于 absent。首行坏 JSON 时 entries=[]、header=null，
     // 先判 absent 会把「账本损坏」报成「全新会话」（旁路 damaged 字段才看得到）。
-    state: parsed.damaged ? 'damaged' : (parsed.entries.length === 0 && parsed.header === null ? 'absent' : 'ok'),
-    entries: parsed.entries,
-    revision,
-    damaged: parsed.damaged,
-    damageDetail: parsed.damageDetail,
-    repairedBytes,
+    state: ledger.state,
+    entries: ledger.entries,
+    revision: ledger.entries.length,
+    damaged: ledger.damaged,
+    damageDetail: ledger.damageDetail,
+    repairedBytes: ledger.repairedBytes,
   }
 }
 
@@ -351,24 +322,13 @@ function validateEntryShape(entry) {
   return problems
 }
 
-async function ensureLedgerHeader(sessionDir) {
-  const file = dispositionPath(sessionDir)
-  await mkdir(sessionDir, { recursive: true })
-  try {
-    await readFile(file, 'utf8')
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      const header = canonicalLine({ kind: DISPOSITION_HEADER_KIND, schemaVersion: DISPOSITION_SCHEMA_VERSION })
-      await writeFile(file, header + '\n', { encoding: 'utf8' })
-      return
-    }
-    throw error
-  }
-}
-
 /**
- * 追加一条 disposition 条目（崩溃注入点⑥：追加本身原子——单次 appendFile
- * 一行 + LF，进程在半行处中断时下次打开按半行截断修复）。
+ * 追加一条 disposition 条目（崩溃注入点⑥）。
+ *
+ * 「先整理账本再追加」这件事现在由 `appendable-ledger.mjs` 的 `appendLines` 做：
+ * 锁内重读 → 0 字节补 header → 截坏尾巴 → 末尾补 LF → 追加 + fsync。
+ * 可见性账本必须先于表面墓碑持久化：这行丢了，已遗忘的记录会在重启后重新可见
+ * （隐私回退），所以它与冷库载荷同口径付一次 fsync，不跟派生缓存合并。
  */
 async function appendEntry(sessionDir, entry) {
   return withWriteLock(sessionDir, () => appendEntryUnlocked(sessionDir, entry))
@@ -377,16 +337,7 @@ async function appendEntry(sessionDir, entry) {
 async function appendEntryUnlocked(sessionDir, entry) {
   const problems = validateEntryShape(entry)
   if (problems.length) throw new DispositionError(`disposition 条目非法：${problems.join('；')}`, { code: 'EINVAL' })
-  await ensureLedgerHeader(sessionDir)
-  // 可见性账本必须先于表面墓碑持久化：这行丢了，已遗忘的记录会在重启后重新
-  // 可见（隐私回退）。因此它与冷库载荷同口径付一次 fsync，不跟派生缓存合并。
-  const handle = await open(dispositionPath(sessionDir), 'a')
-  try {
-    await handle.writeFile(canonicalLine(entry) + '\n', 'utf8')
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
+  await ledgerFor(sessionDir).appendLines([entry])
   invalidateForgetIndex(sessionDir)
 }
 
@@ -718,22 +669,24 @@ export function computePlanId(recordIds, revision) {
 
 export async function saveForgetPlan(sessionDir, plan) {
   const file = forgetPlansPath(sessionDir)
-  let current = { plans: [] }
-  try {
-    current = JSON.parse(await readFile(file, 'utf8'))
-  } catch {
-    // 计划文件损坏时重建（它只是重放窗口，不是权威账本）。
-  }
-  if (!Array.isArray(current.plans)) current.plans = []
-  const next = [...current.plans.filter((item) => item?.planId !== plan.planId), plan]
-    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-    .slice(0, FORGET_PLAN_LIMIT)
-  const payload = canonicalLine({ plans: next }) + '\n'
-  await mkdir(sessionDir, { recursive: true })
-  const temp = file + '.tmp'
-  await writeFile(temp, payload, 'utf8')
-  await rename(temp, file)
-  return { planId: plan.planId, kept: next.length }
+  // 读-改-写必须整段在写锁内：否则两个并发的 preview 各自读到同一份旧计划、
+  // 各自写回自己那份，后写者覆盖先写者——被覆盖的那条计划就再也 apply 不了
+  // （0.13.2-beta.6 G8；agg-voucher 的计划文件是同款缺陷）。
+  return withWriteLock(sessionDir, async () => {
+    let current = { plans: [] }
+    try {
+      current = JSON.parse(await readFile(file, 'utf8'))
+    } catch {
+      // 计划文件损坏时重建（它只是重放窗口，不是权威账本）。
+    }
+    if (!Array.isArray(current.plans)) current.plans = []
+    const next = [...current.plans.filter((item) => item?.planId !== plan.planId), plan]
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+      .slice(0, FORGET_PLAN_LIMIT)
+    // 临时名必须唯一：固定 `file + '.tmp'` 在并发写者之间是同一个名字。
+    await writeFileAtomic(file, canonicalLine({ plans: next }) + '\n')
+    return { planId: plan.planId, kept: next.length }
+  })
 }
 
 export async function loadForgetPlans(sessionDir) {

@@ -541,6 +541,7 @@ export function createV2Runtime(dependencies) {
     return parseBudgetTokens(Number(raw.trim()), options)
   }
 
+
   async function commandHandler(invocation) {
     const parsed = parseV2Operation(invocation.rawInput ?? invocation.input)
     switch (parsed.operation) {

@@ -534,7 +534,92 @@ const CASES = {
     file: 'src/v2/readback.mjs',
     edits: [['  if (parsed > MAX_PAGE_SIZE) {', '  if (false) {']],
   },
+  // ── beta.6 根因组（G1…G9）：每条对应一个根因抽象，改回症状修法必红 ──
+  // G1：三份 append-only 账本共用一个开账协议。改回「各自 if (size===0) 补 header」
+  // 就是 P0 原形（0 字节账本无 header + 尾部修复不在写锁内）。
+  'appendable-ledger-shared': {
+    test: 'test/v2-beta6-g1-ledger.test.mjs',
+    file: 'src/v2/appendable-ledger.mjs',
+    edits: [[
+      "    if (text === null || text.trim().length === 0) {",
+      '    if (text === null || text.length === 0) {',
+    ]],
+  },
+  // G2：对外错误统一基类。把 InvalidArgumentError 退回裸 TypeError，
+  // 任何调用方拿到的 code 又变回 undefined。
+  'error-contract-code': {
+    test: 'test/v2-beta6-g2-error-contract.test.mjs',
+    file: 'src/errors.mjs',
+    edits: [[
+      'export class InvalidArgumentError extends EngineV2Error {',
+      'class InvalidArgumentError extends TypeError {',
+    ]],
+  },
+  // G3：未知量三态。restoreGrowth 把「窗口未知」判成 overflow:false 就是失败开放。
+  'restore-growth-unknown': {
+    test: 'test/v2-beta6-g3-three-state.test.mjs',
+    file: 'src/core.mjs',
+    edits: [[
+      '  if (!assembledKnown || !windowKnown) {',
+      '  if (false) {',
+    ]],
+  },
+  // G4：状态字段清单单一真源。闸门只校验 4 个字段 → 消费方裸取 archive 抛 TypeError。
+  'state-required-fields': {
+    test: 'test/v2-beta6-g4-state-shape.test.mjs',
+    file: 'src/v2/state.mjs',
+    edits: [[
+      'export const REQUIRED_STATE_FIELDS = Object.freeze([',
+      'const REQUIRED_STATE_FIELDS = Object.freeze([',
+    ]],
+  },
+  // G5：命令结果宿主契约。错误结果不带 text，宿主侧直接 TypeError。
+  'host-result-contract': {
+    test: 'test/v2-beta6-g5-command-result.test.mjs',
+    file: 'src/v2/command-result.mjs',
+    edits: [[
+      "  if (!result || typeof result !== 'object' || result.kind !== 'error') return result",
+      '  return result',
+    ]],
+  },
+  // G6：导出即被使用。rememberRecall 定义但无调用 → 回注去重整条链失效。
+  'dead-export-recall': {
+    test: 'test/v2-beta6-g6-dead-export.test.mjs',
+    file: 'src/v2/runtime-recall.mjs',
+    edits: [[
+      '    engine.rememberRecall(record, {',
+      '    void 0 && engine.rememberRecall(record, {',
+    ]],
+  },
+  // G7：注释即规格。piggyback 说「够批就进 units」而实现 continue 跳过。
+  'comment-is-spec-piggyback': {
+    test: 'test/v2-beta6-g7-comment-spec.test.mjs',
+    file: 'src/apply.mjs',
+    edits: [[
+      '  if (countable.length >= threshold) {',
+      '  if (false) {',
+    ]],
+  },
+  // G8：读账本并发登记走同一把锁 + 原子替换。
+  'read-ledger-concurrent': {
+    test: 'test/v2-beta6-g8-read-ledger.test.mjs',
+    file: 'src/v2/read-ledger.mjs',
+    edits: [[
+      '  return withWriteLock(sessionDir, () => registerReadsUnlocked(sessionDir, {',
+      '  return (async (fn) => fn())(async () => registerReadsUnlocked(sessionDir, {',
+    ]],
+  },
+  // G9：句柄关闭后不得再开事务（否则同进程两把写锁）。
+  'store-closed-guard': {
+    test: 'test/v2-beta6-g9-store-closed.test.mjs',
+    file: 'src/v2/store.mjs',
+    edits: [[
+      '    if (this.#closed) {',
+      '    if (false) {',
+    ]],
+  },
 }
+
 
 /**
  * 跑一个子进程并把它的输出收进文件。

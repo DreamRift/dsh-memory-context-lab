@@ -6,6 +6,7 @@ import {
   PACKAGE_NAME,
   PACKAGE_VERSION,
 } from './core.mjs'
+import { EngineV2Error, InvalidArgumentError } from './errors.mjs'
 
 const INITIALIZE_TIMEOUT_MS = 30_000
 const TOOL_TIMEOUT_MS = 60_000
@@ -134,9 +135,9 @@ export class DisposableJsonRpcBridge {
 
   async request(method, params, signal, timeoutMs = this.options.timeoutMs) {
     throwIfAborted(signal, method)
-    if (this.disposed) throw new Error('隔离冷库进程已关闭。')
+    if (this.disposed) throw new EngineV2Error('隔离冷库进程已关闭。', { code: 'EBACKENDCLOSED' })
     const child = this.child
-    if (!child?.stdin?.writable) throw new Error('隔离冷库进程不可写。')
+    if (!child?.stdin?.writable) throw new EngineV2Error('隔离冷库进程不可写。', { code: 'EBACKENDCLOSED' })
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -162,7 +163,7 @@ export class DisposableJsonRpcBridge {
 
   #write(message) {
     const stdin = this.child?.stdin
-    if (!stdin?.writable) throw new Error('隔离冷库进程不可写。')
+    if (!stdin?.writable) throw new EngineV2Error('隔离冷库进程不可写。', { code: 'EBACKENDCLOSED' })
     stdin.write(`${JSON.stringify(message)}\n`)
   }
 
@@ -211,7 +212,7 @@ export class DisposableJsonRpcBridge {
       if (!graceful && child.exitCode === null) {
         try { child.kill() } catch { /* process already exited */ }
         const killed = await timeoutResult(this.closed ?? Promise.resolve(true), STOP_KILL_WAIT_MS)
-        if (!killed) throw new Error('隔离冷库进程未能停止，已保留会话目录避免误删。')
+        if (!killed) throw new EngineV2Error('隔离冷库进程未能停止，已保留会话目录避免误删。', { code: 'ESTOPTIMEOUT' })
       }
     }
     this.reader?.close()
@@ -271,7 +272,7 @@ export function mcpText(result) {
 
 function parseToolResult(result) {
   const text = mcpText(result)
-  if (result?.isError === true) throw new Error(text || '隔离冷库拒绝了请求。')
+  if (result?.isError === true) throw new EngineV2Error(text || '隔离冷库拒绝了请求。', { code: 'EBACKENDREJECTED' })
   try {
     return text ? JSON.parse(text) : {}
   } catch {
@@ -328,7 +329,7 @@ export class TemporaryLingshuClient {
       const tools = Array.isArray(listing?.tools) ? listing.tools : []
       const names = new Set(tools.map((tool) => tool?.name))
       if (!names.has('mdcg_remember') || !names.has('cg') || !names.has('mdcg_get')) {
-        throw new Error('隔离冷库未暴露 mdcg_remember/cg/mdcg_get，已拒绝启用降温。')
+        throw new InvalidArgumentError('隔离冷库未暴露 mdcg_remember/cg/mdcg_get，已拒绝启用降温。', { code: 'EBACKENDUNAVAILABLE' })
       }
       // Startup capability probe: one read-only call, recorded for diagnostics
       // (C-08). Inconclusive results do not block enablement; every real recall
@@ -376,10 +377,10 @@ export class TemporaryLingshuClient {
     // `ok:true, committed:false, moved_to:'review_queue'` — queued, not stored.
     // Treat both as an explicit write failure instead.
     if (result && typeof result === 'object' && result.ok === false) {
-      throw new Error(`冷库拒收写入（${result.error ?? 'unknown'}）：${result.hint ?? 'no hint'}`)
+      throw new EngineV2Error(`冷库拒收写入（${result.error ?? 'unknown'}）：${result.hint ?? 'no hint'}`, { code: 'EBACKENDREJECTED', details: { reason: result.error ?? null } })
     }
     if (result && typeof result === 'object' && result.committed === false) {
-      throw new Error('冷库未提交写入（同 id 节点已持有不同正文，被排入复核队列而非落盘）')
+      throw new EngineV2Error('冷库未提交写入（同 id 节点已持有不同正文，被排入复核队列而非落盘）', { code: 'ECOLDWRITECONFLICT' })
     }
     return result
   }

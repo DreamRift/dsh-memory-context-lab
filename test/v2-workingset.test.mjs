@@ -476,7 +476,13 @@ test('稳定前缀：投影按批次追加不重写历史，卡片前缀哈希�
   assert.equal(empty.stages.length, 0)
   assert.equal(first.stages.length, 1)
   assert.equal(second.stages.length, 2)
-  assert.throws(() => appendProjectionStage(first, { stageId: '' }), TypeError)
+  // 0.13.2-beta.6 G2：空 stageId 此前抛裸 TypeError（`code` 为 undefined）。
+  // 现在抛 InvalidArgumentError（继承 EngineV2Error），带 `EINVAL`——判据从
+  // 「是哪个内置类」改成「有没有可判别的 code」，后者才是调用方真正依赖的东西。
+  assert.throws(() => appendProjectionStage(first, { stageId: '' }), (error) => {
+    assert.equal(error.code, 'EINVAL')
+    return true
+  })
 
   const stateA = fullState()
   const stateB = fullState({

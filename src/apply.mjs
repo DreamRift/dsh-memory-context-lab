@@ -660,6 +660,11 @@ export function planCooling({
   // 找到 `threshold` 个合格候选就停：够批与否已经确定，没必要为整条积压租节点。
   // 搭车的卡片不占门槛名额，所以先取 countable，再补 piggyback。
   const ready = []
+  // 搭车单元的身份必须单独记：它们**不占门槛名额**（注释里的语义），但提交循环
+  // 曾用同一个计数器数它们，于是「countable 刚好填满 threshold」时循环在第一句
+  // 就 break，piggyback 一条都进不了 units（gate/p-12 X30）。用集合记住身份，
+  // 计数与上限仍共用同一个循环体，避免出现第二份提交逻辑。
+  const piggybackUnits = new Set()
   if (countable.length >= threshold) {
     for (const candidate of countable) {
       if (ready.length >= threshold) break
@@ -668,7 +673,10 @@ export function planCooling({
     }
     for (const candidate of piggyback) {
       const unit = prepare(candidate)
-      if (unit) ready.push(unit)
+      if (unit) {
+        piggybackUnits.add(unit)
+        ready.push(unit)
+      }
     }
   }
 
@@ -677,7 +685,8 @@ export function planCooling({
   let baselineUnits = 0
   if (baselineReady) {
     for (const unit of ready) {
-      if (baselineUnits >= threshold) break
+      // 门槛只数 countable：搭车单元不占名额（与阶段 2 的选取口径一致）。
+      if (!piggybackUnits.has(unit) && baselineUnits >= threshold) break
       if (units.length >= maxOperations) break
       if (plannedReleaseTokens > 0 && plannedReleaseTokens + unit.netReleaseTokens > maxReleaseTokens) {
         // Soft ceiling (C-07/C-12): once the batch holds work, stop before
@@ -690,7 +699,7 @@ export function planCooling({
       }
       units.push(unit)
       plannedReleaseTokens += unit.netReleaseTokens
-      baselineUnits += 1
+      if (!piggybackUnits.has(unit)) baselineUnits += 1
     }
   }
 
@@ -1514,7 +1523,10 @@ export function formatRestoreReport(result) {
   const still = Number(result.stillSkipped ?? 0)
   if (retried > 0 && still > 0) {
     lines.push(`本次重试了 ${retried} 个上次跳过的回执，其中 ${still} 个仍无法恢复：它们的原文仍只在冷库，回执保持跳过状态，下一次 restore 会再次尝试。`)
-  } else if (retried > 0) {
+  } else if (retried > 0 && forgotten === 0) {
+    // G5：`still === 0` 不足以支持「全部取回」——`forgotten` 的行同样没被恢复，
+    // 只是它们被软遗忘挡在 aliveRows 之外、根本没进重试集（restore/p-13 X33 的
+    // 全遗忘早退就是这种形状）。判据必须是「既没有仍跳过、也没有被遗忘」。
     lines.push(`本次重试了 ${retried} 个上次跳过的回执，全部取回。`)
   }
   return lines.join('\n')

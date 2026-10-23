@@ -530,7 +530,27 @@ export function createRecallDomain({
     const sessionId = sessionIdOf(invocation.agent.session)
     const record = records.get(sessionId)
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
-    const statusOnly = (args[0] ?? 'status') === 'status'
+    // 0.13.2-beta.6 G10（store/p-07 W5/W7/W7b）：**子命令必须先校验再执行**。
+    //
+    // 收口前这里写的是 `(args[0] ?? 'status') === 'status'`——于是**任何**拼错
+    // 的子命令（`index syn`、`index stauts`）都落到 statusOnly=false，也就是
+    // 「执行同步」分支：不仅拉起后端子进程，还真的去索引。
+    // 「不在白名单里」被当成了「就是另一个合法取值」，这是二值化枚举的典型错。
+    // 现在先归一化再分派：不认识的参数一律回用法错误，不执行任何副作用。
+    const subcommand = args[0] ?? 'status'
+    if (subcommand !== 'status' && subcommand !== 'sync') {
+      return {
+        kind: 'error',
+        text: `用法：\`/memory-lab index\`（查看状态）或 \`/memory-lab index sync\`（执行同步）。收到的是「${subcommand}」。`,
+      }
+    }
+    if (args.length > 1) {
+      return {
+        kind: 'error',
+        text: `用法：\`/memory-lab index [status|sync]\` 不接受额外参数。收到 ${args.length} 个：${args.map((a) => `「${a}」`).join(' ')}`,
+      }
+    }
+    const statusOnly = subcommand === 'status'
     const retrievalIndex = await readRetrievalIndex(record.directory)
 
     /** 后端不可用时的如实报告：不假装索引可用，也不回退正式灵枢根。 */
@@ -662,10 +682,31 @@ export function createRecallDomain({
     } catch (error) {
       logger?.warn?.(`v2 自动回注记账失败：${error?.message ?? error}`)
     }
+    const messageId = randomUUID()
+    // G6：回注去重链的写端。`engine.buildRecall` 每次都调 `pruneRecallDeliveries`
+    // 读 `record.recallDeliveries` 判断「同一证据是否还在活动面上」，但**全仓没有
+    // 一处写它**（`rememberRecall` 定义了、导出了、零调用）——于是每次回注都算
+    // 「新鲜」，同一批命中被反复注入。这里补上写端：只有真的注入了才登记。
+    try {
+      engine.rememberRecall(record, {
+        messageId,
+        nodeIds: (Array.isArray(digest.hits) ? digest.hits : []).map((hit) => hit?.id).filter((id) => typeof id === 'string' && id),
+        queryId: trigger.id,
+        status: digest.status,
+        reason: digest.reason ?? '',
+        hits: Array.isArray(digest.hits) ? digest.hits.length : 0,
+        skippedVisible: digest.skippedVisible ?? 0,
+        truncated: digest.truncated === true,
+        omitted: digest.omitted ?? 0,
+      })
+    } catch (error) {
+      // 登记失败只影响去重，不影响已注入的正文：不吞掉注入，但要留痕。
+      logger?.warn?.(`v2 回注登记失败：${error?.message ?? error}`)
+    }
     return {
       ...decision,
       messages: [...decision.messages, {
-        id: randomUUID(),
+        id: messageId,
         role: 'user',
         content: [{ type: 'text', text }],
         source: { kind: PACKAGE_NAME, form: 'recall' },

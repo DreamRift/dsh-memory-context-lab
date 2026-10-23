@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 
-import { EngineV2Error } from './errors.mjs'
+import { DamagedError, EngineV2Error } from './errors.mjs'
 import { writeJsonFileAtomic } from './store.mjs'
 
 // 错误码风格与 store.mjs / retrieval.mjs 保持一致：内联字符串，不建集中常量表。
@@ -168,10 +168,10 @@ async function readSidecar(sessionDir) {
   try {
     const parsed = JSON.parse(text)
     if (parsed?.kind !== VERIFICATION_KIND || parsed?.schemaVersion !== VERIFICATION_SCHEMA_VERSION) {
-      throw new Error('kind/schemaVersion 不匹配')
+      throw new DamagedError('kind/schemaVersion 不匹配')
     }
     if (parsed?.records === null || typeof parsed?.records !== 'object' || Array.isArray(parsed?.records)) {
-      throw new Error('records 字段形态不对')
+      throw new DamagedError('records 字段形态不对')
     }
     return {
       ok: true,

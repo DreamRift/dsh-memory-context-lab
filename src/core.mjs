@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { InvalidArgumentError } from './errors.mjs'
+
 export const PACKAGE_NAME = 'dsh-memory-context-lab'
 
 /**
@@ -406,8 +408,8 @@ export function estimateTokens(text) {
 
 export function ensureBoundedText(value, maxChars, label) {
   const text = String(value ?? '').trim()
-  if (!text) throw new Error(`${label}不能为空。`)
-  if (text.length > maxChars) throw new Error(`${label}最多 ${maxChars} 个字符。`)
+  if (!text) throw new InvalidArgumentError(`${label}不能为空。`)
+  if (text.length > maxChars) throw new InvalidArgumentError(`${label}最多 ${maxChars} 个字符。`, { code: 'ELIMIT', details: { length: text.length, maxChars } })
   return text
 }
 
@@ -959,7 +961,7 @@ export function buildProjectionHeader({
   readbackTokens = null,
 } = {}) {
   if (kind !== PROJECTION_KIND.EXACT) {
-    throw new Error('投影失真等级只能是 A 类（可完整重建）；B 类有损投影被禁止（收到 '
+    throw new InvalidArgumentError('投影失真等级只能是 A 类（可完整重建）；B 类有损投影被禁止（收到 '
       + JSON.stringify(kind) + '）')
   }
   const released = Math.max(0, Math.trunc(Number(releasedTokens) || 0))
@@ -1044,7 +1046,7 @@ export function buildReceipt({
   const known = [RECEIPT_FORMAT_LEGACY, 2, RECEIPT_FORMAT_VERSION, RECEIPT_FORMAT_OPERATION]
   // 显式 dispatch（0.10.1 S2c）：每个历史版本一个冻结分支，未知版本失败关闭。
   if (!known.includes(formatVersion)) {
-    throw new Error(`未知的回执格式版本：${JSON.stringify(formatVersion)}（已知 1/2/4/6；批次摘要走 buildBatchReceipt，片段回执走 buildSpanReceipt）`)
+    throw new InvalidArgumentError(`未知的回执格式版本：${JSON.stringify(formatVersion)}（已知 1/2/4/6；批次摘要走 buildBatchReceipt，片段回执走 buildSpanReceipt）`)
   }
   const modern = formatVersion === RECEIPT_FORMAT_OPERATION
   const lines = [marker]
@@ -1231,7 +1233,19 @@ export function resultStatusOf(text) {
   const exit = /(?:exit code|退出码)\s*[:：]?\s*(\d{1,3})/i.exec(source)
   if (exit) return `exit ${exit[1]}`
   if (/"?(?:isError|is_error)"?\s*[:]\s*true/i.test(source)) return 'error'
-  return 'ok'
+  // 0.13.2-beta.6 G3：三态。此前这里直接返回 'ok'，把「没看到失败」写成了
+  // 「看到成功」——read / edit / MCP 这类不带 exit code、也不带 isError 的结果
+  // （含空正文、Python 异常栈）于是全部被记成成功。这是「未知量没有三态」根因组
+  // 在回执层的表现：一个恒 false 的比较被当成了否定结论。
+  //
+  // 字节影响面（实测，非推测）：本函数的返回值进 statuses 数组。
+  // - format 5/6/7/8 走 receiptStatusOf，它只把匹配 error / exit[1-9] 的算失败，
+  //   'unknown' 与 'ok' 同属「非失败」，verdict 仍是 ok → 字节不变。
+  // - format 2 的「返回状态：tool#id=ok」会变成 =unknown（该行本就逐条列状态，
+  //   是如实披露，不是格式变化）。
+  // 回执层面的 status=ok 仍把「未知」读成「成功」——那要开新格式号才能改，
+  // 见 修复计划-beta.6 的「不修」节。
+  return 'unknown'
 }
 
 function formatStatusLine(tools, callIds, statuses) {
@@ -1297,7 +1311,7 @@ export function buildSpanReceipt({
 }) {
   const known = [RECEIPT_FORMAT_SPAN, RECEIPT_FORMAT_SPAN_V2]
   if (!known.includes(formatVersion)) {
-    throw new Error(`未知的片段回执格式版本：${JSON.stringify(formatVersion)}（已知 5/7）`)
+    throw new InvalidArgumentError(`未知的片段回执格式版本：${JSON.stringify(formatVersion)}（已知 5/7）`)
   }
   const modern = formatVersion === RECEIPT_FORMAT_SPAN_V2
   const lines = [marker]
@@ -1475,6 +1489,20 @@ export function normalizeRecallPayload(payload, maxHits = MAX_RECALL_HITS) {
 }
 
 /**
+ * 三态判定（0.13.2-beta.6 G3）：`true` / `false` / `'unknown'`。
+ *
+ * 全仓的「未知量」曾各自用 `number > undefined` 这类恒 false 的比较处理，
+ * 结果是**失败开放**：判不了的时候一律当成「没问题」。这里把它变成一个
+ * 显式的第三态，调用方必须处理 `'unknown'`。
+ */
+export const TRI_STATE = Object.freeze({ TRUE: true, FALSE: false, UNKNOWN: 'unknown' })
+
+/** 判定一个数是否可用于比较（有限数；`undefined`/`null`/`NaN`/字符串都不行）。 */
+export function isKnownNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+/**
  * Tokens a restore would ADD to the surface, and whether that overflows.
  *
  * Restoring swaps each receipt for the original it replaced, so the growth is
@@ -1483,19 +1511,87 @@ export function normalizeRecallPayload(payload, maxHits = MAX_RECALL_HITS) {
  * refuses restores that would have fit, pushing the user to delete the session
  * -- the opposite of the guard's purpose.
  *
- * @returns { growth, heldByReceipts, total, overflow }
+ * ## 未知量（0.13.2-beta.6 G3）
+ *
+ * 旧实现有三处失败开放，全部来自「拿未知量做比较」：
+ *
+ * 1. `overflow: assembledTokens + growth > contextWindow` —— 两个参数任一缺失时
+ *    `number > undefined` / `NaN > x` 恒 false，于是**判不了就当成没超窗**，
+ *    恢复照做。这正是 Q-01 修好的那条窗口守卫，又从这里漏出去。
+ *    同文件 `batchReleaseCeilingOf` 对同一个未知量明确失败关闭，两处口径相反。
+ * 2. `Number(row?.originalTokens) || 0` —— 缺失的原文量被当成 0，增长被**系统性
+ *    低估**，守卫放过本该拒绝的恢复。
+ * 3. 没有任何字段告诉调用方「这个结论不可靠」。
+ *
+ * 现在：`overflow` 是**三态**，任一必需量未知即 `'unknown'`（调用方必须按
+ * 失败关闭处理）；`unknown` 布尔位与 `unknownRows` 计数如实披露有多少行
+ * 缺原文量；`total` 只累加**已知**的行，不再用 0 冒充。
+ *
+ * @returns {{ total: number, heldByReceipts: number, growth: number,
+ *            overflow: boolean|'unknown', unknown: boolean, unknownRows: number,
+ *            unknownReasons: string[] }}
  */
-export function restoreGrowth(pending, { assembledTokens, contextWindow }) {
+export function restoreGrowth(pending, { assembledTokens, contextWindow } = {}) {
   const rows = Array.isArray(pending) ? pending : []
-  const total = rows.reduce((sum, row) => sum + (Number(row?.originalTokens) || 0), 0)
-  const heldByReceipts = rows.reduce((sum, row) => sum + (Number(row?.receiptTokens) || 0), 0)
+  const unknownReasons = []
+  let total = 0
+  let heldByReceipts = 0
+  let unknownRows = 0
+  for (const row of rows) {
+    const original = row?.originalTokens
+    const receipt = row?.receiptTokens
+    // 缺 originalTokens 的行只**披露**、不参与「判不了就拒绝」：0.12 之前的旧回执
+    // 行本来就没有这个字段，若按 unknown 失败关闭，全部历史数据都永远恢复不了
+    // ——那正是本文档开头警告的「守卫拒绝本可以放下的恢复」。故按 0 计入下界
+    // （增长只会被低估），同时用 unknownRows/unknownReasons 如实告诉调用方。
+    if (isKnownNumber(original)) total += original
+    else unknownRows += 1
+    // receiptTokens 缺失时按 0 计是**安全方向**：增长只会被高估（更保守），
+    // 不会被低估。这一点与 originalTokens 相反，所以两处口径不同。
+    if (isKnownNumber(receipt)) heldByReceipts += receipt
+  }
   const growth = total - heldByReceipts
+  const assembledKnown = isKnownNumber(assembledTokens)
+  const windowKnown = isKnownNumber(contextWindow)
+  if (!assembledKnown) unknownReasons.push('assembledTokens')
+  if (!windowKnown) unknownReasons.push('contextWindow')
+  if (unknownRows > 0) unknownReasons.push('originalTokens')
+  let overflow
+  if (!assembledKnown || !windowKnown) {
+    // 判不了超没超窗。**失败关闭**：调用方必须当作「可能超窗」处理。
+    overflow = TRI_STATE.UNKNOWN
+  } else if (unknownRows > 0) {
+    // 有行缺原文量 → growth 只是下界。下界已经超窗就直接判 true（结论仍然成立）；
+    // 下界没超时**不**升级成 unknown：拒绝会锁死旧数据，而这里的缺口方向已知
+    // （只可能低估），披露在 unknown/unknownRows 里由调用方决定要不要更保守。
+    overflow = assembledTokens + growth > contextWindow
+  } else {
+    overflow = assembledTokens + growth > contextWindow
+  }
   return {
     total,
     heldByReceipts,
     growth,
-    overflow: assembledTokens + growth > contextWindow,
+    overflow,
+    // `unknown` 的口径是「本次判定**涉及**未知量」，不是「结论未知」：
+    // 即使下界已经足以判定超窗（overflow=true），「有一行的原文量我们不知道」
+    // 这件事仍然必须披露——调用方据此才能判断这个结论的可靠边界。
+    unknown: unknownReasons.length > 0,
+    unknownRows,
+    unknownReasons,
   }
+}
+
+/**
+ * 窗口守卫的**唯一**判据（0.13.2-beta.6 G3）。
+ *
+ * `overflow === true` 拒绝，`'unknown'` 也拒绝——「判不了」与「超了」在
+ * 用户可见后果上是同一件事（都可能顶穿窗口），区别只在回执文案。把这条
+ * 收成一个函数，是为了让每个调用点都**必须**做同一个决定，而不是各自
+ * 写 `if (growth.overflow)`（那样 `'unknown'` 会被当成假值放行）。
+ */
+export function windowGuardRefuses(growth) {
+  return growth?.overflow === TRI_STATE.TRUE || growth?.overflow === TRI_STATE.UNKNOWN
 }
 
 /**
