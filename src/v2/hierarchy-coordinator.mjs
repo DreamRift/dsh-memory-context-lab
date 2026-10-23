@@ -303,7 +303,11 @@ async function computeCandidates(deps) {
           }
         : null,
       evaluation,
+      // Y-07：memberTexts 与 memberSeqs 平行（每条回执一份），而 recordIds 是扁平去重集，
+      // 两者基数不同。计划里额外存一份 recordId→回执正文的映射，重放按 recordId 配对；
+      // 只有旧计划（没有该映射且基数恰好相等）才退回按下标取。
       memberTexts: view.receiptTexts,
+      memberTextByRecordId: Object.fromEntries(view.members.map((m) => [m.recordId, m.receiptText])),
     })
   }
   return { ledger, plans, candidates }
@@ -433,11 +437,21 @@ export async function compressRun(deps) {
   }
   // 已应用的组把挂起计划清掉：run 是唯一出口，reconcile 只兜崩溃窗口。
   for (const a of applied) await dropVoucherPlan(deps.sessionDir, a.voucherId).catch(() => {})
-  await auditRun(deps, {
-    applied: applied.map((a) => a.voucherId),
-    rejected,
-    failures,
-  }).catch(() => {})
+  // Y-21（beta.7 B 组）：**审计失败不是审计通过**。
+  // 旧实现 .catch(() => {}) 把 run 审计的失败吞掉：层级账本里没有这次 run 的记录，
+  // 而回执照常宣称「已替换 N 组」——事后既无法证明替换发生过，也无法发现它与
+  // 凭证计划不一致。现在失败进 lines 与 failures 一起如实上报（仍不阻断替换本身：
+  // 替换已经落盘，回滚比披露更危险）。
+  let auditFailure = null
+  try {
+    await auditRun(deps, {
+      applied: applied.map((a) => a.voucherId),
+      rejected,
+      failures,
+    })
+  } catch (error) {
+    auditFailure = error instanceof Error ? (error.message || error.name) : String(error)
+  }
   const lines = ['压缩执行：']
   for (const a of applied) {
     lines.push(`已替换 seq ${a.startSeq}–${a.endSeq}：${a.memberCount} 条回执 → 凭证 ${a.voucherId}（expand 分页回读）。`)
@@ -449,6 +463,10 @@ export async function compressRun(deps) {
   }
   if (failures.length > 0) {
     lines.push(`失败 ${failures.length} 组（原状态保留）：${failures.map((f) => `${f.voucherId}(${f.message})`).join('、')}。`)
+  }
+  if (auditFailure) {
+    lines.push(`⚠ run 审计未写入层级账本：${auditFailure}。替换已落盘，但这次运行在账本里没有记录——`
+      + '后续 compress status 不会列出它，重跑也不会补记（可重复收口只覆盖替换本身）。')
   }
   if (applied.length === 0 && rejected.length === 0 && failures.length === 0) {
     lines.push('没有可替换的候选组（已应用的组不重复替换）。')
@@ -466,6 +484,12 @@ async function applyVoucher(deps, { plan, evaluation, memberTexts, l2CardText })
     voucherText: evaluation.voucherText,
     phaseCard,
     memberTexts,
+    // Y-07：计划必须自带 recordId→正文映射。只存按下标的 memberTexts，重放时
+    // 就只能在「基数不等的两个数组」上做下标对齐——正文会挂到别的 cardId 下。
+    memberTextByRecordId: Object.fromEntries(
+      (plan.recordIds ?? []).map((recordId) => [recordId, plan.memberTextByRecordId?.[recordId]])
+        .filter(([, text]) => typeof text === 'string'),
+    ),
     savedAt: new Date().toISOString(),
   })
   const replacement = await deps.appendVoucherMessage({
@@ -785,10 +809,19 @@ export function replayEntriesFromPlan({ plan, replacementSeq, sourceRevision, at
   // T1/F-03：重放同样受开关约束——未共享正文时 L1 只写占位，绝不把成员原文
   // 从计划快照搬进账本卡（否则「默认不复制正文」在崩溃重放路径上被绕过）。
   const shareContent = deps?.shareL2Content === true
+  const byRecordId = plan.memberTextByRecordId && typeof plan.memberTextByRecordId === 'object'
+    ? plan.memberTextByRecordId
+    : null
+  const alignedByIndex = byRecordId === null
+    && Array.isArray(plan.recordIds)
+    && memberTexts.length === plan.recordIds.length
   const l1Entries = (plan.recordIds ?? []).map((recordId, i) => {
     const placeholder = `（L1 占位：${recordId} 的正文未共享；用 expand/read 显式展开）`
+    // Y-07：正文只能按 recordId 取。旧计划没有映射时，只有基数相等才允许按下标；
+    // 基数不等就落占位——错配（B 的正文挂到 A 的 cardId）比缺正文更坏。
+    const paired = byRecordId ? byRecordId[recordId] : (alignedByIndex ? memberTexts[i] : undefined)
     const text = shareContent
-      ? (memberTexts[i] ?? `（重放占位：${recordId} 的原文不在计划快照里）`)
+      ? (paired ?? `（重放占位：${recordId} 的原文不在计划快照里）`)
       : placeholder
     return {
       kind: HIERARCHY_ENTRY_L1,

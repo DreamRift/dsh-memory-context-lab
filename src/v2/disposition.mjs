@@ -23,6 +23,8 @@ import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
+import { isAbsent } from './fail-closed.mjs'
+import { parseAppendableLedger } from './appendable-ledger.mjs'
 import { canonicalJson, canonicalLine, createAppendableLedger, writeFileAtomic } from './appendable-ledger.mjs'
 
 // 规范序列化的唯一实现在 appendable-ledger.mjs（三份账本共用）。这里重新导出，
@@ -36,8 +38,16 @@ export const DISPOSITION_FILE = 'disposition.jsonl'
 export const FORGET_PLANS_FILE = 'forget-plans.json'
 export const DISPOSITION_HEADER_KIND = 'dsh-memory-context-lab/v2/disposition'
 export const DISPOSITION_SCHEMA_VERSION = 1
+
 export const DISPOSITION_ENTRY_FORGET = 'disposition/forget'
 export const DISPOSITION_ENTRY_UNDO = 'disposition/undo'
+
+const DISPOSITION_LEDGER_SCHEMA = Object.freeze({
+  ledgerName: 'disposition',
+  headerKind: DISPOSITION_HEADER_KIND,
+  schemaVersion: DISPOSITION_SCHEMA_VERSION,
+  entryKinds: Object.freeze([DISPOSITION_ENTRY_FORGET, DISPOSITION_ENTRY_UNDO]),
+})
 /** 计划文件最多保留条数：两段式宽条件的重放窗口，超限丢最旧。 */
 export const FORGET_PLAN_LIMIT = 32
 
@@ -80,63 +90,12 @@ function sha256Hex(text) {
 
 // ---------------------------------------------------------------- 账本读取
 
+// 读侧协议只有一份实现（appendable-ledger.mjs 的 parseAppendableLedger）。
+// 本文件只声明自己的 schema：header 的 kind/schemaVersion 与条目 kind 白名单。
+// 新增账本请照此绑定，不要在这里再写一遍 split/partialLine/header 校验——
+// provenance 当年少抄一段 D-01，就是因为「读侧」被抄了三遍（L-1）。
 function parseLedgerText(text) {
-  const lines = text.split('\n')
-  // 文本以 \n 结尾时 split 会留一个空尾元素，所以完整行恒为 slice(0, -1)。
-  const trailingNewline = /\n$/.test(text)
-  const completeLines = lines.slice(0, -1)
-  // 尾部没有 LF 时**先试解析**再判半行（0.13.2 D-01）。
-  //
-  // 旧实现把「文件末尾缺 \n」直接当成「崩溃残留的半行」，于是任何不走
-  // appendFile('…\\n') 的写入路径（外部编辑器、手写、跨平台换行、writeFile 少一个
-  // 字节）留下的**完整合法条目**都被 loadDisposition 在读取动作里物理删除：
-  // 遗忘失效、记录重新可见、revision 回退、操作号从头发。完整条目的判定依据必须
-  // 是「这一行能否解析成 JSON」，不是「文件末尾有没有换行」。
-  let partialLine = ''
-  if (!trailingNewline && lines.length > 0) {
-    const tail = lines[lines.length - 1]
-    if (tail.length > 0) {
-      try {
-        JSON.parse(tail)
-        completeLines.push(tail) // 合法 → 就是最后一条完整行，不进 partialLine
-      } catch {
-        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
-      }
-    }
-  }
-  const entries = []
-  let damaged = false
-  let damageDetail = null
-  let header = null
-  let headerProblems = []
-  for (let index = 0; index < completeLines.length; index += 1) {
-    const raw = completeLines[index]
-    if (raw.length === 0) continue
-    let parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      damaged = true
-      damageDetail = { line: index + 1, message: error.message }
-      break
-    }
-    if (index === 0 || header === null) {
-      if (parsed?.kind !== DISPOSITION_HEADER_KIND || parsed?.schemaVersion !== DISPOSITION_SCHEMA_VERSION) {
-        damaged = true
-        damageDetail = { line: index + 1, message: '首行不是合法 disposition header' }
-        break
-      }
-      header = parsed
-      continue
-    }
-    if (parsed?.kind !== DISPOSITION_ENTRY_FORGET && parsed?.kind !== DISPOSITION_ENTRY_UNDO) {
-      damaged = true
-      damageDetail = { line: index + 1, message: `未知条目 kind：${JSON.stringify(parsed?.kind)}` }
-      break
-    }
-    entries.push(parsed)
-  }
-  return { header, entries, damaged, damageDetail, partialLine, rawByteLength: Buffer.byteLength(text, 'utf8') }
+  return parseAppendableLedger(text, DISPOSITION_LEDGER_SCHEMA)
 }
 
 /**
@@ -255,8 +214,34 @@ async function refreshForgetIndex(sessionDir) {
     const info = await stat(file)
     size = info.size
     mtimeMs = info.mtimeMs
-  } catch {
-    return { revision: 0, forgotten: new Map(), damaged: false, absent: true, size: -1, mtimeMs: 0, repairedBytes: 0 }
+  } catch (error) {
+    // Y-01（beta.7 B 组）：**「读不到」不是「没有」**。
+    //
+    // 旧实现在这里 catch 一切并返回 absent:true —— 于是 EACCES / EMFILE / ELOOP /
+    // EIO 与「全新会话没有账本」得到同一个结论：遗忘索引为空。读面据此判定
+    // 「没有任何记录被遗忘」，**已遗忘的记录重新可见、被索引、被回注**——
+    // 这是隐私回退，不是可用性问题。
+    //
+    // 只有 ENOENT/ENOTDIR 才是真的没有账本；其余一律失败关闭：damaged:true +
+    // damageDetail，让读面按「无法判定遗忘状态」拒绝，而不是放行。
+    if (isAbsent(error)) {
+      return { revision: 0, forgotten: new Map(), damaged: false, absent: true, size: -1, mtimeMs: 0, repairedBytes: 0 }
+    }
+    return {
+      revision: 0,
+      forgotten: new Map(),
+      damaged: true,
+      damageDetail: {
+        line: 0,
+        message: `遗忘账本无法读取（${error?.code ?? 'unknown'}：${error instanceof Error ? error.message : String(error)}）——不是「没有账本」`,
+      },
+      absent: false,
+      size: -1,
+      mtimeMs: 0,
+      repairedBytes: 0,
+      entries: [],
+      unreadable: true,
+    }
   }
   const ledger = await loadDisposition(sessionDir)
   return {
@@ -279,14 +264,50 @@ async function refreshForgetIndex(sessionDir) {
  */
 export async function getForgetIndex(sessionDir) {
   const key = cacheKey(sessionDir)
+  // 同 Y-01：这里只用于缓存键（size/mtime），读不到时键退化为 -1/0 是可以的
+  // （下次一定重算），但**不能**因此让上层以为账本不存在——是否 absent 由
+  // refreshForgetIndex 判定，它区分 ENOENT 与其余 errno。
   let info = await stat(dispositionPath(sessionDir)).catch(() => null)
   const size = info?.size ?? -1
   const mtimeMs = info?.mtimeMs ?? 0
   const cached = forgetIndexCache.get(key)
   if (cached && cached.size === size && cached.mtimeMs === mtimeMs) return cached
   const fresh = await refreshForgetIndex(sessionDir)
-  forgetIndexCache.set(key, fresh)
+  // 「读不到」不进缓存：否则一次 EMFILE/ELOOP 会被 (size:-1, mtimeMs:0) 这个键
+  // 长期钉住，直到账本尺寸恰好变化才重算——那等于把瞬时 IO 故障升级成永久遗忘失效。
+  if (!fresh.unreadable) forgetIndexCache.set(key, fresh)
   return fresh
+}
+
+/**
+ * 读面统一入口：遗忘索引 + **失败关闭**。
+ *
+ * 这是 Y-01 的结构性收口。旧形态是每个读面各自 `await getForgetIndex(...)`
+ * 然后 `isForgotten(index, id)`——索引损坏/读不到时 `forgotten` 是空表，
+ * 于是「已遗忘」被判成「未遗忘」，记录重新可见。逐个调用点加判断是调用点修补：
+ * 下一个读面照样会忘。
+ *
+ * 现在分两个函数，语义按**用途**分开（这是唯一的判据分流点）：
+ * - `getForgetIndexOrThrow`：**会返回正文/结果**的读面用。损坏或读不到一律抛
+ *   `EDISPOSITIONDAMAGED`（失败关闭：宁可不给，也不把遗忘的记录还回去）。
+ * - `getForgetIndexForStatus`：**只读状态面**用。返回索引并带 `damaged`/`unreadable`，
+ *   由渲染层如实写「无法判定」，不得渲染成「无」。
+ */
+export async function getForgetIndexOrThrow(sessionDir, { what = '读取遗忘账本' } = {}) {
+  const index = await getForgetIndex(sessionDir)
+  if (index.damaged || index.unreadable) {
+    throw new DispositionError(
+      `${what}失败：遗忘账本${index.unreadable ? '不可读' : '已损坏'}（${index.damageDetail?.message ?? '未知原因'}）。`
+      + '无法判定哪些记录已被遗忘，按失败关闭拒绝读取——这不等于「没有记录被遗忘」。',
+      { code: 'EDISPOSITIONDAMAGED', details: { damageDetail: index.damageDetail ?? null } },
+    )
+  }
+  return index
+}
+
+/** 状态面专用：不抛，但把损坏/不可读如实带出去。 */
+export async function getForgetIndexForStatus(sessionDir) {
+  return getForgetIndex(sessionDir)
 }
 
 export function invalidateForgetIndex(sessionDir) {

@@ -19,13 +19,20 @@
 
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
-import { canonicalLine as sharedCanonicalLine, createAppendableLedger } from './appendable-ledger.mjs'
+import { canonicalLine as sharedCanonicalLine, createAppendableLedger, parseAppendableLedger } from './appendable-ledger.mjs'
 
 export const PROVENANCE_FILE = 'provenance.jsonl'
 export const PROVENANCE_HEADER_KIND = 'dsh-memory-context-lab/v2/provenance'
 export const PROVENANCE_SCHEMA_VERSION = 1
 export const PROVENANCE_EDGE = 'provenance/edge'
 export const PROVENANCE_INVALIDATION = 'provenance/invalidation'
+
+const PROVENANCE_LEDGER_SCHEMA = Object.freeze({
+  ledgerName: 'provenance',
+  headerKind: PROVENANCE_HEADER_KIND,
+  schemaVersion: PROVENANCE_SCHEMA_VERSION,
+  entryKinds: Object.freeze([PROVENANCE_EDGE, PROVENANCE_INVALIDATION]),
+})
 /** 有界 BFS 上限：节点数与深度都封顶，超出如实报告截断。 */
 export const PROVENANCE_BFS_MAX_NODES = 512
 export const PROVENANCE_BFS_MAX_DEPTH = 8
@@ -47,61 +54,11 @@ export function provenancePath(sessionDir) {
 // 与 disposition/hierarchy 的同名函数逐字重复——三份账本三份协议，正是 G1 的根因。
 const canonicalLine = sharedCanonicalLine
 
+// 读侧协议只有一份实现（appendable-ledger.mjs 的 parseAppendableLedger）。
+// 本文件只声明自己的 schema。**这一份**当年是唯一漏了 D-01 的（末尾缺 LF 就删掉
+// 最后一条完整边）；把它变成纯 schema 声明，是「第四份账本不会少抄一段」的结构保证。
 function parseProvenanceText(text) {
-  const lines = text.split('\n')
-  const trailingNewline = /\n$/.test(text)
-  const completeLines = lines.slice(0, -1)
-  // 尾部没有 LF 时**先试解析**再判半行（0.13.2-beta.2 W-01b / D-01 口径）。
-  //
-  // 旧实现（本文件）写的是「没有 LF 就整条尾巴都是半行」，那是 D-01 修复**之前**
-  // 的口径：任何不走 appendFile('…\n') 的写入路径留下的**完整合法边**都被
-  // loadProvenance 在读取动作里物理删除——来源图少一条边、遗忘级联报告少一段。
-  // 同一个 bug 在 disposition 与 hierarchy 都修过，唯独这第三份账本没跟上，
-  // 因为它自己抄了一份 parse。完整条目的判据是「这一行能否解析成 JSON」。
-  let partialLine = ''
-  if (!trailingNewline && lines.length > 0) {
-    const tail = lines[lines.length - 1]
-    if (tail.length > 0) {
-      try {
-        JSON.parse(tail)
-        completeLines.push(tail) // 合法 → 最后一条完整行，不进 partialLine
-      } catch {
-        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
-      }
-    }
-  }
-  const entries = []
-  let damaged = false
-  let damageDetail = null
-  let sawHeader = false
-  for (let index = 0; index < completeLines.length; index += 1) {
-    const raw = completeLines[index]
-    if (raw.length === 0) continue
-    let parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      damaged = true
-      damageDetail = { line: index + 1, message: error.message }
-      break
-    }
-    if (!sawHeader) {
-      if (parsed?.kind !== PROVENANCE_HEADER_KIND || parsed?.schemaVersion !== PROVENANCE_SCHEMA_VERSION) {
-        damaged = true
-        damageDetail = { line: index + 1, message: '首行不是合法 provenance header' }
-        break
-      }
-      sawHeader = true
-      continue
-    }
-    if (parsed?.kind !== PROVENANCE_EDGE && parsed?.kind !== PROVENANCE_INVALIDATION) {
-      damaged = true
-      damageDetail = { line: index + 1, message: `未知条目 kind：${JSON.stringify(parsed?.kind)}` }
-      break
-    }
-    entries.push(parsed)
-  }
-  return { entries, damaged, damageDetail, partialLine }
+  return parseAppendableLedger(text, PROVENANCE_LEDGER_SCHEMA)
 }
 
 /**

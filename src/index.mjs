@@ -40,6 +40,7 @@ import { createV2RecallTool } from './v2/tool.mjs'
 import { labRootFor } from './storage.mjs'
 import { globalSuppressionCoordinator, locatePinnedDshMemory } from './dsh-memory-suppression.mjs'
 import { InvalidArgumentError } from './errors.mjs'
+import { commandSurface } from './v2/command-surface.mjs'
 
 export const name = 'memory-context-lab'
 
@@ -454,13 +455,16 @@ export async function apply(ctx, config) {
     return decision
   })
 
-  const disposeRecall = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+  const disposeRecall = ctx.on('agent/pre-step', async ({ agent, signal, step, turn }, next) => {
     const decision = await next()
     if (decision?.kind !== 'enter' || signal?.aborted) return decision
     // 计划模式激活期间不回注（与 v1 同规则）。
     if (planFirst.coolingSuspensionFor(agent).suspended) return decision
     try {
-      return await v2.buildRecall(agent, decision, signal)
+      // Y-00（beta.7）：步号来自**钩子第一个参数**（宿主把 {messages, turn, step, signal}
+      // 原样传进 payload），不是 next() 的返回值。旧写法读 decision.step 恒 undefined，
+      // 于是「步数兜底回注」是死分支：单回合长任务永不回注，回执却每批承诺会回注。
+      return await v2.buildRecall(agent, decision, signal, { step, turn })
     } catch (error) {
       ctx.logger.warn(`memory-context-lab: recall skipped: ${error instanceof Error ? error.message : String(error)}`)
       return decision
@@ -574,7 +578,9 @@ export async function apply(ctx, config) {
       name: COMMAND_NAME,
       description: '记忆上下文：已完成历史沉入会话隔离冷库，按需回读，必要工作状态有界常驻',
       input: { hint: 'on | off | status | restore | now | dry-run | read <ID...> | set <key> <value> | help' },
-      handler: (invocation) => commandHandler(invocation),
+      // 第二处出口同样过命令面：本层自己的 finally（写权威状态记录）若抛错，
+      // 也不得穿成宿主级崩溃。commandSurface 幂等，与 runtime 那层叠加无副作用。
+      handler: (invocation) => commandSurface(commandHandler)(invocation),
     })
     // 固定注册的只读召回工具：完整模式的一部分，不随 v2 的 on/off 增删 schema。
     // 未启用 v2 的会话调用它只会得到一条「未启用」结果，工具集恒定。

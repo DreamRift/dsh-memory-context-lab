@@ -1,6 +1,6 @@
 import { V2SessionStore, v2SessionDirectoryFor } from './store.mjs'
 import { EngineV2Error, InvalidArgumentError } from './errors.mjs'
-import { getForgetIndex, isForgotten } from './disposition.mjs'
+import { getForgetIndexOrThrow, isForgotten } from './disposition.mjs'
 import { BYTES_PER_TOKEN } from './budget.mjs'
 import { readForkMap } from './fork.mjs'
 import { RECORD_KINDS } from './records.mjs'
@@ -52,7 +52,7 @@ export async function readRecordById(labRoot, sessionId, id, { verifyHash = true
   try {
     // 主动遗忘守卫：遗忘记录不再按 ID 回读正文。账本是唯一权威；损坏的账本
     // 仍按已解析前缀过滤（读侧不因旁车损坏而硬失败），损坏披露由状态面负责。
-    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId))
+    const forgetIndex = await getForgetIndexOrThrow(v2SessionDirectoryFor(labRoot, sessionId))
     if (isForgotten(forgetIndex, id)) {
       throw new EngineV2Error(`记录 ${id} 已被主动遗忘，不再回读正文；如需恢复请先 forget undo`, {
         code: 'EFORGOTTEN',
@@ -177,7 +177,7 @@ export async function listRecordsPage(labRoot, sessionId, { pageSize = 200, afte
   try {
     // 遗忘记录不进列表：原始分页逐页拉取、过滤后补足一页可见条目；
     // forgottenCount 只计本页补页过程中被过滤的条数（逐页累计，非全库总数）。
-    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId))
+    const forgetIndex = await getForgetIndexOrThrow(v2SessionDirectoryFor(labRoot, sessionId))
     const visible = []
     let cursor = afterId
     let forgottenCount = 0
@@ -273,7 +273,7 @@ export async function packWorkingSet(labRoot, sessionId, {
     let used = 0
     let forgottenSkipped = 0
     // 工作集不装遗忘记录：显式点名如实警告，头部扫描静默跳过并计数披露。
-    const forgetIndex = await getForgetIndex(v2SessionDirectoryFor(labRoot, sessionId))
+    const forgetIndex = await getForgetIndexOrThrow(v2SessionDirectoryFor(labRoot, sessionId))
 
     // 显式指定的记录：缺失不静默。
     for (const id of explicitRecordIds) {

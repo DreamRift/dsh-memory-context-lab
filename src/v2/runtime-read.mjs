@@ -22,7 +22,7 @@
  * 由调用方（命令面）决定是否触发，本域不自行启动。
  */
 import { formatRange, renderReadResults, renderV2Status } from './runtime-render.mjs'
-import { readV2SessionState } from './state.mjs'
+import { readV2SessionState, v2SessionDirectoryFor } from './state.mjs'
 import { V2SessionStore } from './store.mjs'
 import { parseRecordId } from './records.mjs'
 import { MAX_PAGE_SIZE, readRecordById, listRecordsPage, packWorkingSet, resolvePageSize } from './readback.mjs'
@@ -275,12 +275,19 @@ export function createReadDomain({
     if (ids.length === 0) {
       return { kind: 'error', text: '用法：`/memory-lab read <记录ID...>`（记录 ID 形如 t00000001-r0001）。' }
     }
+    // 注意：read **不** adopt。回读走 withReadableStore 的只读打开，重启后本来就可用；
+    // 在这里 adopt 反而会因「同进程已持有该目录句柄」而 EOPEN。
     const record = records.get(sessionId)
     const results = []
     // 验证跟踪：回读前查人工失效标记（只读旁证，零 hash；内容级失效走 verify）。
-    const staleMarks = record
-      ? await annotateStale({ sessionDir: record.directory, recordIds: ids }).catch(() => new Map())
-      : new Map()
+    // Y-22（beta.7 B 组）：旁证在**会话目录**里，不依赖进程内记录。旧实现以
+    // `record` 是否存在为前提，于是重启/停用后 read 与 recall 静默丢掉失效注记——
+    // 用户把一条记录标成失效，重启后它又以「有效」的样子被读回来。目录可以从
+    // labRoot + sessionId 直接算出来，判据不该是「本进程有没有 record」。
+    const staleMarks = await annotateStale({
+      sessionDir: record?.directory ?? v2SessionDirectoryFor(labRoot, sessionId),
+      recordIds: ids,
+    }).catch(() => new Map())
     // 证据重读计数：冷记录被再次读取是要计入成本账本的（T-12）。
     let reRead = 0
     let reReadBytes = 0
@@ -414,7 +421,11 @@ export function createReadDomain({
   async function verifyCommand(invocation, ids) {
     const sessionId = sessionIdOf(invocation.agent.session)
     if (ids.length === 0) return { kind: 'error', text: '用法：`/memory-lab verify <记录ID...>`。' }
-    const record = records.get(sessionId)
+    // Y-11（beta.7 B 组）：重启后必须**先 adopt 再判**。
+    // 旧实现只查进程内 records，于是进程重启后 verify/relations/mark-stale/index
+    // 一律谎报「未启用」，而同一时刻 status 走的是 adopt 路径、明确说「已启用」——
+    // 同一条事实两个入口两个答案，用户无法判断到底哪个是真的。
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
     // 先补采：升级前落库的旧记录没有旁证条目，直接 check 会全部 unverified。
     // 差集式采集只补缺口，已采过的绝不重采（重采会把事后改动洗成 valid）。
@@ -450,7 +461,11 @@ export function createReadDomain({
     if (!recordId || !reason) {
       return { kind: 'error', text: '用法：`/memory-lab mark-stale <记录ID> <原因（必填，会入旁证留痕）>`。' }
     }
-    const record = records.get(sessionId)
+    // Y-11（beta.7 B 组）：重启后必须**先 adopt 再判**。
+    // 旧实现只查进程内 records，于是进程重启后 verify/relations/mark-stale/index
+    // 一律谎报「未启用」，而同一时刻 status 走的是 adopt 路径、明确说「已启用」——
+    // 同一条事实两个入口两个答案，用户无法判断到底哪个是真的。
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
     try {
       const marked = await markRecordsStale({
@@ -476,7 +491,11 @@ export function createReadDomain({
     const sessionId = sessionIdOf(invocation.agent.session)
     const recordId = args[0]
     if (!recordId) return { kind: 'error', text: '用法：`/memory-lab relations <记录ID>`。' }
-    const record = records.get(sessionId)
+    // Y-11（beta.7 B 组）：重启后必须**先 adopt 再判**。
+    // 旧实现只查进程内 records，于是进程重启后 verify/relations/mark-stale/index
+    // 一律谎报「未启用」，而同一时刻 status 走的是 adopt 路径、明确说「已启用」——
+    // 同一条事实两个入口两个答案，用户无法判断到底哪个是真的。
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
     return factoryFor(record).withStore(async (store) => {
       const [forkMap, retrievalIndex] = await Promise.all([

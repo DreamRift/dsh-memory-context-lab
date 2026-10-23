@@ -42,6 +42,8 @@ import { getForgetIndex } from './disposition.mjs'
 import { sessionKeyFor } from '../storage.mjs'
 import { readNeedsMigration } from './fork.mjs'
 import { reconcileVouchers } from './hierarchy-coordinator.mjs'
+import { rollbackBlockedEnable } from './enable-rollback.mjs'
+import { createCommandChain } from './command-chain.mjs'
 
 export function createLifecycleDomain({
   // 共享注册表（活引用）
@@ -240,14 +242,12 @@ export function createLifecycleDomain({
     }
   }
 
+  // Y-37：此前只把 promise 记进 activeOperations（给停用等待），并未真正排队，
+  // 「on 建记录」与「off 拆记录」可以交错。串行逻辑见 v2/command-chain.mjs。
+  const commandChain = createCommandChain()
+
   async function runExclusive(sessionId, work) {
-    const pending = (async () => work())()
-    activeOperations.add(pending)
-    try {
-      return await pending
-    } finally {
-      activeOperations.delete(pending)
-    }
+    return commandChain.run(sessionId, work, { track: activeOperations })
   }
 
   /**
@@ -377,10 +377,19 @@ export function createLifecycleDomain({
     try {
       const audit = await auditInheritedArchive(record)
       if (audit.missing.length > 0) {
-        // 阻断启用：完整回滚（账本已 on、engine 已声明），先停用再释放，
-        // 保证「台账声明 / engine.json / 会话账本」三者回到启用前状态。
-        records.delete(sessionId)
-        await rollbackV2Activation(sessionId, `继承审计失败：${audit.missing.length} 条回执不可解析`)
+        // 阻断启用 = 完整回滚（Y-10/Y-12）：进程内记录 / engine.json / state.json
+        // 三处都回到启用前，并释放抑制租约。判据与实现见 v2/enable-rollback.mjs。
+        await rollbackBlockedEnable({
+          records,
+          record,
+          sessionId,
+          reason: `继承审计失败：${audit.missing.length} 条回执不可解析`,
+          rollbackActivation: rollbackV2Activation,
+          disposeRecord,
+          disabledStateOf: disabledV2State,
+          writeState: writeV2SessionState,
+          logger,
+        })
         throw new EngineV2Error(
           `本会话热投影里有 ${audit.missing.length} 条 v2 回执指向本会话冷库中不存在的记录`
           + `${audit.truncated ? '（仅抽查了前 50 条）' : ''}：${audit.missing.slice(0, 5).join('、')}\n`
@@ -447,16 +456,14 @@ export function createLifecycleDomain({
     let pendingCount = 0
 
     if (record) {
-      // 0) 窗口守卫（rc.5，与 v1 normalizeAndStop 同口径）：恢复会让组装输入
-      // 超出模型窗口时跳过恢复、照常停用，原文留在冷库并如实给出路。
-      // 「无测量不设闸」——测量不可用时照常恢复（与 v1 一致），不静默扣留。
-      // P0-2：restore-skipped 的行同样「原文只在冷库」，停用前同样要走窗口守卫，
-      // 否则跳过行在恢复时突然全部回来会击穿模型窗口。
-      //
-      // Q-01（0.13.2-beta.5）：`autoRestore` 只决定**要不要恢复**，不决定要不要做
-      // 窗口守卫。旧实现把两者并进同一个条件，于是关掉「停用时恢复原文」时守卫被
-      // 一起关掉、恢复却照做——这个开关的实际作用与字面意思相反（按回执指引操作
-      // 反而更容易顶穿模型窗口）。守卫保护的是模型窗口，不是恢复策略。
+      // 0) 停用意图先落盘（Y-26）：旧顺序崩溃时留下「表面已回原文、账本仍 enabled:true」，
+      // 重启后 on 报假 EALREADYON 且 pendingReceipts 找不到回执。先写停用再恢复。
+      const disabledIntent = disabledV2State(record.state, reason)
+      await writeV2SessionState(record.directory, disabledIntent)
+      record.state = disabledIntent
+
+      // 0) 窗口守卫：恢复会让组装输入超窗时跳过恢复、照常停用（原文留冷库并给出路）。
+      // restore-skipped 行同样走守卫。Q-01：autoRestore 只决定要不要恢复，不决定要不要守卫。
       const settings = engine.settingsOf(record)
       // 缺失视为开（与 normalizeSettings 的默认一致）：旧账本没有这个字段时按默认恢复。
       autoRestore = settings?.autoRestore !== false
@@ -469,11 +476,7 @@ export function createLifecycleDomain({
             assembledTokens: occupancy.host.assembledTokens,
             contextWindow: occupancy.host.contextWindow,
           })
-          // 0.13.2-beta.6 G3：判据收成 windowGuardRefuses——`overflow === 'unknown'`
-          // 与 `true` 一样**拒绝**。旧写法 `if (growth.overflow)` 之所以「碰巧」
-          // 也拒绝 unknown，是因为 'unknown' 是非空字符串、在 JS 里为真——那是
-          // 字符串真值性的巧合，不是设计：换任何一个假值哨兵（0/null/''）就会静默
-          // 放行。集中判据让这个决定显式，且调用点不可能各自理解成不同的东西。
+          // G3：windowGuardRefuses 是唯一判据，unknown 与 true 同样拒绝（不靠字符串真值性）。
           if (windowGuardRefuses(growth)) {
             windowGuardRefusal = {
               total: growth.total,
@@ -486,10 +489,7 @@ export function createLifecycleDomain({
             }
           }
         } catch (error) {
-          // G3（对抗审查 finding 1）：测量失败**不能**等于「没有守卫」。
-          // 旧写法只 warn 一句，随后 `else if (!windowGuardRefusal)` 判真，
-          // 恢复照做——这正是本组要消灭的「判不了就放行」。现在失败落成
-          // 一个 undetermined 的拒绝结论，与 overflow==='unknown' 走同一条路径。
+          // G3：测量失败 ≠ 没有守卫——落成 undetermined 拒绝结论（判不了不放行）。
           logger?.warn?.(`memory-context-lab: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
           windowGuardRefusal = {
             total: Number.NaN,
@@ -553,9 +553,8 @@ export function createLifecycleDomain({
           '  /memory-lab clean confirm delete-session',
         )
       }
-      const disabledState = disabledV2State(record.state, reason)
-      await writeV2SessionState(record.directory, disabledState)
-      record.state = disabledState
+      record.state = disabledV2State(record.state, reason) // 计数变化再落一次（幂等）
+      await writeV2SessionState(record.directory, record.state)
       await disposeRecord(record)
       records.delete(sessionId)
     } else {

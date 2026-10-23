@@ -27,16 +27,27 @@ import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
 
-import { canonicalLine, createAppendableLedger } from './appendable-ledger.mjs'
+import { canonicalLine, createAppendableLedger, parseAppendableLedger } from './appendable-ledger.mjs'
 
 export const HIERARCHY_FILE = 'hierarchy.jsonl'
 export const HIERARCHY_HEADER_KIND = 'dsh-memory-context-lab/v2/hierarchy'
 export const HIERARCHY_SCHEMA_VERSION = 1
+
 export const HIERARCHY_ENTRY_L1 = 'hierarchy/l1-card'
 export const HIERARCHY_ENTRY_L2 = 'hierarchy/l2-phase'
 export const HIERARCHY_ENTRY_L3 = 'hierarchy/l3-task'
 export const HIERARCHY_ENTRY_RUN = 'hierarchy/run'
 export const HIERARCHY_ENTRY_VOUCHER = 'hierarchy/agg-voucher'
+
+const HIERARCHY_LEDGER_SCHEMA = Object.freeze({
+  ledgerName: 'hierarchy',
+  headerKind: HIERARCHY_HEADER_KIND,
+  schemaVersion: HIERARCHY_SCHEMA_VERSION,
+  entryKinds: Object.freeze([
+    HIERARCHY_ENTRY_L1, HIERARCHY_ENTRY_L2, HIERARCHY_ENTRY_L3,
+    HIERARCHY_ENTRY_RUN, HIERARCHY_ENTRY_VOUCHER,
+  ]),
+})
 
 /** run 审计行允许的 outcome 闭集（写侧校验，防手写账本引入新语义）。 */
 export const HIERARCHY_RUN_OUTCOMES = Object.freeze(['committed', 'no-safe-gain', 'skipped-batch-empty', 'skipped-llm-unavailable', 'skipped-damaged'])
@@ -56,67 +67,10 @@ export function hierarchyPath(sessionDir) {
   return path.join(sessionDir, HIERARCHY_FILE)
 }
 
+// 读侧协议只有一份实现（appendable-ledger.mjs 的 parseAppendableLedger）。
+// 本文件只声明自己的 schema。L-1：provenance 当年少抄一段 D-01，就是读侧被抄了三遍。
 function parseLedgerText(text) {
-  const lines = text.split('\n')
-  // 文本以 \n 结尾时 split 会留一个空尾元素，所以完整行恒为 slice(0, -1)。
-  const trailingNewline = /\n$/.test(text)
-  const completeLines = lines.slice(0, -1)
-  // 尾部没有 LF 时**先试解析**再判半行（0.13.2-beta.2 W-01b，与 disposition 的 D-01 同口径）。
-  //
-  // 旧实现把「文件末尾缺 \n」直接当成「崩溃残留的半行」，于是任何不走
-  // appendFile('…\n') 的写入路径留下的**完整合法条目**都被 loadHierarchy 在读取
-  // 动作里物理删除：层级账本少一条卡、revision 回退、entrySeq 重号。完整条目的
-  // 判定依据必须是「这一行能否解析成 JSON」，不是「文件末尾有没有换行」。
-  let partialLine = ''
-  if (!trailingNewline && lines.length > 0) {
-    const tail = lines[lines.length - 1]
-    if (tail.length > 0) {
-      try {
-        JSON.parse(tail)
-        completeLines.push(tail) // 合法 → 就是最后一条完整行，不进 partialLine
-      } catch {
-        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
-      }
-    }
-  }
-  const entries = []
-  let damaged = false
-  let damageDetail = null
-  let header = null
-  for (let index = 0; index < completeLines.length; index += 1) {
-    const raw = completeLines[index]
-    if (raw.length === 0) continue
-    let parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      damaged = true
-      damageDetail = { line: index + 1, message: error.message }
-      break
-    }
-    if (index === 0 || header === null) {
-      if (parsed?.kind !== HIERARCHY_HEADER_KIND || parsed?.schemaVersion !== HIERARCHY_SCHEMA_VERSION) {
-        damaged = true
-        damageDetail = { line: index + 1, message: '首行不是合法 hierarchy header' }
-        break
-      }
-      header = parsed
-      continue
-    }
-    if (![
-      HIERARCHY_ENTRY_L1,
-      HIERARCHY_ENTRY_L2,
-      HIERARCHY_ENTRY_L3,
-      HIERARCHY_ENTRY_RUN,
-      HIERARCHY_ENTRY_VOUCHER,
-    ].includes(parsed?.kind)) {
-      damaged = true
-      damageDetail = { line: index + 1, message: `未知条目 kind：${JSON.stringify(parsed?.kind)}` }
-      break
-    }
-    entries.push(parsed)
-  }
-  return { header, entries, damaged, damageDetail, partialLine, rawByteLength: Buffer.byteLength(text, 'utf8') }
+  return parseAppendableLedger(text, HIERARCHY_LEDGER_SCHEMA)
 }
 
 /**

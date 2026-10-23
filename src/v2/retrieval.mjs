@@ -16,7 +16,7 @@ import { readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { EngineV2Error } from './errors.mjs'
-import { isForgotten } from './disposition.mjs'
+import { getForgetIndexOrThrow, isForgotten } from './disposition.mjs'
 import { registerProvenanceEdges } from './provenance-index.mjs'
 import { RECEIPT_MARKER, V2_RECEIPT_MARKER } from '../core.mjs'
 import { CARD_HEADER } from './working-state.mjs'

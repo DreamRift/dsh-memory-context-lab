@@ -54,6 +54,8 @@ import {
   makeEntry,
   recallProtectionEntries,
 } from './protection.mjs'
+import { archiveRowsOf } from './v2/state.mjs'
+import { unparkRanges } from './v2/parked-ranges.mjs'
 
 /**
  * Resolve the authoritative context window and the assembled-input estimate.
@@ -227,7 +229,7 @@ export function makeOrdinalAllocator(record) {
     const ordinal = Number(row?.ordinal)
     if (Number.isSafeInteger(ordinal) && ordinal >= 1) used.add(ordinal)
   }
-  for (const row of record.state.archive) {
+  for (const row of archiveRowsOf(record.state)) {
     mark(row?.nodeId)
     if (Array.isArray(row?.chunkIds)) for (const chunkId of row.chunkIds) mark(chunkId)
   }
@@ -632,6 +634,15 @@ export function createEngine(dependencies) {
     // any retry after a partial failure) reuses the same node ids.
     if (!persistClaims) {
       for (const rangeStart of freshClaims) delete claims[rangeStart]
+    } else {
+      // Y-16：批上限／释放上限在提交阶段截断时，被截掉的单元**已经租了号**却永不落盘。
+      // 规划器把「租了但没用」的区间如实放在 discardedRangeStarts 里（判据只有一处），
+      // 这里按同一份事实回收声明——否则声明永久残留，下一个周期谁也清理不到。
+      // 只回收**本次新租**的号：老声明可能属于已落盘的历史批次，删掉会造成号复用。
+      const discarded = new Set(plan.discardedRangeStarts ?? [])
+      for (const rangeStart of freshClaims) {
+        if (discarded.has(rangeStart)) delete claims[rangeStart]
+      }
     }
     // 报告在规划**之后**生成：规划过程中守卫可能因证据修订变化释放软保护，
     // 这些释放必须出现在同一轮的 dry-run／status 里，而不是等到下一轮。
@@ -1036,7 +1047,7 @@ export function createEngine(dependencies) {
     })]
     for (const outcome of outcomes) {
       if (outcome.state === 'forgotten') continue
-      const stored = record.state.archive.find((row) => row.rangeStart === outcome.rangeStart
+      const stored = archiveRowsOf(record.state).find((row) => row.rangeStart === outcome.rangeStart
         && (row.status === 'applied' || row.status === 'verify-failed' || row.status.startsWith('restore-skipped')))
       if (!stored) continue
       stored.status = outcome.state === 'restored' ? 'restored' : `restore-skipped: ${outcome.reason}`
@@ -1516,7 +1527,7 @@ export function createEngine(dependencies) {
     const settings = settingsOf(record)
     const pending = pendingReceipts(record)
     const verifyFailed = pending.filter((row) => row.status === 'verify-failed').length
-    const restored = record.state.archive.filter((row) => row.status === 'restored').length
+    const restored = archiveRowsOf(record.state).filter((row) => row.status === 'restored').length
     const suppression = record.suppressionLease?.stats?.() ?? { write: 0, read: 0 }
     const lines = [
       `上下文降温：已启用（session=${record.sessionId}）`,
@@ -1584,7 +1595,7 @@ export function createEngine(dependencies) {
     // P0-2：回执 Σ 与 prune.shadowedTokenCount 量的是同一对象、取的都是宿主 meter 的
     // 启发式价（见 docs/降温模式.md「token 口径与对账」）。实测样本逐条严格相等；一旦
     // 差额超过阈值就必须报出来，不能让它看起来像"两个数本来就该差"。
-    const accounting = tokenAccountingOf(record.state.archive)
+    const accounting = tokenAccountingOf(archiveRowsOf(record.state))
     if (accounting && accounting.ratio > TOKEN_ACCOUNTING_TOLERANCE) {
       lines.push(
         `token 对账：回执 Σ${accounting.receipt} vs compaction/prune.shadowedTokenCount Σ${accounting.prune}`

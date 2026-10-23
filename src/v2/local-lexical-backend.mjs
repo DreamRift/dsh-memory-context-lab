@@ -41,6 +41,19 @@ export const LOCAL_LEXICAL_CAPABILITIES = Object.freeze({
  * 中文没有可靠的空格分词边界，二元组是召回率与实现复杂度的最优交点，
  * 且与灵枢后端的词法行为同量级——两者都不做语义。
  */
+/**
+ * 文档长度（BM25 归一化用）的**唯一定义**（F 组，beta.7）。
+ *
+ * 旧实现两处各算一遍：分母用 `coveredBytes ?? bytes`、分子只用 `bytes`。
+ * P1-7 分块索引之后 `bytes` 只是首块长度，于是「同一篇文档在分子里短、
+ * 在分母里长」——长文被当成短文加权，排序与 avgBytes 不同源。
+ * 收成一个函数后，新增第三个使用点时不会再各写一份。
+ */
+function docLengthOf(doc) {
+  if (!doc) return 0
+  return Number.isFinite(doc.coveredBytes) ? doc.coveredBytes : (Number.isFinite(doc.bytes) ? doc.bytes : 0)
+}
+
 export function tokenizeForLexicalIndex(text) {
   const out = []
   const lower = String(text ?? '').toLowerCase()
@@ -165,7 +178,15 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
           continue
         }
         // 代次不匹配 = 该条已随压实进入 base；跳过而不是重放，避免双计。
-        if (entry.base !== state.gen) continue
+        //
+        // Y-06（beta.7）：跳过**必须计数**。旧实现静默 continue——当 base 文件损坏
+        // 导致 gen 归零时，整本增量日志的代次都对不上，于是全部条目被丢掉，
+        // 而 index 回执仍报「已索引 N 条」：检索永久缺段且无人知晓。
+        // 计数进 state.staleEntries，由 index 回执与 status 如实展示。
+        if (entry.base !== state.gen) {
+          state.staleEntries += 1
+          continue
+        }
         applyLogEntry(state, entry)
       }
       state.logLines = lines
@@ -249,10 +270,11 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
           externalIds[id] = id
           continue
         }
-        if (current.limitReached) {
-          skipped.push({ id, reason: 'term-limit-reached' })
-          continue
-        }
+        // Y-17：触顶不是终态。词条上限挡的是「新词条」，而已有词条的**新文档**
+        // 完全能索引（它的词频只加进既有 posting，不会让词条数增长）。旧实现一旦
+        // 触顶就整条 `continue`，于是「先触顶一次」→ 此后所有新记录永久不可检索，
+        // 连「把已有词条用得更充分」的增量也一起停掉。这里改成按文档实测：
+        // 只有真的需要新词条时才判触顶。
         // P1-7 分块：长正文按块送达（textParts），逐块分词、词频累加进同一文档。
         const parts = Array.isArray(record.textParts) && record.textParts.length > 0
           ? record.textParts.filter((part) => typeof part === 'string' && part.length > 0)
@@ -415,7 +437,7 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       let totalBytes = 0
       // 文档长度按覆盖字节计：P1-7 分块索引后 doc.bytes 只是首块长度，
       // 归一化用实际索引到的字节数才不自欺（超限未覆盖的部分本来就没进索引）。
-      for (const doc of current.docs.values()) totalBytes += doc?.coveredBytes ?? doc?.bytes ?? 0
+      for (const doc of current.docs.values()) totalBytes += docLengthOf(doc)
       const avgBytes = totalBytes / docCount || 1
       // 门槛（P1 dev 集校准，见 test/v2-local-lexical.test.mjs）二选一放行：
       // ① rel ≥ 0.5：过半 idf 质量——单词命中但那是查询的稀缺主题词（如「做饭」）
@@ -428,7 +450,7 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       const MULTI_TERM_FLOOR = 0.25
       const ranked = []
       for (const [id, tfByTerm] of candidates) {
-        const len = current.docs.get(id)?.bytes ?? 0
+        const len = docLengthOf(current.docs.get(id))
         const norm = K1 * (1 - B + (B * len) / avgBytes)
         let bm25 = 0
         let matchedIdf = 0
@@ -494,7 +516,7 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       const K1 = 1.5
       const B = 0.75
       let totalBytes = 0
-      for (const doc of current.docs.values()) totalBytes += doc?.coveredBytes ?? doc?.bytes ?? 0
+      for (const doc of current.docs.values()) totalBytes += docLengthOf(doc)
       const avgBytes = totalBytes / docCount || 1
       const REL_FLOOR = 0.5
       const MULTI_TERM_FLOOR = 0.25
@@ -502,7 +524,7 @@ export function createLocalLexicalBackend({ directory, logger = null, maxTerms =
       const weak = []
       let rank = 0
       for (const [id, tfByTerm] of candidates) {
-        const len = current.docs.get(id)?.bytes ?? 0
+        const len = docLengthOf(current.docs.get(id))
         const norm = K1 * (1 - B + (B * len) / avgBytes)
         let bm25 = 0
         let matchedIdf = 0

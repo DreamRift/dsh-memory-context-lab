@@ -20,6 +20,7 @@ import { invalidateReadLedger, registerReads } from './read-ledger.mjs'
 import { syncRetrievalIndex } from './retrieval.mjs'
 import { getForgetIndex } from './disposition.mjs'
 import { syncVerification } from './verification.mjs'
+import { unparkRanges } from './parked-ranges.mjs'
 
 export function createCoolingDomain({
   records,
@@ -274,6 +275,9 @@ async function runNow(invocation, { dryRun }) {
   if (!record) {
     return { kind: 'error', text: 'v2 引擎在本会话未启用。先 `/memory-lab on`。' }
   }
+  // Y-05：`now` 是人给的「我再试一次」——必须先解除停摆，否则被 parked 过滤掉的
+  // 区间永远不会重新进候选，而回执却提示用户「用 /memory-lab now」这条假出路。
+  const unparked = dryRun ? 0 : unparkRanges(record)
   const outcome = await engine.runOnce(record, undefined, { dryRun })
   // 预演零副作用：不记账（它没提交任何东西）。
   if (!dryRun) {
@@ -282,9 +286,10 @@ async function runNow(invocation, { dryRun }) {
   }
   // 全失败不能报成功：runOnce 失败关闭时返回 kind:'error'，命令面必须跟随它，
   // 否则「一段都没归档」会被渲染成「已归档一批」。
+  const head = unparked > 0 ? `已解除 ${unparked} 个停摆区间，重新进入候选。\n` : ''
   return {
     kind: outcome?.kind === 'error' ? 'error' : 'success',
-    text: outcome?.text ?? JSON.stringify(outcome),
+    text: `${head}${outcome?.text ?? JSON.stringify(outcome)}`,
   }
 }
 

@@ -134,8 +134,9 @@ export function createRecallDomain({
         const warnings = [...budgetNotes]
         // 验证跟踪：人工失效标记（只读旁证，零 hash，查询失败静默不注记——
         // 失效注记是加强信息，不能反过来把正常回读打挂）。
+        // Y-22：旁证目录从 labRoot + sessionId 直接算，不依赖进程内 record（重启后仍生效）。
         const staleMarks = await annotateStale({
-          sessionDir: records.get(sessionId)?.directory,
+          sessionDir: records.get(sessionId)?.directory ?? v2SessionDirectoryFor(labRoot, sessionId),
           recordIds: ids,
         }).catch(() => new Map())
         let used = 0
@@ -192,7 +193,10 @@ export function createRecallDomain({
                   text: null,
                   error: row.error,
                 })
-                used += 1
+                // Y-36：失败行（回读不到、解析失败）没有产生任何正文，
+                // 却推进预算游标——它们会把真正可读的记录挤出预算窗口。
+                // 失败要如实列出，但不得计费：
+                // 预算是「已交回的正文量」，不是「尝试过的条数」。
                 continue
               }
               const rowTokens = estimateTokensOf(row.text)
@@ -514,9 +518,16 @@ export function createRecallDomain({
     const sessionId = sessionIdOf(invocation.agent.session)
     const useIds = args[0] === 'id'
     const rest = useIds ? args.slice(1) : args
-    const ids = useIds ? rest.flatMap((arg) => arg.split(',')).filter(Boolean) : []
+    // Y-23：帮助文本承诺了 `recall id <ID> [预算]`，但这里把整串都当记录 ID，
+    // 于是 `recall id mcl2-… 800` 会拿「800」去回读一条不存在的记录，
+    // 白占一行失败项还挤掉真实预算。判据只有一处：末位是纯数字且前面还有 id 时，
+    // 它才是预算；否则一律当 id（ID 本身不可能是纯数字）。
+    const numericTail = useIds && rest.length >= 2 && /^\d+$/.test(rest[rest.length - 1])
+    const idArgs = numericTail ? rest.slice(0, -1) : rest
+    const budget = numericTail ? Number(rest[rest.length - 1]) : undefined
+    const ids = useIds ? idArgs.flatMap((arg) => arg.split(',')).filter(Boolean) : []
     const query = useIds ? null : (rest.join(' ').trim() || null)
-    const result = await recall(sessionId, { recordIds: ids, query, session: invocation.agent.session })
+    const result = await recall(sessionId, { recordIds: ids, query, budget, session: invocation.agent.session })
     // 复用工具渲染：命令面与模型可见工具看到的是同一份措辞。
     return { kind: 'success', text: renderToolOutput(sessionId, toToolValue(sessionId, result)) }
   }
@@ -528,7 +539,8 @@ export function createRecallDomain({
    */
   async function indexCommand(invocation, args) {
     const sessionId = sessionIdOf(invocation.agent.session)
-    const record = records.get(sessionId)
+    // Y-11（beta.7 B 组）：重启后必须先 adopt 再判，否则与 status 自相矛盾。
+    const record = records.get(sessionId) ?? await adopt(invocation.agent)
     if (!record) return { kind: 'error', text: 'v2 引擎在本会话未启用。' }
     // 0.13.2-beta.6 G10（store/p-07 W5/W7/W7b）：**子命令必须先校验再执行**。
     //
@@ -623,7 +635,7 @@ export function createRecallDomain({
     return { kind: 'success', text: lines.join('\n') }
   }
 
-  function recallTriggerOf(record, decision, query) {
+  function recallTriggerOf(record, decision, query, position) {
     if (query) return { kind: 'query', id: query.id, text: query.text }
     // 1) 重读同一文件
     try {
@@ -642,7 +654,9 @@ export function createRecallDomain({
       // 触发点判定失败不阻塞主流程。
     }
     // 2) 步数兜底
-    const step = Number(decision?.step ?? decision?.turn?.step)
+    // Y-00（beta.7）：步号只在**宿主传入的 position** 里。`decision` 是 next() 的
+    // 返回值（`{kind, messages}`），从来没有 step 字段——读它等于这条兜底永不触发。
+    const step = Number(position?.step ?? decision?.step ?? decision?.turn?.step)
     if (Number.isInteger(step)) {
       const last = Number(record.lastRecallStep)
       if (!Number.isInteger(last) || step - last >= RECALL_STEP_FALLBACK) {
@@ -653,14 +667,14 @@ export function createRecallDomain({
     return null
   }
 
-  async function buildRecall(agent, decision, signal) {
+  async function buildRecall(agent, decision, signal, position = null) {
     const record = await adopt(agent)
     if (!record || !engine.settingsOf(record).autoRecall) return decision
     // P0-2：restore-skipped 行的原件仍在冷库且回执在活动面上，回注与工作卡
     // 一样以「是否有冷库依赖」为闸门，跳过行同样算依赖。
     if (engine.pendingReceipts(record).length === 0 && engine.restoreSkippedReceipts(record).length === 0) return decision
     const query = recallQueryFrom(decision.messages)
-    const trigger = recallTriggerOf(record, decision, query)
+    const trigger = recallTriggerOf(record, decision, query, position)
     if (!trigger) return decision
     // 去重：同一触发 id 只回注一次。
     if (record.recallQueryId === trigger.id) return decision

@@ -18,6 +18,7 @@
  */
 import { NUMERIC_SETTINGS, normalizeSettings, parseStrictInteger, restoreGrowth, windowGuardRefuses } from '../core.mjs'
 import { describeWindowGuardRefusal } from './window-guard-text.mjs'
+import { refusalFromError } from './fail-closed.mjs'
 import { describeRestoreSkipReasons } from '../apply.mjs'
 import { stateWithDefaults, writeV2SessionState } from './state.mjs'
 
@@ -149,7 +150,23 @@ export function createSettingsDomain({
               }
             }
           } catch (error) {
-            logger?.warn?.(`memory-context-lab: restore guard unavailable: ${error instanceof Error ? error.message : String(error)}`)
+            // Y-09（beta.7 B 组）：**「判不了」不是「没超窗」**。
+            //
+            // 旧实现在这里只 warn，然后 fullHistoryGuardRefusal 仍是 null，代码直接
+            // 落到下面的 engine.runRestore —— 与另外两条恢复路径（off / restore）
+            // 口径分叉：它们都落 undetermined 拒绝。三处同一件事三种答案，
+            // 而这一处的答案是「照做」，代价是可能把整段历史灌回模型窗口。
+            const refusal = refusalFromError(error, { what: '判定恢复增量（窗口守卫）' })
+            logger?.warn?.(`memory-context-lab: ${refusal.reason}`)
+            fullHistoryGuardRefusal = {
+              total: null,
+              heldByReceipts: null,
+              assembled: null,
+              window: null,
+              undetermined: true,
+              unknownReasons: [refusal.reason],
+              refusal,
+            }
           }
         }
         if (fullHistoryGuardRefusal) {

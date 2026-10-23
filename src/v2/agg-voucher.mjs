@@ -22,13 +22,14 @@
  */
 
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { withWriteLock } from './write-lock.mjs'
 
 import { AGG_VOUCHER_MARKER, buildProjectionHeader, V2_RECEIPT_MARKER } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
 import { canonicalLine } from './disposition.mjs'
+import { writeFileAtomic } from './appendable-ledger.mjs'
 
 // 标记常量单一出处（core.mjs）：isReceiptMessage 与本模块共用同一份，改一处即两处同步。
 export { AGG_VOUCHER_MARKER }
@@ -362,10 +363,10 @@ async function saveVoucherPlanUnlocked(sessionDir, plan) {
     .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
     .slice(0, AGG_VOUCHER_PLAN_LIMIT)
   const payload = canonicalLine({ plans: next }) + '\n'
-  await mkdir(sessionDir, { recursive: true })
-  const temp = file + '.tmp'
-  await writeFile(temp, payload, 'utf8')
-  await rename(temp, file)
+  // Y-14（beta.7 A 组）：临时名必须唯一且要 fsync。旧写法固定 `file + '.tmp'`：
+  // 同进程两个并发写者互相截断对方正在写的临时文件，后写者 rename 走的是残缺内容。
+  // 同仓 writeFileAtomic 已是唯一原子写实现（randomUUID 临时名），不再自造一份。
+  await writeFileAtomic(file, payload)
   return { voucherId: plan.voucherId, kept: next.length }
 }
 
@@ -382,10 +383,7 @@ export async function loadVoucherPlans(sessionDir) {
 async function writeVoucherPlansUnlocked(sessionDir, plans) {
   const file = voucherPlansPath(sessionDir)
   const payload = canonicalLine({ plans }) + '\n'
-  await mkdir(sessionDir, { recursive: true })
-  const temp = file + '.tmp'
-  await writeFile(temp, payload, 'utf8')
-  await rename(temp, file)
+  await writeFileAtomic(file, payload) // Y-14：唯一临时名 + fsync
 }
 
 export async function dropVoucherPlan(sessionDir, voucherId) {

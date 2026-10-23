@@ -948,7 +948,17 @@ export class V2SessionStore {
     await writeFileAtomic(target, buffer)
   }
 
-  /** 写入屏障：已关闭/只读/已停用的库不得接受任何写入，哪怕事务是停用前打开的。 */
+  /**
+   * 写入屏障：已关闭 / 只读 / 已停用 / **已丢失写锁** 的库不得接受任何写入。
+   *
+   * Y-02（beta.7 A 组）：最后一条是新增的。写锁的心跳自检失败会把句柄标成
+   * `lost`（锁被别的进程接管），但全仓**没有任何消费者**读过它——被接管的写者
+   * 继续 stage/commit，于是两个进程各自基于「我是唯一写者」的前提推进 manifest，
+   * 后写者整段覆盖先写者：lost update，正是这把锁存在的唯一理由。
+   *
+   * 判据放在**唯一写入屏障**里而不是各写入点：新增第 N 个写入原语时自动继承，
+   * 不需要记得加一句检查（本组反复出现的形态就是「有正确实现、调用点没用」）。
+   */
   #assertWritable(what) {
     if (this.#closed) {
       throw new EngineV2Error(`${what}被拒绝：v2 句柄已关闭（关闭后不再持有写锁）。`, { code: 'ESTORECLOSED' })
@@ -958,6 +968,12 @@ export class V2SessionStore {
     }
     if (this.disabled) {
       throw new EngineV2Error(`${what}被拒绝：v2 会话已停用（停用即只读）。`, { code: 'EREADONLY' })
+    }
+    if (this.#writeLock?.lost?.() === true) {
+      throw new EngineV2Error(
+        `${what}被拒绝：本句柄的写锁已被其他进程接管（心跳自检失败），继续写入会造成丢失更新。请关闭本句柄后重新打开。`,
+        { code: 'ELOCKLOST' },
+      )
     }
   }
 

@@ -1,5 +1,75 @@
 # 变更记录
 
+## 0.13.2-beta.7（2026-10-23）**测试版**
+
+**第 10 轮排查（42 条：3 遗留 + 13 P1 + 14 P2 + 10 P3 + 6 待验证）的根因收口批。只修缺陷、不改产品边界。**
+
+不按 42 条逐条打补丁，而是先归并成 6 组根因（A 协议无载体 / B 失败关闭无判据 / C 宿主契约无强制点 /
+D 状态字段无 schema / E 治理假设理想序列 / F 消费者与生产者口径不一），一组一处抽象改动。
+
+源码树 **118 套全绿、0 套失败**（新增 `test/v2-beta7-command-surface.test.mjs`）；回归集探针 142 项全 0 退出；
+`revert-probe` **66 场景 / 64 OK / 2 未覆盖**（基线 62 OK；本轮把 4 条「夹具脱节」重新对准源码，
+2 条变成改回去必红、2 条如实记为未覆盖，未放宽任何断言）。
+
+### A 组·协议只有一个载体
+
+- **读侧解析收口（L-1）**：`parseAppendableLedger()` 与 `createAppendableLedger()` 成对落在
+  `v2/appendable-ledger.mjs`，disposition / hierarchy / provenance 只提供 schema 参数。
+  此前三份各写一遍读侧，provenance 就是抄到第三遍时漏了尾行 LF 判定（D-01 的成因）。
+- **原子写收口（Y-03 / Y-14）**：`engine.json`、`agg-voucher` 的落盘改走 `writeFileAtomic`；
+  崩溃不再留半截 JSON 导致永久 `EENGINEDAMAGED`。
+- **写锁被真正消费（Y-02）**：`store` 的 stage/commit 前查 `writeLock.lost()`，被接管的写者失败关闭，
+  不再制造 lost update（这正是这把锁存在的唯一理由）。
+- **旁证索引读-改-写进锁（Y-08）**：`verification.json` 的归档补采与 `mark-stale` 不再互相覆盖。
+
+### B 组·失败关闭有唯一判据
+
+- 新增 `v2/fail-closed.mjs`：`isAbsent()`（只有 ENOENT 才算「没有」）、`classifyReadFailure()`、
+  `capLimitOf()`（非有限上限 = 不截断，不是 0）。
+- **遗忘索引不再把「读不到」当「没有」（Y-01）**：EACCES/EMFILE/ELOOP 不再归零 `forgotten` 表——
+  那会让已遗忘记录重新可见（隐私回退）。
+- **窗口守卫失败关闭（Y-09）**、**启用失败回滚三处一致（Y-10）**、**停用先写盘后恢复（Y-26）**、
+  **forget 撤回失败不标 forgotten（Y-25）**、**audit 失败不再被吞（Y-21）**。
+
+### C 组·宿主契约在命令面强制
+
+- 新增 `v2/command-surface.mjs`：包在 `runtime.mjs` 的 `commandHandler` 外层，
+  把任何抛出的 `EngineV2Error` 转成 `{kind:'error', code, message, text}`（L-2）。
+  新增命令域不需要自己 catch——契约在注册点，不在 30 个 case 里。
+- **四条命令重启后正确 adopt（Y-11）**、**read/recall 重启后保留失效注记（Y-22）**、
+  **recall 预算参数不再被当记录 ID（Y-23）**、**阻断提示不再让用户 fork 到自身（Y-24）**。
+
+### D 组·状态字段有元素级 schema
+
+- `isArchiveRow()` / `archiveRowsOf()` 成为 `archive` 的唯一读取入口（L-3）：
+  闸门判 damaged、消费者拿过滤后的安全视图，`apply-engine` 的 4 处裸取全部收口。
+- **claim 租号后移到提交期（Y-16）**、**显式 undefined 不再清空硬保护（Y-28）**、
+  **claim 保留最新的 positive（Y-27）**、**抑制租约不再泄漏（Y-12）**。
+
+### E 组·治理按真实序列设计
+
+- **`/memory-lab now` 先解除停摆（Y-05）**：`unparkRanges()` 让被 guard 撤销三次的区间重新进候选，
+  此前 status 提示「用 now」是假出路。
+- **批摘要认两种头（Y-15）**：format 3「N 个相邻操作」与 format 8「本批 N/M 个操作」都识别，
+  只认一种会让 format 8 的部分批组永远落进「整组拒绝」。
+- **词法索引 base 损坏不再静默丢段（Y-06）**、**`limitReached` 不再永久粘滞（Y-17）**。
+
+### F 组·同一个量只算一次
+
+- BM25 文档长度统一走 `docLengthOf()`（`coveredBytes` 优先、回落 `bytes`），索引侧与检索侧共用（Y-18）。
+- 分块索引不再按字节切 UTF-8（Y-20）；状态面不再虚报灵枢后端生效（Y-19）。
+
+### P3 十条
+
+`truncateAtCodePoints(0)` 不再返回 1 字符；增量卡尾行区分行数/字符触发原因；在途调用不再渲染两次；
+`seq:N` 与回读工具口径一致；未接线类目如实标注；`mergeFacts` 保留 `verified:false`；
+`confirmInjection` 时机后移；别名失败行不再挤占预算；`runExclusive` 名副其实；设置页卡片接入 locale。
+
+### 本轮未做
+
+`release/` 已镜像并复跑（118 套全绿）；**未打 git tag、未推送 GitHub、未重启 DSH**。
+卡片治理（Q3）与未接线类目（Q4）属产品决策，未在本批；真实会话 A/B 收益量化未做。
+
 ## 0.13.2-beta.6（2026-10-23）**测试版，未打 tag / 未装到本机 profile，未推送 GitHub**
 
 **第 8 轮审计（`reports/第8轮结论.md`）的按根因修复批。只修缺陷、不改产品边界。**

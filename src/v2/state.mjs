@@ -62,8 +62,32 @@ export function v2SessionDirectoryFor(labRoot, sessionId) {
  * 每项是 `[字段名, 校验函数, 缺失时的默认值]`。默认值只在**读**路径用
  * （`stateWithDefaults`）；写路径仍然失败关闭（不替调用方编一个 archive）。
  */
+/**
+ * archive 一行的最小形状（D 组，beta.7）。
+ *
+ * 为什么闸门要管元素而不只 `Array.isArray`（L-3 的根）：`archive: [null]` 能通过
+ * 旧闸门，`stateWithDefaults` 对「已是数组」的字段什么都不做，于是坏元素原样透传
+ * 到 4 个消费者，`row.status` 抛 TypeError（code=undefined，连错误类型都丢了）。
+ * 闸门校验「形状」而消费者需要「内容」，两者此前没有共用定义——这里就是那份定义。
+ *
+ * 判据刻意宽松：只要求「是对象且带非空的 nodeId 或 recordId」。
+ * 真实的 archive 行以 `nodeId` 标识（apply-engine 落盘时写 nodeId/rangeStart/rangeEnd/
+ * callIds/tools/hash…），没有 recordId；`recordId` 只在旧格式与部分测试构造里出现，
+ * 所以两者取其一即可。其余字段随回执格式演化（format 3/5/7/8 各有不同），
+ * 把演化字段钉死会制造版本脆性。
+ */
+export function isArchiveRow(row) {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) return false
+  const id = typeof row.nodeId === 'string' && row.nodeId ? row.nodeId : row.recordId
+  return typeof id === 'string' && id.length > 0
+}
+
 export const REQUIRED_STATE_FIELDS = Object.freeze([
-  Object.freeze({ name: 'archive', check: (value) => Array.isArray(value), empty: () => [] }),
+  Object.freeze({
+    name: 'archive',
+    check: (value) => Array.isArray(value) && value.every(isArchiveRow),
+    empty: () => [],
+  }),
   Object.freeze({
     name: 'settings',
     check: (value) => value !== null && typeof value === 'object' && !Array.isArray(value),
@@ -97,6 +121,20 @@ export function stateFieldProblems(value) {
     if (!field.check(value[field.name])) problems.push(field.name)
   }
   return problems
+}
+
+/**
+ * 消费者取 archive 的**唯一路径**（L-3）。
+ *
+ * 闸门（isV2SessionState）已保证元素形状；这里再挡一次「调用方拿到的根本不是
+ * 合法状态」（例如从旧版本文件直接读、或测试构造的半成品）。返回空数组而不是抛错
+ * 是有意的：**读**路径不该因为一条坏行就让整个 status 不可用——但**写**路径
+ * 仍失败关闭（闸门拒绝），所以坏行不会被当成「从没归档过」写回去。
+ */
+export function archiveRowsOf(state) {
+  const rows = state?.archive
+  if (!Array.isArray(rows)) return []
+  return rows.filter(isArchiveRow)
 }
 
 /**

@@ -226,3 +226,90 @@ export function createAppendableLedger({ file, sessionDir, header, parse, serial
 
   return { file, headerLine, readText, load, repairTail, prepareUnlocked, appendLines }
 }
+// ---------------------------------------------------------------- 唯一解析实现
+
+/**
+ * 解析一份 append-only 账本文本（三份账本共用）。
+ *
+ * 为什么必须只有一份（0.13.2-beta.7 L-1）：
+ *
+ * beta.6 把**写侧**收成了 createAppendableLedger，读侧却留了三份各写一遍的
+ * parse。三份的差异不是风格，而是缺陷历史：provenance 那份漏了 D-01（末尾缺 LF
+ * 时把最后一条**完整合法**条目当半行删掉），原因是「抄到第三遍时少抄了一段」。
+ * 只要「新增账本 = 再抄一份 parse」，第四份账本就会再少抄一段。
+ *
+ * 所以协议在这里只有一份实现，账本只提供**schema 参数**（header 的 kind 与
+ * schemaVersion、条目 kind 白名单、给用户看的名字）。返回形状也只有一种：
+ * `{ entries, header, damaged, damageDetail, partialLine, rawByteLength }`——
+ * 三份账本此前形状不一致（provenance 不返回 header/rawByteLength），
+ * 消费者于是不能互换；统一后「多一个账本」不再意味着「多一套返回契约」。
+ *
+ * 判据（与 D-01 / W-01b 一致，不再各处重述）：
+ * - 末尾没有 LF：**先试解析**，能解析就是完整行，只有解析失败的尾巴才进 partialLine；
+ * - 首行必须是 header（kind + schemaVersion 同时匹配）；
+ * - 其余行必须在 entryKinds 白名单内；
+ * - 中部任何解析失败 / header 非法 / kind 未知 → damaged + damageDetail（带行号）。
+ *
+ * @param {string} text 账本全文
+ * @param {object} schema
+ * @param {string} schema.ledgerName 账本名（进 damageDetail 文案）
+ * @param {string} schema.headerKind 首行 kind
+ * @param {number} schema.schemaVersion 首行 schemaVersion
+ * @param {readonly string[]} schema.entryKinds 合法条目 kind 白名单
+ * @returns {{ entries: object[], header: object|null, damaged: boolean, damageDetail: object|null, partialLine: string, rawByteLength: number }}
+ */
+export function parseAppendableLedger(text, { ledgerName, headerKind, schemaVersion, entryKinds }) {
+  if (typeof text !== 'string') throw new InvalidArgumentError('parseAppendableLedger: text 必须是字符串')
+  if (!ledgerName || !headerKind || !Number.isInteger(schemaVersion)) {
+    throw new InvalidArgumentError('parseAppendableLedger: ledgerName / headerKind / schemaVersion 必填')
+  }
+  const kinds = new Set(Array.isArray(entryKinds) ? entryKinds : [])
+  const lines = text.split('\n')
+  // 文本以 \n 结尾时 split 会留一个空尾元素，所以完整行恒为 slice(0, -1)。
+  const trailingNewline = /\n$/.test(text)
+  const completeLines = lines.slice(0, -1)
+  let partialLine = ''
+  if (!trailingNewline && lines.length > 0) {
+    const tail = lines[lines.length - 1]
+    if (tail.length > 0) {
+      try {
+        JSON.parse(tail)
+        completeLines.push(tail) // 合法 → 最后一条完整行，不进 partialLine
+      } catch {
+        partialLine = tail // 只有解析失败的尾巴才是崩溃残留
+      }
+    }
+  }
+  const entries = []
+  let damaged = false
+  let damageDetail = null
+  let header = null
+  for (let index = 0; index < completeLines.length; index += 1) {
+    const raw = completeLines[index]
+    if (raw.length === 0) continue
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      damaged = true
+      damageDetail = { line: index + 1, message: error.message }
+      break
+    }
+    if (header === null) {
+      if (parsed?.kind !== headerKind || parsed?.schemaVersion !== schemaVersion) {
+        damaged = true
+        damageDetail = { line: index + 1, message: `首行不是合法 ${ledgerName} header` }
+        break
+      }
+      header = parsed
+      continue
+    }
+    if (!kinds.has(parsed?.kind)) {
+      damaged = true
+      damageDetail = { line: index + 1, message: `未知条目 kind：${JSON.stringify(parsed?.kind)}` }
+      break
+    }
+    entries.push(parsed)
+  }
+  return { entries, header, damaged, damageDetail, partialLine, rawByteLength: Buffer.byteLength(text, 'utf8') }
+}

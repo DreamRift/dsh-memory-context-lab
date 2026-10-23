@@ -136,16 +136,42 @@ export function createForgetDomain({
         failures.push({ replacementSeq: withdrawal.replacementSeq, message: error?.message ?? String(error) })
       }
     }
+    // Y-25（beta.7 B 组）：**撤回失败不是撤回成功**。
+    //
+    // 旧实现无论表面替换成不成功，都把所有 touchedRows 写成 status='forgotten'。
+    // 后果是：账本说「已遗忘」，表面却还留着原文回执（替换抛错那一行）——
+    // 读面按账本过滤、投影按表面渲染，两个答案并存，而 restore 会认为这段
+    // 「已经不在表面」而跳过它。用户看到「已遗忘」，原文仍在模型可见面上。
+    //
+    // 现在只有**表面替换成功**的那些区间对应的行才落 forgotten；失败的区间
+    // 保持原状态（applied），并在回执里逐条列出，由用户重试或 forget undo。
+    const failedSeqs = new Set(failures.map((item) => item.replacementSeq))
+    const pendingSeqs = new Set(plan.pendingWithdrawals.map((item) => item.replacementSeq))
+    const rows = []
     for (const row of plan.touchedRows) {
+      const seq = Number.isInteger(row.rangeStart) ? row.rangeStart : null
+      if (seq !== null && (failedSeqs.has(seq) || pendingSeqs.has(seq))) {
+        rows.push({ row, outcome: failedSeqs.has(seq) ? 'withdraw-failed' : 'surface-missing' })
+        continue
+      }
       row.status = 'forgotten'
       row.forgottenBy = result.entry?.operationId ?? null
+      rows.push({ row, outcome: 'forgotten' })
     }
-    if (plan.touchedRows.length > 0) await writeV2SessionState(record.directory, record.state)
+    const forgottenRows = rows.filter((item) => item.outcome === 'forgotten').map((item) => item.row)
+    if (forgottenRows.length > 0) await writeV2SessionState(record.directory, record.state)
     return {
       failures,
       pendingWithdrawals: plan.pendingWithdrawals,
       withdrawn: plan.withdrawals.length,
-      reconciledRows: plan.touchedRows.length,
+      reconciledRows: forgottenRows.length,
+      // 未落 forgotten 的行：调用方据此如实报告「这些区间仍然可见」。
+      stillVisibleRows: rows.filter((item) => item.outcome !== 'forgotten').map((item) => ({
+        rangeStart: item.row.rangeStart,
+        rangeEnd: item.row.rangeEnd,
+        nodeId: item.row.nodeId,
+        outcome: item.outcome,
+      })),
     }
   }
 
@@ -431,6 +457,18 @@ async function forgetCommand(invocation, args) {
   }
   if (withdrawal.pendingWithdrawals.length > 0) {
     lines.push('表面缺失待对账 ' + withdrawal.pendingWithdrawals.length + ' 组（下次 adopt 时收敛）。')
+  }
+  // Y-25：撤回失败/表面缺失的行**没有**落 forgotten——它们仍在模型可见面上。
+  // 回执必须如实说，否则用户以为「已遗忘」，原文却还挂在投影里。
+  if (Array.isArray(withdrawal.stillVisibleRows) && withdrawal.stillVisibleRows.length > 0) {
+    const sample = withdrawal.stillVisibleRows.slice(0, 5)
+      .map((row) => `seq ${row.rangeStart}–${row.rangeEnd}`)
+      .join('、')
+    lines.push(
+      `⚠ ${withdrawal.stillVisibleRows.length} 段表面回执未能撤回（${sample}${withdrawal.stillVisibleRows.length > 5 ? ' 等' : ''}）：`
+      + '这些区间**仍然对模型可见**，账本已记遗忘但投影未收口。用 /memory-lab forget status 看重放清单，'
+      + '或先 /memory-lab forget undo ' + result.entry.operationId + ' 回到一致状态再重试。',
+    )
   }
   lines.push('冷库原文与审计日志保留；撤销用 /memory-lab forget undo ' + result.entry.operationId + '。')
   return { kind: 'success', text: lines.join('\n') }

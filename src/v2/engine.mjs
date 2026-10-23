@@ -15,7 +15,8 @@
  * 错误状态，而不是任何安全边界。
  */
 
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
+import { writeFileAtomic } from './appendable-ledger.mjs'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
@@ -79,9 +80,14 @@ export async function claimV2Engine(labRoot, sessionId) {
   }
 
   // 所有权标记先行：此后任何时刻 engine.json 都反映 v2 是否持有投影。
+  //
+  // Y-03（beta.7 A 组）：这里必须走 writeFileAtomic（同仓 appendable-ledger 已实现
+  // temp+rename+fsync）。旧的裸 writeFile 在崩溃时留下半截 JSON，而 readV2EngineState
+  // 对解析失败报 damaged → claim/disable 双双 EENGINEDAMAGED，on/off 全废、
+  // 只能手删文件才能恢复。同一份协议在仓里已有一份正确实现，就不该有第二份。
   const sessionDir = v2SessionDirectoryFor(labRoot, sessionId)
   await mkdir(sessionDir, { recursive: true })
-  await writeFile(
+  await writeFileAtomic(
     path.join(sessionDir, ENGINE_FILE),
     `${JSON.stringify({
       kind: V2_ENGINE_KIND,
@@ -141,7 +147,7 @@ export async function disableV2Engine(labRoot, sessionId, reason) {
   if (v2State.active) {
     const file = path.join(v2SessionDirectoryFor(labRoot, sessionId), ENGINE_FILE)
     const current = JSON.parse(await readFile(file, 'utf8'))
-    await writeFile(
+    await writeFileAtomic(
       file,
       `${JSON.stringify({
         ...current,

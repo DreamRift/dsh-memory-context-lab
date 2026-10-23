@@ -28,6 +28,7 @@ import { createCoolingDomain, createRunNow } from './runtime-cooling.mjs'
 import { classifyRange } from './guard.mjs'
 import { bodyOfSpan, collectHistoryCandidates, spanLabelOf, SPAN_KINDS } from './history.mjs'
 import { claimV2Engine } from './engine.mjs'
+import { commandSurface } from './command-surface.mjs'
 import { createV2ClientFactory } from './client-adapter.mjs'
 import { maybeStageCompress } from './hierarchy-coordinator.mjs'
 import { v2SessionDirectoryFor, writeV2SessionState } from './state.mjs'
@@ -590,7 +591,9 @@ export function createV2Runtime(dependencies) {
     history,
     workingSet,
     recall,
-    commandHandler,
+    // 命令面：**唯一**的「抛出 → 宿主错误结果」转换点。
+    // 30 个 case 谁都不必自带 try/catch；新增第 31 个也不会穿（见 command-surface.mjs）。
+    commandHandler: commandSurface(commandHandler),
     autoCooling,
     buildRecall,
     workingSetInjection,

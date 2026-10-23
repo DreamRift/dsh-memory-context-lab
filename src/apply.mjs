@@ -704,9 +704,18 @@ export function planCooling({
   }
 
   const archivedFromRetained = units.filter((unit) => unit.withinRetention).length
+  // Y-16：prepare() 会为候选租一个冷节点 id（有副作用）。批上限／释放上限在提交
+  // 阶段截断时，被截掉的那些单元**已经租了号**却永远不会落盘，声明永久残留——
+  // 下一个周期它们既不在 units 里、也不会被任何路径清理。这里如实报出「租了但没用」
+  // 的区间，由调用方按同一份事实回收声明（判据只有一处，不在调用点各判一遍）。
+  const usedRangeStarts = new Set(units.map((unit) => unit.rangeStart))
+  const discardedRangeStarts = ready
+    .map((unit) => unit.rangeStart)
+    .filter((rangeStart) => !usedRangeStarts.has(rangeStart))
   return {
     units,
     rejected,
+    discardedRangeStarts,
     plannedReleaseTokens,
     /** True when the released-token ceiling stopped this batch early (C-07/C-12). */
     releaseCapped,
@@ -2152,9 +2161,13 @@ function forgetTombstoneSeqFor(session, replacementSeq) {
  */
 function partialBatchMatches(text, receipts) {
   if (typeof text !== 'string') return false
-  const header = /批次归档：(\d+) 个相邻操作/.exec(text)
-  if (!header) return false
-  if (Number(header[1]) < receipts.length) return false
+  // Y-15：批摘要的两种头形态都要认——format 3 是「批次归档：N 个相邻操作」，
+  // format 8 是「批次归档：本批 N/M 个操作」。只认前者会让 format 8 的部分批组
+  // 永远落进「整组永久拒绝」，与 partial 分支存在的理由相反。
+  const declared = /批次归档：(?:本批\s*(\d+)\s*\/\s*(\d+)|(\d+)\s*个相邻操作)/.exec(text)
+  if (!declared) return false
+  const covered = Number(declared[1] ?? declared[3])
+  if (!Number.isInteger(covered) || covered < receipts.length) return false
   for (const receipt of receipts) {
     const hash = String(receipt.hash ?? '').slice(0, 12)
     if (!text.includes(`冷记录 ${receipt.nodeId} hash ${hash}`)) return false

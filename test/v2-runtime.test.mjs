@@ -182,7 +182,14 @@ test('v2 运行时：on 建档、重复 on 被拒、v2 持有投影时 v1 不得
     assert.equal(stored?.state?.enabled, true, 'on 必须落盘 v2 账本')
 
     // 重复 on：如实拒绝，不静默重来。
-    await assert.rejects(() => run(ctx, agent, 'on'), (error) => error.code === 'EENGINEACTIVE')
+    // 0.13.2-beta.7 C 组：拒绝形态从「抛穿给宿主」改成「命令面返回错误结果」——
+    // 抛出会让宿主的 normalizeResult 拿不到 text，用户看到的是宿主级崩溃，
+    // 而不是「v2 已持有本会话投影」。判据从 rejects 改成 kind/code。
+    const again = await run(ctx, agent, 'on')
+    assert.equal(again.kind, 'error', again.text)
+    assert.equal(again.code, 'EENGINEACTIVE')
+    assert.ok(again.text.trim().length > 0, '宿主对 error 分支要求非空 text')
+    assert.match(again.text, /重复声明|已激活|已持有/)
 
     const status = await run(ctx, agent, 'status')
     assert.match(status.text, /v2 引擎：已启用/)

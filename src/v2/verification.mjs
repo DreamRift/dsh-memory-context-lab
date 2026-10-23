@@ -18,6 +18,7 @@ import path from 'node:path'
 
 import { DamagedError, EngineV2Error } from './errors.mjs'
 import { writeJsonFileAtomic } from './store.mjs'
+import { withWriteLock } from './write-lock.mjs'
 
 // 错误码风格与 store.mjs / retrieval.mjs 保持一致：内联字符串，不建集中常量表。
 const EVERIFICATIONSTALE = 'EVERIFICATIONSTALE'
@@ -202,16 +203,26 @@ function isFrozenRecord(createdAt, frozenBefore) {
 
 async function updateSidecar(sessionDir, mutate, { warn = () => {} } = {}) {
   const file = verificationFilePath(sessionDir)
-  const current = await readSidecarRawForUpdate(sessionDir)
-  if (current.rebuilt) {
-    warn(`verification: 旁证文件损坏，已按空表重建；${current.frozenBefore} 之前落库的记录冻结重采（旧指纹丢失 → 未验证，绝不洗成 valid）`)
-  }
-  const next = mutate(current.records)
-  await writeJsonFileAtomic(file, {
-    kind: VERIFICATION_KIND,
-    schemaVersion: VERIFICATION_SCHEMA_VERSION,
-    ...(current.frozenBefore ? { frozenBefore: current.frozenBefore } : {}),
-    records: next,
+  // Y-08（beta.7 A 组）：**读-改-写必须整段进写锁**。
+  //
+  // 旧实现只给最后的 rename 加了原子性（writeJsonFileAtomic），读与写之间是敞开的。
+  // 归档后补采（syncVerification）与 mark-stale 交错时，后写者拿着自己读到的旧表
+  // 整表覆盖先写者——stale 标记被抹掉，`check` 于是把「文件已变」洗成 valid。
+  // 这是本组第三个「协议有正确实现、调用点没用」的地方（前两个是 engine.json 与
+  // 三份账本的读侧）。判据：只要一个写操作以「读到的当前值」为输入，它就必须与
+  // 那次读在同一把锁里，原子写本身只保证「不写坏」，不保证「不丢别人的修改」。
+  return withWriteLock(sessionDir, async () => {
+    const current = await readSidecarRawForUpdate(sessionDir)
+    if (current.rebuilt) {
+      warn(`verification: 旁证文件损坏，已按空表重建；${current.frozenBefore} 之前落库的记录冻结重采（旧指纹丢失 → 未验证，绝不洗成 valid）`)
+    }
+    const next = mutate(current.records)
+    await writeJsonFileAtomic(file, {
+      kind: VERIFICATION_KIND,
+      schemaVersion: VERIFICATION_SCHEMA_VERSION,
+      ...(current.frozenBefore ? { frozenBefore: current.frozenBefore } : {}),
+      records: next,
+    })
   })
 }
 

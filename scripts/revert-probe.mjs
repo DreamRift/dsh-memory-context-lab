@@ -47,16 +47,10 @@ const CASES = {
   // P0-1：替换节点缺 data.source（把 source 挪回 opts，宿主会静默丢弃，回归测试必须变红）
   'surface-source-in-data': {
     test: 'test/v2-surface-source.test.mjs',
-    file: 'src/v2/runtime.mjs',
+    file: 'src/v2/runtime-compress.mjs',
     edits: [[
-      `          source: { kind: 'user', form: 'memory-lab2-surface' },
-        }, {
-          surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
-          sourceEventSeqs: [...plan.memberSeqs],`,
-      `        }, {
-          surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
-          sourceEventSeqs: [...plan.memberSeqs],
-          source: { kind: 'user', form: 'memory-lab2-surface' },`,
+      `          source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-lab2-surface' },`,
+      '',
     ]],
   },
   // P0-2：prune 名单必须是活动面位置切片（改回 flatMap 拼名单，回归测试必须变红）
@@ -148,10 +142,8 @@ const CASES = {
     test: 'test/v2-regression.test.mjs',
     file: 'src/v2/store.mjs',
     edits: [[
-      `      openDirectories.delete(directory)
-      writeLock?.release()
-      throw error`,
-      '      writeLock?.release()\n      throw error',
+      `    openDirectories.delete(this.directory)`,
+      '',
     ]],
   },
   'fork-borrow': {
@@ -176,8 +168,8 @@ const CASES = {
     test: 'test/v2-regression.test.mjs',
     file: 'src/v2/engine.mjs',
     edits: [[
-      "  const v2State = await readV2EngineState(labRoot, sessionId)\n  if (v2State.damaged) {\n    // 「无法确认 v2 是否仍持有投影」",
-      "  const v2State = await readV2EngineState(labRoot, sessionId)\n  if (false) {\n    // 「无法确认 v2 是否仍持有投影」",
+      "  if (v2State.damaged) {",
+      "  if (false) {",
     ]],
   },
   'budget-silent-fallback': {
@@ -263,10 +255,11 @@ const CASES = {
   },
   'literal-index-honesty': {
     test: 'test/v2-regression.test.mjs',
-    file: 'src/v2/runtime.mjs',
+    // 域拆分（0.13.1 P4）后这段搬到了 runtime-recall.mjs；夹具跟着源码走。
+    file: 'src/v2/runtime-recall.mjs',
     edits: [[
-      "        } else if (!found.semanticUsed) {",
-      "        } else if (false) {",
+      "          matchedBy: found.semanticUsed ? 'literal+semantic' : 'literal',",
+      "          matchedBy: 'literal',",
     ]],
   },
   'readback-payload-text': {
@@ -307,14 +300,17 @@ const CASES = {
   }`,
     ]],
   },
-  // 0.13.2-beta.2 W-01b：hierarchy 读路径的 D-01 口径（改回「缺 LF 即半行」必红）
+  // 0.13.2-beta.7 A-1：三份账本的读侧解析已收口到 parseAppendableLedger。
+  // 本场景的还原点随之从 hierarchy-store 的本地循环移到共享解析器：
+  // 改回「缺 LF 即半行」= 把尾部半行判据放回 parseAppendableLedger 之前，
+  // 三份账本会一起复现 D-01（读一次就物理删掉末尾合法条目）。
   'hierarchy-tail-parse': {
     test: 'test/v2-hierarchy-concurrency.test.mjs',
-    file: 'src/v2/hierarchy-store.mjs',
+    file: 'src/v2/appendable-ledger.mjs',
     edits: [[
       `      try {
         JSON.parse(tail)
-        completeLines.push(tail) // 合法 → 就是最后一条完整行，不进 partialLine
+        completeLines.push(tail) // 合法 → 最后一条完整行，不进 partialLine
       } catch {
         partialLine = tail // 只有解析失败的尾巴才是崩溃残留
       }`,
@@ -348,14 +344,11 @@ const CASES = {
     test: 'test/v2-card-delta-cap.test.mjs',
     file: 'src/v2/working-state.mjs',
     edits: [[
-      `    if (body.length + 3 >= maxLines || next > maxChars - reserved) break`,
-      `    if (body.length + 3 >= maxLines || next > maxChars) break`,
+      `    if (body.length + 3 >= maxLines) { stoppedBy = 'lines'; break }`,
+      `    if (body.length + 3 >= maxLines) { stoppedBy = 'lines'; }`,
     ], [
-      `  while (body.length > 0
-    && [...head, ...body, deltaTailOf(lines.length - head.length - body.length)].join('\\n').length > maxChars) {
-    body.pop()
-  }`,
-      '',
+      `    if (next > maxChars - reserved) { stoppedBy = 'chars'; break }`,
+      `    if (next > maxChars) { stoppedBy = 'chars'; break }`,
     ]],
   },
   // 0.13.2-beta.2：没做哈希校验不得报 integrity 'ok'

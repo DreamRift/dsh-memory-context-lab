@@ -793,8 +793,12 @@ function truncateAtCodePoints(text, limit, ellipsis = '…') {
   const source = String(text ?? '')
   const points = Array.from(source)
   if (points.length <= limit) return { text: source, truncated: false }
-  const keep = Math.max(0, limit - ellipsis.length)
-  return { text: points.slice(0, keep).join('') + ellipsis, truncated: true }
+  // Y-29：上界是**含省略号**的硬上界。limit=0 时 `keep` 也是 0，旧写法返回「…」
+  // 这一个字符，比声明的上界还长；limit 小于省略号长度时同理。
+  const budget = Math.max(0, Math.floor(Number(limit) || 0))
+  if (budget === 0) return { text: '', truncated: true }
+  if (budget <= ellipsis.length) return { text: ellipsis.slice(0, budget), truncated: true }
+  return { text: points.slice(0, budget - ellipsis.length).join('') + ellipsis, truncated: true }
 }
 
 function excerpt(text, limit) {
@@ -870,8 +874,13 @@ function selectClaims(claims, cap) {
   if (limit >= items.length) return indexed
   const negatives = indexed.filter(negative)
   const positives = indexed.filter((entry) => !negative(entry))
-  return [...negatives.slice(-limit), ...positives.slice(0, Math.max(0, limit - Math.min(negatives.length, limit)))]
-    .sort((a, b) => a.index - b.index)
+  // Y-27：正文保留**最新**的 positive——`slice(0, n)` 会留下最旧的 n 条，把
+  // 「最新结论」挤出卡片，而页脚还写「另有 N 条未展开」。与 takeNewest 同一口径：
+  // 先取尾部再按时间升序输出。
+  return [
+    ...negatives.slice(-limit),
+    ...positives.slice(-Math.max(0, limit - Math.min(negatives.length, limit))),
+  ].sort((a, b) => a.index - b.index)
 }
 
 function take(list, cap) {
@@ -954,7 +963,28 @@ export function buildWorkingState({
    */
   readback = [],
 } = {}) {
-  const config = { ...WORKING_SET_DEFAULTS, ...limits }
+  // Y-28（beta.7 B 组）：**显式 undefined 不是「用默认值」，更不是「清零」**。
+  //
+  // 旧写法 { ...DEFAULTS, ...limits } 对 limits = { maxEvidence: undefined }
+  // 的结果是 config.maxEvidence === undefined，随后 Math.max(undefined, 0) === NaN，
+  // 而 slice(0, NaN) === [] —— 三个硬保护段（必要证据 / 有效 pin / 在途作业）
+  // 静默清空，卡片仍印「（无）」。参数缺失被当成了「用户要求零配额」。
+  //
+  // 这里按 DEFAULT 的键逐个取：调用方给了**有限数**才覆盖，undefined/null/NaN/
+  // 负数一律回落默认值（硬保护的上限不允许被静默降到 0——那等于关掉保护）。
+  // 判据三分（与 beta.5 已确立的「非有限上限＝不截断」一致）：
+  //   - 键不存在        → 用默认值（老调用方）；
+  //   - 有限非负数      → 用调用方的值；
+  //   - 存在但非有限/负数 → **不截断**（Infinity），既不是 0 也不是默认值。
+  // 最后一条对硬保护与软保留都是安全方向：宁可多保留，绝不静默清空。
+  const config = { ...WORKING_SET_DEFAULTS }
+  for (const key of Object.keys(WORKING_SET_DEFAULTS)) {
+    if (!limits || !Object.hasOwn(limits, key)) continue
+    const given = limits[key]
+    // 有限数：负数夹到 0（显式「一条都不列」是既有语义，见 D-11），其余照用；
+    // 非有限（undefined / null / NaN）：不截断。
+    config[key] = (typeof given === 'number' && Number.isFinite(given)) ? Math.max(0, given) : Infinity
+  }
   const nodes = Array.isArray(surfaceNodes) ? [...surfaceNodes] : []
   const clock = Number.isFinite(Number(now)) ? Number(now) : Date.now()
 
@@ -1297,7 +1327,10 @@ export function buildWorkingState({
     if (terminal && confirmed) settledJobs.push({ ...job, index })
     else openJobs.push({ ...job, index })
   }
-  for (const job of take(openJobs, config.maxInflightJobs).items) {
+  // Y-28 同族：渲染展开数也必须走同一把尺子——`undefined` 在这里会退化成
+  // 「take(…, undefined)」的默认行为，与下面 overflow 行用的上界不一致。
+  const inflightCap = capLimitOf(config.maxInflightJobs, openJobs.length)
+  for (const job of take(openJobs, inflightCap).items) {
     const label = job.jobId ?? job.id ?? `job#${job.index}`
     const kind = job.kind === 'side-effect' ? '未确认副作用' : '在途作业'
     protectedSet.push(protectedItem({
@@ -1309,18 +1342,19 @@ export function buildWorkingState({
       detail: { state: job.state ?? null, confirmed: job.confirmed === true },
     }))
   }
-  if (openJobs.length > config.maxInflightJobs) {
+  if (openJobs.length > inflightCap) {
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.INFLIGHT_JOB,
       itemId: 'inflight:overflow',
-      lines: [`另有 ${openJobs.length - config.maxInflightJobs} 个在途作业未展开（同样不可丢弃）`],
+      lines: [`另有 ${openJobs.length - jobCap} 个在途作业未展开（同样不可丢弃）`],
       source: 'host:jobs',
     }))
   }
 
   // (e)(f) 证据与 pin
-  const boundEvidence = (Array.isArray(evidence) ? evidence : [])
-    .slice(0, Math.max(config.maxEvidence, 0))
+  const rawEvidence = Array.isArray(evidence) ? evidence : []
+  const boundEvidence = rawEvidence
+    .slice(0, capLimitOf(config.maxEvidence, rawEvidence.length))
     .map((item) => bindEvidence(item, { now: clock }))
   const necessaryEvidence = boundEvidence.filter((item) => item.status === EVIDENCE_STATUS.VALID && item.necessary)
   const staleNecessary = boundEvidence.filter((item) => item.status === EVIDENCE_STATUS.STALE && item.necessary)
@@ -1360,8 +1394,9 @@ export function buildWorkingState({
     }))
   }
 
-  const evaluatedPins = (Array.isArray(pins) ? pins : [])
-    .slice(0, Math.max(config.maxPins, 0))
+  const rawPins = Array.isArray(pins) ? pins : []
+  const evaluatedPins = rawPins
+    .slice(0, capLimitOf(config.maxPins, rawPins.length))
     .map((pin) => evaluatePin(pin, { now: clock, step }))
   const validPins = evaluatedPins.filter((pin) => pin.status === PIN_STATUS.VALID)
   const expiredPins = evaluatedPins.filter((pin) => pin.status === PIN_STATUS.EXPIRED)
@@ -2312,11 +2347,17 @@ export const CARD_DELTA_MAX_CHARS = 1600
  * 增量卡上界：头部两行必须保留（它说明这张卡引用哪张全量卡），其余按行截断，
  * 截断时追加一行如实说明「还有 N 行变化未列出，可按记录 ID 回读」。
  */
-function deltaTailOf(rest) {
+function deltaTailOf(rest, { cause = 'chars', maxLines = 0 } = {}) {
   // 措辞必须成立：模型手里的「最近一张全量卡」是**上一张**，它不含这些新行——
   // 旧文案「完整内容以最近一张全量卡为准」是一句假话。截断的增量卡由调用方
   // 改发全量卡（见 runtime-card 的 delta 分支），这里只如实说明本卡不全。
-  return `（另有 ${rest} 行变化未在本卡列出：增量卡有上界；这些行没有进入本卡，可按记录 ID 回读）`
+  //
+  // Y-30：触发原因必须如实分叉。旧文案恒称「增量卡有上界」，把**行数**触发的
+  // 截断说成字符上界，模型据此误判「还能再放几行」。行数与字符是两条不同的闸。
+  const why = cause === 'lines'
+    ? `增量卡有行数上界（${maxLines} 行）`
+    : '增量卡有字符上界'
+  return `（另有 ${rest} 行变化未在本卡列出：${why}；这些行没有进入本卡，可按记录 ID 回读）`
 }
 
 function boundDeltaLines(lines, { maxLines, maxChars }) {
@@ -2331,11 +2372,14 @@ function boundDeltaLines(lines, { maxLines, maxChars }) {
   //
   // 预留按**最坏 rest**（一条正文都没装进去）算：正文装得越多 rest 越小，尾行只可能
   // 更短，所以「预留 + 实际尾行」不会超。这个「≤」不是估计，是构造出来的。
-  const reserved = deltaTailOf(lines.length - head.length).length + 1
+  const reserved = deltaTailOf(lines.length - head.length, { cause: 'chars' }).length + 1
+  // Y-30：停下来的时候要记住**是哪条闸**停的，尾行才能如实说是行数还是字符。
+  let stoppedBy = 'chars'
   for (const line of lines.slice(2)) {
     const next = used + 1 + line.length
     // 行数预算 = 头部 2 行 + 正文 + 尾行 1 行；越界即停（尾行必须留得出位置）。
-    if (body.length + 3 >= maxLines || next > maxChars - reserved) break
+    if (body.length + 3 >= maxLines) { stoppedBy = 'lines'; break }
+    if (next > maxChars - reserved) { stoppedBy = 'chars'; break }
     body.push(line)
     used = next
   }
@@ -2347,7 +2391,7 @@ function boundDeltaLines(lines, { maxLines, maxChars }) {
     body.pop()
   }
   const rest = lines.length - head.length - body.length
-  return { text: [...head, ...body, deltaTailOf(rest)].join('\n'), truncated: true }
+  return { text: [...head, ...body, deltaTailOf(rest, { cause: stoppedBy, maxLines })].join('\n'), truncated: true }
 }
 
 const CARD_DELTA_CHANGE_TITLE = '■ 相对上一张全量卡的变化（只列变化行；未列出的行以最近一张全量卡为准）'
