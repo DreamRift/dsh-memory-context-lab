@@ -30,6 +30,7 @@ import {
 } from '../src/v2/working-state.mjs'
 import { acquireWriteLock, writeLockDirectoryFor, WRITE_LOCK_KIND } from '../src/v2/write-lock.mjs'
 import {
+  RECEIPT_FORMAT_SPAN_SLIM,
   RECEIPT_FORMAT_SPAN_V2,
   V2_RECEIPT_MARKER,
   buildReceipt,
@@ -587,7 +588,10 @@ test('N-06b/c 真实入口：归档行落 spanLabel 与批次口径，off 后 8/
       assert.ok(Number.isInteger(row.batchThreshold), '批次行必须落 batchThreshold（否则恢复只能回落）')
       assert.ok(Number.isInteger(row.batchMembers), '批次行必须落 batchMembers')
     }
-    const spanRows = rowsBefore.filter((row) => row.receiptFormat === RECEIPT_FORMAT_SPAN_V2)
+    // P0-3（Z-01）：第一批印全样例（format 7），后续批次走 slim（format 10）——
+    // 两种都是合法归档行，恢复侧对两种都能逐字节重建。
+    const spanRows = rowsBefore.filter((row) => row.receiptFormat === RECEIPT_FORMAT_SPAN_V2
+      || row.receiptFormat === RECEIPT_FORMAT_SPAN_SLIM)
     assert.ok(spanRows.length > 0, '夹具必须产出 span 回执行')
     for (const row of spanRows) {
       assert.equal(typeof row.spanLabel, 'string', 'span 行必须落 spanLabel（否则恢复只能回落成「历史片段」）')

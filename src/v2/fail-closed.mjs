@@ -24,9 +24,6 @@
  *    只有 absent 允许被当成「空」，其余必须失败关闭。
  * 2. refusalFromError(error)：构造**统一的拒绝形状**（refused + reason + code + undetermined），
  *    让三条恢复路径说同一句话。
- * 3. assertReadable(result)：读原语收口——非 ok 一律抛带 code 的错误。
- * 4. unreadableNote(what, error)：给**不能抛**的渲染路径用，把「没读成」如实写进文本，
- *    而不是渲染成「（无）」。
  *
  * ## 不适用条件
  * 本模块不判断「该不该失败」（那是业务语义），只判断「这个异常算不算读不到」。
@@ -67,11 +64,6 @@ export function isAbsent(error) {
   return classifyReadFailure(error).state === READ_FAILURE.ABSENT
 }
 
-/** 这次读失败是不是「读到了但坏了」。 */
-export function isDamaged(error) {
-  return classifyReadFailure(error).state === READ_FAILURE.DAMAGED
-}
-
 /** 统一的拒绝形状：三条恢复路径（off / restore / set fullhistory off）共用。 */
 export function refusalFromError(error, { what = '判定', code = 'EGUARDUNDETERMINED' } = {}) {
   const classified = classifyReadFailure(error)
@@ -85,32 +77,4 @@ export function refusalFromError(error, { what = '判定', code = 'EGUARDUNDETER
     reason: what + '失败（' + reason + '）：无法判定，按失败关闭处理',
     readFailure: classified.state,
   }
-}
-
-/** 是否是一个「拒绝」结果。 */
-export function isRefusal(value) {
-  return Boolean(value) && typeof value === 'object' && value.refused === true
-}
-
-/**
- * 读原语收口：非 ok 的结果一律抛带 code 的错误。
- *
- * 为什么不是返回空表：返回空表等于把「读不到」洗成「没有」，正是本组要根除的形态。
- */
-export function assertReadable(result, { what = '读取', code = 'EREADFAILED' } = {}) {
-  if (result && result.ok === true) return result
-  const detail = result?.error ?? result?.reason ?? '未知原因'
-  throw new EngineV2Error(what + '失败：' + detail, {
-    code: result?.code ?? code,
-    details: { what },
-  })
-}
-
-/**
- * 给那些**不能抛**的路径（状态渲染、卡片渲染）用：它们必须继续产出文本，
- * 但要把「这一项没读成」如实带进文本，而不是渲染成「（无）」。
- */
-export function unreadableNote(what, error) {
-  const reason = error instanceof Error ? (error.message || error.name) : String(error ?? '未知原因')
-  return what + '：不可读（' + reason + '）——不是「没有」，按失败关闭不展示结论'
 }

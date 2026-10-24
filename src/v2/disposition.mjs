@@ -33,6 +33,7 @@ import { canonicalJson, canonicalLine, createAppendableLedger, writeFileAtomic }
 export { canonicalJson, canonicalLine }
 
 import { applyRecordToPairingLedger, compareRecordIds, openCallsOf, parseRecordId, RECORD_KINDS } from './records.mjs'
+import { dependentsOf, foldProvenance, loadProvenance, propagateInvalidations } from './provenance-index.mjs'
 
 export const DISPOSITION_FILE = 'disposition.jsonl'
 export const FORGET_PLANS_FILE = 'forget-plans.json'
@@ -305,11 +306,6 @@ export async function getForgetIndexOrThrow(sessionDir, { what = '读取遗忘�
   return index
 }
 
-/** 状态面专用：不抛，但把损坏/不可读如实带出去。 */
-export async function getForgetIndexForStatus(sessionDir) {
-  return getForgetIndex(sessionDir)
-}
-
 export function invalidateForgetIndex(sessionDir) {
   forgetIndexCache.delete(cacheKey(sessionDir))
 }
@@ -375,7 +371,54 @@ export async function applyForget(options) {
   return withWriteLock(options.sessionDir, () => applyForgetUnlocked(options))
 }
 
-async function applyForgetUnlocked({ sessionDir, targetIds, actor, reason, expectedRevision = null, withdrawals = [] }) {
+/**
+ * P0-1（beta.9）遗忘传播：以本次实际生效的显式目标为种子，沿来源图做有界 BFS，
+ * 找出「依赖它们」的记录级派生物（fork 摘要等）。
+ *
+ * 失败关闭口径（与 Y-01 同款）：来源图缺席 → state 'absent'；损坏或读不到 →
+ * state 'damaged'——两种情况都**只忘显式目标**，不把「算不出级联」冒充成
+ * 「没有级联」，由调用方在回执里如实披露未传播。
+ *
+ * 并入选择（二选一已定，不选逐个 invalidateProvenance 的理由）：
+ * ① undo 按 operationId 摘 cause——并入同一条 forget 条目，一次 undo 就能还原
+ *   全部级联；传播另记第二个 operationId 会打破「撤销用 undo <op>」的回执承诺；
+ * ② 检索命中闸门（searchRecords 的 push）与索引同步差集只读 forgetIndex，
+ *   逐个失效只写 provenance 账本、不过闸门——还得给每个读面再加一条 provenance
+ *   失效表的读路径；
+ * ③ 并入后回执「新增 N 条」即真实级联总量，不产生双条目的状态行噪音。
+ *
+ * 非记录级派生 id（index-doc:/surface: 前缀的检索文档与表面回执）不进可见性
+ * 账本：它们的可见性由源记录决定（索引同步差集清除 + 命中侧闸门按记录 id 拦），
+ * 用调用方注入的 knownRecordIds（store 全量记录 id 集）把它们挡在外面。
+ * 返回值始终携带 state 与截断标记，调用方据此披露；knownRecordIds 未提供时返回
+ * null（传播跳过，行为与 beta.8 一致——生产调用点 forgetCommand 恒传入）。
+ */
+async function forgetPropagationOf(sessionDir, seeds, knownRecordIds) {
+  if (!Array.isArray(seeds) || seeds.length === 0 || !(knownRecordIds instanceof Set)) return null
+  try {
+    const loaded = await loadProvenance(sessionDir)
+    if (loaded.state === 'absent') {
+      return { state: 'absent', affected: [], recordIds: [], truncated: false, layers: 0 }
+    }
+    if (loaded.state !== 'ok') {
+      return { state: 'damaged', affected: [], recordIds: [], truncated: false, layers: 0, message: loaded.damageDetail?.message ?? null }
+    }
+    const report = propagateInvalidations(seeds, foldProvenance(loaded.entries))
+    return {
+      state: 'ok',
+      affected: report.affected,
+      recordIds: report.affected.filter((id) => knownRecordIds.has(id)),
+      truncated: report.truncated === true,
+      layers: report.layers.length,
+      maxNodes: report.maxNodes,
+      maxDepth: report.maxDepth,
+    }
+  } catch (error) {
+    return { state: 'damaged', affected: [], recordIds: [], truncated: false, layers: 0, message: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function applyForgetUnlocked({ sessionDir, targetIds, actor, reason, expectedRevision = null, withdrawals = [], knownRecordIds = null }) {
   const ledger = await loadDisposition(sessionDir)
   assertWritable(ledger, 'forget apply')
   if (expectedRevision !== null && ledger.revision !== expectedRevision) {
@@ -389,8 +432,11 @@ async function applyForgetUnlocked({ sessionDir, targetIds, actor, reason, expec
   const effective = unique.filter((id) => !visibility.has(id))
   const already = unique.filter((id) => visibility.has(id))
   if (effective.length === 0) {
-    return { appended: false, alreadyForgotten: already, entry: null, revision: ledger.revision }
+    return { appended: false, alreadyForgotten: already, entry: null, revision: ledger.revision, propagation: null }
   }
+  // P0-1：传播在本条目落账前算（同一把会话写锁内；provenance 读不加锁、互不冲突）。
+  const propagation = await forgetPropagationOf(sessionDir, effective, knownRecordIds)
+  const propagatedIds = (propagation?.recordIds ?? []).filter((id) => !visibility.has(id))
   const operationId = nextOperationId(ledger.entries, 'f')
   const entry = {
     kind: DISPOSITION_ENTRY_FORGET,
@@ -398,7 +444,9 @@ async function applyForgetUnlocked({ sessionDir, targetIds, actor, reason, expec
     entrySeq: ledger.entries.length + 1,
     actor: String(actor ?? 'user'),
     reason: String(reason ?? ''),
-    targetIds: effective,
+    targetIds: [...effective, ...propagatedIds].sort(compareRecordIds),
+    // 传播子集单列（审计口径）：条目的 targetIds = 显式目标 ∪ propagatedIds。
+    ...(propagatedIds.length > 0 ? { propagatedIds } : {}),
     undoOf: null,
     // 表面撤回快照（P2-5）：[{replacementSeq, nodeIds, receiptText}]，由 runtime
     // 在提交前从活动面读出。undo 按它逐字节还原回执；账本不解释其语义。
@@ -410,7 +458,7 @@ async function applyForgetUnlocked({ sessionDir, targetIds, actor, reason, expec
     at: nowIso(),
   }
   await appendEntry(sessionDir, entry)
-  return { appended: true, alreadyForgotten: already, entry, revision: ledger.revision + 1 }
+  return { appended: true, alreadyForgotten: already, entry, revision: ledger.revision + 1, propagation }
 }
 
 function normalizeWithdrawals(withdrawals) {
@@ -729,8 +777,8 @@ export async function getForgetPlan(sessionDir, planId) {
 // ---------------------------------------------------------------- 预览与状态
 
 /**
- * 账本级预览：解析目标 → 硬保护 → 分类（unknown/blocked/already/toForget）。
- * 回执/索引层面的级联影响由 runtime 层补充（那里才有归档行与索引状态）。
+ * 账本级预览：解析目标 → 硬保护 → 分类（unknown/blocked/already/toForget），
+ * 并按来源图反向边报告级联影响（cascade）；表面回执层面的级联仍由 runtime 补充。
  */
 export async function buildForgetPreview({ sessionDir, targets, entries, readRecord = null }) {
   const index = await getForgetIndex(sessionDir)
@@ -769,6 +817,29 @@ export async function buildForgetPreview({ sessionDir, targets, entries, readRec
         createdAt: nowIso(),
       }
     : null
+  // P0-4（beta.9）接线 dependentsOf：以「将遗忘集合」为种子查来源图反向边，
+  // preview 如实报告级联影响（apply 时这些派生记录会经遗忘传播一并入账）。
+  // provenance 缺席/损坏不阻断 preview：cascade.state 如实带出，调用方披露。
+  // 还原点（revert-probe forget-preview-cascade）：把 dependents 置空即断开接线。
+  let cascade = null
+  try {
+    const provenance = await loadProvenance(sessionDir)
+    if (provenance.state === 'ok') {
+      const folded = foldProvenance(provenance.entries)
+      // 传递闭包与 apply 侧同用 propagateInvalidations：preview 预告 == apply 行为。
+      // dependentsOf 只补直接层的「经由」信息（它是单层反向边查询）。
+      const report = propagateInvalidations(toForget, folded)
+      const direct = new Map(dependentsOf(toForget, folded).map((item) => [item.derivedId, item]))
+      // 还原点（revert-probe forget-preview-cascade）：affected 置空即断开级联预告。
+      const dependents = report.affected.filter((id) => !visibility.has(id))
+        .map((id) => ({ derivedId: id, derivedKind: direct.get(id)?.derivedKind ?? '', viaSources: direct.get(id)?.viaSources ?? [] }))
+      cascade = { state: 'ok', dependents, truncated: report.truncated === true }
+    } else {
+      cascade = { state: provenance.state === 'absent' ? 'absent' : 'damaged', dependents: [] }
+    }
+  } catch (error) {
+    cascade = { state: 'damaged', dependents: [], message: error instanceof Error ? error.message : String(error) }
+  }
   return {
     revision: index.revision,
     wide: resolved.wide,
@@ -779,6 +850,7 @@ export async function buildForgetPreview({ sessionDir, targets, entries, readRec
     already,
     toForget,
     plan,
+    cascade,
     damaged: index.damaged,
     repairedBytes: index.repairedBytes,
   }

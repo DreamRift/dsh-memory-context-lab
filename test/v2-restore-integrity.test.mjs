@@ -23,7 +23,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { isCardNode, isArchiveReceiptNode, planCardFolds } from '../src/v2/card-fold.mjs'
+import { isCardNode, planCardFolds } from '../src/v2/card-fold.mjs'
 import { V2_RECEIPT_MARKER, FOLD_RECEIPT_MARKER } from '../src/core.mjs'
 
 function card(seq, form = 'working-set') {
@@ -38,8 +38,6 @@ function foldReceipt(seq) {
 
 test('A1 归档回执不是可折叠的卡（isCardNode 必须为 false）', () => {
   assert.equal(isCardNode(archiveReceipt(10)), false)
-  // 它仍然是「回执」，供断组边界与 restore 句柄判定使用。
-  assert.equal(isArchiveReceiptNode(archiveReceipt(10)), true)
 })
 
 test('A2 工作状态卡仍然可折叠（修复不得把该折的也放过）', () => {

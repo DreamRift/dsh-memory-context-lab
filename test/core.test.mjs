@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 
 import {
   archiveChunkNodeId,
-  archiveNodeId,
   BOOLEAN_SETTINGS,
   buildReceipt,
   chunkArchiveBody,
@@ -12,7 +11,6 @@ import {
   DEFAULT_SETTINGS,
   escapePromptBraces,
   foldCommandIntoState,
-  formatRatio,
   formatRecallDigest,
   initialProjectionState,
   isReceiptMessage,
@@ -30,7 +28,6 @@ import {
   SettingsError,
   textFromContent,
 } from '../src/core.mjs'
-import { recallDigest } from '../src/apply.mjs'
 import { applyEvent, initProjectionState, viewOf } from '../src/projection.mjs'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -111,11 +108,6 @@ test('the stop-time restore switch is user-settable and defaults on', () => {
   // A bad value must not corrupt the switch.
   assert.equal(foldCommandIntoState(state, 'set autorestore maybe'), false)
   assert.equal(state.autoRestore, true)
-})
-
-test('formatRatio renders a fraction as a percentage', () => {
-  assert.equal(formatRatio(0.6), '60%')
-  assert.equal(formatRatio(null), '未设置')
 })
 
 test('foldCommandIntoState applies on/off and every set form', () => {
@@ -296,11 +288,6 @@ test('recall summaries survive the common md_cg envelopes', () => {
   // 旧版服务端不带标记：行为不变，照常回注。
   const legacy = normalizeRecallPayload({ results: [{ id: 'r1', content: 'real hit' }] })
   assert.equal(legacy.status, RECALL_STATUS.OK)
-})
-
-test('archive node ids are stable and filesystem-safe', () => {
-  assert.equal(archiveNodeId('abc123', 2), 'archived_abc123_2')
-  assert.equal(archiveNodeId('abc123', 2), archiveNodeId('abc123', 2))
 })
 
 test('the projection folds settings from command/run records', () => {

@@ -17,6 +17,7 @@ import { COMPRESS_SUBCOMMANDS, compressPreview, compressRun, compressStatus, des
 import { AGG_VOUCHER_MARKER } from './agg-voucher.mjs'
 import { v2SessionDirectoryFor } from './state.mjs'
 import { getForgetIndex } from './disposition.mjs'
+import { appendModelCacheEntry, appendModelUsageEntry, readModelCacheEntry } from './model-ledger.mjs'
 import { resolveReadTargets } from './identity-index.mjs'
 import { withHostContract } from './command-result.mjs'
 
@@ -143,7 +144,17 @@ export function createCompressDomain({
             ? await Promise.resolve(modelPhaseResolver(sessionId, { signal: record.abortSignal }))
             : null
           if (!resolved || typeof resolved.stream !== 'function') return null
-          return resolved
+          // P0-4（beta.9）接线 model-ledger：缓存/费用侧车挂到模型相位上（协调器
+          // 341-343 行一直在透传这三个槽位，生产侧此前从未供给）。观察面钩子抛错
+          // 由 compressor-model 的 safely 吞并计数，不阻断压缩。
+          // 还原点（revert-probe model-ledger-wiring）：wireModelLedger → false。
+          const wireModelLedger = true
+          return wireModelLedger ? {
+            ...resolved,
+            cacheLookup: async (key, blocksHash) => readModelCacheEntry(record.directory, key, blocksHash),
+            cacheSave: async (entry) => appendModelCacheEntry(record.directory, entry),
+            onUsage: async (row) => appendModelUsageEntry(record.directory, row),
+          } : resolved
         } catch {
           return null
         }

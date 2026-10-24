@@ -95,24 +95,6 @@ export const REQUIRED_STATE_FIELDS = Object.freeze([
   }),
 ])
 
-/**
- * 校验并列出**存在但非法**的字段（空数组 = 全部合格）。
- *
- * 为什么把「缺失」与「非法」分开：这两个判定此前是同一个分支，于是
- * 字段清单一旦变长，**旧版本账本**（字段是后来才加的）就会被判成损坏——
- * 旧账本明明可以按默认值补全继续用（`stateWithDefaults` 就能补），
- * 闸门却抛 ESTATEDAMAGED，让 /memory-lab on|off|restore 从「返回结构化结果」
- * 变成「从命令处理函数抛穿」。缺字段是**版本差**，坏字段才是**损坏**。
- */
-export function missingStateFields(value) {
-  const missing = []
-  for (const field of REQUIRED_STATE_FIELDS) {
-    const present = value !== null && typeof value === 'object' && field.name in value
-    if (!present) missing.push(field.name)
-  }
-  return missing
-}
-
 export function stateFieldProblems(value) {
   const problems = []
   for (const field of REQUIRED_STATE_FIELDS) {

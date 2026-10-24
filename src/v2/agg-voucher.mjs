@@ -67,11 +67,6 @@ function nodeTextOf(node) {
   return null
 }
 
-/** 任何不是回执成员的节点都是边界：人类消息、助手正文、工具事件、状态卡。 */
-export function isBoundaryNode(node) {
-  return !isV2ReceiptNode(node)
-}
-
 /** 从回执原文解析成员冷记录 id（冷记录：mcl2-… 行，逐条全局扫描）。 */
 export function parseReceiptRecordIds(text) {
   if (typeof text !== 'string') return []

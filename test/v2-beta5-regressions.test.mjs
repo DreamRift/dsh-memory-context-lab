@@ -324,7 +324,7 @@ async function driveNumberInput({ shim, component, value }, index, text) {
   }
   const page = shim.mount(component, { view: 'page', form })
   const inputs = collect(page, (n) => n.type === 'input' && n.props && n.props.type === 'number')
-  assert.equal(inputs.length, 3, '设置卡必须有 3 个数字框')
+  assert.equal(inputs.length, 4, '设置卡必须有 4 个数字框（beta.9 P2.5 起含软保护预算）')
   inputs[index].props.onChange({ target: { value: text } })
   const page2 = shim.mount(component, { view: 'page', form })
   collect(page2, (n) => n.type === 'input' && n.props && n.props.type === 'number')[index].props.onBlur()
@@ -339,8 +339,10 @@ async function driveNumberInput({ shim, component, value }, index, text) {
 
 test('M-01 设置页数字框：非法输入不落盘、回落原值，且给出提示', async () => {
   const card = await loadSettingsCard()
-  // 输入框顺序：0 = 保留最近操作，1 = 归档批量，2 = 压力闸门
+  // 输入框顺序：0 = 保留最近操作，1 = 归档批量，2 = 压力闸门，3 = 软保护预算
   const cases = [
+    [3, '', 'protectBudgetTokens', '清空「软保护预算」不得被写成下界 0'],
+    [3, '2.5', 'protectBudgetTokens', '2.5 不得被静默四舍五入'],
     [1, '', 'archiveBatchSize', '清空「归档批量」不得被写成下界 1'],
     [0, '', 'retainOperations', '清空「保留最近操作」不得被写成 0'],
     [0, '2.5', 'retainOperations', '2.5 不得被静默四舍五入成 3'],
@@ -390,6 +392,8 @@ test('N-12 设置页的 clampInt 域与 NUMERIC_SETTINGS 同域（三个入口�
     ['retainOperations', NUMERIC_SETTINGS.retain],
     ['archiveBatchSize', NUMERIC_SETTINGS.batch],
     ['pressureGate', NUMERIC_SETTINGS.pressure],
+    ['protectBudgetTokens', NUMERIC_SETTINGS.protect],
+    ['retainReads', NUMERIC_SETTINGS.readlease],
   ]
   for (const [field, spec] of pairs) {
     const pattern = new RegExp('clampInt\\((?:inner|base)\\.' + field + ',\\s*(\\d+),\\s*(\\d+),')

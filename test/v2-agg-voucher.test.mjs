@@ -16,7 +16,6 @@ import {
   AGG_VOUCHER_PAGE_SIZE,
   dropVoucherPlan,
   getVoucherPlan,
-  isBoundaryNode,
   isV2ReceiptNode,
   loadVoucherPlans,
   parseAggVoucherText,
@@ -53,8 +52,6 @@ test('isV2ReceiptNode：v2 回执是成员；v1 回执/凭证/人类消息都是
   assert.equal(isV2ReceiptNode(receiptNode(1)), true)
   assert.equal(isV2ReceiptNode(textNode(2, '[已归档操作] 旧格式回执')), false, 'v1 回执不是成员')
   assert.equal(isV2ReceiptNode(textNode(3, AGG_VOUCHER_MARKER + '\n凭证')), false, '聚合凭证不得再被聚合')
-  assert.equal(isBoundaryNode(textNode(4, '用户消息')), true)
-  assert.equal(isBoundaryNode(null), true)
 })
 
 test('parseReceiptRecordIds：逐条解析冷记录 id 并去重', () => {

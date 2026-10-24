@@ -212,68 +212,6 @@ const RETENTION_TITLES = Object.freeze({
 // 来源与权威：不可提升
 // ---------------------------------------------------------------------------
 
-export const SOURCE_KINDS = Object.freeze({
-  SYSTEM: 'system',
-  DEVELOPER: 'developer',
-  USER: 'user',
-  TOOL_RESULT: 'tool-result',
-  MODEL_INFERENCE: 'model-inference',
-  SUMMARY: 'summary',
-  STATUS_CARD: 'status-card',
-  UNKNOWN: 'unknown',
-})
-
-const SOURCE_KIND_SET = new Set(Object.values(SOURCE_KINDS))
-
-/** 三条不变量 + 一条总则；作为数据随每个 authority 结果一起给出。 */
-export const AUTHORITY_INVARIANTS = Object.freeze([
-  '摘要不是原文：sourceKind=summary 不携带原文保真，要原文必须按记录 ID 回读。',
-  '模型推断不是授权：sourceKind=model-inference 不构成用户授权，也不能扩大许可范围。',
-  '状态卡不是系统消息：sourceKind=status-card 只走工作资料通道。',
-  '任何来源都不能被提升为 system/developer/user：authority 只能等于来源本身。',
-])
-
-/**
- * 解析一个来源的权威等级。
- *
- * `authority` 恒等于归一化后的来源本身；`claimedAuthority` 只作为**被拒绝的声明**
- * 记录下来，绝不参与判定。这样「摘要/推断/状态卡冒充系统消息」在数据层就不可能成立。
- */
-export function resolveAuthority({ sourceKind, claimedAuthority = null } = {}) {
-  const raw = String(sourceKind ?? '').trim().toLowerCase()
-  const known = SOURCE_KIND_SET.has(raw)
-  const kind = known ? raw : SOURCE_KINDS.UNKNOWN
-  const reasons = []
-  if (!known) {
-    reasons.push(`未知来源 ${JSON.stringify(sourceKind ?? null)}：按 unknown 处理，不继承任何更高权限。`)
-  }
-  const claimed = claimedAuthority === null || claimedAuthority === undefined
-    ? null
-    : String(claimedAuthority).trim().toLowerCase()
-  const promotionRejected = claimed !== null && claimed !== kind
-  if (promotionRejected) {
-    reasons.push(`来源 ${kind} 声称自己是 ${claimed}：拒绝提升，authority 只能等于来源本身。`)
-  }
-  const isOriginalText = kind !== SOURCE_KINDS.SUMMARY
-  if (!isOriginalText) reasons.push('摘要不是原文：需要原文时按记录 ID 回读。')
-  const authorizes = kind === SOURCE_KINDS.USER
-  if (kind === SOURCE_KINDS.MODEL_INFERENCE) reasons.push('模型推断不是授权：不能扩大许可范围。')
-  const canBeSystemMessage = kind === SOURCE_KINDS.SYSTEM
-  if (kind === SOURCE_KINDS.STATUS_CARD) reasons.push('状态卡不是系统消息：只走工作资料通道。')
-  return {
-    sourceKind: kind,
-    authority: kind,
-    claimedAuthority: claimed,
-    promotionRejected,
-    isOriginalText,
-    authorizes,
-    canBeSystemMessage,
-    channel: canBeSystemMessage ? 'system' : 'working-material',
-    reasons,
-    invariants: AUTHORITY_INVARIANTS,
-  }
-}
-
 // ---------------------------------------------------------------------------
 // 预算分解
 // ---------------------------------------------------------------------------

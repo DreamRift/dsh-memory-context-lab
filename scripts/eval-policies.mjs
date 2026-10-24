@@ -245,7 +245,8 @@ function v2Policy(session, { retainOperations, batchSize }) {
       tokens: card.usedTokens,
       unclosedPairCount: state.unclosedPairCount,
       exposureDecidable: state.exposureDecidable,
-      pinnedEvidence: state.pinnedEvidence.length,
+      // 0.13.2-beta.8（Q4）：pinnedEvidence 字段随 pin 类目摘除；改报 unknowns 计数。
+      unknownCount: state.unknowns.length,
     },
     notes: [
       `稳态 ${steady.steps} 步归档 ${steady.archived.length} 段`,

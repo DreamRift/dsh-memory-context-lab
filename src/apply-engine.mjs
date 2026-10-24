@@ -39,6 +39,10 @@ import {
   normalizeRecallPayload,
   PACKAGE_NAME,
   RECALL_STATUS,
+  RECEIPT_FORMAT_OPERATION,
+  RECEIPT_FORMAT_OPERATION_SLIM,
+  RECEIPT_FORMAT_SPAN_SLIM,
+  RECEIPT_FORMAT_SPAN_V2,
   RECEIPT_MARKER,
   retainReadsTtlOf,
   textFromContent,
@@ -539,7 +543,7 @@ export function createEngine(dependencies) {
     // 全历史记忆上下文模式（仅 v2 账本会置位）：保留窗口整体失效，留下与否交给
     // 收集器里的不可压缩凭证规则 + 守卫 + 保护层。v1 账本不会置位，行为不变。
     const fullHistory = record.state?.fullHistory === true
-    return collect({
+    const collected = collect({
       surfaceNodes: [...session.surface.nodes],
       eventAt: (seq) => session.eventAt(seq),
       nodeAt: (index) => session.eventAt(session.surface.nodes[index]),
@@ -562,6 +566,21 @@ export function createEngine(dependencies) {
       minimumChars: MIN_OPERATION_CHARS,
       lastAssistantSeq,
     })
+    // P0-3（beta.9 Z-01）：本会话已印过全样例 → 后续批次候选走 slim 回执格式。
+    // 候选携带的 receiptFormat 是渲染与恢复的共同真源（N-06a），在这里改写一处，
+    // 渲染（receiptOf 按候选值）、归档行（outcome.receiptFormat）、恢复重建
+    // （按行内值）三处自动一致；v1 候选没有 receiptFormat，不受影响。
+    if (typeof dependencies.receiptSlimOf === 'function' && dependencies.receiptSlimOf(record) === true) {
+      // v1 收集器返回数组；v2 收集器返回 { candidates, ... }——两种形态都兼容。
+      const candidates = Array.isArray(collected) ? collected : collected?.candidates
+      if (Array.isArray(candidates)) {
+        for (const candidate of candidates) {
+          if (candidate.receiptFormat === RECEIPT_FORMAT_SPAN_V2) candidate.receiptFormat = RECEIPT_FORMAT_SPAN_SLIM
+          else if (candidate.receiptFormat === RECEIPT_FORMAT_OPERATION) candidate.receiptFormat = RECEIPT_FORMAT_OPERATION_SLIM
+        }
+      }
+    }
+    return collected
   }
 
   /** Measure occupancy and select the oldest-safe candidates. Pure: no side effects. */
@@ -953,6 +972,16 @@ export function createEngine(dependencies) {
       } catch (error) {
         record.occupancy = null
         record.occupancyError = error instanceof Error ? error.message : String(error)
+      }
+    }
+    // P0-3（beta.9）：批次提交后的回执生命周期收敛（明细→合并行、超限占位）与
+    // 「每会话第一批印全样例」置位。收敛失败不阻塞批次本身：明细保持原样，
+    // 下一批再收敛；宿主拒绝 replace 的次数由回调方记 receiptMergeFallbacks。
+    if (applied > 0 && typeof dependencies.afterBatchCommitted === 'function') {
+      try {
+        await dependencies.afterBatchCommitted(record, record.agent.session)
+      } catch (error) {
+        logger?.warn?.(`[memory-lab] 回执生命周期收敛失败（不阻塞归档）: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
     return {

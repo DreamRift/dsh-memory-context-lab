@@ -19,7 +19,7 @@ import { SPAN_KINDS, spanLabelOf } from './history.mjs'
 import { INDEX_TEXT_MAX_BYTES, exactPostfilterHit, isPluginAuthoredEntry, pluginAuthoredBody, searchRecords } from './retrieval.mjs'
 import { planQuery } from './query-plan.mjs'
 import { getForgetIndex, isForgotten } from './disposition.mjs'
-import { coldRecordContent } from '../core.mjs'
+import { coldRecordContent, skipReasonSection } from '../core.mjs'
 import { EngineV2Error } from './errors.mjs'
 
 const ARCHIVED_TAG = 'archived'
@@ -362,7 +362,12 @@ export function createV2ClientFactory({ labRoot, sessionId, logger = null, backe
               excludedSpans.push(entry.id)
               continue
             }
-            if (body !== null) previewById.set(entry.id, recallPreviewOf(body))
+            // P0-2：预览取样前先滤 [推理] 段——recallPreviewOf 会把空白展平，段结构
+            // 过了它就找不回来，所以必须在这一步之前。
+            // P0-2 补充：分块续段（inline.chunk ≥ 2）开头无段头，可能落在
+            // [推理] 段中部——continuation 模式失败关闭，不可判定开头不进预览。
+            const isChunkContinuation = entry.inline?.chunk > 1
+            if (body !== null) previewById.set(entry.id, recallPreviewOf(skipReasonSection(body, { continuation: isChunkContinuation })))
             spanEntries.push(entry)
           }
           const spans = spanEntries

@@ -15,7 +15,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -542,4 +542,45 @@ test('接线：模型模式未注入（modelPhase 缺失）全链路程序档可
   const l2 = ledger.entries.find((e) => e.kind === HIERARCHY_ENTRY_L2)
   assert.ok(l2, '程序档也应写 L2 相位卡')
   assert.ok(!l2.text.includes('模型摘要模式'))
+})
+
+// ── P0-4（beta.9）生产接线判据：compressDepsOf 的 modelPhase 组装必须挂上
+// model-ledger 三钩子（还原 wireModelLedger 后必红，见 revert-probe 场景）──
+test('compressDepsOf 的 modelPhase 组装（beta.9）：接线 model-ledger 三钩子', async () => {
+  const { createCompressDomain } = await import('../src/v2/runtime-compress.mjs')
+  const labRoot = mkdtempSync(join(tmpdir(), 'mcl2-mlw-'))
+  try {
+    const { mkdir } = await import('node:fs/promises')
+    const directory = join(labRoot, 'session-dir')
+    await mkdir(directory, { recursive: true })
+    const domain = createCompressDomain({
+      adopt: async () => null,
+      factoryFor: () => ({ withStore: async (fn) => fn({ listEntries: () => ({ entries: [] }) }) }),
+      labRoot,
+      sessionIdOf: () => 'sess-mlw',
+      modelPhaseResolver: async () => ({ stream: async function* () {} }),
+      stageCompress: null,
+    })
+    const record = {
+      sessionId: 'sess-mlw',
+      directory,
+      abortSignal: undefined,
+      agent: { session: {} },
+      state: { compressModel: true, shareL2Content: false },
+    }
+    const deps = await domain.compressDepsOf(record)
+    const mp = deps.modelPhase
+    assert.ok(mp && typeof mp.stream === 'function', 'modelPhase 必须可用')
+    assert.equal(typeof mp.cacheLookup, 'function', 'cacheLookup 必须已接线')
+    assert.equal(typeof mp.cacheSave, 'function', 'cacheSave 必须已接线')
+    assert.equal(typeof mp.onUsage, 'function', 'onUsage 必须已接线')
+    await mp.cacheSave({ key: 'k1', blocksHash: 'h1', text: '正文', model: 'm1' })
+    const hit = await readModelCacheEntry(directory, 'k1', 'h1')
+    assert.equal(hit?.text, '正文', '钩子必须真实落在 model-ledger 账本上')
+    await mp.onUsage({ model: 'm1', usage: { input: 3 }, cacheHit: false })
+    const rows = await readModelUsageEntries(directory)
+    assert.equal(rows.length, 1, '费用行必须落账本')
+  } finally {
+    rmSync(labRoot, { recursive: true, force: true })
+  }
 })

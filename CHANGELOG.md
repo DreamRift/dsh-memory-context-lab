@@ -1,5 +1,14 @@
 # 变更记录
 
+## 0.13.2-beta.9（2026-10-24，测试版，未发布）
+
+本版是第 13 轮「根治与结构收口」批的**中间测试版**（P0 批大部分落地；P0-3 / P1 / P2 / P2.5 尚未实施）：
+
+- **P0-1 遗忘传播**：forget 级联派生记录——`applyForget` 以生效显式目标为种子沿来源图做有界 BFS，受影响记录级派生物并入同一条 forget 条目（undo 一次还原全级联）；来源图缺席/损坏失败关闭，只忘显式目标并如实披露；forget preview 新增级联影响预告（与 apply 同源闭包）。
+- **P0-2 推理段不回灌**：预览层过滤 `[推理]` 段（v2 适配器 + `displayPreview`），整段替换为「（推理段已省略，原文可按 id 回读）」；按 record id 的精确回读不过滤。
+- **P0-4 部分清偿**：删除 22 个全仓零引用死导出；接线 `dependentsOf`（preview 级联）与 model-ledger 三钩子（模型摘要缓存/费用账首次真实落账）；删除 `decideNetBenefit`（闸门点无 token 估算可披露，接线属新产品设计）。
+- **P0-5 契约接线守卫**：`test/contract-wiring.test.mjs` 两闸（导出必被消费 / 单点孤儿标识符），理由白名单只缩不涨；裸 throw 禁令由 G2 套件继续覆盖（src 实测 0 处）。
+- 门禁：源码树 **123 套全绿**（前台）；revert-probe 新增 6 场景（forget-propagation / reasoning-not-in-preview / forget-preview-cascade / model-ledger-wiring / contract-wiring-dead-export / contract-wiring-undefined-ref），全部实测「还原必红」。
 ## 0.13.2-beta.8（2026-10-24）**测试版，release 仓已打本地 tag（未推送 GitHub）/ 未装到本机 profile**
 
 **卡片治理（Q3）+ 未接线类目（Q4）。上一批（beta.7）刻意留下的两个产品决策项，

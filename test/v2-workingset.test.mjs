@@ -29,8 +29,6 @@ import {
   buildWorkingState,
   planWorkingSetBudget,
   renderWorkingSetInjection,
-  resolveAuthority,
-  SOURCE_KINDS,
 } from '../src/v2/working-state.mjs'
 
 const NOW = 1_700_000_000_000
@@ -372,33 +370,7 @@ test('未闭合调用与未曝光结果在保护集里显式登记，且不因�
   assert.equal(card.overflow, true)
 })
 
-test('权威不变量：摘要≠原文、模型推断≠授权、状态卡≠系统消息，且不能提升为 system', () => {
-  const summary = resolveAuthority({ sourceKind: SOURCE_KINDS.SUMMARY, claimedAuthority: 'system' })
-  assert.equal(summary.authority, 'summary')
-  assert.equal(summary.promotionRejected, true)
-  assert.equal(summary.isOriginalText, false)
-  assert.equal(summary.canBeSystemMessage, false)
-  assert.equal(summary.channel, 'working-material')
-
-  const inference = resolveAuthority({ sourceKind: SOURCE_KINDS.MODEL_INFERENCE })
-  assert.equal(inference.authorizes, false)
-  assert.equal(inference.canBeSystemMessage, false)
-
-  const statusCard = resolveAuthority({ sourceKind: SOURCE_KINDS.STATUS_CARD })
-  assert.equal(statusCard.canBeSystemMessage, false)
-  assert.equal(statusCard.isOriginalText, true)
-
-  const user = resolveAuthority({ sourceKind: SOURCE_KINDS.USER })
-  assert.equal(user.authorizes, true)
-  assert.equal(user.canBeSystemMessage, false, '用户消息也不是 system 消息')
-
-  const system = resolveAuthority({ sourceKind: SOURCE_KINDS.SYSTEM })
-  assert.equal(system.canBeSystemMessage, true)
-
-  const bogus = resolveAuthority({ sourceKind: 'something-else' })
-  assert.equal(bogus.sourceKind, SOURCE_KINDS.UNKNOWN)
-  assert.equal(bogus.canBeSystemMessage, false)
-
+test('保护不变量：卡片渲染面锁四条权威不变量（权威解析原语已随 resolveAuthority 移除）', () => {
   const state = fullState()
   assert.equal(state.protectionInvariants.authorityNeverPromotedToSystem, true)
   assert.equal(state.protectionInvariants.summaryIsNotOriginalText, true)

@@ -231,6 +231,32 @@ export function createForgetDomain({
 
 
 /**
+ * P0-1（beta.9）：把遗忘传播报告翻成回执披露行。
+ *
+ * 四态各自如实：并入成功（条数+层数）、有界截断警告、来源图缺席、来源图损坏。
+ * ok 且零受影响 → 不占回执篇幅；propagation 为 null（调用方未启用传播或幂等
+ * 重放）→ 不输出——「没传播」只有在**本该传播而没传**时才需要说话。
+ */
+export function describeForgetPropagation(propagation) {
+  if (!propagation || typeof propagation !== 'object') return []
+  if (propagation.state === 'absent') {
+    return ['来源图不存在（本会话没有派生关系）：只遗忘显式目标，未传播。']
+  }
+  if (propagation.state === 'damaged') {
+    return ['⚠ 来源图损坏，无法计算派生级联（未传播）：只遗忘显式目标，派生记录可能仍可被检索命中。']
+  }
+  if (propagation.state !== 'ok') return []
+  const lines = []
+  if ((propagation.recordIds ?? []).length > 0) {
+    lines.push(`遗忘传播：${propagation.recordIds.length} 条派生记录并入本次遗忘（级联 ${propagation.layers ?? 0} 层）。`)
+  }
+  if (propagation.truncated === true) {
+    lines.push(`⚠ 有界传播在 ${propagation.maxNodes ?? '?'} 节点/${propagation.maxDepth ?? '?'} 层上限处截断：未遍历到的派生记录可能仍可被检索命中。`)
+  }
+  return lines
+}
+
+/**
  * 遗忘命令面（P4c 迁入）。
  *
  * 与 `createForgetDomain` 分开是因为**装配顺序**：命令面要 `records` / `adopt`，
@@ -314,6 +340,15 @@ async function forgetCommand(invocation, args) {
       lines.push('警告（显式目标已放行）：' + preview.warnings.map((item) => item.id + '（' + item.detail + '）').join('、'))
     }
     if (preview.already.length > 0) lines.push('已遗忘（幂等跳过）：' + preview.already.map((item) => item.id).join('、'))
+    // P0-4（beta.9）：来源图级联影响如实预告。
+    if (preview.cascade?.state === 'ok' && preview.cascade.dependents.length > 0) {
+      const sample = preview.cascade.dependents.slice(0, 5)
+        .map((item) => `${item.derivedId}（${item.derivedKind || '派生'}，经由 ${item.viaSources.join('、')}）`)
+        .join('、')
+      lines.push(`级联影响：${preview.cascade.dependents.length} 条派生记录依赖上述目标，apply 时将一并进入可见性账本：${sample}${preview.cascade.dependents.length > 5 ? ' 等' : ''}。`)
+    } else if (preview.cascade?.state === 'damaged') {
+      lines.push('⚠ 来源图损坏：无法预览级联影响；apply 时按失败关闭只遗忘显式目标。')
+    }
     lines.push('本次将遗忘 ' + preview.toForget.length + ' 条记录。')
     if (preview.plan) {
       await saveForgetPlan(sessionDir, preview.plan)
@@ -401,6 +436,9 @@ async function forgetCommand(invocation, args) {
     reason = 'explicit'
   }
   // 先快照再提交：账本条目携带 undo 所需的回执原文（崩溃窗口内不丢快照）。
+  // P0-1：store 全量记录 id 集，供 applyForget 把来源图上的记录级派生物
+  // 挡进可见性账本（index-doc:/surface: 等非记录 id 据此排除）。
+  const knownRecordIds = new Set(entries.map((entry) => entry.id))
   const forgetNodeIds = forgetNodeBasesOf(entries, targetIds)
   const withdrawalPlan = await planWithdrawals(record, forgetNodeIds, targetIds)
   let result
@@ -412,6 +450,7 @@ async function forgetCommand(invocation, args) {
       reason,
       expectedRevision: plan ? plan.revision : null,
       withdrawals: withdrawalPlan.withdrawals,
+      knownRecordIds,
     })
   } catch (error) {
     if (error instanceof DispositionError) {
@@ -451,6 +490,8 @@ async function forgetCommand(invocation, args) {
   const lines = [
     '软遗忘已生效（操作 ' + result.entry.operationId + '）：新增 ' + result.entry.targetIds.length + ' 条，已遗忘 ' + result.alreadyForgotten.length + ' 条幂等跳过。',
     '表面回执撤回 ' + withdrawal.withdrawn + ' 个节点' + (withdrawal.failures.length ? '，失败 ' + withdrawal.failures.length + ' 个（forget status 待收口清单可重放）' : '') + '。',
+    // P0-1：传播四态如实披露（并入条数/截断/缺席/损坏）；零受影响不占行。
+    ...describeForgetPropagation(result.propagation),
   ]
   if (planCleanup.dropped.length > 0) {
     lines.push('作废层级压缩计划 ' + planCleanup.dropped.length + ' 条（含已遗忘成员）：' + planCleanup.dropped.join('、') + '。')

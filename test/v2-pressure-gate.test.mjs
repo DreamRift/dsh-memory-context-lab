@@ -19,7 +19,6 @@ import { fileURLToPath } from 'node:url'
 
 import {
   decidePressureGate,
-  decideNetBenefit,
   hysteresisPercentOf,
   occupancyPercentOf,
   PRESSURE_DEFAULTS,
@@ -72,14 +71,6 @@ test('G6 动态死区：σ 大时死区变宽，但有上限', () => {
   assert.ok(noisy <= PRESSURE_DEFAULTS.maxHysteresisPercent, '死区不得超过上限')
 })
 
-test('G7 净收益：低折扣下大量释放才划算', () => {
-  // 释放 10k、失效 20k：即使按 0.1 折扣也只有 1k 收益，不划算。
-  assert.equal(decideNetBenefit({ releaseTokens: 10000, invalidationTokens: 20000 }).profitable, false)
-  // 释放 100k、失效 20k：收益 10k > 成本 20k？不，10k < 20k，仍不划算。
-  assert.equal(decideNetBenefit({ releaseTokens: 100000, invalidationTokens: 20000 }).profitable, false)
-  // 释放 300k、失效 20k：收益 30k > 成本 20k，划算。
-  assert.equal(decideNetBenefit({ releaseTokens: 300000, invalidationTokens: 20000 }).profitable, true)
-})
 
 test('G8 occupancyPercentOf 对缺失/非法窗口返回 null（不编造）', () => {
   assert.equal(occupancyPercentOf({ assembledTokens: 100, contextWindow: 0 }), null)

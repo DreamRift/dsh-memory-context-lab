@@ -10,10 +10,6 @@ import test from 'node:test'
 
 import { estimateTokensOf } from '../src/v2/budget.mjs'
 import {
-  COMPRESS_BATCH_SOURCE_TOKENS,
-  COMPRESS_BATCH_SOURCE_TOKENS_MAX,
-  COMPRESS_CONCURRENCY,
-  COMPRESS_TASK_TIMEOUT_MS,
   MMR_LAMBDA,
   PHASE_CARD_MAX_TOKENS,
   budgetSelect,
@@ -80,10 +76,6 @@ function pipeline(members) {
 // ---------------------------------------------------------------- 常量与门
 
 test('试运行参数常量与计划拍板一致（8–12k 源 token、卡 1k、超时 60s、并发 1）', () => {
-  assert.equal(COMPRESS_BATCH_SOURCE_TOKENS, 8192)
-  assert.ok(COMPRESS_BATCH_SOURCE_TOKENS_MAX <= 12288)
-  assert.equal(COMPRESS_TASK_TIMEOUT_MS, 60_000)
-  assert.equal(COMPRESS_CONCURRENCY, 1)
   assert.equal(PHASE_CARD_MAX_TOKENS, 1024)
   assert.ok(MMR_LAMBDA > 0 && MMR_LAMBDA < 1)
 })

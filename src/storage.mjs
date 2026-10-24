@@ -31,10 +31,6 @@ export function sessionKeyFor(sessionId) {
   return createHash('sha256').update(String(sessionId), 'utf8').digest('hex').slice(0, 24)
 }
 
-export function sessionDirectoryFor(labRoot, sessionId) {
-  return path.join(sessionsRootFor(labRoot), sessionKeyFor(sessionId))
-}
-
 function rootMarker() {
   return {
     kind: LAB_ROOT_MARKER_KIND,

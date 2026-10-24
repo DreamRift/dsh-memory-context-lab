@@ -12,6 +12,7 @@
 //
 // 只读本包、只写系统临时目录；不改本仓任何文件。
 import { cp, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -528,10 +529,13 @@ const CASES = {
     edits: [['  if (parsed > MAX_PAGE_SIZE) {', '  if (false) {']],
   },
   // ── beta.6 根因组（G1…G9）：每条对应一个根因抽象，改回症状修法必红 ──
+  // G1/G4：beta.7 把 g1/g4 两份测试合并成 v2-beta6-g1-ledger-g4-state.test.mjs，
+  // 这里跟着重指（夹具对准源码现状）。G4 是结构性覆盖（还原点让 REQUIRED_STATE_FIELDS
+  // 失去导出，测试 import 即崩）；G1 若合并测试没有空白账本用例，会如实记「未覆盖」。
   // G1：三份 append-only 账本共用一个开账协议。改回「各自 if (size===0) 补 header」
   // 就是 P0 原形（0 字节账本无 header + 尾部修复不在写锁内）。
   'appendable-ledger-shared': {
-    test: 'test/v2-beta6-g1-ledger.test.mjs',
+    test: 'test/v2-beta6-g1-ledger-g4-state.test.mjs',
     file: 'src/v2/appendable-ledger.mjs',
     edits: [[
       "    if (text === null || text.trim().length === 0) {",
@@ -559,7 +563,7 @@ const CASES = {
   },
   // G4：状态字段清单单一真源。闸门只校验 4 个字段 → 消费方裸取 archive 抛 TypeError。
   'state-required-fields': {
-    test: 'test/v2-beta6-g4-state-shape.test.mjs',
+    test: 'test/v2-beta6-g1-ledger-g4-state.test.mjs',
     file: 'src/v2/state.mjs',
     edits: [[
       'export const REQUIRED_STATE_FIELDS = Object.freeze([',
@@ -611,7 +615,151 @@ const CASES = {
       '    if (false) {',
     ]],
   },
+  // ── beta.8（Q3/Q4）：卡片治理与未接线类目 ──
+  // Q3-A 一进一出：把「槽位存在才替换」还原成「永不替换」（恒 append）——
+  // 双槽不变量消失，卡节点数随步数无界增长，v2-card-replace 的 R1 必红。
+  'card-replace-target': {
+    test: 'test/v2-card-replace.test.mjs',
+    file: 'src/v2/runtime-card.mjs',
+    edits: [[
+      '      if (form === \'delta\') {\n        const deltaSlots = live(findCardSlotsOf(session, { full: false }))\n        if (deltaSlots.length > 0) {',
+      '      if (form === \'delta\') {\n        const deltaSlots = live(findCardSlotsOf(session, { full: false }))\n        if (false) {',
+    ], [
+      '      } else {\n        const fullSlots = live(findCardSlotsOf(session, { full: true }))\n        if (fullSlots.length > 0) {',
+      '      } else {\n        const fullSlots = live(findCardSlotsOf(session, { full: true }))\n        if (false) {',
+    ]],
+  },
+  // Q3-A 失败降级：把「宿主拒绝 → ok:false」还原成「拒绝也报 ok」——卡静默丢失、
+  // fallback 不计数（fail-visible 消失），R4 必红。
+  'card-replace-fallback': {
+    test: 'test/v2-card-replace.test.mjs',
+    file: 'src/v2/runtime-card.mjs',
+    edits: [[
+      '    } catch {\n      return { ok: false }\n    }\n  }',
+      '    } catch {\n      return { ok: true, anchorSeq: null, receiptOk: true }\n    }\n  }',
+    ]],
+  },
+  // Q3-A 增量基准：把「基准 = 上一张全量卡渲染文本」还原成「基准 = 上一张注入文本」
+  // ——增量卡会重复宣告上一张增量卡已宣告的行，R5 必红。
+  'delta-baseline': {
+    test: 'test/v2-card-replace.test.mjs',
+    file: 'src/v2/runtime-card.mjs',
+    edits: [[
+      '      text: prepared.cardText,',
+      '      text: prepared.text,',
+    ]],
+  },
+  // Y-31 硬/软去重：把「call-only/未曝光行不进软段」还原成「每个调用都进进度行」
+  // ——同一事实双渲染回归，v2-workingset 的 Y-31 用例必红。
+  'soft-dup': {
+    test: 'test/v2-workingset.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [[
+      '    if (!result) continue\n    if (exposureDecidable && result.seq > threshold) continue\n',
+      '',
+    ]],
+  },
+  // Y-32 可执行句柄：把「readable 才印句柄」还原成「有 ref 就印」——seq:N 死句柄
+  // 回归（模型照抄必败），v2-workingset 的 Y-32 用例必红。
+  'readable-handle': {
+    test: 'test/v2-workingset.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [[
+      "    if (ref && ref.readable === true && typeof ref.ref === 'string' && ref.ref !== '') {",
+      "    if (ref && typeof ref.ref === 'string' && ref.ref !== '') {",
+    ]],
+  },
+  // Q4 死入参回流：把零生产方形参 constraints 偷偷加回签名——wiring 守卫①
+  // （形参必须接线或白名单）必红，「先渲染后接线」的死类目不再可能静默回归。
+  'dead-input-regression': {
+    test: 'test/v2-workingset-wiring.test.mjs',
+    file: 'src/v2/working-state.mjs',
+    edits: [[
+      '  recordIdsForSeq = null,',
+      '  constraints = [],\n  recordIdsForSeq = null,',
+    ]],
+  },
+  // ── beta.9 P0-3：回执生命周期接线 ──
+  // 还原「批次提交后收敛 + slim 置位」——明细回执不再合并、slim 不再生效，
+  // v2-receipt-lifecycle 的 R7 接线判据必红（回执无界累积回归）。
+  'receipt-lifecycle': {
+    test: 'test/v2-receipt-lifecycle.test.mjs',
+    file: 'src/v2/runtime.mjs',
+    edits: [[
+      "    receiptSlimOf: (record) => slimStyleOf(record?.state) === 'slim',",
+      "    receiptSlimOf: null, // revert-probe：还原 slim 判定",
+    ], [
+      "    afterBatchCommitted: (record, session) => {\n      const report = consolidateReceipts(session, { pluginSourceKind: PLUGIN_SOURCE_KIND })\n      if (report.fallbacks > 0) record.cost.bump('receiptMergeFallbacks', report.fallbacks)\n      record.state.receiptSamplePrinted = true\n    },",
+      "    afterBatchCommitted: null, // revert-probe：还原收敛回调",
+    ]],
+  },
+  // ── beta.9 P0-1：遗忘传播接线 ──
+  // P0-1：把「受影响派生记录并入同一条 forget 条目」还原成「只写显式目标」——
+  // forget(A) 后 B/B' 重新可被检索命中，v2-forget-propagation 的验收判据必红。
+  'forget-propagation': {
+    test: 'test/v2-forget-propagation.test.mjs',
+    file: 'src/v2/disposition.mjs',
+    edits: [[
+      '  const propagatedIds = (propagation?.recordIds ?? []).filter((id) => !visibility.has(id))',
+      '  const propagatedIds = []',
+    ]],
+  },
+  // P0-2：把 displayPreview 的推理段过滤还原成裸展平——预览重新泄漏 [推理]
+  // 段正文，v2-reasoning-preview 的三处预览判据必红。
+  'reasoning-not-in-preview': {
+    test: 'test/v2-reasoning-preview.test.mjs',
+    file: 'src/core.mjs',
+    edits: [[
+      "  const text = skipReasonSection(value).replace(/\\s+/g, ' ').trim()",
+      "  const text = String(value ?? '').replace(/\\s+/g, ' ').trim()",
+    ]],
+  },  // P0-5：契约接线守卫的坏样本（M14）——注入死导出 / 未定义引用，
+  // contract-wiring 的两道闸必须分别变红。
+  'contract-wiring-dead-export': {
+    test: 'test/contract-wiring.test.mjs',
+    file: 'src/core.mjs',
+    edits: [[
+      'export const MIN_OPERATION_CHARS = 1200',
+      'export const MIN_OPERATION_CHARS = 1200\nexport const __probeDeadExportP05 = 1',
+    ]],
+  },
+  'contract-wiring-undefined-ref': {
+    test: 'test/contract-wiring.test.mjs',
+    file: 'src/core.mjs',
+    edits: [[
+      'export const MIN_OPERATION_CHARS = 1200',
+      'export const MIN_OPERATION_CHARS = 1200\nfunction __probeUndefinedRefP05() { return __probeMissingIdP05 + 1 }',
+    ]],
+  },  // P0-4：把 preview 级联预告的传递闭包还原成空集——forget preview 不再报告
+  // 派生级联，v2-forget-propagation 的 preview 判据必红。
+  'forget-preview-cascade': {
+    test: 'test/v2-forget-propagation.test.mjs',
+    file: 'src/v2/disposition.mjs',
+    edits: [[
+      '      const dependents = report.affected.filter((id) => !visibility.has(id))',
+      '      const dependents = [].filter((id) => !visibility.has(id))',
+    ]],
+  },  // P0-4：把 model-ledger 三钩子的生产接线还原成直通——缓存/费用侧车重新
+  // 无人供给，v2-compressor-model 的接线判据必红。
+  'model-ledger-wiring': {
+    test: 'test/v2-compressor-model.test.mjs',
+    file: 'src/v2/runtime-compress.mjs',
+    edits: [[
+      '          const wireModelLedger = true',
+      '          const wireModelLedger = false',
+    ]],
+  },  // P0-2 补充（核验小项②）：把续块的失败关闭判定还原成单参调用——续块预览
+  // 重新泄漏 [推理] 段尾（无段头可滤），v2-reasoning-chunk-boundary 必红。
+  'reasoning-chunk-boundary': {
+    test: 'test/v2-reasoning-chunk-boundary.test.mjs',
+    file: 'src/v2/client-adapter.mjs',
+    edits: [[
+      "            if (body !== null) previewById.set(entry.id, recallPreviewOf(skipReasonSection(body, { continuation: isChunkContinuation })))",
+      "            if (body !== null) previewById.set(entry.id, recallPreviewOf(skipReasonSection(body)))",
+    ]],
+  },
 }
+
 
 
 /**
@@ -651,6 +799,7 @@ async function runNode(args, cwd, { timeoutMs = 60_000 } = {}) {
   }
 }
 
+
 async function prepareWorkDir() {
   const work = await mkdtemp(path.join(tmpdir(), 'mcl-revert-probe-'))
   await cp(path.join(PACKAGE_ROOT, 'src'), path.join(work, 'src'), { recursive: true })
@@ -689,6 +838,10 @@ if (caseId) {
   }
   const work = await prepareWorkDir()
   try {
+    if (!existsSync(path.join(PACKAGE_ROOT, spec.test))) {
+      process.stderr.write(`case ${caseId}: 测试文件不存在：${spec.test}（记未覆盖）\n`)
+      process.exit(4)
+    }
     await applyCase(work, caseId)
     // 与 package.json 的测试链同口径：无 force-exit 时部分套件会因常驻句柄
     // 挂住，探针永远等不到 close（把「测试失败」误读成「夹具卡死」）。
@@ -710,6 +863,14 @@ let broken = 0
 for (const id of Object.keys(CASES)) {
   const work = await prepareWorkDir()
   try {
+    // 测试文件不存在时 node 也会以非 0 退出，曾被当成「还原后测试失败」记 OK——
+    // 那是把「没有断言可跑」伪装成守卫成立（0.13.2-beta.8 修正：8 个 beta.6 场景
+    // 指向已合并/已删除的测试文件，全部虚计 OK）。缺失一律如实记「未覆盖」。
+    if (!existsSync(path.join(PACKAGE_ROOT, CASES[id].test))) {
+      broken += 1
+      rows.push({ id, caught: false, code: null, note: `测试文件不存在：${CASES[id].test}（记未覆盖，不计 OK）` })
+      continue
+    }
     await applyCase(work, id)
     const result = await runNode(['--test-force-exit', CASES[id].test], work)
     const caught = result.code !== 0
@@ -724,9 +885,13 @@ for (const id of Object.keys(CASES)) {
 }
 
 const width = Math.max(...rows.map((row) => row.id.length))
+let okCount = 0
 for (const row of rows) {
-  const verdict = row.note ? `夹具脱节：${row.note}` : (row.caught ? 'OK（还原后测试失败）' : '未覆盖（还原后测试仍通过）')
+  if (row.caught) okCount += 1
+  const verdict = row.note
+    ? (row.note.startsWith('测试文件不存在') ? row.note : `夹具脱节：${row.note}`)
+    : (row.caught ? 'OK（还原后测试失败）' : '未覆盖（还原后测试仍通过）')
   process.stdout.write(`${row.id.padEnd(width)}  ${verdict}\n`)
 }
-process.stdout.write(`\n场景 ${rows.length} 个，未覆盖 ${broken} 个\n`)
+process.stdout.write(`\n场景 ${rows.length} 个，OK ${okCount} 个，未覆盖 ${broken} 个\n`)
 process.exit(broken === 0 ? 0 : 1)

@@ -61,13 +61,7 @@ function hash16(text) {
   return createHash('sha256').update(String(text), 'utf8').digest('hex').slice(0, 16)
 }
 
-/** 试验起点常量（计划 §5 P3-7；P4 末标定，不在运行时自适应）。 */
-export const COMPRESS_BATCH_SOURCE_TOKENS = 8192
-export const COMPRESS_BATCH_SOURCE_TOKENS_MAX = 12288
 export const PHASE_CARD_MAX_TOKENS = 1024
-export const COMPRESS_TASK_TIMEOUT_MS = 60_000
-/** 阶段压缩并发恒为 1（pre-step 串行天然满足；此常量仅作声明与文档锚点）。 */
-export const COMPRESS_CONCURRENCY = 1
 /** MMR 多样性权重（计划 §3：0.7 起步，只影响已过必选硬门的候选次序）。 */
 export const MMR_LAMBDA = 0.7
 /** 预算覆盖选择的贪心批步长：候选一次评分后逐块装包，不做回溯。 */

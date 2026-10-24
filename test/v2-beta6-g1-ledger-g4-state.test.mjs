@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { createAppendableLedger } from '../src/v2/appendable-ledger.mjs'
-import { REQUIRED_STATE_FIELDS, isV2SessionState, missingStateFields, stateWithDefaults } from '../src/v2/state.mjs'
+import { REQUIRED_STATE_FIELDS, isV2SessionState, stateWithDefaults } from '../src/v2/state.mjs'
 import { readFile as readSrc } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
@@ -176,7 +176,6 @@ test('G4：状态字段清单只有一份，闸门与消费者读同一份', () 
     const missing = { ...complete }
     delete missing[field.name]
     assert.equal(isV2SessionState(missing), true, `缺 ${field.name} 属于版本差，不得判损坏`)
-    assert.deepEqual(missingStateFields(missing), [field.name], `missingStateFields 必须报出 ${field.name}`)
     assert.equal(field.name in stateWithDefaults(missing), true, `消费者必须能补出 ${field.name}`)
 
     const invalid = { ...complete, [field.name]: field.name === 'archive' ? 'not-an-array' : 42 }

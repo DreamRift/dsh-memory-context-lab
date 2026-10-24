@@ -185,15 +185,6 @@ export function createCostLedger(initial = {}) {
   }
 }
 
-export function mergeCostCounters(...snapshots) {
-  const merged = emptyCostCounters()
-  for (const snapshot of snapshots) {
-    const normalized = normalizeCostCounters(snapshot)
-    for (const key of COST_COUNTER_KEYS) merged[key] += normalized[key]
-  }
-  return merged
-}
-
 /** 人类可读报告：逐项列出，并显式声明哪些项在本版恒为 0 及原因。 */
 export function renderCostReport(counters, { sessionId = null } = {}) {
   const value = normalizeCostCounters(counters)

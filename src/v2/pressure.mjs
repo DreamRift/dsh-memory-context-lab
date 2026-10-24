@@ -118,39 +118,3 @@ export function decidePressureGate({
     ? { open: true, reason: 'above-enter', exitPercent: exit, hysteresis }
     : { open: false, reason: 'below-enter', exitPercent: exit, hysteresis }
 }
-
-/**
- * 净收益判据（纯函数）。
- *
- * 保守估计：释放的 token 按**缓存读价**计收益（最便宜的那部分），失效溢价按
- * 「替换点之后的上下文重算」计成本。只有收益严格大于成本才放行。
- *
- * 任何一项不可判定 → 返回 `unknown: true`，由调用方决定（当前策略：放行，
- * 因为压力已经确认，此时不降温的代价是窗口溢出）。这一取舍写在文档里，
- * 不假装它是精确经济学。
- *
- * @param {object} input
- * @param {number} input.releaseTokens 预计释放
- * @param {number} input.invalidationTokens 预计失效溢价（替换点之后的组装量）
- * @param {number} [input.navigationTaxTokens] 导航税代理（近期回读/重读量）
- * @param {number} [input.cacheReadDiscount] 缓存读相对未命中的折扣（0–1）
- * @returns {{profitable: boolean|null, reason: string}}
- */
-export function decideNetBenefit({
-  releaseTokens,
-  invalidationTokens,
-  navigationTaxTokens = 0,
-  cacheReadDiscount = 0.1,
-} = {}) {
-  const release = Number(releaseTokens)
-  const invalidation = Number(invalidationTokens)
-  if (!Number.isFinite(release) || !Number.isFinite(invalidation)) {
-    return { profitable: null, reason: 'net-benefit-unknown' }
-  }
-  const tax = Number.isFinite(Number(navigationTaxTokens)) ? Math.max(0, Number(navigationTaxTokens)) : 0
-  const discount = Number.isFinite(Number(cacheReadDiscount)) ? Math.max(0, Math.min(1, Number(cacheReadDiscount))) : 0.1
-  const benefit = release * discount
-  const cost = invalidation + tax
-  if (benefit > cost) return { profitable: true, reason: 'benefit-exceeds-cost' }
-  return { profitable: false, reason: 'benefit-below-cost' }
-}

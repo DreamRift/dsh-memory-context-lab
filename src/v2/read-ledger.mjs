@@ -302,9 +302,3 @@ export function summarizeReadLedger(ledger, { totalChars = 0 } = {}) {
     totalChars: total,
   }
 }
-
-/** 账本里该键的登记（供回执/卡片标「该区间已于 seq N 归档」）。 */
-export function ledgerEntryFor(ledger, key) {
-  const entries = Array.isArray(ledger?.entries) ? ledger.entries : []
-  return entries.find((entry) => entry.key === key) ?? null
-}

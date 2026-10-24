@@ -14,7 +14,8 @@
  * 本模块不注册任何模型可见工具，也不重定向正式 `lingshu_cg`。
  */
 
-import { DEFAULT_SETTINGS, buildReceipt, buildSpanReceipt, RECEIPT_FORMAT_OPERATION, RECEIPT_FORMAT_SPAN_V2, V2_RECEIPT_MARKER } from '../core.mjs'
+import { DEFAULT_SETTINGS, PLUGIN_SOURCE_KIND, buildReceipt, buildSpanReceipt, RECEIPT_FORMAT_OPERATION, RECEIPT_FORMAT_SPAN_V2, V2_RECEIPT_MARKER } from '../core.mjs'
+import { consolidateReceipts, slimStyleOf } from './receipt-lifecycle.mjs'
 import { createEngine } from '../apply-engine.mjs'
 import { createForgetCommand, createForgetDomain } from './runtime-forget.mjs'
 import { createLifecycleDomain } from './runtime-lifecycle.mjs'
@@ -238,6 +239,17 @@ export function createV2Runtime(dependencies) {
     // 旧回执、旧状态卡、旧召回包），而 v1 的收集器只认「助手工具调用 + 紧邻结果」，
     // 还会把失败结果整段跳过。改宽 v1 的收集器等于顺手改掉 v1 的行为，所以另走一个。
     collectCandidates: (view) => collectHistoryCandidates(view),
+    // P0-3（Z-01）：本会话第一批已印全样例（receiptSamplePrinted）→ 后续批次
+    // 的候选回执走 slim 格式（9/10），由 apply-engine 在候选收集后统一改写。
+    receiptSlimOf: (record) => slimStyleOf(record?.state) === 'slim',
+    // P0-3：批次提交后的收敛（明细→合并行、超限占位）+ 置位 + 降级计数。
+    // 失败已在 runBatch 侧兜住（不阻塞归档）；这里的计数进成本账本，
+    // 与 cardReplaceFallbacks 同款（fail-visible：持续增长 = 收敛在退化）。
+    afterBatchCommitted: (record, session) => {
+      const report = consolidateReceipts(session, { pluginSourceKind: PLUGIN_SOURCE_KIND })
+      if (report.fallbacks > 0) record.cost.bump('receiptMergeFallbacks', report.fallbacks)
+      record.state.receiptSamplePrinted = true
+    },
     // 提交前漂移检查按跨度种类重建正文；工具操作与普通历史段的形状不同。
     spanBodyOf: (session, unit) => bodyOfSpan(session, unit),
     // 普通历史段的回执不冒充工具操作回执：操作段照旧印工具与调用次数，其他段
@@ -255,7 +267,9 @@ export function createV2Runtime(dependencies) {
         tokens: candidate.originalTokens,
         chunks: candidate.chunkCount ?? 1,
         marker,
-        formatVersion: RECEIPT_FORMAT_OPERATION,
+        // N-06a：格式以候选携带的值为唯一真源（slim 批次的候选已被
+        // apply-engine 改写成 9）；候选没带时回落 format 6。
+        formatVersion: Number.isInteger(candidate.receiptFormat) ? candidate.receiptFormat : RECEIPT_FORMAT_OPERATION,
         releasedTokens: candidate.originalTokens,
         errorLine: candidate.firstErrorLine ?? null,
       })

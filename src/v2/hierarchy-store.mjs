@@ -357,10 +357,6 @@ export function invalidateHierarchyIndex(sessionDir) {
   hierarchyIndexCache.delete(cacheKey(sessionDir))
 }
 
-export function resetHierarchyIndexCache() {
-  hierarchyIndexCache.clear()
-}
-
 // ---------------------------------------------------------------- 查询助手
 
 /**

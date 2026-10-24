@@ -895,9 +895,4 @@ export function coldDependencyEntries({ archiveRows = [], operationEpoch = 0 }) 
   return entries
 }
 
-/** 估算一段文本的 token（与 core 的粗估口径一致，仅用于预算展示）。 */
-export function tokensOfText(text) {
-  return Math.ceil(String(text ?? '').length / 4)
-}
-
 export { canonicalHash }

@@ -201,11 +201,6 @@ export function validateRecord(candidate) {
   return { ...record, inline: { ...record.inline }, refs: { ...record.refs } }
 }
 
-/** kind → 期望的保真等级（合成记录除外）。 */
-export function expectedFidelity(kind) {
-  return kind === RECORD_KINDS.PROJECTION_SPAN ? 'synthesized' : 'verbatim'
-}
-
 /**
  * 把一个宿主事件规范化为记录草案（纯函数）。
  *

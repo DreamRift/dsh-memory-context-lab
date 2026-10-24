@@ -18,7 +18,6 @@ import { createV2Runtime } from '../src/v2/runtime.mjs'
 import { createV2SessionState, writeV2SessionState } from '../src/v2/state.mjs'
 import { buildSession, operation, fakeMeter } from './helpers/fake-host.mjs'
 import { isCardNode } from '../src/v2/card-fold.mjs'
-import { mergeCostCounters } from '../src/v2/cost.mjs'
 
 function agentFor(session) {
   return {
@@ -161,14 +160,6 @@ test('M2 三态账本自洽：多轮 prepare/confirm/放弃后 prepared ≥ comm
       await runtime.shutdown()
     }
   })
-})
-
-test('M3 claim 盘点有界：40 条 claim 截断到配额 + overflow 数量行', () => {
-  // 纯函数面已在 v2-claims-card R2 锁定；此处做集成级：合并账本口径不因 claim 改变。
-  const merged = mergeCostCounters({ workingStatePrepared: 3, workingStateCommitted: 2, workingStateSent: 2 })
-  assert.equal(merged.workingStatePrepared, 3)
-  assert.equal(merged.workingStateCommitted, 2)
-  assert.equal(merged.workingStateSent, 2)
 })
 
 import { renderFoldReceipt } from '../src/v2/card-fold.mjs'

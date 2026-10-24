@@ -115,16 +115,6 @@ export function isCardNode(node) {
 }
 
 /**
- * 一个节点是不是归档回执（restore 的句柄）。折叠规划用它做**断组边界**，
- * 与回注包同等对待：任何回执都不得进入折叠区间。
- */
-export function isArchiveReceiptNode(node) {
-  if (!node || node.type !== 'user/message') return false
-  if (node.sourceForm === 'archive-receipt') return true
-  return typeof node.text === 'string' && node.text.startsWith(V2_RECEIPT_MARKER)
-}
-
-/**
  * 规划折叠。返回 { plans, runs }：
  * - runs 是全部连续卡组（含太短的），供诊断与计数；
  * - plans 是可提交计划：组长 ≥ minRun 才折叠，超长按 maxRun 切片，

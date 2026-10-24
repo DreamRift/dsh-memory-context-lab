@@ -26,18 +26,6 @@ export const MODEL_SUMMARY_MAX_LINES = 32
 /** 模型卡 token 预算（与压缩拍板的 ~1k 摘要预算一致）。 */
 export const MODEL_CARD_TOKEN_BUDGET = 1024
 
-export const MODEL_SUMMARY_CACHE_FILE = 'model-summary-cache.jsonl'
-export const MODEL_USAGE_LEDGER_FILE = 'model-usage.jsonl'
-
-/** 失败关闭档位：一律落回程序版本。 */
-export const MODEL_FALLBACK_REASONS = Object.freeze([
-  'no-model', 'auth', 'rate-limit', 'host-error', 'timeout',
-  'invalid-shape', 'empty-output', 'invalid-ref', 'over-budget', 'no-gain',
-])
-
-/** 任务撤销档位：不是失败，run 即停，不落兜底。 */
-export const MODEL_CANCEL_REASONS = Object.freeze(['user-cancel', 'plugin-off', 'stage-restart', 'source-stale'])
-
 /** 粗略 token 估算：中文按字、ASCII 按词计，宁紧勿松。 */
 function approxTokens(text) {
   const s = String(text ?? '')

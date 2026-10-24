@@ -5,7 +5,6 @@ import {
   applyOneOperation,
   applyOperations,
   cacheStatsOf,
-  cleanDecision,
   collectOperationCandidates,
   computeOccupancy,
   formatBatchReport,
@@ -1041,12 +1040,6 @@ test('recallQueryFrom reads the claimed batch, skipping our own injections', () 
     { id: 's1', role: 'user', content: [{ type: 'text', text: '环境快照' }], source: { kind: 'time-context' } },
   ]
   assert.deepEqual(recallQueryFrom(mixed), { id: 'h1', text: '人类提问' })
-})
-
-test('cleanDecision refuses while receipts still shadow the surface', () => {
-  assert.equal(cleanDecision({ pendingReceipts: 2, confirmDelete: false }).refuse, true)
-  assert.equal(cleanDecision({ pendingReceipts: 2, confirmDelete: true }).refuse, false)
-  assert.equal(cleanDecision({ pendingReceipts: 0, confirmDelete: false }).refuse, false)
 })
 
 /**

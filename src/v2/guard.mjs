@@ -620,18 +620,6 @@ export function classifyRange({
   return { safe: true, code: null, reason: '', scan, exposure }
 }
 
-/** 门禁形式：不安全时抛 `EGUARD`，绝不静默放行。 */
-export function assertCoolableRange(options) {
-  const verdict = classifyRange(options)
-  if (verdict.safe !== true) {
-    throw new EngineV2Error(`候选范围 seq ${options.rangeStart}–${options.rangeEnd} 不允许降温：${verdict.reason}`, {
-      code: 'EGUARD',
-      details: { code: verdict.code, rangeStart: options.rangeStart, rangeEnd: options.rangeEnd },
-    })
-  }
-  return verdict
-}
-
 /**
  * 冷库配对账本自检：一段归档跨度写完后，它的调用/结果索引必须成对闭合。
  *
