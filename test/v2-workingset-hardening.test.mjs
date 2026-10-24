@@ -136,12 +136,21 @@ function surfaceWithCalls(count) {
 
 test('maxProgressItems 非有限时进度不消失（不是被夹成 0）', () => {
   const { nodes, events } = surfaceWithCalls(14)
+  // Y-31（beta.8）后进度只收「已曝光的完成态」：补一个收尾助手节点（seq 30），
+  // 让全部结果都落在最后助手之前（曝光），本测试的主题「非有限上限 = 不截断」
+  // 不被曝光口径干扰。
+  events.set(30, {
+    type: 'assistant/message',
+    seq: 30,
+    data: { turn: 2, step: 2, message: { id: 'm30', content: [{ type: 'text', text: '汇总。' }] } },
+  })
+  nodes.push(30)
   const state = buildWorkingState({
     sessionId: SESSION_ID,
     surfaceNodes: nodes,
     eventAt: (seq) => events.get(seq),
     openCalls: [],
-    lastAssistantSeq: 1,
+    lastAssistantSeq: 30,
     now: 0,
     limits: { maxProgressItems: undefined },
   })

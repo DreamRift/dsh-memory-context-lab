@@ -1,74 +1,50 @@
 # 变更记录
 
-## 0.13.2-beta.7（2026-10-23）**测试版**
+## 0.13.2-beta.8（2026-10-24）**测试版，release 仓已打本地 tag（未推送 GitHub）/ 未装到本机 profile**
 
-**第 10 轮排查（42 条：3 遗留 + 13 P1 + 14 P2 + 10 P3 + 6 待验证）的根因收口批。只修缺陷、不改产品边界。**
+**卡片治理（Q3）+ 未接线类目（Q4）。上一批（beta.7）刻意留下的两个产品决策项，
+由用户拍板路线后实施（一进一出 / 双槽 / 合并硬段 / 可执行句柄 / 全部摘掉 / 不印标注）。
+只做已拍板的治理与同族缺陷，不新增功能。**
 
-不按 42 条逐条打补丁，而是先归并成 6 组根因（A 协议无载体 / B 失败关闭无判据 / C 宿主契约无强制点 /
-D 状态字段无 schema / E 治理假设理想序列 / F 消费者与生产者口径不一），一组一处抽象改动。
+源码树 **120 套全绿、0 套失败**（新增 v2-workingset-wiring、v2-card-replace）；
+回归集探针 **73 项全 0 退出**（新增 p-wiring、p-card-budget-e2e）；
+`revert-probe` **72 个场景 / 64 OK / 8 未覆盖**（本批新增 6 条，全部实测还原必红；
+8 条未覆盖 = 6 条 beta.6 场景无测试文件 + 2 条真未覆盖，口径修正后如实计数）。
+计划见[修复计划-beta.8](../docs/dev-0.13.2/修复计划-beta.8.md)。
 
-源码树 **118 套全绿、0 套失败**（新增 `test/v2-beta7-command-surface.test.mjs`）；回归集探针 142 项全 0 退出；
-`revert-probe` **66 场景 / 64 OK / 2 未覆盖**（基线 62 OK；本轮把 4 条「夹具脱节」重新对准源码，
-2 条变成改回去必红、2 条如实记为未覆盖，未放宽任何断言）。
+### Q3 卡片治理：折叠从未生效的根因收口（一进一出·双槽）
 
-### A 组·协议只有一个载体
+- **Q3-1/Q3-2 卡片无界累积**：折叠的「卡节点连续 ≥2」前提在真实注入序列里永不成立
+  （实测 512 张卡 / 306,071 字符 = 上限 76.5 倍，0 张被折）。换成**注入即替换**：
+  增量步 replace 面上最近一张增量卡，全量步 replace 最近一张全量卡、其余卡槽转一行
+  占位回执；稳态 [全量][增量] 双槽，净增 0。replace 直连 `session.append`
+  （decision.messages 通道不携带 surfaceOp）；宿主拒绝 → 降级 append + 计数。
+- **Q3-3（Y-31）同一事实双渲染**：进度行只收「已曝光的完成态」，call-only 与未曝光行
+  移交硬段；误导性 unknown 与「保守规则」「整条长任务 pin」两张常量行摘除。
+- **Q3-4（Y-32）seq:N 死句柄**：渲染层消费 `readable`——可读句柄升级
+  `memory_lab_recall(record_ids=["…"])` 可执行形态，不可读 seq:N 一律不印。
+- 折叠管线保留为兜底；`CARD_NET_CHAR_CAP` 4000→8000（语义降级为双槽破坏的告警线）；
+  `CARD_SEMANTIC_VERSION` 4→5；新计数键 `cardReplaceFallbacks` / `cardReplaceReceiptFailures`。
 
-- **读侧解析收口（L-1）**：`parseAppendableLedger()` 与 `createAppendableLedger()` 成对落在
-  `v2/appendable-ledger.mjs`，disposition / hierarchy / provenance 只提供 schema 参数。
-  此前三份各写一遍读侧，provenance 就是抄到第三遍时漏了尾行 LF 判定（D-01 的成因）。
-- **原子写收口（Y-03 / Y-14）**：`engine.json`、`agg-voucher` 的落盘改走 `writeFileAtomic`；
-  崩溃不再留半截 JSON 导致永久 `EENGINEDAMAGED`。
-- **写锁被真正消费（Y-02）**：`store` 的 stage/commit 前查 `writeLock.lost()`，被接管的写者失败关闭，
-  不再制造 lost update（这正是这把锁存在的唯一理由）。
-- **旁证索引读-改-写进锁（Y-08）**：`verification.json` 的归档补采与 `mark-stale` 不再互相覆盖。
+### Q4 未接线类目：类目必须先有生产方（全部摘掉）
 
-### B 组·失败关闭有唯一判据
+- **十类零生产方入参整类摘除**（evidence / pins / inflightJobs / constraints / relations /
+  projection / prefetch / redundantCards / nonEssentialHistory / rejectedOptions /
+  openQuestions + step）：三个硬保护段与六个软保留类目在 beta.7 之前就从未渲染过任何内容
+  （空段整段跳过，「恒空却印（无）」的前提不成立）。随行摘除死构造器、八个死 limits 键与
+  七个死输出字段；保护类目 8→5、软保留 8→2；`WORKING_STATE_SCHEMA_VERSION` 3→4。
+- **结构性守卫**：`test/v2-workingset-wiring.test.mjs` + 探针 p-wiring +
+  revert-probe `dead-input-regression`——形参必须接线或在白名单附理由，「先渲染后接线」
+  的死类目不可能静默回归。接线记产品需求 U-03。
+- 同族清理：`working-state.mjs` 在途作业溢出行引用未定义变量 `jobCap`（被「没人传参」
+  掩盖的潜伏 ReferenceError）、`foldWorkingCards` 死参数 `requireOverCap`，随摘除消失。
 
-- 新增 `v2/fail-closed.mjs`：`isAbsent()`（只有 ENOENT 才算「没有」）、`classifyReadFailure()`、
-  `capLimitOf()`（非有限上限 = 不截断，不是 0）。
-- **遗忘索引不再把「读不到」当「没有」（Y-01）**：EACCES/EMFILE/ELOOP 不再归零 `forgotten` 表——
-  那会让已遗忘记录重新可见（隐私回退）。
-- **窗口守卫失败关闭（Y-09）**、**启用失败回滚三处一致（Y-10）**、**停用先写盘后恢复（Y-26）**、
-  **forget 撤回失败不标 forgotten（Y-25）**、**audit 失败不再被吞（Y-21）**。
+### 守卫体系
 
-### C 组·宿主契约在命令面强制
-
-- 新增 `v2/command-surface.mjs`：包在 `runtime.mjs` 的 `commandHandler` 外层，
-  把任何抛出的 `EngineV2Error` 转成 `{kind:'error', code, message, text}`（L-2）。
-  新增命令域不需要自己 catch——契约在注册点，不在 30 个 case 里。
-- **四条命令重启后正确 adopt（Y-11）**、**read/recall 重启后保留失效注记（Y-22）**、
-  **recall 预算参数不再被当记录 ID（Y-23）**、**阻断提示不再让用户 fork 到自身（Y-24）**。
-
-### D 组·状态字段有元素级 schema
-
-- `isArchiveRow()` / `archiveRowsOf()` 成为 `archive` 的唯一读取入口（L-3）：
-  闸门判 damaged、消费者拿过滤后的安全视图，`apply-engine` 的 4 处裸取全部收口。
-- **claim 租号后移到提交期（Y-16）**、**显式 undefined 不再清空硬保护（Y-28）**、
-  **claim 保留最新的 positive（Y-27）**、**抑制租约不再泄漏（Y-12）**。
-
-### E 组·治理按真实序列设计
-
-- **`/memory-lab now` 先解除停摆（Y-05）**：`unparkRanges()` 让被 guard 撤销三次的区间重新进候选，
-  此前 status 提示「用 now」是假出路。
-- **批摘要认两种头（Y-15）**：format 3「N 个相邻操作」与 format 8「本批 N/M 个操作」都识别，
-  只认一种会让 format 8 的部分批组永远落进「整组拒绝」。
-- **词法索引 base 损坏不再静默丢段（Y-06）**、**`limitReached` 不再永久粘滞（Y-17）**。
-
-### F 组·同一个量只算一次
-
-- BM25 文档长度统一走 `docLengthOf()`（`coveredBytes` 优先、回落 `bytes`），索引侧与检索侧共用（Y-18）。
-- 分块索引不再按字节切 UTF-8（Y-20）；状态面不再虚报灵枢后端生效（Y-19）。
-
-### P3 十条
-
-`truncateAtCodePoints(0)` 不再返回 1 字符；增量卡尾行区分行数/字符触发原因；在途调用不再渲染两次；
-`seq:N` 与回读工具口径一致；未接线类目如实标注；`mergeFacts` 保留 `verified:false`；
-`confirmInjection` 时机后移；别名失败行不再挤占预算；`runExclusive` 名副其实；设置页卡片接入 locale。
-
-### 本轮未做
-
-`release/` 已镜像并复跑（118 套全绿）；**未打 git tag、未推送 GitHub、未重启 DSH**。
-卡片治理（Q3）与未接线类目（Q4）属产品决策，未在本批；真实会话 A/B 收益量化未做。
+- revert-probe：测试文件不存在 → 如实记「未覆盖」，不再被 node 的非 0 退出误报成 OK；
+  G1/G4 重指合并后的测试文件，G1 补空白账本用例（只加断言）。
+- 端到端守卫（单测绿不算）：`v2-card-replace`（25 步交替序列双槽不变量）与探针
+  `p-card-budget-e2e`（30 步真实交替序列 + 宿主拒绝注入点 + fallback 一步恢复）。
 
 ## 0.13.2-beta.6（2026-10-23）**测试版，未打 tag / 未装到本机 profile，未推送 GitHub**
 

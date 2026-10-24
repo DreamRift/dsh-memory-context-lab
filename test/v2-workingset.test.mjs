@@ -1,6 +1,11 @@
 /**
- * v2 活跃工作集测试：硬保护 vs 软保留、pin 与过期、版本指纹、未知关系回退、
- * 稳定前缀、有界热上下文（200 vs 2000 条记录）、预算 0/负数/非法值语义。
+ * v2 活跃工作集测试：硬保护 vs 软保留、未知关系回退、稳定前缀、
+ * 有界热上下文（200 vs 2000 条记录）、预算 0/负数/非法值语义。
+ *
+ * 0.13.2-beta.8（Q4）：evidence/pins/constraints/inflightJobs/prefetch/redundantCards/
+ * nonEssentialHistory/rejectedOptions/openQuestions/relations/projection 十一类入参
+ * 零生产方，已整类摘除——原「测死代码」的用例（pin 三态、版本指纹、关系回退、
+ * 投影批次）不再保留；软保留夹具统一改用有生产方的 claims 与 progress。
  *
  * 全部用确定性夹具；需要落库的部分用临时隔离库，不触碰真实会话与正式灵枢。
  */
@@ -17,25 +22,15 @@ import { packWorkingSet, readRecordById } from '../src/v2/readback.mjs'
 import {
   WORKING_SET_DEFAULTS,
   PROTECTION_CLASSES,
+  PROTECTION_ORDER,
   RETENTION_CLASSES,
   DROP_ORDER,
-  EVIDENCE_STATUS,
-  FINGERPRINT_VERDICTS,
-  SOURCE_KINDS,
-  PIN_STATUS,
   TTL_FREE_HARD_CLASSES,
   buildWorkingState,
   planWorkingSetBudget,
   renderWorkingSetInjection,
   resolveAuthority,
-  fingerprintOf,
-  compareFingerprints,
-  bindEvidence,
-  pinEvidence,
-  evaluatePin,
-  resolveRelation,
-  createProjection,
-  appendProjectionStage,
+  SOURCE_KINDS,
 } from '../src/v2/working-state.mjs'
 
 const NOW = 1_700_000_000_000
@@ -86,20 +81,12 @@ function scenario({ operations = 4, openCallCount = 1, now = NOW } = {}) {
   return { events, surfaceNodes, openCalls, now, eventAt: (target) => events.get(target) ?? null }
 }
 
-const FILE_FINGERPRINT_V1 = fingerprintOf({
-  target: 'src/v2/working-state.mjs',
-  version: 'v1',
-  environment: 'node20-win32',
-  testEvidence: 'pass@2026-10-01',
-})
-const FILE_FINGERPRINT_V2 = fingerprintOf({
-  target: 'src/v2/working-state.mjs',
-  version: 'v2',
-  environment: 'node20-win32',
-  testEvidence: 'pass@2026-10-01',
-})
+const CLAIMS = [
+  { value: '结论一：构建脚本走 test-all', polarity: 'positive', recordRef: 'r1' },
+  { value: '结论二：进度按最新保留', polarity: 'positive', recordRef: 'r2' },
+]
 
-/** 一个「什么都有」的状态：硬保护齐全，软保留候选也齐全。 */
+/** 一个「什么都有」的状态：硬保护齐全，软保留候选（claims + progress）也齐全。 */
 function fullState(overrides = {}) {
   const base = scenario({ operations: 4 })
   return buildWorkingState({
@@ -109,50 +96,54 @@ function fullState(overrides = {}) {
     openCalls: base.openCalls,
     lastAssistantSeq: null,
     now: base.now,
-    constraints: [
-      { text: '不要修改 runtime.mjs', sourceRef: 'seq:1' },
-      { text: '只写两个文件', sourceRef: 'seq:1' },
-    ],
-    evidence: [
-      {
-        recordRef: 't00000001-r0009',
-        necessary: true,
-        sourceKind: SOURCE_KINDS.TOOL_RESULT,
-        fingerprint: FILE_FINGERPRINT_V1,
-        currentFingerprint: FILE_FINGERPRINT_V1,
-      },
-    ],
-    pins: [
-      pinEvidence({
-        recordRef: 't00000001-r0010',
-        reason: '刚重读的关键证据',
-        source: 'readback',
-        trigger: 'readback',
-        ttlMs: 60_000,
-        pinnedAt: NOW,
-        now: NOW,
-      }),
-    ],
-    inflightJobs: [{ jobId: 'job-1', kind: 'job', state: 'running', source: 'host:jobs' }],
-    prefetch: [{ itemId: 'prefetch-1', text: '可能用得到的旧检索结果' }],
-    redundantCards: [{ itemId: 'card-old', supersededBy: 'card-new' }],
-    nonEssentialHistory: [{ itemId: 'branch-done', ref: 't00000001-r0001' }],
-    rejectedOptions: [{ option: '用 TTL 驱逐硬保护', reason: '与规范冲突' }],
-    openQuestions: [{ question: '软保留的默认 TTL 取多少？' }],
-    relations: [{ subjectRef: 'seq:2', objectRef: 'seq:3' }],
+    claims: CLAIMS,
     ...overrides,
   })
 }
 
 const SOFT_CLASSES_PRESENT = [
-  RETENTION_CLASSES.OPTIONAL_PREFETCH,
-  RETENTION_CLASSES.REDUNDANT_CARD,
   RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
-  RETENTION_CLASSES.REJECTED_OPTION,
-  RETENTION_CLASSES.OPEN_QUESTION,
+  RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
 ]
 
-test('保护集逐条带 reason/source/releaseCondition，七类硬保护都在封闭集里', () => {
+test('Q4：零生产方类目已移出封闭集，软保留只剩两类（未接线类目不再渲染）', () => {
+  // 类目封闭集只允许「有生产方」的成员：硬保护 5（4 内容类 + 未知协议位）、
+  // 软保留 2（非必要历史、未验证证据）。evidence/pins/inflightJobs/constraints/
+  // relations/projection/prefetch/redundantCards/rejectedOptions/openQuestions
+  // 十类入参没有生产方，对应类目/配额键已整体摘除（修复计划-beta.8 §〇）。
+  assert.deepEqual(Object.keys(PROTECTION_CLASSES), [
+    'HUMAN_REQUEST',
+    'UNCLOSED_CALL',
+    'UNEXPOSED_RESULT',
+    'MINIMAL_WORKING_STATE',
+    'UNKNOWN_PROTOCOL',
+  ])
+  assert.deepEqual(Object.keys(RETENTION_CLASSES), ['NON_ESSENTIAL_HISTORY', 'UNVERIFIED_EVIDENCE'])
+  assert.deepEqual([...DROP_ORDER], [RETENTION_CLASSES.NON_ESSENTIAL_HISTORY, RETENTION_CLASSES.UNVERIFIED_EVIDENCE])
+  assert.deepEqual([...PROTECTION_ORDER], [...TTL_FREE_HARD_CLASSES])
+  // 配额键跟随类目：已摘类目的配额键不得残留。
+  for (const dead of ['maxConstraints', 'maxEvidence', 'maxPins', 'maxInflightJobs', 'maxPrefetch',
+    'maxRedundantCards', 'maxRejectedOptions', 'maxOpenQuestions', 'pinTtlMs']) {
+    assert.equal(Object.hasOwn(WORKING_SET_DEFAULTS, dead), false, `${dead} 必须移出 WORKING_SET_DEFAULTS`)
+  }
+  // 死入参即使被传进来也只是普通多余键：不得崩溃、不得复活任何类目。
+  const base = scenario({ operations: 2 })
+  const tolerant = buildWorkingState({
+    sessionId: SESSION_ID,
+    surfaceNodes: base.surfaceNodes,
+    eventAt: base.eventAt,
+    openCalls: base.openCalls,
+    now: 0,
+    evidence: [null],
+    pins: [null],
+    inflightJobs: [{ jobId: 'x' }],
+    constraints: ['不该生效的约束'],
+  })
+  assert.ok(!JSON.stringify(tolerant.retention).includes('不该生效的约束'), '死入参内容不得进入任何段')
+  assert.deepEqual(Object.keys(tolerant.retention), Object.values(RETENTION_CLASSES))
+})
+
+test('保护集逐条带 reason/source/releaseCondition，各类硬保护都在封闭集里', () => {
   const state = fullState()
   assert.ok(state.protectedSet.length > 0)
   for (const item of state.protectedSet) {
@@ -165,17 +156,106 @@ test('保护集逐条带 reason/source/releaseCondition，七类硬保护都在�
   assert.ok(classes.has(PROTECTION_CLASSES.HUMAN_REQUEST), '当前人类请求必须在保护集里')
   assert.ok(classes.has(PROTECTION_CLASSES.UNCLOSED_CALL), '未闭合调用必须在保护集里')
   assert.ok(classes.has(PROTECTION_CLASSES.UNEXPOSED_RESULT), '未曝光结果必须在保护集里')
-  assert.ok(classes.has(PROTECTION_CLASSES.INFLIGHT_JOB), '在途作业必须在保护集里')
-  assert.ok(classes.has(PROTECTION_CLASSES.NECESSARY_EVIDENCE), '必要证据必须在保护集里')
-  assert.ok(classes.has(PROTECTION_CLASSES.VALID_PIN), '有效 pin 必须在保护集里')
   assert.ok(classes.has(PROTECTION_CLASSES.MINIMAL_WORKING_STATE), '最小工作状态必须在保护集里')
-  assert.ok(classes.has(PROTECTION_CLASSES.UNKNOWN_PROTOCOL), '未知协议位必须在保护集里')
-  // 当前请求 + 两条约束
-  assert.ok(state.protectionSummary.hardByClass[PROTECTION_CLASSES.HUMAN_REQUEST] >= 3)
+  // UNKNOWN_PROTOCOL 是协议位：健康夹具里 unknowns 为空是正常态（不渲染空段），
+  // 它的生产证明见下方「未知协议位」用例与 wiring 守卫的第二夹具。
   // 硬保护类目不允许带 TTL
-  assert.deepEqual([...TTL_FREE_HARD_CLASSES].includes(PROTECTION_CLASSES.VALID_PIN), false)
   assert.equal(state.protectionInvariants.hardClassesAreTtlFree, true)
   assert.equal(state.protectionInvariants.hardItemsNeverDroppedForBudget, true)
+})
+
+test('Y-31：软保留进度行只保留硬段未覆盖的完成态（call-only/未曝光行移交硬段）', () => {
+  // 夹具：op0 已曝光（result seq 3 ≤ 最后助手 seq 4）、call_00_fresh 的结果在最后
+  // 助手之后（未曝光）、call_00_open 纯在途（无结果）。
+  const events = new Map()
+  const surfaceNodes = []
+  let seq = 1
+  events.set(seq, { type: 'user/message', data: { id: 'u1', source: { kind: 'user' }, content: [{ type: 'text', text: '扫描。' }] } })
+  surfaceNodes.push(seq); seq += 1
+  events.set(seq, { type: 'assistant/message', data: { turn: 0, message: { id: 'a0', content: [{ type: 'tool-call', id: 'call_00_done', name: 'read' }] } } })
+  surfaceNodes.push(seq); seq += 1
+  events.set(seq, { type: 'tool/result', data: { message: { id: 'r0', toolCallId: 'call_00_done', content: [{ type: 'text', text: 'out0' }] } } })
+  surfaceNodes.push(seq); seq += 1
+  events.set(seq, { type: 'assistant/message', data: { turn: 1, message: { id: 'a1', content: [{ type: 'tool-call', id: 'call_00_fresh', name: 'grep' }, { type: 'tool-call', id: 'call_00_open', name: 'write' }] } } })
+  const lastAssistant = seq
+  surfaceNodes.push(seq); seq += 1
+  events.set(seq, { type: 'tool/result', data: { message: { id: 'r1', toolCallId: 'call_00_fresh', content: [{ type: 'text', text: 'out1' }] } } })
+  surfaceNodes.push(seq); seq += 1
+  const state = buildWorkingState({
+    sessionId: SESSION_ID,
+    surfaceNodes,
+    eventAt: (target) => events.get(target) ?? null,
+    openCalls: [],
+    lastAssistantSeq: lastAssistant,
+    now: NOW,
+  })
+  // 软段只剩 op0 的完成态；call_00_fresh（未曝光）与 call_00_open（call-only）
+  // 不得重复出现在进度行。
+  const progressRows = state.retention[RETENTION_CLASSES.NON_ESSENTIAL_HISTORY]
+    .filter((item) => (item.itemId ?? '').startsWith('progress:'))
+  assert.equal(progressRows.length, 1, `进度行必须只剩已曝光完成态，实际 ${JSON.stringify(progressRows.map((i) => i.itemId))}`)
+  assert.match(progressRows[0].lines[0], /工具 read/)
+  const card = renderWorkingSetInjection(state, { budgetTokens: 8000 })
+  assert.equal(card.text.includes('call-only'), false, '卡内不得再有 call-only 状态行（硬段已覆盖）')
+  assert.match(card.text, /在途动作 call_00_open/, '纯在途调用必须在硬段')
+  assert.match(card.text, /未曝光结果（callId call_00_fresh/, '未曝光结果必须在硬段且不再印裸句柄')
+})
+
+test('Y-32：不可读句柄不印 seq:N；可读句柄是 memory_lab_recall 可执行形态', () => {
+  // 无 recordIdsForSeq 映射 → refOf 退回 host-seq（readable:false）→ 不得印出 seq:N。
+  const base = scenario({ operations: 2, openCallCount: 1 })
+  const state = buildWorkingState({
+    sessionId: SESSION_ID,
+    surfaceNodes: base.surfaceNodes,
+    eventAt: base.eventAt,
+    openCalls: base.openCalls,
+    lastAssistantSeq: null,
+    now: NOW,
+  })
+  const card = renderWorkingSetInjection(state, { budgetTokens: 20000 })
+  const handleLines = card.text.split('\n').filter((line) =>
+    line.startsWith('- 在途动作') || line.startsWith('- 进度 ') || line.startsWith('- 未曝光结果'))
+  for (const line of handleLines) {
+    assert.doesNotMatch(line, /seq:\d+/, `句柄行不得印 seq:N：${line}`)
+  }
+  // 有记录 ID 的行必须是可执行形态；open_0 来自冷库账本（callRecordId 可读，优先于 callId）。
+  assert.match(card.text, /memory_lab_recall\(record_ids=\["t00000001-r0000"\]\)/, '冷库在途配对的可读记录 ID 是合法回读句柄')
+  // readback 段是 P0-1 设计：段题给出可执行工具形态、行只给结构 + 真实记录 ID
+  //（不是 seq:N）——可读句柄以「段题工具形态 + 行内记录 ID」组合呈现。
+  const withReadback = buildWorkingState({
+    sessionId: SESSION_ID,
+    surfaceNodes: base.surfaceNodes,
+    eventAt: base.eventAt,
+    openCalls: base.openCalls,
+    lastAssistantSeq: null,
+    now: NOW,
+    readback: [{ recordId: 't00000001-r0001', tools: ['read'], range: { start: 2, end: 3 }, locator: '位置', tokens: 5 }],
+  })
+  const readbackCard = renderWorkingSetInjection(withReadback, { budgetTokens: 20000 })
+  assert.match(readbackCard.text, /■ 本步可回读（memory_lab_recall\(record_ids=\[…\]\)/)
+  assert.match(readbackCard.text, /- t00000001-r0001｜read｜/, '行内必须是真实记录 ID')
+})
+
+test('未知协议位：判定不可用（曝光未知）时必须以未知条目常驻，不得当成「没有」', () => {
+  // lastAssistant 从**表面**推导：表面里没有 assistant/message 节点时才判定不可用
+  //（只传 lastAssistantSeq=null 压不过表面推导）。
+  const base = scenario({ operations: 0, openCallCount: 1 })
+  const state = buildWorkingState({
+    sessionId: SESSION_ID,
+    surfaceNodes: base.surfaceNodes,
+    eventAt: base.eventAt,
+    openCalls: base.openCalls,
+    lastAssistantSeq: null,
+    now: base.now,
+  })
+  assert.equal(state.exposureDecidable, false)
+  assert.ok(
+    state.protectedSet.some((item) => item.protectionClass === PROTECTION_CLASSES.UNKNOWN_PROTOCOL
+      && item.lines.join('').includes('未知')),
+    '没有可判定的助手决策节点时，未知条目必须进保护集',
+  )
+  const card = renderWorkingSetInjection(state, { budgetTokens: 8000 })
+  assert.match(card.text, /未知/)
 })
 
 test('硬保护在「什么都装不下」的预算下全部存活，软保留先出局并如实报告', () => {
@@ -187,13 +267,8 @@ test('硬保护在「什么都装不下」的预算下全部存活，软保留�
   assert.match(card.overflowReason, /保护集/)
   // 硬内容一条都不能少
   assert.match(card.text, /把工作集做成有界常驻/)
-  assert.match(card.text, /不要修改 runtime.mjs/)
-  assert.match(card.text, /只写两个文件/)
   assert.match(card.text, /open_0/)
   assert.match(card.text, /未曝光结果/)
-  assert.match(card.text, /job-1/)
-  assert.match(card.text, /必要证据/)
-  assert.match(card.text, /有效 pin/)
   assert.match(card.text, /最小依赖集/)
   // 软保留全部让位，且如实点名（F1 后丢弃报告按分值升序，类目集合不变）
   assert.deepEqual([...card.droppedClasses.map((item) => item.class)].sort(), [...SOFT_CLASSES_PRESENT].sort())
@@ -205,7 +280,7 @@ test('硬保护在「什么都装不下」的预算下全部存活，软保留�
   assert.deepEqual(card.keptClasses, [])
   // 「永不丢弃」的类目清单随结果一起给出
   assert.ok(card.neverDropped.includes(PROTECTION_CLASSES.HUMAN_REQUEST))
-  assert.ok(!card.neverDropped.includes(RETENTION_CLASSES.OPTIONAL_PREFETCH))
+  assert.ok(!card.neverDropped.includes(RETENTION_CLASSES.NON_ESSENTIAL_HISTORY))
 })
 
 test('软保留按 F1 重要度退役：紧预算全丢、宽预算全留、装包序与丢弃报告序确定', () => {
@@ -247,28 +322,26 @@ test('软保留按 F1 重要度退役：紧预算全丢、宽预算全留、装�
   }
 })
 
-test('F1 集成：与当前任务相关的非必要历史靠后丢（novelty 反向校准落到装包序）', () => {
+test('F1 集成：与当前任务相关的助手结论靠后丢（novelty 反向校准落到装包序）', () => {
   // 硬前缀固定：当前人类请求「把工作集做成有界常驻」。
-  const related = '把工作集做成的上下文历史记录：runtime.mjs 只写两个文件的约束'
-  const unrelated = '㊀㊁㊂㊃㊄㊅㊆㊇ ㊈㊊㊋㊌ 旧探索分支记录'
+  const related = '把工作集做成的上下文历史记录：runtime.mjs 只写两个文件的结论'
+  const unrelated = '㊀㊁㊂㊃㊄㊅㊆㊇ ㊈㊊㊋㊌ 旧探索分支的结论'
   const state = fullState({
-    nonEssentialHistory: [
-      { itemId: 'branch-related', text: related },
-      { itemId: 'branch-unrelated', text: unrelated },
+    claims: [
+      { value: related, polarity: 'positive', recordRef: 'r-related' },
+      { value: unrelated, polarity: 'positive', recordRef: 'r-unrelated' },
     ],
   })
   const zero = renderWorkingSetInjection(state, { budgetTokens: 0 })
-  // 中间预算：软段按分值装包，相关的非必要历史分值更高、必须排在无关历史之后
-  // （装包序后段=后丢）。用 softImportance 逐段核对两项的相对次序。
+  // 中间预算：软段按分值装包。用 softImportance 逐段核对装包序不变式。
   const middle = renderWorkingSetInjection(state, { budgetTokens: zero.hardTokens + 60 })
-  const soft = middle.softImportance.filter((item) => item.class === RETENTION_CLASSES.NON_ESSENTIAL_HISTORY)
-  // 夹具里的进度/overflow 项与显式历史项同类目；按 lines 区分不现实，改为验证
-  // 分值降序不变式 + 丢弃从低分开始：所有被丢段的分值 ≤ 所有保留段的分值。
+  // 夹具里的进度/overflow 项与 claim 段可能同类目；改为验证分值降序不变式
+  // + 丢弃从低分开始：所有被丢段的分值 ≤ 所有保留段的分值。
   const droppedMax = Math.max(...middle.dropped.map((item) => item.importance ?? 0), -Infinity)
   const keptMin = Math.min(...(middle.softImportance
     .filter((item) => middle.keptClasses.includes(item.class))
     .map((item) => item.importance ?? Infinity)), Infinity)
-  assert.ok(soft.length >= 1, '非必要历史段必须在装包管道里')
+  assert.ok(middle.softImportance.length >= 1, '软段必须在装包管道里')
   assert.ok(droppedMax <= keptMin, `被丢段的最大分值不得超过保留段的最小分值（${droppedMax} vs ${keptMin}）`)
   // 丢弃报告的 reason 带分量：可解释，不给黑盒分。
   for (const item of middle.dropped) {
@@ -297,136 +370,6 @@ test('未闭合调用与未曝光结果在保护集里显式登记，且不因�
   assert.match(card.text, /open_1/)
   assert.match(card.text, /未曝光结果/)
   assert.equal(card.overflow, true)
-})
-
-test('pin：有效 pin 是硬保护；过期 / 缺复核条件 / 整任务 pin 一律不构成硬保护', () => {
-  const readbackPin = pinEvidence({
-    recordRef: 't00000001-r0002',
-    trigger: 'readback',
-    ttlMs: 1000,
-    pinnedAt: 0,
-    now: 0,
-  })
-  assert.ok(readbackPin.reviewCondition && readbackPin.reviewCondition.length > 0, 'pin 必须自带复核条件')
-  assert.equal(evaluatePin(readbackPin, { now: 500 }).status, PIN_STATUS.VALID)
-  const expired = evaluatePin(readbackPin, { now: 1500 })
-  assert.equal(expired.status, PIN_STATUS.EXPIRED)
-  assert.equal(expired.reviewRequired, true)
-  assert.match(expired.releaseCondition, /复核/)
-
-  // 没有失效时间、没有复核条件、整任务 pin：三种都不能当硬保护
-  assert.equal(evaluatePin({ recordRef: 'x', reviewCondition: '随便' }, { now: 0 }).status, PIN_STATUS.INVALID)
-  assert.equal(evaluatePin(pinEvidence({ recordRef: 'y', expiresAt: 10_000, now: 0 }), { now: 0 }).status, PIN_STATUS.INVALID)
-  const wholeTask = evaluatePin(
-    { recordRef: 'task:all', scope: 'whole-task', expiresAtMs: 10_000, reviewCondition: 'never' },
-    { now: 0 },
-  )
-  assert.equal(wholeTask.status, PIN_STATUS.INVALID)
-  assert.match(wholeTask.invalidReason, /整条长任务/)
-
-  const base = scenario({ operations: 2 })
-  const state = buildWorkingState({
-    sessionId: SESSION_ID,
-    surfaceNodes: base.surfaceNodes,
-    eventAt: base.eventAt,
-    openCalls: base.openCalls,
-    now: 500,
-    pins: [readbackPin, { recordRef: 'expired-1', expiresAtMs: 100, reviewCondition: '复核', source: 'caller' }, wholeTask],
-  })
-  assert.equal(state.pins.filter((pin) => pin.status === PIN_STATUS.VALID).length, 1)
-  assert.equal(state.pins.filter((pin) => pin.status === PIN_STATUS.EXPIRED).length, 1)
-  assert.equal(state.pins.filter((pin) => pin.status === PIN_STATUS.INVALID).length, 1)
-  assert.equal(state.protectedSet.filter((item) => item.protectionClass === PROTECTION_CLASSES.VALID_PIN).length, 1)
-  assert.equal(state.retention[RETENTION_CLASSES.EXPIRED_PIN].length, 2)
-  assert.ok(state.unknowns.some((item) => /整条长任务/.test(item.reason)), '无效 pin 必须进未知清单，不能静默')
-
-  // 有效 pin 在极小预算下仍然在卡里；过期 pin 属软保留，可被丢但会被点名
-  const card = renderWorkingSetInjection(state, { budgetTokens: 1 })
-  assert.match(card.text, /有效 pin/)
-  assert.equal(card.overflow, true)
-  const expiredDropped = card.droppedClasses.find((item) => item.class === RETENTION_CLASSES.EXPIRED_PIN)
-  assert.ok(expiredDropped, '过期 pin 必须出现在丢弃报告里')
-
-  // 空值容错：null / 非对象既不能崩，也不能被当成有效保护。
-  assert.equal(evaluatePin(null, { now: 0 }).status, PIN_STATUS.INVALID)
-  assert.equal(bindEvidence(null).status, EVIDENCE_STATUS.UNVERIFIED)
-  assert.equal(resolveRelation(null).relation, 'unknown')
-  const tolerant = buildWorkingState({ sessionId: SESSION_ID, now: 0, pins: [null], evidence: [null], relations: [null] })
-  assert.equal(tolerant.pins[0].status, PIN_STATUS.INVALID)
-  assert.equal(tolerant.evidence[0].status, EVIDENCE_STATUS.UNVERIFIED)
-})
-
-test('版本指纹：旧通过结果对不上新版本 → stale，绝不是 valid', () => {
-  assert.equal(compareFingerprints(FILE_FINGERPRINT_V1, FILE_FINGERPRINT_V2), FINGERPRINT_VERDICTS.MISMATCH)
-  assert.equal(compareFingerprints(FILE_FINGERPRINT_V1, FILE_FINGERPRINT_V1), FINGERPRINT_VERDICTS.MATCH)
-  assert.equal(compareFingerprints(FILE_FINGERPRINT_V1, null), FINGERPRINT_VERDICTS.UNKNOWN)
-  assert.equal(compareFingerprints(null, null), FINGERPRINT_VERDICTS.UNKNOWN)
-  assert.equal(fingerprintOf({}), null, '没有指纹就是 null，不能造一个「相同」')
-
-  const stale = bindEvidence({
-    recordRef: 'r-stale',
-    necessary: true,
-    fingerprint: FILE_FINGERPRINT_V1,
-    currentFingerprint: FILE_FINGERPRINT_V2,
-  })
-  assert.equal(stale.status, EVIDENCE_STATUS.STALE)
-  assert.notEqual(stale.status, EVIDENCE_STATUS.VALID)
-  assert.equal(stale.fingerprintVerdict, FINGERPRINT_VERDICTS.MISMATCH)
-  assert.match(stale.statusReason, /不能作为当前版本的证据/)
-
-  const unverified = bindEvidence({ recordRef: 'r-unverified', fingerprint: FILE_FINGERPRINT_V1 })
-  assert.equal(unverified.status, EVIDENCE_STATUS.UNVERIFIED)
-
-  const valid = bindEvidence({
-    recordRef: 'r-valid',
-    necessary: true,
-    fingerprint: FILE_FINGERPRINT_V1,
-    currentFingerprint: FILE_FINGERPRINT_V1,
-  })
-  assert.equal(valid.status, EVIDENCE_STATUS.VALID)
-
-  // 状态级：stale 的关键证据不得冒充 necessary-evidence，必须转成「未知」协议位 + 软保留。
-  const base = scenario({ operations: 2 })
-  const state = buildWorkingState({
-    sessionId: SESSION_ID,
-    surfaceNodes: base.surfaceNodes,
-    eventAt: base.eventAt,
-    openCalls: base.openCalls,
-    now: NOW,
-    evidence: [{ recordRef: 'r-stale', necessary: true, fingerprint: FILE_FINGERPRINT_V1, currentFingerprint: FILE_FINGERPRINT_V2 }],
-  })
-  assert.equal(state.protectedSet.filter((item) => item.protectionClass === PROTECTION_CLASSES.NECESSARY_EVIDENCE).length, 0)
-  assert.ok(state.protectedSet.some((item) => item.protectionClass === PROTECTION_CLASSES.UNKNOWN_PROTOCOL
-    && item.lines.join('').includes('stale')))
-  assert.equal(state.retention[RETENTION_CLASSES.STALE_EVIDENCE].length, 1)
-  const card = renderWorkingSetInjection(state, { budgetTokens: 8000 })
-  assert.match(card.text, /stale/)
-  assert.match(card.text, /不得当作有效证据/)
-})
-
-test('关系判定不了就是 unknown：回退保守原文 + 显式规则，绝不编造关系', () => {
-  const unknown = resolveRelation({ subjectRef: 'a', objectRef: 'b' })
-  assert.equal(unknown.relation, 'unknown')
-  assert.equal(unknown.resolved, false)
-  assert.equal(unknown.fallback, 'verbatim-text')
-  assert.ok(unknown.rules.length >= 3)
-  assert.match(unknown.reason, /无法确定性判定/)
-
-  // 只给关系种类、不给结构化依据 → 仍然是 unknown
-  const noBasis = resolveRelation({ subjectRef: 'a', objectRef: 'b', relation: 'depends-on' })
-  assert.equal(noBasis.relation, 'unknown')
-  assert.equal(noBasis.resolved, false)
-
-  const known = resolveRelation({ subjectRef: 'a', objectRef: 'b', relation: 'depends-on', basis: 'callId 配对 + 投影跨度' })
-  assert.equal(known.resolved, true)
-  assert.equal(known.relation, 'depends-on')
-
-  const state = fullState()
-  assert.ok(state.relations.every((item) => item.relation === 'unknown'))
-  const card = renderWorkingSetInjection(state, { budgetTokens: 8000 })
-  assert.match(card.text, /关系未知/)
-  assert.match(card.text, /保守规则/)
-  assert.match(card.text, /不补写因果/)
 })
 
 test('权威不变量：摘要≠原文、模型推断≠授权、状态卡≠系统消息，且不能提升为 system', () => {
@@ -466,27 +409,13 @@ test('权威不变量：摘要≠原文、模型推断≠授权、状态卡≠�
   assert.match(card.text, /不可提升为 system/)
 })
 
-test('稳定前缀：投影按批次追加不重写历史，卡片前缀哈希在软内容变化时不变', () => {
-  const empty = createProjection({})
-  const first = appendProjectionStage(empty, { stageId: 'stage-1', lines: ['第一批'] })
-  const second = appendProjectionStage(first, { stageId: 'stage-2', lines: ['第二批'] })
-  assert.ok(first.text.startsWith(empty.text))
-  assert.ok(second.text.startsWith(first.text), '追加批次必须以旧文本为前缀')
-  assert.equal(second.rewroteEarlierStages, false)
-  assert.equal(empty.stages.length, 0)
-  assert.equal(first.stages.length, 1)
-  assert.equal(second.stages.length, 2)
-  // 0.13.2-beta.6 G2：空 stageId 此前抛裸 TypeError（`code` 为 undefined）。
-  // 现在抛 InvalidArgumentError（继承 EngineV2Error），带 `EINVAL`——判据从
-  // 「是哪个内置类」改成「有没有可判别的 code」，后者才是调用方真正依赖的东西。
-  assert.throws(() => appendProjectionStage(first, { stageId: '' }), (error) => {
-    assert.equal(error.code, 'EINVAL')
-    return true
-  })
-
+test('稳定前缀：保护集不变时卡片前缀哈希在软内容变化时不变', () => {
   const stateA = fullState()
   const stateB = fullState({
-    prefetch: [{ itemId: 'prefetch-new-1', text: '新的可选预取' }, { itemId: 'prefetch-new-2', text: '另一条可选预取' }],
+    claims: [
+      { value: '新的可选结论一', polarity: 'positive', recordRef: 'r-new-1' },
+      { value: '新的可选结论二', polarity: 'positive', recordRef: 'r-new-2' },
+    ],
   })
   const cardA = renderWorkingSetInjection(stateA, { budgetTokens: 8000 })
   const cardB = renderWorkingSetInjection(stateB, { budgetTokens: 8000, previousPrefixHash: cardA.prefix.hash })
@@ -506,7 +435,6 @@ test('有界热上下文：200 与 2000 条记录下渲染 token 不随总量线
     openCalls: small.openCalls,
     lastAssistantSeq: null,
     now: NOW,
-    constraints: [{ text: '不要修改 runtime.mjs', sourceRef: 'seq:1' }],
   })
   const largeState = buildWorkingState({
     sessionId: SESSION_ID,
@@ -515,10 +443,12 @@ test('有界热上下文：200 与 2000 条记录下渲染 token 不随总量线
     openCalls: large.openCalls,
     lastAssistantSeq: null,
     now: NOW,
-    constraints: [{ text: '不要修改 runtime.mjs', sourceRef: 'seq:1' }],
   })
-  assert.equal(smallState.progressCount, 200)
-  assert.equal(largeState.progressCount, 2000)
+  // Y-31 后进度只收硬段未覆盖的完成态：每个 operation 的结果都落在自己的助手之后、
+  // 最后一个 operation 的结果在最后助手之后（未曝光，进 UNEXPOSED_RESULT 硬段），
+  // 所以 progressCount = operations - 1（0.13.2-beta.8 起，旧口径是每调用一行 = 200）。
+  assert.equal(smallState.progressCount, 199)
+  assert.equal(largeState.progressCount, 1999)
   // 展开进卡片的条目数被上限截断，不随总量增长
   assert.equal(smallState.progress.length, WORKING_SET_DEFAULTS.maxProgressItems)
   assert.equal(largeState.progress.length, WORKING_SET_DEFAULTS.maxProgressItems)
@@ -599,8 +529,8 @@ test('token 口径：usedTokens 是 token 而不是字节，且四个关键字�
   }
 })
 
-test('临时隔离库：重读证据获得临时 pin，pin 过期后证据仍可按记录 ID 回读', async () => {
-  const root = await makeLabRoot('readback-pin')
+test('临时隔离库：readback 打包按记录 ID 精确取回，原文不被任何 TTL 删掉', async () => {
+  const root = await makeLabRoot('readback-pack')
   try {
     const store = await V2SessionStore.init({ labRoot: root, sessionId: SESSION_ID })
     const ids = []
@@ -625,26 +555,8 @@ test('临时隔离库：重读证据获得临时 pin，pin 过期后证据仍可
     assert.equal(pack.entries[0].id, ids[1])
     assert.match(pack.entries[0].kind, /operation\.result/)
 
-    // 刚重读的证据：拿一个带显式过期的临时 pin
-    const pin = pinEvidence({
-      recordRef: ids[1],
-      trigger: 'readback',
-      source: 'readback',
-      ttlMs: WORKING_SET_DEFAULTS.pinTtlMs,
-      pinnedAt: 0,
-      now: 0,
-    })
-    const fresh = buildWorkingState({ sessionId: SESSION_ID, now: 1, pins: [pin] })
-    assert.equal(fresh.pins[0].status, PIN_STATUS.VALID)
-    assert.equal(fresh.protectedSet.filter((item) => item.protectionClass === PROTECTION_CLASSES.VALID_PIN).length, 1)
-
-    const later = buildWorkingState({ sessionId: SESSION_ID, now: WORKING_SET_DEFAULTS.pinTtlMs + 1, pins: [pin] })
-    assert.equal(later.pins[0].status, PIN_STATUS.EXPIRED)
-    assert.equal(later.retention[RETENTION_CLASSES.EXPIRED_PIN].length, 1)
-    const card = renderWorkingSetInjection(later, { budgetTokens: 8000 })
-    assert.match(card.text, /过期 pin/)
-
-    // pin 过期只是转「需复核」：记录本身仍然可按 ID 回读，原文没有被任何 TTL 删掉。
+    // 0.13.2-beta.8（Q4）：pin 机制随零生产方入参摘除；「记录仍可按 ID 回读、
+    // 原文不被 TTL 删掉」的承诺由 readRecordById 直接验证。
     const loaded = await readRecordById(root, SESSION_ID, ids[1])
     assert.equal(loaded.ok, true)
     assert.equal(loaded.verified, true)

@@ -487,11 +487,26 @@ export async function apply(ctx, config) {
     try {
       const card = await v2.workingSetInjection(agent)
       if (!card) return decision
-      // S3 prepare→确认→commit：pre-step 钩子返回的 decision 就是「宿主已接受
-      // 本次注入」的确认面——消息被宿主实际携带进这一步，等价于已经持久化到
-      // 会话批次。只有走到这里才 confirm；早退路径（skip / aborted / 抛错）
-      // 不会到这里，prepared 载荷自然留在未确认账上（prepared−committed 残差）。
-      v2.confirmInjection(sessionIdOf(agent.session), card.preparedId)
+      // beta.8（Q3-A 一进一出·双槽）：replace 模式优先直连提交（decision.messages
+      // 通道不携带 surfaceOp）。S3 确认面不变——仍是「已落面」之后才 confirm；
+      // replace 路径的落面 = session.append 成功，append 路径 = 宿主接受 decision。
+      let replaced = false
+      let details = {}
+      if (card.mode === 'replace') {
+        const submitted = v2.submitCardReplace(agent, card)
+        if (submitted.ok) {
+          replaced = true
+          details = { anchorSeq: submitted.anchorSeq, receiptOk: submitted.receiptOk }
+        } else {
+          // 宿主拒绝替换（区间已变 / 校验失败）：降级为 append——宁可多付一次净增，
+          // 也不丢卡；fallback 计数让「一进一出失效」可观测。
+          details = { fallback: true }
+        }
+      }
+      // S3 prepare→确认→commit：只有走到这里才 confirm；早退路径（skip / aborted /
+      // 抛错）不会到这里，prepared 载荷自然留在未确认账上（prepared−committed 残差）。
+      v2.confirmInjection(sessionIdOf(agent.session), card.preparedId, details)
+      if (replaced) return decision
       const content = escapePromptBraces(card.text)
       return {
         ...decision,

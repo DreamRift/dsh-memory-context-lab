@@ -76,6 +76,25 @@ test('G1：0 字节账本追加时必须补 header（不是「有文件就有 he
   }
 })
 
+test('G1：空白账本（只有空白、没有任何有效内容）追加时同样必须补 header（trim 判据的定向还原点）', async () => {
+  const { dir, file, ledger } = await freshLedger()
+  try {
+    // beta.8 revert-probe：G1 场景的还原点把判据从 `text.trim().length === 0`
+    // 退回 `text.length === 0`——只有 0 字节用例时还原点不红（两判据对 0 字节同判）。
+    // 空白文件正是两判据唯一分歧的输入：length=2 但 trim 后为空，必须按空账本补 header。
+    await writeFile(file, ' \n', 'utf8')
+    await ledger.appendLines([{ id: 'a' }])
+    const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+    assert.notEqual((lines[0] ?? '').trim(), '', '首行不得是空白行：空白账本必须先补 header 再追加')
+    assert.deepEqual(JSON.parse(lines[0]), HEADER)
+    assert.deepEqual(JSON.parse(lines[1]), { id: 'a' })
+    const loaded = await ledger.load()
+    assert.equal(loaded.damaged, false, '补 header 后不得判 damaged')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('G1：末尾缺 LF 时追加必须补 LF（否则两条 JSON 拼成一行）', async () => {
   const { dir, file, ledger } = await freshLedger()
   try {

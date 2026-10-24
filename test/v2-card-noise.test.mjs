@@ -33,15 +33,16 @@ function cardOf(overrides = {}) {
 
 test('P1-6a 丢弃页脚只报「类别 × 段/行数」，不逐条列重要度打分算式', () => {
   // 预算压到极小 → 硬保护装不下软段，页脚必须给出丢弃报告。
+  // 0.13.2-beta.8（Q4）：nonEssentialHistory 入参摘除，软段夹具改用有生产方的 claims。
   const { card } = cardOf({
-    nonEssentialHistory: Array.from({ length: 4 }, (_, index) => ({
-      itemId: 'h' + index,
-      lines: ['历史片段 ' + index],
-      source: 'history',
+    claims: Array.from({ length: 4 }, (_, index) => ({
+      value: '历史片段 ' + index,
+      polarity: 'positive',
+      recordRef: 'r' + index,
     })),
   })
   const small = renderWorkingSetInjection(
-    buildWorkingState({ sessionId: 'noise-test', surfaceNodes: [], eventAt: () => null, nonEssentialHistory: [{ itemId: 'h', lines: ['x'], source: 'h' }] }),
+    buildWorkingState({ sessionId: 'noise-test', surfaceNodes: [], eventAt: () => null, claims: [{ value: 'x', polarity: 'positive', recordRef: 'r0' }] }),
     { budgetTokens: 200 },
   )
   const footer = small.text.split('\n').find((line) => line.startsWith('因预算丢弃')) ?? ''
@@ -54,12 +55,13 @@ test('P1-6a 丢弃页脚只报「类别 × 段/行数」，不逐条列重要度
 
 test('P1-6b 软段头不再逐条重复整条类目次序（只在全量卡里保留一句）', () => {
   const { card } = cardOf({
-    nonEssentialHistory: [{ itemId: 'h1', lines: ['历史片段'], source: 'history' }],
+    claims: [{ value: '历史片段', polarity: 'positive', recordRef: 'r0' }],
   })
   const header = card.text.split('\n').find((line) => line.startsWith('■ 软保留'))
   assert.ok(header, '必须有软段头：' + card.text)
-  assert.equal(header.includes('可选预取 → 冗余卡片 → 非必要历史'), false, '类目次序不再逐条写进每张卡')
-  assert.match(header, /低分先丢/)
+  assert.equal(header.includes('低分先丢'), true, '软段头保留装包口径一句')
+  // 段头指「■ 软保留（…）」这一行；各软段标题（■ 软保留·…）不算重复段头。
+  assert.equal((card.text.match(/^■ 软保留（/gm) ?? []).length, 1, '软段头只出现一次')
 })
 
 test('P1-6c 增量卡有硬上限（行数 + 字节），超出只留「变化摘要 + 记录 ID」提示', () => {

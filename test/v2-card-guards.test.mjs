@@ -94,10 +94,12 @@ test('D-13：在途调用与有效约束超配额时保留最新的', () => {
   const card = renderWorkingSetInjection(state, { budgetTokens: 40000 })
   assert.match(card.text, new RegExp(callIds[callIds.length - 1]), '最新的在途调用必须在卡里（它是「我在等哪个结果」）')
 
-  const constraints = Array.from({ length: 8 }, (_, i) => ({ text: '约束 ' + i, sourceRef: 'c' + i }))
-  const constrained = stateOf({ constraints, limits: { maxConstraints: 6 } })
-  const constraintCard = renderWorkingSetInjection(constrained, { budgetTokens: 40000 })
-  assert.match(constraintCard.text, /约束 7/, '最新的约束必须留下（take 留头部等于丢最新）')
+  // 0.13.2-beta.8（Q4）：约束入参摘除，D-13 的第二半改用有生产方的 claims
+  // （selectClaims 同为「保最新」口径）：8 条 positive、配额 6 → 最新一条必须留下。
+  const claims = Array.from({ length: 8 }, (_, i) => ({ value: '结论 ' + i, polarity: 'positive', recordRef: 'r' + i }))
+  const claimed = stateOf({ claims, limits: { maxAssistantClaims: 6 } })
+  const claimCard = renderWorkingSetInjection(claimed, { budgetTokens: 40000 })
+  assert.match(claimCard.text, /结论 7/, '最新的结论必须留下（slice(0, n) 等于丢最新）')
 })
 
 test('D-19：浮点配额下页脚的「另有 N 条」必须是整数', () => {

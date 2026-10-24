@@ -52,6 +52,10 @@ const PLUGIN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
  */
 function stepFixture(step) {
   const base = 100 + step * 10
+  // callId 必须随步唯一（真实宿主的 callId 本来就唯一）：Y-32 后卡片不再印 seq:N，
+  // 跨步恒定的 callId 会让卡片逐字节相同，「每步哈希都变」的对照前提失效。
+  const closedId = `call_closed_step${step}`
+  const openId = `call_open_step${step}`
   const events = new Map()
   events.set(1, {
     type: 'user/message',
@@ -59,15 +63,15 @@ function stepFixture(step) {
   })
   events.set(base, {
     type: 'assistant/message',
-    data: { turn: 0, step: 0, message: { id: 'a1', content: [{ type: 'tool-call', id: 'call_closed', name: 'read' }] } },
+    data: { turn: 0, step: 0, message: { id: 'a1', content: [{ type: 'tool-call', id: closedId, name: 'read' }] } },
   })
   events.set(base + 1, {
     type: 'assistant/message',
-    data: { turn: 1, step: 1, message: { id: 'b1', content: [{ type: 'tool-call', id: 'call_open', name: 'grep' }] } },
+    data: { turn: 1, step: 1, message: { id: 'b1', content: [{ type: 'tool-call', id: openId, name: 'grep' }] } },
   })
   events.set(base + 2, {
     type: 'tool/result',
-    data: { message: { id: 'r1', toolCallId: 'call_closed', content: [{ type: 'text', text: `output ${'x'.repeat(160)}` }] } },
+    data: { message: { id: 'r1', toolCallId: closedId, content: [{ type: 'text', text: `output ${'x'.repeat(160)}` }] } },
   })
   return {
     surfaceNodes: [1, base, base + 1, base + 2],
@@ -84,7 +88,9 @@ function stateForStep(step, overrides = {}) {
     openCalls: [],
     lastAssistantSeq: null,
     now: NOW,
-    constraints: [{ text: '不要修改 runtime.mjs', sourceRef: 'seq:1' }],
+    // 软段夹具：进度行已随 Y-31 移交硬段（本夹具的结果未曝光），claims 是有生产方
+    // 的软内容来源；0.13.2-beta.8（Q4）起 constraints 入参已摘除。
+    claims: [{ value: '示例结论：状态卡按语义键去重', polarity: 'positive', recordRef: 'r0' }],
     ...overrides,
   })
 }
@@ -266,14 +272,12 @@ test('Case C：语义没变时去重键不变，逐字节硬前缀哈希可以�
   assert.equal(cardA.prefix.tokenEstimate, estimateTokensOf(hardPortion))
   assert.equal(cardA.prefix.dedupKey, workingSetDedupKeyOf(cardA.text), '键必须能从卡片文本按同一口径重算')
 
-  // 语义真变了 → 键必须变：多一条约束。
+  // 语义真变了 → 键必须变：硬前缀多一段「本步可回读」（readback 是硬段生产方；
+  // 0.13.2-beta.8（Q4）起 constraints 入参已摘除，改用有生产方的 readback）。
   const cardC = renderWorkingSetInjection(stateForStep(0, {
-    constraints: [
-      { text: '不要修改 runtime.mjs', sourceRef: 'seq:1' },
-      { text: '只写两个文件', sourceRef: 'seq:1' },
-    ],
+    readback: [{ recordId: 't00000001-r0999', tools: ['read'], range: { start: 1, end: 2 }, locator: '位置说明', tokens: 5 }],
   }), { budgetTokens: 4000 })
-  assert.notEqual(cardC.prefix.dedupKey, cardA.prefix.dedupKey, '保护集内容变了，去重键必须变')
+  assert.notEqual(cardC.prefix.dedupKey, cardA.prefix.dedupKey, '硬前缀内容变了，去重键必须变')
 
   // 语义真变了 → 键必须变：多一个未闭合配对（条数变化，不是 seq 号变化）。
   const cardD = renderWorkingSetInjection(stateForStep(0, {
@@ -377,7 +381,9 @@ test('P2-5(d)：进度保留最新若干条（旧条目先退役），并如实�
     sessionId: SESSION_ID,
     surfaceNodes: fixture.surfaceNodes,
     eventAt: fixture.eventAt,
-    lastAssistantSeq: null,
+    // Y-31（beta.8）后未曝光结果不进进度：把判定阈值抬到最后一条结果之后，
+    // 全部结果视为已曝光（本测试主题是「配额取舍方向」，不被曝光口径干扰）。
+    lastAssistantSeq: fixture.callSeqs.at(-1) + 1,
     now: NOW,
   })
   const cap = WORKING_SET_DEFAULTS.maxProgressItems
@@ -390,42 +396,22 @@ test('P2-5(d)：进度保留最新若干条（旧条目先退役），并如实�
   assert.ok(!state.progress.some((item) => item.itemId === oldestRef), '最早的进度应当先退役')
 
   const card = renderWorkingSetInjection(state, { budgetTokens: 20_000 })
-  assert.ok(card.text.includes(`进度 ${newestRef} 工具`), '卡片必须展示最新进度')
-  assert.ok(!card.text.includes(`进度 ${oldestRef} 工具`), '卡片不该还停在最早的进度上')
+  // Y-32 后进度行不印 itemId 本体，印可执行句柄：本测试无 recordIdsForSeq 映射，
+  // 句柄回落 callId 形态——最新一条 = call_{count-1}，最旧 = call_0。
+  const newestCallId = `call_${count - 1}`
+  const oldestCallId = 'call_0'
+  assert.ok(card.text.includes(`record_ids=["${newestCallId}"]`), '卡片必须展示最新进度（可执行句柄）')
+  assert.ok(!card.text.includes(`record_ids=["${oldestCallId}"]`), '卡片不该还停在最早的进度上')
   assert.ok(card.text.includes(`另有 ${count - cap} 条进度未展开`), '被丢掉的条数必须如实报告')
 
   console.log(`[P2-5(d)] 进度共 ${state.progressCount} 条，卡片保留最新 ${state.progress.length} 条`
     + `（${state.progress[0].itemId} … ${state.progress.at(-1).itemId}），如实报未展开 ${count - cap} 条`)
 })
 
-test('P2-5(e)：wholeTaskPinned 由实际进入保护集的 pin 算出，整任务 pin 请求被拒绝且计数', () => {
-  const plain = stateForStep(0)
-  assert.equal(plain.minimalWorkingState.wholeTaskPinned, false)
-  assert.equal(plain.protectionInvariants.wholeTaskNeverPinned, true)
-  const minimalItem = plain.protectedSet.find((item) => item.protectionClass === 'minimal-working-state')
-  assert.match(minimalItem.lines.join('\n'), /wholeTaskPinned=false/)
-  assert.match(minimalItem.lines.join('\n'), /依据 0\/0 条有效 pin 带整任务范围/)
-
-  // 请求整任务 pin：evaluatePin 判 invalid → 不进保护集，但必须被计数、进未知清单。
-  const wholeTaskPin = { recordRef: 'task:all', scope: 'whole-task', expiresAtMs: NOW + 10_000, reviewCondition: 'never' }
-  const withAttempt = stateForStep(0, { pins: [wholeTaskPin] })
-  assert.equal(withAttempt.minimalWorkingState.wholeTaskPinned, false)
-  assert.equal(withAttempt.minimalWorkingState.wholeTaskPinRejected, 1)
-  assert.ok(withAttempt.unknowns.some((item) => /整条长任务/.test(item.reason)), '被拒的整任务 pin 必须进未知清单')
-  const card = renderWorkingSetInjection(withAttempt, { budgetTokens: 8000 })
-  assert.match(card.text, /wholeTaskPinned=false/)
-  assert.match(card.text, /1 条整任务 pin 请求被拒绝/)
-
-  // 值确实是**算出来**的（不是写死常量）：来源里必须是「从保护集过滤 + 判空」这一步。
-  const source = readFileSync(path.join(PLUGIN_DIR, 'src', 'v2', 'working-state.mjs'), 'utf8')
-  assert.match(source, /const wholeTaskPinItems = protectedSet\.filter\(/, 'wholeTaskPinned 必须从保护集推导')
-  assert.match(source, /const wholeTaskPinned = wholeTaskPinItems\.length > 0/)
-  assert.ok(!source.includes('wholeTaskPinned: false'), '不得再写死 wholeTaskPinned=false')
-
-  console.log('[P2-5(e)] wholeTaskPinned 由 protectedSet 中 scope=whole-task 的有效 pin 条数算出：'
-    + `无请求=${plain.minimalWorkingState.wholeTaskPinned}，有 1 条整任务请求=${withAttempt.minimalWorkingState.wholeTaskPinned}`
-    + `（被拒 ${withAttempt.minimalWorkingState.wholeTaskPinRejected} 条）`)
-})
+// 0.13.2-beta.8（Q4）：P2-5(e)（wholeTaskPinned 由保护集推导、整任务 pin 计数）随
+// pin 类目整段摘除——「测死代码的用例」不再保留；「不许整体 pin」的边界改由
+// test/v2-workingset-wiring.test.mjs 的「类目必须有生产方」守卫承接（pin 无数据源，
+// whole-task pin 结构上不可能出现）。
 
 /**
  * 验收标准 ③ 定点验证：把用户原始要求落成可判定夹具。
@@ -552,7 +538,9 @@ test('F2 复现 ①：共享 seq 的并行调用（含 text 块）各自行必�
     surfaceNodes,
     eventAt: (seq) => events.get(seq) ?? null,
     openCalls: [],
-    lastAssistantSeq: null,
+    // Y-31（beta.8）：结果在最后助手之后属未曝光、不进进度行；本测试主题是
+    // refOf 的精确对位，把阈值抬到结果之后使进度行存在。
+    lastAssistantSeq: 99,
     now: NOW,
     recordIdsForSeq: (seq) => bySeq.get(seq) ?? [],
     recordIdsForCallId: (callId) => byCallId.get(callId) ?? null,
@@ -604,7 +592,7 @@ test('F2 复现 ②：并行在途调用（共享 seq、无结果）不得都指
     surfaceNodes: [1, 5],
     eventAt: (seq) => events.get(seq) ?? null,
     openCalls: [],
-    lastAssistantSeq: null,
+    lastAssistantSeq: 99,
     now: NOW,
     recordIdsForSeq: (seq) => bySeq.get(seq) ?? [],
     recordIdsForCallId: (callId) => byCallId.get(callId) ?? null,
@@ -626,7 +614,7 @@ test('F2 兜底：没有 callId 精确映射时，共享 seq 的并行调用退�
     surfaceNodes,
     eventAt: (seq) => events.get(seq) ?? null,
     openCalls: [],
-    lastAssistantSeq: null,
+    lastAssistantSeq: 99,
     now: NOW,
     recordIdsForSeq: () => [],
   })
@@ -651,7 +639,7 @@ test('F2 失败关闭：只有 seq 倒排（多记录）、无 callId 映射时�
     surfaceNodes,
     eventAt: (seq) => events.get(seq) ?? null,
     openCalls: [],
-    lastAssistantSeq: null,
+    lastAssistantSeq: 99,
     now: NOW,
     recordIdsForSeq: (seq) => bySeq.get(seq) ?? [],
   })
@@ -672,7 +660,7 @@ test('F2 失败关闭：只有 seq 倒排（多记录）、无 callId 映射时�
         ? { type: 'assistant/message', data: { turn: 1, step: 1, message: { id: 'a8', content: [{ type: 'tool-call', id: 'call_only', name: 'read' }] } } }
         : { type: 'tool/result', data: { message: { id: 'r9', toolCallId: 'call_only', content: [{ type: 'text', text: `single ${'x'.repeat(100)}` }] } } }),
     openCalls: [],
-    lastAssistantSeq: null,
+    lastAssistantSeq: 99,
     now: NOW,
     recordIdsForSeq: (seq) => (seq === 8 ? ['t00000001-r0009'] : []),
   })
@@ -685,9 +673,11 @@ test('F2 失败关闭：只有 seq 倒排（多记录）、无 callId 映射时�
 // D1 升级（c896f803 循环根因 #1）：增量注入
 // ---------------------------------------------------------------------------
 
-test('语义版本升级到 v4：F1 软保留按重要度分值装包，键里编 v4', () => {
-  assert.equal(CARD_SEMANTIC_VERSION, 4, 'F1 改变软段结构与次序（每项一段、按分值降序装包），是渲染语义变化，必须 +1 让旧键全部失效')
-  assert.match(workingSetDedupKeyOf('任意文本'), /^ws-card:v4:/, '键前缀必须携带 v4')
+test('语义版本升级到 v5：Q4 摘类目 + Y-31/Y-32 渲染口径变化，键里编 v5', () => {
+  // v4 是 F1（软保留按重要度装包）；v5 是 0.13.2-beta.8（Q4 类目封闭集收缩 +
+  // Y-31 进度行判重 + Y-32 可执行句柄）——渲染语义整体变化，旧键必须全部失效。
+  assert.equal(CARD_SEMANTIC_VERSION, 5)
+  assert.match(workingSetDedupKeyOf('任意文本'), /^ws-card:v5:/, '键前缀必须携带 v5')
 })
 
 test('形态裁决：首张全量、每 N 张再锚定、重启回落全量', () => {

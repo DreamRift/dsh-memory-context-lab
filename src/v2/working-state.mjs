@@ -12,15 +12,18 @@
  *
  * 三条不可越过的边界（本模块把它们编码成数据，而不只是注释）：
  *
- * 1. **硬保护 vs 软保留**：`PROTECTION_CLASSES` 里的七类内容（当前人类请求与
- *    有效约束、未闭合调用、未曝光结果、在途作业与未确认副作用、当前必要证据、
- *    有效 pin、最小工作状态）加上「未知」这一协议位，是**硬保护**：任何预算下
- *    都不从保护集里丢弃，只如实报溢出。可丢的只有软保留（可选预取、冗余卡片、
- *    非必要历史、stale/未验证证据、过期 pin、已否决选项、未决问题）。
+ * 1. **硬保护 vs 软保留**：`PROTECTION_CLASSES` 里的四类内容（当前人类请求、
+ *    未闭合调用、未曝光结果、最小工作状态）加上「未知」这一协议位，是**硬保护**：
+ *    任何预算下都不从保护集里丢弃，只如实报溢出。可丢的只有软保留
+ *    （非必要历史、未验证证据）。
+ *
+ *    0.13.2-beta.8（Q4）：在途作业 / 必要证据 / 有效 pin 三个硬类目与可选预取、
+ *    冗余卡片、stale 证据、过期 pin、已否决选项、未决问题六个软类目**整体摘除**——
+ *    它们的入参在 src 内从未有过调用方（恒空，见修复计划-beta.8 §〇）。
+ *    口径：**类目必须先有生产方才能进渲染集**；接线属产品需求，回归时随数据源
+ *    一起重建，并由 `test/v2-workingset-wiring.test.mjs` 的结构性守卫把关。
  * 2. **硬保护不用朴素 TTL 驱逐**：`TTL_FREE_HARD_CLASSES` 列出的硬类目不携带
- *    任何 TTL；唯一带显式过期的是 pin，而 pin 的过期**本身就是它的保护契约**
- *    （必须同时给出失效时间与复核条件），过期只是转成「需复核」，不静默消失。
- *    软保留（如重读产生的临时 pin、进度）才允许按 recency/TTL 处理。
+ *    任何 TTL。软保留（如进度）才允许按 recency/TTL 处理。
  * 3. **来源不可提升**：摘要不是原文、模型推断不是授权、状态卡不是系统消息。
  *    `resolveAuthority` 只回显来源本身，声称自己是 system/developer/user 一律拒绝。
  *
@@ -31,9 +34,8 @@ import { createHash } from 'node:crypto'
 import { isHumanAuthoredMessage } from '../core.mjs'
 import { estimateTokensOf } from './budget.mjs'
 import { formatImportanceReason, scoreSoftRetention } from './importance.mjs'
-import { InvalidArgumentError } from '../errors.mjs'
 
-export const WORKING_STATE_SCHEMA_VERSION = 3
+export const WORKING_STATE_SCHEMA_VERSION = 4
 
 /**
  * 卡片语义版本。
@@ -49,8 +51,13 @@ export const WORKING_STATE_SCHEMA_VERSION = 3
  *
  * v4（2026-10-15，F1）：软保留按灵枢重要度分值装包（每项一段，分值降序、
  * 低分先丢；丢弃报告带分量）。软段的次序与结构语义变化，旧键全部失效。
+ *
+ * v5（2026-10-24，beta.8）：Q4 摘除零生产方类目（保护集八类→五类、软保留八类→
+ * 两类、「保守规则」与「整条长任务 pin」常量行不再渲染）；Y-31 软段进度行只留
+ * 硬段未覆盖的完成态；Y-32 句柄统一为 memory_lab_recall 可执行形态、seq:N 不再
+ * 印出。渲染口径整体变化，旧键必须全部失效。
  */
-export const CARD_SEMANTIC_VERSION = 4
+export const CARD_SEMANTIC_VERSION = 5
 
 /** 每个会话最多记住多少个已注入的语义键：有界集合，防会话内无限增长。 */
 export const WORKING_SET_DEDUP_HISTORY_LIMIT = 32
@@ -61,39 +68,29 @@ export const WORKING_SET_DEFAULTS = Object.freeze({
   maxOpenActions: 8,
   maxUnseenResults: 6,
   maxProgressItems: 12,
-  maxConstraints: 6,
   /** 单条摘录的字符上限：够模型定位，又不把原文搬回来。 */
   excerptChars: 240,
-  // --- 以下为活跃工作集新增上限；都有默认值，老调用方不传也成立。---
   maxUnknowns: 6,
-  maxEvidence: 8,
-  maxPins: 8,
-  maxInflightJobs: 6,
   /** 最小依赖集上限：绝不因为「任务很长」就整体 pin。 */
   maxMinimalDependencies: 8,
-  maxPrefetch: 6,
-  maxRedundantCards: 6,
   maxNonEssentialHistory: 6,
-  maxRejectedOptions: 6,
-  maxOpenQuestions: 6,
   /** S1：助手结论（claim）盘点配额——全局有界，不是每单元无限兜底（方案 §7）。 */
   maxAssistantClaims: 8,
-  /** 最近重读证据的临时 pin 默认有效期（软保留口径，不是硬保护的驱逐手段）。 */
-  pinTtlMs: 30 * 60 * 1000,
+  // 0.13.2-beta.8（Q4）：maxConstraints / maxEvidence / maxPins / maxInflightJobs /
+  // maxPrefetch / maxRedundantCards / maxRejectedOptions / maxOpenQuestions /
+  // pinTtlMs 九个键随零生产方类目一起摘除——配额键只允许跟随「有生产方的类目」
+  // 存在，否则就是渲染不出任何东西的死配置（wiring 守卫把关）。
 })
 
 // ---------------------------------------------------------------------------
 // 保护集：类目、硬/软、释放或复核条件
 // ---------------------------------------------------------------------------
 
-/** 保护类目（封闭集）。 */
+/** 保护类目（封闭集）。0.13.2-beta.8（Q4）：摘除 in-flight-job / necessary-evidence / valid-pin（零生产方）。 */
 export const PROTECTION_CLASSES = Object.freeze({
   HUMAN_REQUEST: 'human-request',
   UNCLOSED_CALL: 'unclosed-call',
   UNEXPOSED_RESULT: 'unexposed-result',
-  INFLIGHT_JOB: 'inflight-job',
-  NECESSARY_EVIDENCE: 'necessary-evidence',
-  VALID_PIN: 'valid-pin',
   MINIMAL_WORKING_STATE: 'minimal-working-state',
   UNKNOWN_PROTOCOL: 'unknown-protocol',
 })
@@ -120,21 +117,6 @@ export const PROTECTION_RULES = Object.freeze({
     reason: '结果已落库但还没进入主模型活动面；丢掉等于替主模型扔掉它尚未收到的证据。',
     releaseCondition: '只在该结果的 seq 进入主模型活动面（后续回合已曝光）后释放。',
   }),
-  [PROTECTION_CLASSES.INFLIGHT_JOB]: Object.freeze({
-    strength: PROTECTION_STRENGTH.HARD,
-    reason: '在途作业与未确认副作用的状态未知；丢掉会让「可能已经发生的写操作」变成无人认领的事实。',
-    releaseCondition: '只在作业到达终态、且副作用被显式确认或显式否认后释放。',
-  }),
-  [PROTECTION_CLASSES.NECESSARY_EVIDENCE]: Object.freeze({
-    strength: PROTECTION_STRENGTH.HARD,
-    reason: '当前决策直接依赖的证据；丢掉会让后续步骤建立在猜测上。',
-    releaseCondition: '只在依赖它的未决问题/在途动作结束后、或出现同指纹的更新证据时释放。',
-  }),
-  [PROTECTION_CLASSES.VALID_PIN]: Object.freeze({
-    strength: PROTECTION_STRENGTH.HARD,
-    reason: '带明确失效时间与复核条件的 pin；在有效期内是硬保护，避免刚重读的证据立刻又掉出。',
-    releaseCondition: '到达 pin 自带的过期时间，或满足它自带的复核条件时转为「需复核」；不因预算释放。',
-  }),
   [PROTECTION_CLASSES.MINIMAL_WORKING_STATE]: Object.freeze({
     strength: PROTECTION_STRENGTH.HARD,
     reason: '当前最小依赖集：让工作可以继续所需的最小对象集合，不是整条长任务。',
@@ -151,15 +133,11 @@ export const PROTECTION_RULES = Object.freeze({
  * 不允许携带 TTL 的硬保护类目。
  *
  * 硬保护只能按各自的结构性释放条件退出，不能因为「放了很久」被驱逐。
- * pin 不在这个列表里：pin 的显式过期是它自己的保护契约（见 evaluatePin），
- * 过期后转「需复核」而不是静默消失。
  */
 export const TTL_FREE_HARD_CLASSES = Object.freeze([
   PROTECTION_CLASSES.HUMAN_REQUEST,
   PROTECTION_CLASSES.UNCLOSED_CALL,
   PROTECTION_CLASSES.UNEXPOSED_RESULT,
-  PROTECTION_CLASSES.INFLIGHT_JOB,
-  PROTECTION_CLASSES.NECESSARY_EVIDENCE,
   PROTECTION_CLASSES.MINIMAL_WORKING_STATE,
   PROTECTION_CLASSES.UNKNOWN_PROTOCOL,
 ])
@@ -169,9 +147,6 @@ export const PROTECTION_ORDER = Object.freeze([
   PROTECTION_CLASSES.HUMAN_REQUEST,
   PROTECTION_CLASSES.UNCLOSED_CALL,
   PROTECTION_CLASSES.UNEXPOSED_RESULT,
-  PROTECTION_CLASSES.INFLIGHT_JOB,
-  PROTECTION_CLASSES.NECESSARY_EVIDENCE,
-  PROTECTION_CLASSES.VALID_PIN,
   PROTECTION_CLASSES.MINIMAL_WORKING_STATE,
   PROTECTION_CLASSES.UNKNOWN_PROTOCOL,
 ])
@@ -180,9 +155,6 @@ const PROTECTION_TITLES = Object.freeze({
   [PROTECTION_CLASSES.HUMAN_REQUEST]: '保护集·当前人类请求与仍然有效的约束',
   [PROTECTION_CLASSES.UNCLOSED_CALL]: '保护集·在途动作与未闭合配对',
   [PROTECTION_CLASSES.UNEXPOSED_RESULT]: '保护集·尚未被主模型看到的结果',
-  [PROTECTION_CLASSES.INFLIGHT_JOB]: '保护集·在途作业与未确认副作用',
-  [PROTECTION_CLASSES.NECESSARY_EVIDENCE]: '保护集·当前必要证据',
-  [PROTECTION_CLASSES.VALID_PIN]: '保护集·有效 pin（临时硬保护）',
   [PROTECTION_CLASSES.MINIMAL_WORKING_STATE]: '保护集·最小工作状态',
   [PROTECTION_CLASSES.UNKNOWN_PROTOCOL]: '保护集·未知与保守回退规则',
 })
@@ -203,78 +175,37 @@ const ALWAYS_RENDERED_PROTECTION = Object.freeze([
 // ---------------------------------------------------------------------------
 
 export const RETENTION_CLASSES = Object.freeze({
-  OPTIONAL_PREFETCH: 'optional-prefetch',
-  REDUNDANT_CARD: 'redundant-card',
   NON_ESSENTIAL_HISTORY: 'non-essential-history',
-  STALE_EVIDENCE: 'stale-evidence',
   UNVERIFIED_EVIDENCE: 'unverified-evidence',
-  EXPIRED_PIN: 'expired-pin',
-  REJECTED_OPTION: 'rejected-option',
-  OPEN_QUESTION: 'open-question',
 })
 
 export const RETENTION_RULES = Object.freeze({
-  [RETENTION_CLASSES.OPTIONAL_PREFETCH]: Object.freeze({
-    reason: '可选预取：可能有用，但当前没有任何动作依赖它。',
-    releaseCondition: '随时可丢；需要时按记录 ID 重新取回。',
-  }),
-  [RETENTION_CLASSES.REDUNDANT_CARD]: Object.freeze({
-    reason: '冗余卡片：同一事实的旧版本卡片，已被更新版本取代。',
-    releaseCondition: '被取代即可丢；回读仍可达。',
-  }),
   [RETENTION_CLASSES.NON_ESSENTIAL_HISTORY]: Object.freeze({
     reason: '非必要历史：已完成探索分支的进度、不再被依赖的旧内容。',
     releaseCondition: '分支结束即可丢；出处仍可按记录 ID 回读。',
   }),
-  [RETENTION_CLASSES.STALE_EVIDENCE]: Object.freeze({
-    reason: '版本/环境/测试指纹与当前不一致：旧结论不能作为新版本的证据。',
-    releaseCondition: '在对应版本上重新取证后释放；丢弃前必须显式标注 stale。',
-  }),
   [RETENTION_CLASSES.UNVERIFIED_EVIDENCE]: Object.freeze({
     reason: '未绑定版本/环境/测试指纹：既不能当作有效证据，也不能当作已否证。',
     releaseCondition: '补上指纹并复核后释放。',
-  }),
-  [RETENTION_CLASSES.EXPIRED_PIN]: Object.freeze({
-    reason: 'pin 已过期，或缺少明确的失效时间/复核条件。',
-    releaseCondition: '复核后重新 pin，或确认不再需要。',
-  }),
-  [RETENTION_CLASSES.REJECTED_OPTION]: Object.freeze({
-    reason: '已否决/负向选项：避免重复走死路，尽量保留到预算真的不够。',
-    releaseCondition: '预算不足时最后才丢；丢弃后仍可按记录 ID 回读。',
-  }),
-  [RETENTION_CLASSES.OPEN_QUESTION]: Object.freeze({
-    reason: '未决问题：工作未完成的标记，尽量保留到预算真的不够。',
-    releaseCondition: '问题被回答或显式作废后释放。',
   }),
 })
 
 /**
  * 丢弃顺序（从最先丢到最后丢）。
  *
- * 与规范一致：先丢可选预取、冗余卡片、非必要历史（含已完成探索分支），
- * 再丢 stale/未验证证据与过期 pin，最后才动已否决选项与未决问题。
+ * 与规范一致：先丢非必要历史（含已完成探索分支的进度），再丢未验证证据。
  * 协议项、关键约束、在途状态**不在这个列表里**——它们属于硬保护，永不丢弃。
+ * 0.13.2-beta.8（Q4）：可选预取 / 冗余卡片 / stale 证据 / 过期 pin / 已否决选项 /
+ * 未决问题六类随零生产方入参摘除（DROP_ORDER 与类目表同源收缩）。
  */
 export const DROP_ORDER = Object.freeze([
-  RETENTION_CLASSES.OPTIONAL_PREFETCH,
-  RETENTION_CLASSES.REDUNDANT_CARD,
   RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
-  RETENTION_CLASSES.STALE_EVIDENCE,
   RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
-  RETENTION_CLASSES.EXPIRED_PIN,
-  RETENTION_CLASSES.REJECTED_OPTION,
-  RETENTION_CLASSES.OPEN_QUESTION,
 ])
 
 const RETENTION_TITLES = Object.freeze({
-  [RETENTION_CLASSES.OPTIONAL_PREFETCH]: '软保留·可选预取（最先丢弃）',
-  [RETENTION_CLASSES.REDUNDANT_CARD]: '软保留·冗余卡片（可丢弃）',
   [RETENTION_CLASSES.NON_ESSENTIAL_HISTORY]: '软保留·非必要历史（可丢弃）',
-  [RETENTION_CLASSES.STALE_EVIDENCE]: '软保留·版本不匹配证据（stale，不得当作有效证据）',
   [RETENTION_CLASSES.UNVERIFIED_EVIDENCE]: '软保留·未绑定指纹证据（unverified）',
-  [RETENTION_CLASSES.EXPIRED_PIN]: '软保留·过期 pin（需复核）',
-  [RETENTION_CLASSES.REJECTED_OPTION]: '软保留·已否决/负向选项（尽量保留）',
-  [RETENTION_CLASSES.OPEN_QUESTION]: '软保留·未决问题（尽量保留）',
 })
 
 // ---------------------------------------------------------------------------
@@ -340,365 +271,6 @@ export function resolveAuthority({ sourceKind, claimedAuthority = null } = {}) {
     channel: canBeSystemMessage ? 'system' : 'working-material',
     reasons,
     invariants: AUTHORITY_INVARIANTS,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 证据：版本/环境/测试指纹
-// ---------------------------------------------------------------------------
-
-export const EVIDENCE_STATUS = Object.freeze({
-  VALID: 'valid',
-  STALE: 'stale',
-  UNVERIFIED: 'unverified',
-})
-
-export const FINGERPRINT_VERDICTS = Object.freeze({
-  MATCH: 'match',
-  MISMATCH: 'mismatch',
-  UNKNOWN: 'unknown',
-})
-
-/**
- * 构造版本/环境/测试指纹。
- *
- * 三样东西都要能被绑上：目标（文件/模块）、版本（内容哈希/版本号）、
- * 执行环境（运行时/平台/配置），以及测试证据（哪次运行、什么结果）。
- * 一样都没有时返回 null——「没有指纹」不等于「指纹相同」。
- */
-export function fingerprintOf({ target = null, version = null, environment = null, testEvidence = null } = {}) {
-  const parts = []
-  if (target !== null && target !== undefined && String(target).trim() !== '') parts.push(`target=${String(target).trim()}`)
-  if (version !== null && version !== undefined && String(version).trim() !== '') parts.push(`version=${String(version).trim()}`)
-  if (environment !== null && environment !== undefined && String(environment).trim() !== '') parts.push(`env=${String(environment).trim()}`)
-  if (testEvidence !== null && testEvidence !== undefined && String(testEvidence).trim() !== '') parts.push(`test=${String(testEvidence).trim()}`)
-  return parts.length > 0 ? parts.join('|') : null
-}
-
-function normalizeFingerprint(value) {
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    return trimmed === '' ? null : trimmed
-  }
-  if (value && typeof value === 'object') return fingerprintOf(value)
-  return null
-}
-
-/**
- * 比较指纹。只有两侧都存在且逐字符相等才算 match；
- * 任一侧缺失一律 unknown——绝不用「没记录」推断「没变化」。
- */
-export function compareFingerprints(recorded, current) {
-  const left = normalizeFingerprint(recorded)
-  const right = normalizeFingerprint(current)
-  if (left === null || right === null) return FINGERPRINT_VERDICTS.UNKNOWN
-  return left === right ? FINGERPRINT_VERDICTS.MATCH : FINGERPRINT_VERDICTS.MISMATCH
-}
-
-/**
- * 把一条证据绑定到当前版本/环境/测试指纹上。
- *
- * 结论只有三种，且**不可能**从 stale/unverified 升格成 valid：
- * - match → valid；
- * - mismatch → stale（旧通过结果不能当作新版本的证据）；
- * - 任一侧缺指纹 → unverified。
- */
-export function bindEvidence(item, { now = Date.now() } = {}) {
-  const source = item && typeof item === 'object' ? item : {}
-  const recordRef = String(source.recordRef ?? source.id ?? '')
-  const sourceKind = String(source.sourceKind ?? SOURCE_KINDS.TOOL_RESULT)
-  const authority = resolveAuthority({ sourceKind, claimedAuthority: source.claimedAuthority ?? null })
-  const recorded = normalizeFingerprint(source.fingerprint)
-  const current = normalizeFingerprint(source.currentFingerprint ?? source.current)
-  const verdict = compareFingerprints(recorded, current)
-  const status = verdict === FINGERPRINT_VERDICTS.MATCH
-    ? EVIDENCE_STATUS.VALID
-    : verdict === FINGERPRINT_VERDICTS.MISMATCH
-      ? EVIDENCE_STATUS.STALE
-      : EVIDENCE_STATUS.UNVERIFIED
-  const statusReason = status === EVIDENCE_STATUS.VALID
-    ? '记录指纹与当前指纹一致。'
-    : status === EVIDENCE_STATUS.STALE
-      ? `记录指纹 ${recorded} 与当前指纹 ${current} 不一致：旧结论（例如曾经通过的测试）不能作为当前版本的证据。`
-      : '缺少可比的版本/环境/测试指纹（记录侧或当前侧为空）：既不能当作有效证据，也不能当作已否证。'
-  const necessary = source.necessary === true
-  return {
-    itemId: `evidence:${recordRef}`,
-    recordRef,
-    callId: source.callId ?? null,
-    kind: source.kind ?? null,
-    sourceKind: authority.sourceKind,
-    authority,
-    fingerprint: recorded,
-    currentFingerprint: current,
-    fingerprintVerdict: verdict,
-    status,
-    statusReason,
-    necessary,
-    provenance: source.provenance ?? { sourceRef: recordRef, sourceKind: authority.sourceKind },
-    reason: source.reason ?? (necessary
-      ? '当前决策依赖这条证据。'
-      : '曾经取回的观察结果。'),
-    source: source.source ?? `evidence:${authority.sourceKind}`,
-    releaseCondition: source.releaseCondition
-      ?? PROTECTION_RULES[PROTECTION_CLASSES.NECESSARY_EVIDENCE].releaseCondition,
-    boundAt: new Date(Number.isFinite(Number(now)) ? Number(now) : Date.now()).toISOString(),
-  }
-}
-
-// ---------------------------------------------------------------------------
-// pin：显式过期 + 复核条件
-// ---------------------------------------------------------------------------
-
-export const PIN_STATUS = Object.freeze({
-  VALID: 'valid',
-  EXPIRED: 'expired',
-  INVALID: 'invalid',
-})
-
-/**
- * 数值归一化：null/undefined/非有限值一律回 null。
- * 注意 `Number(null) === 0`：不加这层判断会把「没给过期时间」当成「1970 年就过期」。
- */
-function toFiniteOrNull(value) {
-  if (value === undefined || value === null) return null
-  const num = Number(value)
-  return Number.isFinite(num) ? num : null
-}
-
-/**
- * 造一个 pin。**必须**同时给出失效时间与复核条件，否则它不会被当作硬保护。
- *
- * `trigger: 'readback'` 用于「最近重读的证据」：拿到临时 pin，不至于刚回到
- * 工作集就立刻又掉出去；到期后转「需复核」，而不是静默消失（规范 §5）。
- */
-export function pinEvidence({
-  recordRef,
-  reason = null,
-  source = null,
-  reviewCondition = null,
-  ttlMs = null,
-  expiresAt = null,
-  pinnedAt = null,
-  scope = 'item',
-  trigger = 'manual',
-  now = Date.now(),
-} = {}) {
-  const clock = Number.isFinite(Number(now)) ? Number(now) : Date.now()
-  const at = toFiniteOrNull(pinnedAt) ?? clock
-  const ttl = toFiniteOrNull(ttlMs)
-  const explicitExpiry = toFiniteOrNull(expiresAt)
-  const expiry = explicitExpiry ?? (ttl !== null ? at + ttl : null)
-  return {
-    itemId: `pin:${String(recordRef ?? '')}`,
-    recordRef: String(recordRef ?? ''),
-    scope,
-    trigger,
-    pinnedAt: new Date(at).toISOString(),
-    expiresAt: expiry === null ? null : new Date(expiry).toISOString(),
-    expiresAtMs: expiry,
-    reviewCondition: reviewCondition
-      ?? (trigger === 'readback'
-        ? '重读产生的临时 pin：到期即转「需复核」；再次引用该证据、或其目标版本/环境指纹发生变化时立即复核。'
-        : null),
-    reason: reason ?? (trigger === 'readback' ? '最近重读的证据需要临时留在工作集里。' : '调用方要求保护该对象。'),
-    source: source ?? (trigger === 'readback' ? 'readback' : 'caller'),
-  }
-}
-
-/** 评估一个 pin：valid（硬保护）/ expired（需复核，转软保留）/ invalid（不构成保护）。 */
-export function evaluatePin(pin, { now = Date.now(), step = null } = {}) {
-  const source = pin && typeof pin === 'object' ? pin : {}
-  const clock = Number.isFinite(Number(now)) ? Number(now) : Date.now()
-  const recordRef = String(source.recordRef ?? '')
-  const base = {
-    itemId: source.itemId ?? `pin:${recordRef}`,
-    recordRef,
-    scope: source.scope ?? 'item',
-    trigger: source.trigger ?? 'manual',
-    reason: source.reason ?? '未说明',
-    source: source.source ?? 'unknown',
-    reviewCondition: source.reviewCondition ?? null,
-    expiresAt: source.expiresAt ?? null,
-    expiresAtMs: toFiniteOrNull(source.expiresAtMs),
-    step,
-  }
-  if (base.scope === 'whole-task') {
-    return {
-      ...base,
-      status: PIN_STATUS.INVALID,
-      reviewRequired: true,
-      remainingMs: null,
-      releaseCondition: '不允许把整条长任务整体 pin 住；请改为 pin 当前最小依赖集里的具体对象。',
-      invalidReason: '不允许把整条长任务整体 pin 住（规范 §5：只保护当前最小依赖集）。',
-    }
-  }
-  if (base.expiresAtMs === null) {
-    return {
-      ...base,
-      status: PIN_STATUS.INVALID,
-      reviewRequired: true,
-      remainingMs: null,
-      releaseCondition: '补上明确的失效时间与复核条件后重新 pin。',
-      invalidReason: 'pin 缺少明确的失效时间：硬保护不允许没有到期条件的 pin。',
-    }
-  }
-  if (typeof base.reviewCondition !== 'string' || base.reviewCondition.trim() === '') {
-    return {
-      ...base,
-      status: PIN_STATUS.INVALID,
-      reviewRequired: true,
-      remainingMs: base.expiresAtMs - clock,
-      releaseCondition: '补上明确的复核条件后重新 pin。',
-      invalidReason: 'pin 缺少明确的复核条件：过期后无法判断该不该续 pin。',
-    }
-  }
-  const remainingMs = base.expiresAtMs - clock
-  if (remainingMs <= 0) {
-    return {
-      ...base,
-      status: PIN_STATUS.EXPIRED,
-      reviewRequired: true,
-      remainingMs,
-      releaseCondition: `已过期：按复核条件复核（${base.reviewCondition}）；复核后可重新 pin，或确认不再需要。`,
-      invalidReason: null,
-    }
-  }
-  return {
-    ...base,
-    status: PIN_STATUS.VALID,
-    reviewRequired: false,
-    remainingMs,
-    releaseCondition: `到期时间 ${base.expiresAt}；到期或复核条件命中（${base.reviewCondition}）时转「需复核」。`,
-    invalidReason: null,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 关系：判定不了就是 unknown，回退到保守原文 + 显式规则
-// ---------------------------------------------------------------------------
-
-export const RELATION_KINDS = Object.freeze({
-  DEPENDS_ON: 'depends-on',
-  PRODUCED: 'produced',
-  SUPERSEDES: 'supersedes',
-  CONTRADICTS: 'contradicts',
-  UNKNOWN: 'unknown',
-})
-
-const RELATION_KIND_SET = new Set([
-  RELATION_KINDS.DEPENDS_ON,
-  RELATION_KINDS.PRODUCED,
-  RELATION_KINDS.SUPERSEDES,
-  RELATION_KINDS.CONTRADICTS,
-])
-
-/** 关系未知时的保守规则：这些是渲染进卡片的显式条文，不是隐式默认。 */
-export const UNKNOWN_RELATION_RULES = Object.freeze([
-  '关系未知时按原文并列呈现，不补写因果、依赖或取代边。',
-  '关系未知不得用于降温判定：不因「看起来无关」而把对象退役。',
-  '要确定关系必须回到结构化事实（调用/结果配对、投影跨度、显式声明），或由用户显式给出。',
-])
-
-/**
- * 判定两个对象之间的关系。
- *
- * 只有「已知关系种类 + 非空依据」才算判定成功；其余一律 unknown，
- * 并回退到保守原文与显式规则——绝不编造一条关系。
- */
-export function resolveRelation(input) {
-  const source = input && typeof input === 'object' ? input : {}
-  const { subjectRef = null, objectRef = null, relation = null, basis = null, evidenceRefs = [] } = source
-  const subject = subjectRef === null || subjectRef === undefined ? null : String(subjectRef)
-  const object = objectRef === null || objectRef === undefined ? null : String(objectRef)
-  const claimed = relation === null || relation === undefined ? null : String(relation).trim().toLowerCase()
-  const hasBasis = typeof basis === 'string' && basis.trim() !== ''
-  const known = claimed !== null && RELATION_KIND_SET.has(claimed)
-  if (known && hasBasis) {
-    return {
-      subjectRef: subject,
-      objectRef: object,
-      relation: claimed,
-      basis: basis.trim(),
-      evidenceRefs: [...evidenceRefs],
-      resolved: true,
-      fallback: null,
-      rules: [],
-      reason: '关系由结构化事实判定。',
-    }
-  }
-  const missing = []
-  if (!known) missing.push(claimed === null ? '未给出关系种类' : `关系种类不可信（${claimed}）`)
-  if (!hasBasis) missing.push('缺少结构化依据')
-  return {
-    subjectRef: subject,
-    objectRef: object,
-    relation: RELATION_KINDS.UNKNOWN,
-    basis: hasBasis ? basis.trim() : null,
-    evidenceRefs: [...evidenceRefs],
-    resolved: false,
-    fallback: 'verbatim-text',
-    rules: UNKNOWN_RELATION_RULES,
-    reason: `关系无法确定性判定（${missing.join('、')}）：按未知处理，保留原文并适用保守规则。`,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 投影：按批次追加，稳定前缀
-// ---------------------------------------------------------------------------
-
-/** 新建一个空投影（stage 序列 + 已渲染文本）。 */
-export function createProjection({ stageId = null, batchSize = 64, at = null } = {}) {
-  return {
-    schemaVersion: 1,
-    stages: [],
-    text: '',
-    chars: 0,
-    batchSize: Number.isFinite(Number(batchSize)) ? Math.max(1, Math.floor(Number(batchSize))) : 64,
-    rewroteEarlierStages: false,
-    updatedAt: at,
-    lastStageId: stageId,
-  }
-}
-
-function stageTextOf(stageId, lines) {
-  const head = `[投影批次 ${stageId}]`
-  if (!Array.isArray(lines) || lines.length === 0) return head
-  return [head, ...lines.map((line) => `- ${line}`)].join('\n')
-}
-
-/**
- * 追加一个投影批次。
- *
- * 只追加、不重写：新文本以旧文本为前缀（`startsWith` 恒真），
- * `rewroteEarlierStages` 恒为 false。这样历史前缀缓存不会被逐步更新打散。
- */
-export function appendProjectionStage(projection, { stageId, lines = [], reason = null, at = null } = {}) {
-  if (typeof stageId !== 'string' || stageId.trim() === '') {
-    throw new InvalidArgumentError('appendProjectionStage 需要非空 stageId')
-  }
-  const base = projection && typeof projection === 'object' && Array.isArray(projection.stages)
-    ? projection
-    : createProjection({})
-  const duplicateStageId = base.stages.some((stage) => stage.stageId === stageId)
-  const stageText = stageTextOf(stageId, lines)
-  const text = base.text === '' ? stageText : `${base.text}\n${stageText}`
-  const stages = [...base.stages, {
-    stageId,
-    lines: [...lines],
-    chars: stageText.length,
-    reason,
-    at,
-    duplicateStageId,
-  }]
-  return {
-    ...base,
-    stages,
-    text,
-    chars: text.length,
-    rewroteEarlierStages: false,
-    updatedAt: at,
-    lastStageId: stageId,
   }
 }
 
@@ -924,8 +496,11 @@ function capLimitOf(cap, total) {
  * 输入只依赖宿主事实与 v2 配对账本；没有数据就留空并在 `unknowns` 里说明，
  * 不用推测补齐（规范 §5.1：未知不补猜成已完成）。
  *
- * 除原有参数外，新增的都是**可选**入参（evidence / pins / constraints /
- * inflightJobs / 各类软保留候选 / relations / projection），老调用方不传也成立。
+ * 0.13.2-beta.8（Q4）：evidence / pins / constraints / inflightJobs / prefetch /
+ * redundantCards / nonEssentialHistory / rejectedOptions / openQuestions /
+ * relations / projection / step 十二个零生产方入参摘除——src 内从未有调用方
+ * 传入（恒空）。**新增入参前必须先建数据源**，否则 `test/v2-workingset-wiring.test.mjs`
+ * 的结构性守卫必红。
  */
 export function buildWorkingState({
   sessionId,
@@ -935,21 +510,9 @@ export function buildWorkingState({
   lastAssistantSeq = null,
   limits = {},
   now = Date.now(),
-  step = null,
-  constraints = [],
-  evidence = [],
-  pins = [],
-  inflightJobs = [],
-  prefetch = [],
-  redundantCards = [],
-  nonEssentialHistory = [],
-  rejectedOptions = [],
-  openQuestions = [],
   // S1：助手结论盘点（方案 §7）——{ value, polarity, verified, recordRef }。
   // 默认 unverified；否定/撤回标 required（可见性不靠关键词升级）。
   claims = [],
-  relations = [],
-  projection = null,
   recordIdsForSeq = null,
   // callId → { callRecordId, resultRecordId } | null：v2 配对账本的精确对位。
   // 并行调用共享宿主 seq 时这是**唯一**可靠来源（见 `recordOfCall` 注释）。
@@ -1020,6 +583,25 @@ export function buildWorkingState({
     // 记账，实际是几条不同调用。第 0 个保持裸 `seq:N`（最常见、也最像原样）。
     const hostRef = occurrence === 0 ? `seq:${seq}` : `seq:${seq}+${occurrence}`
     return { ref: hostRef, refKind: 'host-seq', readable: false, allIds: ids ?? [] }
+  }
+
+  /**
+   * Y-32（beta.8）：把句柄渲染成 **memory_lab_recall 真能吃**的可执行形态。
+   *
+   * `seq:N` 是宿主事件号、不是记录 ID（`refOf` 已标 readable:false），印出去模型
+   * 照抄必败——不可读的 seq 一律不印。可读时优先稳定记录 ID；没有记录 ID 但有
+   * callId 时，callId 本身就是工具接受的句柄形态（record_ids 三形态之一）。
+   * 两者都没有时返回 null，调用方只印状态描述，不伪造句柄。
+   * 折叠回执里的「成员：seq:N」是 restore 句柄、不走本帮手（restore 不是回读工具）。
+   */
+  const recallHandleOf = (ref, callId = null) => {
+    if (ref && ref.readable === true && typeof ref.ref === 'string' && ref.ref !== '') {
+      return `memory_lab_recall(record_ids=["${ref.ref}"])`
+    }
+    if (typeof callId === 'string' && callId !== '') {
+      return `memory_lab_recall(record_ids=["${callId}"])`
+    }
+    return null
   }
 
   /**
@@ -1096,7 +678,24 @@ export function buildWorkingState({
     }
   }
 
-  // 进度：每个「调用 + 结果」都进了当前表面，就记为已在主模型可见面出现。
+  // 曝光判定（Y-31 合并的前置）：阈值必须在进度行**之前**算出——一行进度要不要进
+  // 软保留，取决于该结果是否已被硬保护段覆盖。
+  //
+  // 未曝光结果：出现在最后一次助手决策之后的结果，主模型还没有机会看到。
+  // `lastAssistant === null` 时**不能**把阈值当作 +Infinity 然后宣布「没有未曝光
+  // 结果」——那是把「不知道」渲染成「都已曝光」。此时判定不可用，如实标 unknown。
+  const exposureDecidable = lastAssistant !== null
+  const threshold = exposureDecidable ? lastAssistant : Number.POSITIVE_INFINITY
+
+  // 进度：只保留**硬段没有覆盖**的行（0.13.2-beta.8 Y-31 合并——同一事实只在
+  // 硬保护段渲染一次，软保留段不再重复）：
+  // - call-only（有调用、无结果）：UNCLOSED_CALL 硬段逐条渲染（callId + 来源 +
+  //   回读句柄），软段重复一次且句柄形态不同（itemId=seq:N）→ 不再生成；
+  // - result-visible 且未曝光：UNEXPOSED_RESULT 硬段渲染 → 不再生成；
+  // - result-visible 且已曝光（结果 seq ≤ 最近一次助手决策）：硬段不含的完成态，
+  //   是进度段的真实内容。
+  // 曝光判定不可用（lastAssistant 缺失）时保守保留 result-visible 行——它只声明
+  // 「结果在可见面里」这一宿主事实，不声称模型看过。
   //
   // 记录句柄优先按 callId 精确对位（配对账本），共享同一宿主 seq 的并行调用各拿
   // 各的；账本没有该 callId 时才退回 `refOf`（seq+出现次序，只保无歧义场景）。
@@ -1105,34 +704,28 @@ export function buildWorkingState({
     const result = resultsById.get(call.callId) ?? null
     const occurrence = callSeenPerSeq.get(call.seq) ?? 0
     callSeenPerSeq.set(call.seq, occurrence + 1)
+    if (!result) continue
+    if (exposureDecidable && result.seq > threshold) continue
     const callRecord = recordOfCall(call.callId)
     const callRef = callRecord?.callRecordId
       ? { ref: callRecord.callRecordId, refKind: 'record-id', readable: true }
       : refOf(call.seq, occurrence)
-    const resultRef = result
-      ? (callRecord?.resultRecordId
-        ? { ref: callRecord.resultRecordId, refKind: 'record-id', readable: true }
-        : refOf(result.seq))
-      : null
+    const resultRef = callRecord?.resultRecordId
+      ? { ref: callRecord.resultRecordId, refKind: 'record-id', readable: true }
+      : refOf(result.seq)
     progress.push({
       itemId: callRef.ref,
       itemIdKind: callRef.refKind,
       itemIdReadable: callRef.readable,
       callId: call.callId,
       tool: call.toolName,
-      // 只声明宿主事实：结果是否在可见面里，不声称模型理解了它。
-      status: result ? 'result-visible' : 'call-only',
-      evidenceRefs: resultRef ? [resultRef.ref] : [],
-      evidenceRefsReadable: resultRef ? resultRef.readable : null,
+      // 只声明宿主事实：结果已在可见面里，不声称模型理解了它。
+      status: 'result-visible',
+      evidenceRefs: [resultRef.ref],
+      evidenceRefsReadable: resultRef.readable,
     })
   }
 
-  // 未曝光结果：出现在最后一次助手决策之后的结果，主模型还没有机会看到。
-  //
-  // `lastAssistant === null` 时**不能**把阈值当作 +Infinity 然后宣布「没有未曝光
-  // 结果」——那是把「不知道」渲染成「都已曝光」。此时判定不可用，如实标 unknown。
-  const exposureDecidable = lastAssistant !== null
-  const threshold = exposureDecidable ? lastAssistant : Number.POSITIVE_INFINITY
   for (const result of resultsById.values()) {
     if (exposureDecidable && result.seq > threshold) {
       // 结果句柄同样优先按 callId 精确对位（多块结果的记录也不与 seq 一一同构）。
@@ -1201,9 +794,9 @@ export function buildWorkingState({
     source: entry.source ?? 'cold-ledger',
   }))
 
-  if (callsById.size > 0 && progress.length === 0) {
-    unknowns.push({ key: 'progress', reason: '表面有工具调用但未能确定性提取进度' })
-  }
+  // 0.13.2-beta.8（Y-31）：进度空不再是「提取失败」——call-only/未曝光行已按
+  // 判重口径移交硬段，progress 为空是正常态；「表面有调用但进度为空」的 unknown
+  // 会把设计行为误报成提取故障，随旧行为一起摘除。
   if (lastAssistant === null && nodes.length > 0) {
     unknowns.push({ key: 'exposure', reason: '没有可判定的助手决策节点，未曝光判定按保守处理' })
   }
@@ -1232,50 +825,20 @@ export function buildWorkingState({
     }))
   }
 
-  const constraintList = Array.isArray(constraints) ? constraints : []
-  const validConstraints = []
-  const revokedConstraints = []
-  for (const [index, raw] of constraintList.entries()) {
-    const item = typeof raw === 'string' ? { text: raw } : (raw ?? {})
-    const text = String(item.text ?? '').trim()
-    if (text === '') continue
-    const entry = {
-      text,
-      sourceRef: item.sourceRef ?? `constraint:${index}`,
-      stillValid: item.stillValid !== false,
-    }
-    if (entry.stillValid) validConstraints.push(entry)
-    else revokedConstraints.push(entry)
-  }
-  // 约束同样旧在前：超配额时必须留**最新**的（0.13.2 D-13）。
-  const constraintCap = capLimitOf(config.maxConstraints, validConstraints.length)
-  for (const item of newestTake(validConstraints, config.maxConstraints)) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.HUMAN_REQUEST,
-      itemId: `constraint:${item.sourceRef}`,
-      lines: [`仍然有效的约束（${item.sourceRef}）：${item.text}`],
-      source: `constraint:${item.sourceRef}`,
-      sourceRef: item.sourceRef,
-    }))
-  }
-  if (validConstraints.length > constraintCap) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.HUMAN_REQUEST,
-      itemId: 'constraint:overflow',
-      lines: [`另有 ${validConstraints.length - constraintCap} 条有效约束未展开（同样不可丢弃，需按记录 ID 回读）`],
-      source: 'constraint:overflow',
-    }))
-  }
+  // 0.13.2-beta.8（Q4）：「仍然有效的约束」入参（constraints）摘除——src 内无生产方。
+  // HUMAN_REQUEST 段保留其自有来源（activeHumanRequest，从表面确定性提取）。
 
   // (b) 未闭合调用
   for (const action of openActions) {
+    // Y-32：句柄统一为可执行形态（记录 ID 优先、callId 兜底）；不可读时只留状态。
+    const openHandle = recallHandleOf({ readable: action.recordRefReadable === true, ref: action.recordRef }, action.callId)
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.UNCLOSED_CALL,
       itemId: `open-call:${action.callId ?? action.recordRef ?? 'unknown'}`,
       lines: [
         `在途动作 ${action.callId ?? '（无 callId）'}${action.toolName ? `（${action.toolName}）` : ''}：`
         + `${action.actionState}，来源 ${action.source === 'surface:unpaired-tool-call' ? '活动面未配对调用' : '冷库配对账本'}`
-        + `${action.recordRef ? `，记录 ${action.recordRef}` : ''}`,
+        + (openHandle ? `，回读 ${openHandle}` : ''),
       ],
       source: action.source === 'surface:unpaired-tool-call'
         ? '活动面（宿主事实：有调用、无结果）'
@@ -1299,10 +862,13 @@ export function buildWorkingState({
   const unseenItems = newestTake(unseenResults, config.maxUnseenResults)
   const unseenDropped = Math.max(0, (Array.isArray(unseenResults) ? unseenResults.length : 0) - unseenItems.length)
   for (const item of unseenItems) {
+    // Y-32：结果句柄同样只印可执行形态；不可读（seq:N）时不印句柄——结果本身
+    // 已在活动面上，随对话继续自然可见，不需要也无法按句柄回读。
+    const unseenHandle = recallHandleOf({ readable: item.recordRefReadable === true, ref: item.recordRef }, item.callId)
     protectedSet.push(protectedItem({
       protectionClass: PROTECTION_CLASSES.UNEXPOSED_RESULT,
       itemId: `unexposed:${item.recordRef}`,
-      lines: [`未曝光结果 ${item.recordRef}（callId ${item.callId ?? '未知'}，依据 ${item.reason}）`],
+      lines: [`未曝光结果（callId ${item.callId ?? '未知'}，依据 ${item.reason}）${unseenHandle ? `，回读 ${unseenHandle}` : ''}`],
       source: 'surface:tool/result',
       sourceRef: item.recordRef,
     }))
@@ -1316,140 +882,31 @@ export function buildWorkingState({
     }))
   }
 
-  // (d) 在途作业与未确认副作用
-  const jobList = Array.isArray(inflightJobs) ? inflightJobs : []
-  const openJobs = []
-  const settledJobs = []
-  for (const [index, raw] of jobList.entries()) {
-    const job = raw ?? {}
-    const terminal = job.state === 'done' || job.state === 'failed' || job.state === 'cancelled'
-    const confirmed = job.confirmed === true
-    if (terminal && confirmed) settledJobs.push({ ...job, index })
-    else openJobs.push({ ...job, index })
-  }
-  // Y-28 同族：渲染展开数也必须走同一把尺子——`undefined` 在这里会退化成
-  // 「take(…, undefined)」的默认行为，与下面 overflow 行用的上界不一致。
-  const inflightCap = capLimitOf(config.maxInflightJobs, openJobs.length)
-  for (const job of take(openJobs, inflightCap).items) {
-    const label = job.jobId ?? job.id ?? `job#${job.index}`
-    const kind = job.kind === 'side-effect' ? '未确认副作用' : '在途作业'
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.INFLIGHT_JOB,
-      itemId: `inflight:${label}`,
-      lines: [`${kind} ${label}：状态 ${job.state ?? '未知'}，副作用确认=${job.confirmed === true}`],
-      source: job.source ?? 'host:jobs',
-      sourceRef: String(label),
-      detail: { state: job.state ?? null, confirmed: job.confirmed === true },
-    }))
-  }
-  if (openJobs.length > inflightCap) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.INFLIGHT_JOB,
-      itemId: 'inflight:overflow',
-      lines: [`另有 ${openJobs.length - jobCap} 个在途作业未展开（同样不可丢弃）`],
-      source: 'host:jobs',
-    }))
-  }
-
-  // (e)(f) 证据与 pin
-  const rawEvidence = Array.isArray(evidence) ? evidence : []
-  const boundEvidence = rawEvidence
-    .slice(0, capLimitOf(config.maxEvidence, rawEvidence.length))
-    .map((item) => bindEvidence(item, { now: clock }))
-  const necessaryEvidence = boundEvidence.filter((item) => item.status === EVIDENCE_STATUS.VALID && item.necessary)
-  const staleNecessary = boundEvidence.filter((item) => item.status === EVIDENCE_STATUS.STALE && item.necessary)
-  const unverifiedNecessary = boundEvidence.filter((item) => item.status === EVIDENCE_STATUS.UNVERIFIED && item.necessary)
-
-  for (const item of necessaryEvidence) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.NECESSARY_EVIDENCE,
-      itemId: `necessary-evidence:${item.recordRef}`,
-      lines: [`必要证据 ${item.recordRef}：状态 valid，指纹 ${item.fingerprint}，来源 ${item.sourceKind}`],
-      source: item.source,
-      sourceRef: item.recordRef,
-      detail: item,
-    }))
-  }
-  // 关键证据一旦 stale/未验证，就必须以「未知」这一协议位常驻，而不是冒充有效证据。
-  for (const item of staleNecessary) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.UNKNOWN_PROTOCOL,
-      itemId: `stale-necessary-evidence:${item.recordRef}`,
-      lines: [`关键证据 ${item.recordRef} 状态=stale：${item.statusReason}`],
-      reason: '关键证据的版本指纹与当前不一致：必须重新取证，不能沿用旧结论。',
-      source: item.source,
-      sourceRef: item.recordRef,
-      detail: item,
-    }))
-  }
-  for (const item of unverifiedNecessary) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.UNKNOWN_PROTOCOL,
-      itemId: `unverified-necessary-evidence:${item.recordRef}`,
-      lines: [`关键证据 ${item.recordRef} 状态=unverified：${item.statusReason}`],
-      reason: '关键证据没有可比的版本指纹：不能当作有效证据，需要补指纹后复核。',
-      source: item.source,
-      sourceRef: item.recordRef,
-      detail: item,
-    }))
-  }
-
-  const rawPins = Array.isArray(pins) ? pins : []
-  const evaluatedPins = rawPins
-    .slice(0, capLimitOf(config.maxPins, rawPins.length))
-    .map((pin) => evaluatePin(pin, { now: clock, step }))
-  const validPins = evaluatedPins.filter((pin) => pin.status === PIN_STATUS.VALID)
-  const expiredPins = evaluatedPins.filter((pin) => pin.status === PIN_STATUS.EXPIRED)
-  const invalidPins = evaluatedPins.filter((pin) => pin.status === PIN_STATUS.INVALID)
-
-  for (const pin of validPins) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.VALID_PIN,
-      itemId: pin.itemId,
-      lines: [`有效 pin ${pin.recordRef}：到期 ${pin.expiresAt}，复核条件 ${pin.reviewCondition}`],
-      source: `pin:${pin.source}`,
-      sourceRef: pin.recordRef,
-      releaseCondition: pin.releaseCondition,
-      detail: pin,
-    }))
-  }
-  for (const pin of invalidPins) {
-    unknowns.push({
-      key: pin.itemId,
-      reason: pin.invalidReason ?? 'pin 不构成保护（缺少失效时间或复核条件）',
-    })
-  }
+  // 0.13.2-beta.8（Q4）：在途作业（inflightJobs）、必要证据/有效 pin（evidence/pins）、
+  // 关系（relations）各段随零生产方入参整段摘除。其中在途作业段的溢出行还引用过
+  // 一个从未定义的变量 jobCap（实际定义名是 inflightCap）——「入参没人传」掩盖了
+  // 这个潜伏崩溃点；接线时必须重建该段并补溢出行守卫。
 
   // (g) 最小工作状态：只保护当前最小依赖集，绝不整体 pin 长任务
+  // 0.13.2-beta.8（Q4）：pin 类目摘除后「整条长任务 pin」检查失去数据源——
+  // 系统不产生任何 pin，whole-task pin 结构上不可能出现，vacuous 断言不再渲染。
   const dependencyRefs = []
   const pushDep = (ref) => {
     if (typeof ref === 'string' && ref !== '' && !dependencyRefs.includes(ref)) dependencyRefs.push(ref)
   }
   if (activeHumanRequest) pushDep(activeHumanRequest.sourceId)
-  for (const action of openActions) pushDep(action.recordRef)
-  for (const item of unseenItems) pushDep(item.recordRef)
-  for (const item of necessaryEvidence) pushDep(item.recordRef)
-  for (const pin of validPins) pushDep(pin.recordRef)
+  // Y-32：依赖集印的是对象标识，不可读的 seq:N 混进去会被模型当回读句柄——
+  // 记录 ID 不可读时用 callId 顶替（它同样是稳定标识，且可作回读句柄）。
+  for (const action of openActions) pushDep(action.recordRefReadable !== false && action.recordRef ? action.recordRef : (action.callId ?? null))
+  for (const item of unseenItems) pushDep(item.recordRefReadable !== false && item.recordRef ? item.recordRef : (item.callId ?? null))
   const minimalRefs = dependencyRefs.slice(0, config.maxMinimalDependencies)
-  // 「整条长任务 pin」不是一句写死的常量，而是从**真正进入保护集的条目**里算出来的：
-  // 只有有效 pin（VALID_PIN）才可能构成 pin，而 evaluatePin 对 scope='whole-task'
-  // 一律判 invalid（见上），所以这里正常恒为 false。把常量当观察结果渲染，等于把
-  // 「规范不允许」冒充成「我们检查过确实没有」（审计 P2-5(e)）。
-  const wholeTaskPinItems = protectedSet.filter((item) => item.protectionClass === PROTECTION_CLASSES.VALID_PIN
-    && (item.detail?.scope === 'whole-task' || item.detail?.wholeTask === true))
-  const wholeTaskPinned = wholeTaskPinItems.length > 0
-  const wholeTaskPinRejected = evaluatedPins.filter((pin) => pin.scope === 'whole-task').length
   const minimalWorkingState = {
     dependencyRefs: minimalRefs,
     cap: config.maxMinimalDependencies,
     total: dependencyRefs.length,
     truncated: dependencyRefs.length > minimalRefs.length,
     excludedCount: Math.max(0, dependencyRefs.length - minimalRefs.length),
-    wholeTaskPinned,
-    // 如实记下「本步请求过整任务 pin、被规范拒绝了几条」，与上面的实际检查分开报。
-    wholeTaskPinRejected,
-    wholeTaskPinBasis: `${validPins.length} 条有效 pin（scope=whole-task 的一律不进保护集）`,
-    source: '确定性提取：当前请求 + 未闭合配对 + 未曝光结果 + 必要证据 + 有效 pin',
+    source: '确定性提取：当前请求 + 未闭合配对 + 未曝光结果',
     reason: PROTECTION_RULES[PROTECTION_CLASSES.MINIMAL_WORKING_STATE].reason,
     releaseCondition: PROTECTION_RULES[PROTECTION_CLASSES.MINIMAL_WORKING_STATE].releaseCondition,
   }
@@ -1458,37 +915,11 @@ export function buildWorkingState({
     itemId: 'minimal-working-state',
     lines: [
       `最小依赖集（${minimalRefs.length}/${minimalWorkingState.cap}）：${minimalRefs.length > 0 ? minimalRefs.join('、') : '无'}`,
-      `整条长任务 pin：${wholeTaskPinned ? '存在（与规范冲突，必须复核）' : '不存在'}`
-      + `（wholeTaskPinned=${wholeTaskPinned}；依据 ${wholeTaskPinItems.length}/${validPins.length} 条有效 pin 带整任务范围，本步另有 ${wholeTaskPinRejected} 条整任务 pin 请求被拒绝）`,
     ],
     source: minimalWorkingState.source,
     releaseCondition: minimalWorkingState.releaseCondition,
     detail: minimalWorkingState,
   }))
-
-  // 关系：判定不了就 unknown + 保守回退
-  const resolvedRelations = (Array.isArray(relations) ? relations : []).map((raw) => resolveRelation(raw ?? {}))
-  const unknownRelations = resolvedRelations.filter((item) => !item.resolved)
-  for (const item of unknownRelations.slice(0, config.maxUnknowns)) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.UNKNOWN_PROTOCOL,
-      itemId: `unknown-relation:${item.subjectRef ?? '?'}->${item.objectRef ?? '?'}`,
-      lines: [`关系未知 ${item.subjectRef ?? '?'} → ${item.objectRef ?? '?'}：按原文并列呈现，不补写依赖边`],
-      reason: item.reason,
-      source: 'relation:unknown',
-      sourceRef: item.subjectRef,
-      detail: item,
-    }))
-  }
-  for (const rule of UNKNOWN_RELATION_RULES) {
-    protectedSet.push(protectedItem({
-      protectionClass: PROTECTION_CLASSES.UNKNOWN_PROTOCOL,
-      itemId: `relation-rule:${rule.slice(0, 12)}`,
-      lines: [`保守规则：${rule}`],
-      reason: '关系不可判定时的显式条文：宁可保守，也不编造关系。',
-      source: 'relation:unknown-rules',
-    }))
-  }
 
   const unknownTake = take(unknowns, config.maxUnknowns)
   for (const item of unknownTake.items) {
@@ -1510,51 +941,28 @@ export function buildWorkingState({
   }
 
   // --- 软保留 ---
+  // 0.13.2-beta.8（Q4）：软保留从八类收缩为两类——非必要历史（progress，内部来源）
+  // 与未验证证据（claims，内部来源）；可选预取 / 冗余卡片 / stale / 过期 pin /
+  // 已否决选项 / 未决问题六类的入参无生产方，整类摘除。
   // claim 配额只算一次：正文（selectClaims）与页脚（溢出计数）必须用同一把尺子。
   const claimCap = capLimitOf(config.maxAssistantClaims, Array.isArray(claims) ? claims.length : 0)
   const retention = {
-    [RETENTION_CLASSES.OPTIONAL_PREFETCH]: take(prefetch, config.maxPrefetch).items.map((raw, index) => {
-      const item = typeof raw === 'string' ? { text: raw } : (raw ?? {})
-      return retentionItem({
-        retentionClass: RETENTION_CLASSES.OPTIONAL_PREFETCH,
-        itemId: item.itemId ?? `prefetch:${index}`,
-        lines: [`可选预取 ${item.itemId ?? index}：${String(item.text ?? item.summary ?? '').slice(0, config.excerptChars)}`],
-        source: item.source ?? 'prefetch',
-        sourceRef: item.sourceRef ?? null,
-      })
-    }),
-    [RETENTION_CLASSES.REDUNDANT_CARD]: take(redundantCards, config.maxRedundantCards).items.map((raw, index) => {
-      const item = typeof raw === 'string' ? { itemId: raw } : (raw ?? {})
-      return retentionItem({
-        retentionClass: RETENTION_CLASSES.REDUNDANT_CARD,
-        itemId: item.itemId ?? `redundant:${index}`,
-        lines: [`冗余卡片 ${item.itemId ?? index}${item.supersededBy ? `（已被 ${item.supersededBy} 取代）` : ''}`],
-        source: item.source ?? 'cards',
-        sourceRef: item.supersededBy ?? null,
-      })
-    }),
     [RETENTION_CLASSES.NON_ESSENTIAL_HISTORY]: [
-      ...take(nonEssentialHistory, config.maxNonEssentialHistory).items.map((raw, index) => {
-        const item = typeof raw === 'string' ? { itemId: raw } : (raw ?? {})
-        return retentionItem({
-          retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
-          itemId: item.itemId ?? `history:${index}`,
-          lines: [`非必要历史 ${item.itemId ?? index}${item.ref ? `（出处 ${item.ref}）` : ''}`],
-          source: item.source ?? 'history',
-          sourceRef: item.ref ?? null,
-        })
-      }),
       // 已完成探索分支的进度也属于非必要历史：先退役，再谈别的。
       // 保留**最新**的若干条（旧条目先退役）：`slice(0, n)` 会把最新进度丢掉，
       // 卡片就永远停在最早的几步上（审计 P2-5(d)）。
-      ...newestTake(progress, config.maxProgressItems).map((item) => retentionItem({
-        retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
-        itemId: `progress:${item.itemId}`,
-        lines: [`进度 ${item.itemId} 工具 ${item.tool ?? '未知'} 状态 ${item.status}`],
-        reason: '进度是宿主事实，但已经进入可见面、且不构成当前依赖：属于可先退役的非必要历史。',
-        source: 'surface:progress',
-        sourceRef: item.itemId,
-      })),
+      ...newestTake(progress, config.maxProgressItems).map((item) => {
+        // Y-32：进度行同样只印可执行句柄；不可读（seq:N）时只留工具与状态描述。
+        const progressHandle = recallHandleOf({ readable: item.itemIdReadable === true, ref: item.itemId }, item.callId)
+        return retentionItem({
+          retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
+          itemId: `progress:${item.itemId}`,
+          lines: [`进度 工具 ${item.tool ?? '未知'} 状态 ${item.status}${progressHandle ? `，回读 ${progressHandle}` : ''}`],
+          reason: '进度是宿主事实，但已经进入可见面、且不构成当前依赖：属于可先退役的非必要历史。',
+          source: 'surface:progress',
+          sourceRef: item.itemId,
+        })
+      }),
       ...(progress.length > capLimitOf(config.maxProgressItems, progress.length)
         ? [retentionItem({
             retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
@@ -1564,41 +972,8 @@ export function buildWorkingState({
             source: 'surface:progress',
           })]
         : []),
-      ...revokedConstraints.map((item) => retentionItem({
-        retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
-        itemId: `revoked-constraint:${item.sourceRef}`,
-        lines: [`已撤销/失效的约束（${item.sourceRef}）：${item.text}`],
-        reason: '该约束已被显式标记为不再有效：保留出处，但不再作为保护对象。',
-        source: `constraint:${item.sourceRef}`,
-        sourceRef: item.sourceRef,
-      })),
-      ...settledJobs.map((job) => retentionItem({
-        retentionClass: RETENTION_CLASSES.NON_ESSENTIAL_HISTORY,
-        itemId: `settled-job:${job.jobId ?? job.id ?? job.index}`,
-        lines: [`已终态且副作用已确认的作业 ${job.jobId ?? job.id ?? job.index}（状态 ${job.state}）`],
-        reason: '作业已到终态且副作用已确认：不再属于在途状态。',
-        source: job.source ?? 'host:jobs',
-      })),
     ],
-    [RETENTION_CLASSES.STALE_EVIDENCE]: boundEvidence
-      .filter((item) => item.status === EVIDENCE_STATUS.STALE)
-      .map((item) => retentionItem({
-        retentionClass: RETENTION_CLASSES.STALE_EVIDENCE,
-        itemId: item.itemId,
-        lines: [`stale 证据 ${item.recordRef}：${item.statusReason}`],
-        source: item.source,
-        sourceRef: item.recordRef,
-      })),
     [RETENTION_CLASSES.UNVERIFIED_EVIDENCE]: [
-      ...boundEvidence
-        .filter((item) => item.status === EVIDENCE_STATUS.UNVERIFIED)
-        .map((item) => retentionItem({
-          retentionClass: RETENTION_CLASSES.UNVERIFIED_EVIDENCE,
-          itemId: item.itemId,
-          lines: [`unverified 证据 ${item.recordRef}：${item.statusReason}`],
-          source: item.source,
-          sourceRef: item.recordRef,
-        })),
       // S1 助手结论盘点（方案 §7）：claim 默认 unverified，进同一软保留段；
       // 否定/撤回标 required（否定/更正可见），positive 不标 required（不冒充已完成）。
       // 配额 maxAssistantClaims 全局有界；超出只报数量（不静默丢）。
@@ -1628,32 +1003,6 @@ export function buildWorkingState({
         })]
         : []),
     ],
-    [RETENTION_CLASSES.EXPIRED_PIN]: [...expiredPins, ...invalidPins].map((pin) => retentionItem({
-      retentionClass: RETENTION_CLASSES.EXPIRED_PIN,
-      itemId: pin.itemId,
-      lines: [`${pin.status === PIN_STATUS.EXPIRED ? '过期' : '无效'} pin ${pin.recordRef}：${pin.invalidReason ?? pin.releaseCondition}`],
-      source: `pin:${pin.source}`,
-      sourceRef: pin.recordRef,
-      releaseCondition: pin.releaseCondition,
-    })),
-    [RETENTION_CLASSES.REJECTED_OPTION]: take(rejectedOptions, config.maxRejectedOptions).items.map((raw, index) => {
-      const item = typeof raw === 'string' ? { option: raw } : (raw ?? {})
-      return retentionItem({
-        retentionClass: RETENTION_CLASSES.REJECTED_OPTION,
-        itemId: item.itemId ?? `rejected:${index}`,
-        lines: [`已否决选项 ${item.option ?? item.itemId ?? index}${item.reason ? `：${item.reason}` : ''}`],
-        source: item.source ?? 'decision',
-      })
-    }),
-    [RETENTION_CLASSES.OPEN_QUESTION]: take(openQuestions, config.maxOpenQuestions).items.map((raw, index) => {
-      const item = typeof raw === 'string' ? { question: raw } : (raw ?? {})
-      return retentionItem({
-        retentionClass: RETENTION_CLASSES.OPEN_QUESTION,
-        itemId: item.itemId ?? `question:${index}`,
-        lines: [`未决问题 ${item.question ?? item.itemId ?? index}`],
-        source: item.source ?? 'open-question',
-      })
-    }),
   }
 
   // P1-4：硬保护项的角色/编号一致性（同 seq 不得同时出现在两类硬保护）。
@@ -1667,21 +1016,12 @@ export function buildWorkingState({
     if (items.length > 0) softByClass[retentionClass] = items.length
   }
 
-  const activeProjection = projection && typeof projection === 'object' && Array.isArray(projection.stages)
-    ? projection
-    : createProjection({})
-
   return {
     schemaVersion: WORKING_STATE_SCHEMA_VERSION,
     sessionId,
     generatedAt: new Date(clock).toISOString(),
     // --- 原有字段（保持形状，消费方不用改）---
     activeHumanRequest,
-    essentialConstraints: newestTake(validConstraints, config.maxConstraints).map((item) => ({
-      text: item.text,
-      sourceRef: item.sourceRef,
-      stillValid: true,
-    })),
     openActions,
     unclosedPairCount: mergedOpenCalls.length,
     unseenResults: unseenItems,
@@ -1694,13 +1034,12 @@ export function buildWorkingState({
     // 进度只报最新的若干条（顺序仍是时间升序）；总数另用 progressCount 如实给出。
     progress: newestTake(progress, config.maxProgressItems),
     progressCount: progress.length,
-    pinnedEvidence: validPins,
     unknowns: unknownTake.items,
     // 明确声明能力边界：首版只读工具不提供模型写 pin 的入口。
+    // 0.13.2-beta.8（Q4）：readbackPinTtlMs 随 pinTtlMs 摘除（无消费链）。
     capabilities: {
       modelWritablePin: false,
       auxiliaryModel: false,
-      readbackPinTtlMs: config.pinTtlMs,
     },
     /**
      * 0.12.0 P0-1：本步可回读候选（渲染时由 readbackSectionOf 装成硬段）。
@@ -1727,15 +1066,9 @@ export function buildWorkingState({
       summaryIsNotOriginalText: true,
       modelInferenceIsNotAuthorization: true,
       statusCardIsNotSystemMessage: true,
-      wholeTaskNeverPinned: minimalWorkingState.wholeTaskPinned === false,
     },
-    evidence: boundEvidence,
-    pins: evaluatedPins,
-    inflightJobs: openJobs,
     minimalWorkingState,
-    relations: resolvedRelations,
     retention,
-    projection: activeProjection,
   }
 }
 
@@ -1996,11 +1329,9 @@ function softSectionsOf(state, { hardPrefixText = '', retrievalHits = null } = {
         lines: item.lines,
         source: item.source,
         retentionClass,
-        evidenceStatus: retentionClass === RETENTION_CLASSES.STALE_EVIDENCE
-          ? EVIDENCE_STATUS.STALE
-          : retentionClass === RETENTION_CLASSES.UNVERIFIED_EVIDENCE
-            ? EVIDENCE_STATUS.UNVERIFIED
-            : null,
+        // 0.13.2-beta.8（Q4）：stale 类摘除后只剩 unverified 一档；evidenceStatus
+        // 语义（'unverified'）与 importance.mjs 的权重表共用同一字符串口径。
+        evidenceStatus: retentionClass === RETENTION_CLASSES.UNVERIFIED_EVIDENCE ? 'unverified' : null,
         recordId: item.sourceRef,
       }, context)
       scored.push({

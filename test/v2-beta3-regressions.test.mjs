@@ -95,12 +95,13 @@ test('N-02 增量卡没有相邻重复行，也没有空段标题', () => {
   }
   assert.match(delta.text, /进度 seq:1001/)
 
-  // N-02 的真实触发条件：新增行**本身就是段标题**（这里让一个新的软类目首次出现）。
+  // N-02 的真实触发条件：新增行**本身就是段标题**（这里让一个新的软类目首次出现；
+  // beta.8 起软保留只有非必要历史与未验证证据两类，用后者造「新类目首次出现」）。
   // 旧实现会先补一次「前导标题」、再把标题当变化行印一次，于是相邻两行完全相同。
   const withQuestion = stateWithSoft(1)
-  withQuestion.retention[RETENTION_CLASSES.OPEN_QUESTION] = [{
+  withQuestion.retention[RETENTION_CLASSES.UNVERIFIED_EVIDENCE] = [{
     lines: ['未决：回注摘录长度是否应可配置'],
-    source: 'surface:open-question',
+    source: 'claim:q-1',
     sourceRef: 'q-1',
   }]
   const grown = renderWorkingStateCard(withQuestion, { budgetTokens: 20000 })

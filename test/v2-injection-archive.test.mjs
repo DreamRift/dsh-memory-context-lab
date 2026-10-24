@@ -80,12 +80,15 @@ function cardNode(seq, chars = 200) {
   return { seq, type: 'user/message', sourceForm: 'working-set', text: '卡'.repeat(chars) }
 }
 
-test('P0-4a 净占用按字符算（不是条数）：超过 4000 字符即判超上限，且字符来自真实文本长度', () => {
-  assert.equal(CARD_NET_CHAR_CAP, 4000)
-  const nodes = [cardNode(2, 2000), cardNode(3, 1500), cardNode(4, 900)]
+test('P0-4a 净占用按字符算（不是条数）：超过 8000 字符即判超上限，且字符来自真实文本长度', () => {
+  // 0.13.2-beta.8：Q3-A 一进一出后双槽不变量构造性保证净占用有界（全量 ≤4.8k +
+  // 增量 ≤1.6k + 回执），本上限降级为「双槽被破坏」的兜底告警线，4000 → 8000
+  // （重校准依据见 card-fold.mjs 注释与修复计划-beta.8）。
+  assert.equal(CARD_NET_CHAR_CAP, 8000)
+  const nodes = [cardNode(2, 4000), cardNode(3, 3000), cardNode(4, 2000)]
   const occupancy = cardOccupancyOf(nodes)
   assert.equal(occupancy.count, 3)
-  assert.equal(occupancy.chars, 4400)
+  assert.equal(occupancy.chars, 9000)
   assert.equal(occupancy.overCap, true)
   assert.equal(occupancy.newestWorkingStateSeq, 4)
   // 短卡也要计入：3 张 300 字的卡只有 900 字符，不该判超限（G3 的反面）。

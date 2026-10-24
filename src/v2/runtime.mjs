@@ -346,6 +346,7 @@ export function createV2Runtime(dependencies) {
     cardCommand,
     workingSetInjection,
     confirmInjection,
+    submitCardReplace,
     foldWorkingCards,
   } = createCardDomain({
     records, engine, factoryFor, adopt, lastAssistantSeqOf, parseBudgetArg,
@@ -598,6 +599,7 @@ export function createV2Runtime(dependencies) {
     buildRecall,
     workingSetInjection,
     confirmInjection,
+    submitCardReplace,
     foldWorkingCards,
     shutdown,
     // 测试与诊断入口。

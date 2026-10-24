@@ -25,7 +25,8 @@
  *   （forgetting.py:68）：映射为 真实用户消息=1.0 / 助手产出=0.5 /
  *   插件自产卡片与工具输出=0.25。
  * - 结构重要度 `basis×信任`（weights.py:443 node_importance）：证据状态
- *   valid=1.0、stale/unverified=0.3（复用 working-state 的 EVIDENCE_STATUS 语义）。
+ *   valid=1.0、stale/unverified=0.3（'unverified' 字符串与 working-state 软段共用同一口径；
+ *   beta.8 起软保留只剩 unverified 一档）。
  * - 长期提升 `hits = max(merge_count, access_count, recall_count)`
  *   （consolidate.py:899 promote_memories）：反复被回读者留热区，log 压缩。
  *
@@ -124,13 +125,15 @@ export function relevanceOf(candidateText, contextText) {
  * 保守默认映射，接入方可显式传 `sourceBucket` 覆盖：
  * - 撤销的约束（`constraint:` 前缀）源自真实用户消息 → user；
  * - 已否决选项（模型决策）→ model；
- * - 其余（surface:/host:/pin:/readback 等宿主与插件自产事实）→ plugin。
+ * - 其余（surface:/host:/readback 等宿主与插件自产事实）→ plugin。
+ *
+ * 0.13.2-beta.8（Q4）：`rejected-option` 类目摘除（零生产方），特判随之清理；
+ * `constraint:` 前缀判据保留——它同时覆盖未来可能回归的约束类目。
  */
-export function sourceBucketForRetentionItem({ source = null, retentionClass = null } = {}) {
+export function sourceBucketForRetentionItem({ source = null } = {}) {
   const sourceText = String(source ?? '')
   if (sourceText === 'user' || sourceText.startsWith('user:') || sourceText.startsWith('constraint:')) return 'user'
   if (sourceText.startsWith('decision') || sourceText.startsWith('model')) return 'model'
-  if (retentionClass === 'rejected-option') return 'model'
   return 'plugin'
 }
 
@@ -149,8 +152,8 @@ export function hitBoostOf(hits) {
  * 对一个软保留候选项打分。
  *
  * @param candidate - `{ lines?, text?, sourceBucket?, evidenceStatus?, recordId?, source?, retentionClass? }`
- *   `lines` 优先于 `text`；`evidenceStatus` 用 working-state 的 EVIDENCE_STATUS
- *   词汇（valid/stale/unverified），缺省按「无证据语义」处理。
+ *   `lines` 优先于 `text`；`evidenceStatus` 词汇为 valid/stale/unverified
+ *   （当前生产路径只产 'unverified'），缺省按「无证据语义」处理。
  * @param context - `{ hardPrefixText?, currentRequestText?, retrievalHits? }`
  *   `retrievalHits` 是 `{ recordId: 次数 }`；只读，不写。
  * @returns `{ score, components, weights }`——分数只决定丢弃顺序（戒律：
@@ -168,7 +171,7 @@ export function scoreSoftRetention(candidate = {}, context = {}) {
   ].filter((part) => part !== '').join('\n')
   const relevance = relevanceOf(candidateText, contextText)
 
-  const bucket = item.sourceBucket ?? sourceBucketForRetentionItem({ source: item.source, retentionClass: item.retentionClass })
+  const bucket = item.sourceBucket ?? sourceBucketForRetentionItem({ source: item.source })
   const sourceWeight = SOURCE_WEIGHTS[bucket] ?? SOURCE_WEIGHTS.plugin
 
   const status = typeof item.evidenceStatus === 'string' ? item.evidenceStatus : null

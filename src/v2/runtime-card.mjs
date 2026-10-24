@@ -19,10 +19,10 @@
  * `record.state.settings`，但不会修改它——写设置只走 `setSetting`。
  */
 import { randomUUID } from 'node:crypto'
-import { PLUGIN_SOURCE_KIND } from '../core.mjs'
+import { PLUGIN_SOURCE_KIND, buildProjectionHeader, escapePromptBraces } from '../core.mjs'
 import { v2SessionDirectoryFor } from './state.mjs'
 import { WORKING_SET_MAX_BUDGET_TOKENS } from './budget.mjs'
-import { cardOccupancyOf, planCardFolds } from './card-fold.mjs'
+import { cardOccupancyOf, isFullCardText, planCardFolds } from './card-fold.mjs'
 import { extractClaims } from './claims.mjs'
 import { getForgetIndex, isForgotten } from './disposition.mjs'
 import { buildWorkingState, decideWorkingSetInjection, planWorkingSetBudget, renderWorkingSetInjection, shouldInjectFullWorkingStateCard, workingSetDedupKeyOf, workingStateCardDelta, WORKING_SET_DEFAULTS, WORKING_SET_DEDUP_HISTORY_LIMIT } from './working-state.mjs'
@@ -220,6 +220,50 @@ export function createCardDomain({
     return null
   }
 
+  /**
+   * beta.8（Q3-A 一进一出·双槽）：在活动面上反查「卡槽」——**全部**指定形态的
+   * 工作卡节点（活动面顺序）。增量步替换最近一张**增量卡**、其余增量槽转回执
+   * （fallback append 会留下多余槽位，下一步必须回收，否则双槽退化为三槽）；
+   * 全量步替换最近一张**全量卡**、其余全量槽与全部增量槽转回执。
+   * 面上没有对应槽位（首次注入 / 锚点被宿主移出面 / 已被折叠成回执）时返回空，
+   * 调用方回落 append。
+   *
+   * 形态判定与折叠层同一把尺子（isFullCardText 前缀判据）；卡文本从 data.content
+   * 取——宿主只把 `source` 存进 `data`（opts 的其余键静默丢弃），读取端两处都查。
+   */
+  function findCardSlotsOf(session, { full }) {
+    const nodes = Array.isArray(session?.surface?.nodes) ? session.surface.nodes : []
+    const slots = []
+    for (const seq of nodes) {
+      const event = typeof session?.eventAt === 'function' ? session.eventAt(seq) : null
+      if (event?.type !== 'user/message') continue
+      const form = event?.source?.form ?? event?.data?.source?.form
+      if (form !== 'working-set') continue
+      const content = event?.data?.content
+      const first = Array.isArray(content) ? content.find((block) => block?.type === 'text') : null
+      const text = typeof first?.text === 'string' ? first.text : ''
+      if (isFullCardText(text) === full) slots.push({ seq, text })
+    }
+    return slots
+  }
+
+  /**
+   * 全量刷新时旧增量槽的占位回执：旧增量的行变化已被新全量卡覆盖，留着会与新
+   * 全量卡不一致。按投影声明纪律同时声明率与失真（与折叠回执同源口径）。
+   */
+  function deltaReceiptTextOf(seq, chars) {
+    return [
+      '[工作状态·v2·槽位更新]',
+      buildProjectionHeader({
+        releasedTokens: Number.isFinite(Number(chars)) ? Math.max(0, Math.ceil(Number(chars) / 4)) : 0,
+        releasedChars: Math.max(0, Math.trunc(Number(chars) || 0)),
+        readbackTokens: null,
+      }),
+      `增量卡（seq ${seq}）已被本会话最新一张全量卡取代：它的全部行变化已并入新全量卡，本条只留占位。`,
+      '原文在 append-only 日志，可按记录 ID 回读。',
+    ].join('\n')
+  }
+
   async function workingSetInjection(agent) {
     const record = await adopt(agent)
     if (!record) return null
@@ -296,6 +340,50 @@ export function createCardDomain({
       }
     }
 
+    // beta.8（Q3-A 一进一出·双槽）：优先把新卡**替换**进同形态旧卡槽位（净增 0），
+    // 槽位不存在或已失效时回落 append（decision.messages）。
+    // - 增量步：目标 = 面上最近一张**增量卡**（全量基准卡受折叠保护、必然仍在面上）；
+    // - 全量步：目标 = 面上最近一张**全量卡**；旧增量槽（若在）转一行占位回执——
+    //   它的行变化已被新全量卡覆盖，留着会与新全量卡不一致。
+    // 双槽不变量：稳态面上恒为 [全量基准卡][最新增量卡]（+ 历史回执），卡节点数
+    // 不随步数增长。replace 经宿主 surfaceOp 通道直连提交（submitCardReplace），
+    // decision.messages 通道不携带 surfaceOp。
+    const session = record.agent?.session
+    let mode = 'append'
+    let replaceTargetSeq = null
+    let deltaReceipts = []
+    if (session && typeof session.append === 'function' && Array.isArray(session.surface?.nodes)) {
+      const live = (slots) => slots.filter((slot) => session.surface.nodes.includes(slot.seq))
+      if (form === 'delta') {
+        const deltaSlots = live(findCardSlotsOf(session, { full: false }))
+        if (deltaSlots.length > 0) {
+          mode = 'replace'
+          // 替换最新增量槽；更旧的增量槽（fallback append 的残余）全部转回执。
+          replaceTargetSeq = deltaSlots.at(-1).seq
+          deltaReceipts = deltaSlots.slice(0, -1).map((slot) => ({
+            seq: slot.seq,
+            text: deltaReceiptTextOf(slot.seq, slot.text.length),
+          }))
+        }
+      } else {
+        const fullSlots = live(findCardSlotsOf(session, { full: true }))
+        if (fullSlots.length > 0) {
+          mode = 'replace'
+          replaceTargetSeq = fullSlots.at(-1).seq
+          deltaReceipts = [
+            ...fullSlots.slice(0, -1).map((slot) => ({
+              seq: slot.seq,
+              text: deltaReceiptTextOf(slot.seq, slot.text.length),
+            })),
+            ...live(findCardSlotsOf(session, { full: false })).map((slot) => ({
+              seq: slot.seq,
+              text: deltaReceiptTextOf(slot.seq, slot.text.length),
+            })),
+          ]
+        }
+      }
+    }
+
     // prepare 计数在此时此刻发生（这是「跑过 prepare」的如实记录）；
     // committed/sent 只能由 confirmInjection 推进。
     record.cost.bump('workingStatePrepared', 1)
@@ -305,6 +393,9 @@ export function createCardDomain({
       cardText: card.text,
       text,
       form,
+      mode,
+      replaceTargetSeq,
+      deltaReceipts,
       dedupKey,
       verdictKeys: verdict.keys,
       usedTokens: card.usedTokens,
@@ -323,13 +414,27 @@ export function createCardDomain({
       dropped: card.dropped,
       // 注入形态（full/delta）：调用方与报表据此区分全量与增量。
       form,
+      // 提交方式（replace/append）与 replace 目标：index 据此走直连替换或
+      // decision.messages 追加（Q3-A 一进一出）。
+      mode,
+      replaceTargetSeq,
+      deltaReceipts,
       dedupKey,
       // 调用方据此去重：前缀哈希不变 = 同一张卡，不需要再注入一次。
       prefixHash: card.prefix?.hash ?? null,
     }
   }
 
-  function confirmInjection(sessionId, preparedId) {
+  /**
+   * 确认注入。beta.8 起接受 details：
+   * - `anchorSeq`：replace 路径传**替换事件的新 seq**（节点内容已换、seq 是新事件的）；
+   *   append 路径不传，锚点在下次 prepare 从面反查刷新。
+   * - `fallback: true`：replace 被宿主拒绝、已降级 append——记 `cardReplaceFallbacks`
+   *   （一进一出的失败必须是可观测的，不能悄悄退化成无界累积）。
+   * - `receiptOk: false`：全量步的旧增量回执提交失败——记
+   *   `cardReplaceReceiptFailures`（旧增量与新全量短暂并存，由下一次全量刷新收敛）。
+   */
+  function confirmInjection(sessionId, preparedId, details = {}) {
     const record = records.get(sessionId)
     if (!record || typeof preparedId !== 'string') return false
     const prepared = record.pendingInjections.get(preparedId)
@@ -341,12 +446,14 @@ export function createCardDomain({
       text: prepared.cardText,
       injections: prepared.cardStateInjections + 1,
       keys: prepared.verdictKeys,
-      // 锚点在下次 prepare 时从面反查刷新；确认时先继承旧值（或 null）。
-      anchorSeq: record.workingSetCard?.anchorSeq ?? null,
+      // replace 路径锚点 = 新事件 seq；append 路径先继承旧值（下次 prepare 反查刷新）。
+      anchorSeq: details.anchorSeq ?? record.workingSetCard?.anchorSeq ?? null,
     }
     record.cost.bump('workingStateInjections', 1)
     record.cost.bump(prepared.form === 'full' ? 'workingStateFullInjections' : 'workingStateDeltaInjections', 1)
     record.cost.bump('workingStateCommitted', 1)
+    if (details.fallback === true) record.cost.bump('cardReplaceFallbacks', 1)
+    if (details.receiptOk === false) record.cost.bump('cardReplaceReceiptFailures', 1)
     // D5：注入记账只认宿主 meter（与归档侧 originalTokens 同一把尺子）。
     const hostTokens = hostMeterTokensOf(prepared.text)
     if (hostTokens !== null) {
@@ -360,7 +467,59 @@ export function createCardDomain({
     return true
   }
 
-  async function foldWorkingCards(agent, { requireOverCap = false } = {}) {
+  /**
+   * beta.8（Q3-A）：replace 提交路径——把 prepared 的卡文本经宿主 surfaceOp 通道
+   * 直连替换进目标槽位。decision.messages 通道不携带 surfaceOp，所以这条路径必须
+   * 直连 `session.append`（样板 = 折叠提交）。
+   *
+   * 返回：
+   * - `{ ok: true, anchorSeq, receiptOk }`——主替换已落面（旧槽位回执若有失败置
+   *   receiptOk=false，不回滚主替换）；调用方据此 confirm（anchorSeq = 新事件 seq）。
+   * - `{ ok: false }`——宿主拒绝/抛错；调用方回落 decision.messages append 并以
+   *   `fallback: true` confirm（失败可观测）。
+   * 这里**不做 confirm**：S3 的确认面只有一个，仍在调用方「已落面」之后显式触发。
+   */
+  function submitCardReplace(agent, prepared) {
+    const session = agent?.session
+    if (!session || typeof session.append !== 'function') return { ok: false }
+    if (!Number.isInteger(prepared?.replaceTargetSeq)) return { ok: false }
+    try {
+      const event = session.append('user/message', {
+        id: `surface-${randomUUID()}`,
+        role: 'user',
+        content: [{ type: 'text', text: escapePromptBraces(prepared.text) }],
+        // 宿主只认 opts 的 surfaceOp/sourceEventSeqs，source 必须写进 data。
+        source: { kind: PLUGIN_SOURCE_KIND, form: 'working-set' },
+      }, {
+        surfaceOp: { op: 'replace', startSeq: prepared.replaceTargetSeq, endSeq: prepared.replaceTargetSeq },
+        sourceEventSeqs: [prepared.replaceTargetSeq],
+      })
+      let receiptOk = true
+      for (const receipt of Array.isArray(prepared.deltaReceipts) ? prepared.deltaReceipts : []) {
+        if (!Number.isInteger(receipt?.seq) || typeof receipt?.text !== 'string') continue
+        try {
+          session.append('user/message', {
+            id: `surface-${randomUUID()}`,
+            role: 'user',
+            content: [{ type: 'text', text: receipt.text }],
+            source: { kind: PLUGIN_SOURCE_KIND, form: 'memory-lab2-surface' },
+          }, {
+            surfaceOp: { op: 'replace', startSeq: receipt.seq, endSeq: receipt.seq },
+            sourceEventSeqs: [receipt.seq],
+          })
+        } catch {
+          // 单条回执失败不回滚主替换：旧卡与新卡短暂并存，由下一次刷新收敛；
+          // receiptOk=false 让它可观测（cardReplaceReceiptFailures）。
+          receiptOk = false
+        }
+      }
+      return { ok: true, anchorSeq: Number.isInteger(event?.seq) ? event.seq : null, receiptOk }
+    } catch {
+      return { ok: false }
+    }
+  }
+
+  async function foldWorkingCards(agent) {
     const record = await adopt(agent)
     if (!record) return { folded: 0, receipts: [], failed: 0, occupancy: null }
     const session = record.agent?.session
@@ -423,6 +582,7 @@ export function createCardDomain({
     cardCommand,
     workingSetInjection,
     confirmInjection,
+    submitCardReplace,
     foldWorkingCards,
   }
 }

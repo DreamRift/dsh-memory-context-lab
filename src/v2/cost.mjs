@@ -54,6 +54,14 @@ export const COST_COUNTER_KEYS = Object.freeze([
   'cardFoldBatches',
   /** 净占用已超上限、但活动面上没有可折叠连续卡组的步数（如实报告上界未达成）。 */
   'cardCapUnreached',
+  /**
+   * Q3-A 一进一出的失败降级次数（0.13.2-beta.8）：replace 被宿主拒绝、退回
+   * decision.messages append。这个数持续增长 = 双槽不变量在退化成无界累积，
+   * 必须告警而不是悄悄吞掉。
+   */
+  'cardReplaceFallbacks',
+  /** 全量刷新时旧增量槽的占位回执提交失败次数（旧增量与新全量短暂并存的观测面）。 */
+  'cardReplaceReceiptFailures',
   /** 证据重读带回的 token 估算（重读不是免费：这部分要计入成本）。 */
   'evidenceReReadTokens',
   /**
