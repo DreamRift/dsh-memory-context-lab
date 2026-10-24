@@ -708,7 +708,7 @@ const CASES = {
   // 段正文，v2-reasoning-preview 的三处预览判据必红。
   'reasoning-not-in-preview': {
     test: 'test/v2-reasoning-preview.test.mjs',
-    file: 'src/core.mjs',
+    file: 'src/core-recall.mjs',
     edits: [[
       "  const text = skipReasonSection(value).replace(/\\s+/g, ' ').trim()",
       "  const text = String(value ?? '').replace(/\\s+/g, ' ').trim()",
