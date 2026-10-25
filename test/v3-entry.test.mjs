@@ -16,7 +16,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, access as fs_access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -130,6 +130,25 @@ test('decision 原样返回；摄入抛错只告警', async () => {
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
+})
+
+test('索引重建分寸：小增量不重建（首字不受 11.5MB 重建拖累），回填才重建', async () => {
+  await withEngine(async ({ ctx, engine, root }) => {
+    const session = fakeSession('s-idx')
+    // 1) 小增量（2 条 < 100）：摄入但不建索引文件
+    session.push('user/message', { data: { text: '第一条' } })
+    session.push('user/message', { data: { text: '第二条' } })
+    await ctx.callPreStep({ session }, { kind: 'enter' })
+    await engine._waitForIdle()
+    const sessionDir = path.join(root, 'sessions', 's-idx')
+    const idxSmall = path.join(sessionDir, 'lexical-index.json')
+    assert.equal(await fs_access(idxSmall).then(() => true, () => false), false, '小增量不得触发全量索引重建')
+    // 2) 回填（≥100 条）：批量化摄入后重建一次
+    for (let i = 0; i < 150; i += 1) session.push('user/message', { data: { text: '回填' + i } })
+    await ctx.callPreStep({ session }, { kind: 'enter' })
+    await engine._waitForIdle()
+    assert.equal(await fs_access(idxSmall).then(() => true, () => false), true, '回填完成后应重建一次索引')
+  })
 })
 
 test('真实宿主形态：session.log 数组（无 events() 方法）同样摄入', async () => {

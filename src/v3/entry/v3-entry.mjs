@@ -50,6 +50,7 @@ export function attachV3Engine(ctx, options = {}) {
   async function ingestAll(entry, log) {
     let batch = []
     let batchFirstSeq = null
+    let ingested = 0
     for (const raw of log) {
       if (disposed.value) return
       if (!MEMORY_EVENT_TYPES.has(raw?.type)) continue
@@ -58,13 +59,18 @@ export function attachV3Engine(ctx, options = {}) {
       batchFirstSeq = batchFirstSeq ?? raw.seq
       if (batch.length >= INGEST_BATCH) {
         await ingestBatch(entry, batch, batchFirstSeq)
+        ingested += batch.length
         batch = []
         batchFirstSeq = null
       }
     }
-    if (batch.length > 0 && !disposed.value) await ingestBatch(entry, batch, batchFirstSeq)
-    // 回填/增量完成后重建一次索引（P9：派生物，写路径不重建——O(N²) 事故修正）
-    if (!disposed.value) {
+    if (batch.length > 0 && !disposed.value) {
+      await ingestBatch(entry, batch, batchFirstSeq)
+      ingested += batch.length
+    }
+    // 只有回填（大批量）才在这里重建索引；每步 1-3 条的小增量留 stale，
+    // 检索时懒重建——否则每步全量重建 11.5MB 索引会卡住宿主事件循环（首字慢）。
+    if (!disposed.value && ingested >= INGEST_BATCH) {
       try { await entry.runtime.store.rebuildIndex() } catch (error) {
         ctx.logger?.warn?.('memory-context-lab-v3: 索引重建失败（检索时会自动重试）：' + (error?.message ?? String(error)))
       }

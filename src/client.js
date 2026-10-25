@@ -790,7 +790,7 @@ window.__ModuleLoader__.load({
       rows.push(h('div', { className: 'mcl-row', key: 'compress' },
         h('span', { className: 'mcl-label', title: t('field.compressHint') }, t('field.compress')),
         switchNode(compressOn, t('field.compress'), busy, function (next) {
-          run('/memory-lab compress ' + (next ? 'on' : 'off'));
+          run('/memory-lab set compress ' + (next ? 'on' : 'off'));
         })));
 
       // 层级压缩模型模式（P4）：仅 v2 会话显示；只发偏好命令，模型不可用时
