@@ -74,6 +74,7 @@ async function withEngine(body) {
   try {
     return await body({ ctx, engine, root })
   } finally {
+    await engine._waitForIdle().catch(() => {})
     engine.dispose()
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
@@ -85,20 +86,24 @@ test('增量摄入：三类入库、system 跳过、不重复', async () => {
     const agent = { session }
     session.push('user/message', { data: { source: { kind: 'user' }, content: [{ type: 'text', text: '用户第一句' }] } })
     await ctx.callPreStep(agent)
+    await engine._waitForIdle()
     let stats = engine.stats()
     assert.equal(stats.s1.lastSeq, 0, '首事件 seq=0 已摄入')
 
     session.push('system/message')
     session.push('assistant/message', { data: { content: [{ type: 'text', text: '助手回复' }] } })
     await ctx.callPreStep(agent)
+    await engine._waitForIdle()
     stats = engine.stats()
     assert.equal(stats.s1.lastSeq, 2, 'system 跳过但断点推进到最新已见事件')
 
     // 再触发一次（无新事件）：lastSeq 不变，不重复落库
     await ctx.callPreStep(agent)
+    await engine._waitForIdle()
     const metricsA = engine.stats().s1.metrics.counters['v3.processTurn.applied']
     session.push('tool/result', { data: { content: [{ type: 'text', text: '工具输出' }] } })
     await ctx.callPreStep(agent)
+    await engine._waitForIdle()
     assert.equal(engine.stats().s1.metrics.counters['v3.processTurn.applied'], (metricsA ?? 0) + 1, '只有新事件落库')
   })
 })
@@ -116,9 +121,10 @@ test('decision 原样返回；摄入抛错只告警', async () => {
     session.push('user/message')
     const decision = await ctx.callPreStep({ session }, { kind: 'enter', step: 42 })
     assert.deepEqual(decision, { kind: 'enter', step: 42 }, '影子不改宿主决策')
-    assert.ok(ctx.warnings.some((w) => /影子摄入失败/.test(w)), '失败只告警')
+    assert.ok(ctx.warnings.some((w) => /影子(摄入|调度)失败/.test(w)), '失败只告警（摄入批或调度层）')
     boom = false
     await ctx.callPreStep({ session })
+    await engine._waitForIdle()
     assert.ok(engine.stats().s1, '恢复后可装配')
     engine.dispose()
   } finally {
@@ -133,6 +139,7 @@ test('真实宿主形态：session.log 数组（无 events() 方法）同样摄�
     const agent = { session }
     session.push('user/message', { data: { source: { kind: 'user' }, content: [{ type: 'text', text: '真实形态' }] } })
     await ctx.callPreStep(agent)
+    await engine._waitForIdle()
     assert.ok(engine.stats()['log-shaped'], 'log 数组形态必须可摄入')
     assert.equal(engine.stats()['log-shaped'].lastSeq, 0)
   })
@@ -149,6 +156,7 @@ test('dispose 后不再摄入；非法 ctx 拒绝', async () => {
     const session = fakeSession('s1')
     session.push('user/message', { data: { content: [{ type: 'text', text: 'x' }] } })
     await ctx.callPreStep({ session })
+    await engine._waitForIdle()
     engine.dispose()
     session.push('user/message', { data: { content: [{ type: 'text', text: 'y' }] } })
     await assert.rejects(() => ctx.callPreStep({ session }), /未注册/, 'dispose 注销钩子')
@@ -156,4 +164,23 @@ test('dispose 后不再摄入；非法 ctx 拒绝', async () => {
   })
   assert.throws(() => attachV3Engine(null), (e) => e?.name === 'V3ContractViolation')
   assert.throws(() => attachV3Engine(fakeCtx(), {}), (e) => /v3Root 必传/.test(e.message))
+})
+
+test('事故修正（2026-10-25）：钩子不阻塞——大回填时 decision 立即返回', async () => {
+  await withEngine(async ({ ctx, engine }) => {
+    const session = fakeSession('big')
+    const agent = { session }
+    for (let i = 0; i < 350; i += 1) {
+      session.push('user/message', { data: { source: { kind: 'user' }, content: [{ type: 'text', text: '消息' + i }] } })
+    }
+    const t0 = Date.now()
+    const decision = await ctx.callPreStep(agent, { kind: 'enter', step: 1 })
+    const hookMs = Date.now() - t0
+    assert.equal(decision.kind, 'enter', 'decision 立即可用')
+    assert.ok(hookMs < 200, '钩子本身必须毫秒级返回（实测 ' + hookMs + 'ms）——摄入在后台')
+    assert.ok(engine.stats().big.ingesting === true || engine.stats().big.lastSeq >= 0, '后台摄入已启动或已完成')
+    await engine._waitForIdle()
+    assert.equal(engine.stats().big.lastSeq, 349, '350 条全部摄入（批 100）')
+    assert.equal((await engine.stats().big.metrics.counters['v3.processTurn.applied']), 350)
+  })
 })

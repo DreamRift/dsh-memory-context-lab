@@ -44,6 +44,51 @@ export function attachV3Engine(ctx, options = {}) {
   }))
   const disposed = { value: false }
 
+  // 摄入批大小：回填按批走事务；新事件通常 1-3 条一批
+  const INGEST_BATCH = 100
+
+  async function ingestAll(entry, log) {
+    let batch = []
+    let batchFirstSeq = null
+    for (const raw of log) {
+      if (disposed.value) return
+      if (!MEMORY_EVENT_TYPES.has(raw?.type)) continue
+      if (Number.isInteger(entry.lastSeq) && raw.seq <= entry.lastSeq) continue
+      batch.push(raw)
+      batchFirstSeq = batchFirstSeq ?? raw.seq
+      if (batch.length >= INGEST_BATCH) {
+        await ingestBatch(entry, batch, batchFirstSeq)
+        batch = []
+        batchFirstSeq = null
+      }
+    }
+    if (batch.length > 0 && !disposed.value) await ingestBatch(entry, batch, batchFirstSeq)
+    // 回填/增量完成后重建一次索引（P9：派生物，写路径不重建——O(N²) 事故修正）
+    if (!disposed.value) {
+      try { await entry.runtime.store.rebuildIndex() } catch (error) {
+        ctx.logger?.warn?.('memory-context-lab-v3: 索引重建失败（检索时会自动重试）：' + (error?.message ?? String(error)))
+      }
+    }
+  }
+
+  async function ingestBatch(entry, batch, firstSeq) {
+    try {
+      let applied = 0
+      for (const raw of batch) {
+        const result = await entry.runtime.handleDshEvent(raw, textOfDshEvent(raw))
+        if (result?.status === 'applied' || result?.status === 'rejected') entry.lastSeq = raw.seq
+        if (result?.status === 'applied') applied += 1
+        if (result?.status === 'rejected') {
+          ctx.logger?.warn?.('memory-context-lab-v3: 事件被拒绝 seq=' + raw.seq + '：' + (result.errors ?? []).join('；'))
+        }
+      }
+      ctx.logger?.info?.('memory-context-lab-v3: 摄入批完成（起 seq=' + firstSeq + '，' + applied + '/' + batch.length + ' 条）')
+    } catch (error) {
+      // 影子模式不干扰宿主：摄入失败只告警，断点停在已完成处，下一步续传
+      ctx.logger?.warn?.('memory-context-lab-v3: 影子摄入失败（seq 起 ' + firstSeq + '）：' + (error?.message ?? String(error)))
+    }
+  }
+
   const off = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (decision?.kind !== 'enter' || signal?.aborted) return decision
@@ -58,21 +103,18 @@ export function attachV3Engine(ctx, options = {}) {
       let entry = runtimes.get(sessionId)
       if (entry === undefined) {
         // 宿主 seq 从 0 起（SessionSeq 源码核验 2026-10-24），断点初值 -1 才不漏首事件
-        entry = { runtime: await makeRuntime(session, sessionId), lastSeq: -1 }
+        entry = { runtime: await makeRuntime(session, sessionId), lastSeq: -1, inflight: null }
         runtimes.set(sessionId, entry)
       }
-      for (const raw of log) {
-        if (!MEMORY_EVENT_TYPES.has(raw?.type)) continue
-        if (Number.isInteger(entry.lastSeq) && raw.seq <= entry.lastSeq) continue
-        const result = await entry.runtime.handleDshEvent(raw, textOfDshEvent(raw))
-        if (result?.status === 'applied' || result?.status === 'rejected') entry.lastSeq = raw.seq
-        if (result?.status === 'rejected') {
-          ctx.logger?.warn?.('memory-context-lab-v3: 事件被拒绝 seq=' + raw.seq + '：' + (result.errors ?? []).join('；'))
-        }
+      // 2026-10-25 事故修正：摄入**后台异步**执行（历史大会话回填实测 10 分钟），
+      // 钩子立即返回 decision，绝不阻塞首字；单飞行防重入，新事件由下一次 pre-step 续传。
+      if (entry.inflight === null) {
+        entry.inflight = ingestAll(entry, log)
+          .catch((error) => ctx.logger?.warn?.('memory-context-lab-v3: 摄入任务异常：' + (error?.message ?? String(error))))
+          .finally(() => { entry.inflight = null })
       }
     } catch (error) {
-      // 影子模式不干扰宿主决策：摄入失败只告警
-      ctx.logger?.warn?.('memory-context-lab-v3: 影子摄入失败：' + (error?.message ?? String(error)))
+      ctx.logger?.warn?.('memory-context-lab-v3: 影子调度失败：' + (error?.message ?? String(error)))
     }
     return decision
   })
@@ -88,10 +130,18 @@ export function attachV3Engine(ctx, options = {}) {
     },
     stats() {
       const out = {}
-      for (const [sessionId, { runtime, lastSeq }] of runtimes) {
-        out[sessionId] = { lastSeq, metrics: runtime.metrics() }
+      for (const [sessionId, { runtime, lastSeq, inflight }] of runtimes) {
+        out[sessionId] = { lastSeq, ingesting: inflight !== null, metrics: runtime.metrics() }
       }
       return out
+    },
+    /** 测试/诊断用：等待所有在飞摄入完成（生产不调用）。 */
+    async _waitForIdle() {
+      for (;;) {
+        const busy = [...runtimes.values()].filter((e) => e.inflight !== null)
+        if (busy.length === 0) return
+        await Promise.all(busy.map((e) => e.inflight))
+      }
     },
   }
 }

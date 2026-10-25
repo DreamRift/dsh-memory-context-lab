@@ -4,7 +4,9 @@
  * 把 session-store（事务/对账）、write-lock（串行化）、lexical-index（派生索引）、
  * vouchers/forgotten（恢复与隐私面）组合成 ports 定义的 SessionStore 方法面，
  * 经 assertPort 装配期校验（缺方法即失败，fail-closed）。
- * 索引维护点：每次写事务后全量重建（M3 口径；M4 换增量失效时只改这里）。
+ * 索引维护点（2026-10-25 事故修正）：写事务**不再**每笔全量重建——真机实测 2252 条
+ * 逐条重建耗时 10 分钟（O(N²)）；索引是派生物（P9），陈化由检索入口自动重建兜底，
+ * 批量摄入完成后由调用方显式 rebuildIndex 一次。
  */
 import { assertPort } from '../../ports/index.mjs'
 import { restoreEligibilityOf } from '../../domain/archive/restore.mjs'
@@ -39,8 +41,7 @@ export async function createSessionStorePort(root, sessionKey) {
     async transaction(records, { at } = {}) {
       return withWriteLock(dir, async () => {
         const txn = await store.submitTransaction(records, { at })
-        const index = await rebuildIndex()
-        return { ...txn, indexedCount: index.indexedCount }
+        return txn
       })
     },
 

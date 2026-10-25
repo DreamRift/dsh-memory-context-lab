@@ -81,10 +81,12 @@ test('合法事件：applied 全链路（落库/回读/冻结/outcome/回合推�
     assert.equal(stored.provenance.sourceEventId, 'evt-1')
     assert.equal((await port.health()).recordCount, 1)
     assert.equal(metrics.counters.get('v3.processTurn.applied'), 1)
-    // 索引随事务重建且新鲜
-    const health = await port.health()
-    assert.equal(health.indexStale, false)
-    assert.equal(health.indexedCount, 1)
+    // 2026-10-25 事故修正：写事务不重建索引（O(N²) 根因）——事务后陈化、重建后新鲜
+    const afterTxn = await port.health()
+    assert.equal(afterTxn.indexStale, true, '写路径不重建（P9：检索时兜底）')
+    const index = await port.rebuildIndex()
+    assert.equal(index.indexedCount, 1)
+    assert.equal((await port.health()).indexStale, false)
   })
 })
 
