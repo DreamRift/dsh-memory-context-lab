@@ -41,6 +41,7 @@ import { labRootFor } from './storage.mjs'
 import { globalSuppressionCoordinator, locatePinnedDshMemory } from './dsh-memory-suppression.mjs'
 import { InvalidArgumentError } from './errors.mjs'
 import { commandSurface } from './v2/command-surface.mjs'
+import { attachV3Engine } from './v3/entry/v3-entry.mjs'
 
 export const name = 'memory-context-lab'
 
@@ -184,6 +185,10 @@ function sessionIdOf(session) {
 export async function apply(ctx, config) {
   const labRoot = labRootFor()
   const activeOperations = new Set()
+
+  // v3 影子引擎（用户 2026-10-24 授权挂载）：只摄入落库（归一化→processTurn），
+  // 不动表面、不注册命令、不改设置，v2 行为零改动。数据根与 v2 会话根隔离。
+  const disposeV3Engine = attachV3Engine(ctx, { v3Root: join(labRoot, 'v3') })
 
   /** 全局默认设置（设置页），与 normalizeSettings 同口径收敛。 */
   function resolveDefaultsSettings() {

@@ -38,6 +38,8 @@ async function listSourceFiles(dir) {
  * 接线或删除后请把条目摘掉，白名单只缩不涨。
  */
 const EXPORT_WHITELIST = new Map(Object.entries({
+  evaluatePressureGate: '定案·白名单：闸门判定纯函数（v3-pressure-gate 套件锁 G1-G4 判据）；触发动作属①②④缓议项（2026-10-25 用户拍板），接线后摘除',
+  isReadLeaseActive: '定案·白名单：租约判据助手（v3-context-budget 套件锁失败关闭口径）；allocateBudget 内联消费 leaseUntil 字段，读路径接线（recall 后记 lastReadAt）后摘除',
   // —— 测试钩子（*ForTest），生产不消费是设计而非缺口 ——
   __setHostSessionModuleForTest: '定案·白名单：测试钩子替换本模块内部 hostSessionModule 缓存，物理上不可外移 test-hooks（外移即失闭包触达）；ForTest 命名自解释',
   resetHostSessionModuleCache: '定案·白名单：同上，操作本模块内部缓存',
@@ -57,6 +59,33 @@ const EXPORT_WHITELIST = new Map(Object.entries({
   resolveLeafRecordIds: '定案·白名单：L3→L0 叶子解析，hierarchy-store 套件锁解析与 missing 披露',
   readModelUsageEntries: '费用账本读侧：写入面已接线（onUsage），展示出口属新产品面暂不建，JSONL 可人工审计；测试消费中',
   withCommandSurface: '定案·白名单：命令面出口包裹原语，beta7 套件锁「抛出→错误结果」契约；生产在 runtime 装配处消费',
+  // —— v3 M0 骨架（dev-0.14.0/进展卡-M0）：M3 composition root 接线后逐项摘除 ——
+  assertPort: 'v3 M0：装配期端口校验，消费者是 M3 的 index.mjs composition root（尚未入驻）；v3 套件锁「缺方法必点名」',
+  isV3Error: 'v3 M0：错误信封判别，M3 边界转换消费；v3-session-isolation 套件锁信封形状',
+  sessionIsolationKey: 'v3 M0：会话隔离键，M3 processTurn 消费；v3-session-isolation 套件锁归一与失败关闭',
+  negotiateMemoryProvider: 'v3 M1：能力协商纯函数，消费者是 M5 dsh-memory adapter（尚未入驻）；v3-capabilities 套件锁 fail-closed 回 T1',
+  applyMinScore: 'v3 M1：双面门槛，消费者是 M4 检索装包（尚未入驻）；套件锁 display/pack/dropped 三分',
+  acquireWriteLock: 'v3 M2：跨进程写锁，消费者是 M3 写路径与 M2 存储事务（接线随 SessionStore 端口装配）；v3-write-lock 套件锁两阶段/心跳/接管',
+  searchLexical: 'v3 M2：tf 口径检索，BM25 主路径在 t1-provider（打分不复用）；留作索引冒烟与降级路径',
+  readLexicalIndex: 'v3 M2：索引读取，消费者是 M4 provider 与 staleness 检查；套件锁损坏不静默重建',
+  rebuildLexicalIndex: 'v3 M2：索引重建，消费者是 M3/M4 写路径维护点（尚未入驻）；套件锁从记录完整重建',
+  isIndexStale: 'v3 M2：新鲜度判定，消费者是检索入口（尚未入驻）；套件锁计数不一致即 stale',
+  createProcessTurn: 'v3 M3：processTurn 用例工厂，composition root 在 M5 宿主接线时消费；v3-process-turn 套件锁全链路五态',
+  createSessionStorePort: 'v3 M3：SessionStore 端口装配，composition root 在 M5 消费；套件锁端口面与真实适配器组合',
+  createSessionLifecycle: 'v3 M3：生命周期用例工厂（enable/disable/restore/forget），composition root 在 M5 消费；v3-session-lifecycle 套件锁 Q-01/G3/N-11',
+  renderWorkingCard: 'v3 M4：卡片渲染器，消费者是 M4/M5 投影执行路径（尚未入驻）；v3-card-renderer 套件锁严格上界含页脚',
+  planSlots: 'v3 M4：双槽规划，消费者是 M5 surface 执行层（尚未入驻）；v3-slot-planner 套件锁稳态双槽',
+  createT1Provider: 'v3 M4：T1 提供者工厂，backend-negotiation 与 composition 消费；v3-t1-recall 套件锁 BM25/OOV/双面门槛/自动重建',
+  negotiateMemoryBackend: 'v3 M5：记忆后端协商（D3 fail-closed），消费者是 composition root 切换处（T2 实测登记后接入）；v3-backend-negotiation 套件锁各回落分支',
+  gateRecallInjection: 'v3 M4：回注闸便捷封装（category=recall-injection），消费者是 M5 surface 执行层；recall 用例走 domain 直连（application 不依赖 projection）',
+  createSurfaceExecutor: 'v3 M4：投影执行器工厂，composition root 在 M5 消费；v3-surface-executor 套件锁 R4 降级/一步恢复',
+  placeholderReceipt: 'v3 M4：占位回执模板，executePlan 消费且导出供 M5 回执渲染复用；套件锁一行占位',
+  createDshHostAdapter: 'v3 M5：HostSurface 端口的 DSH 实现，composition root 在 M5 消费；v3-dsh-host 套件锁宿主契约逐字对齐',
+  normalizeDshEvent: 'v3 M5：DSH 事件→v3 封闭集归一化，消费者是 M5 事件入口（processTurn 前置）；套件锁四类映射/system 拒绝',
+  createV3Runtime: 'v3 M5：composition root，消费者是 entry/v3-entry（影子挂载）与未来插件入口；v3-composition 套件锁端到端四链路',
+  attachV3Engine: 'v3 M5：影子模式挂载（只摄入不动表面），消费者是插件主入口（挂载决策属产品发布面，M6 前不入 index.mjs）；v3-entry 套件锁增量摄入/dispose',
+  textOfDshEvent: 'v3 M5：DSH 事件正文提取，v3-entry 消费；套件锁 content 数组与裸 text 两形态',
+  createRecall: 'v3 M4：recall 用例工厂，composition root 在 M5 消费；v3-t1-recall 套件锁纯壳不注入/首部切片/P3',
 }))
 
 test('P0-5①：src 导出符号必须被 src 消费或在白名单（附理由）', async () => {

@@ -273,7 +273,7 @@ test('v2 运行时：未启用会话里两个钩子都是纯 no-op，不触碰�
     const session = buildSession({ operations: 2, id: 'session-v2-hooks-01' })
     const agent = agentFor(session)
     const listeners = ctx._listeners.get('agent/pre-step')
-    assert.equal(listeners.length, 4, '计划先行自动化 + 自动降温 + 回注 + 工作状态注入（0.13.1 单引擎，v1 的两个钩子已删除）')
+    assert.equal(listeners.length, 5, '计划先行自动化 + 自动降温 + 回注 + 工作状态注入 + v3 影子摄入（2026-10-24 用户授权挂载；影子只写 v3 根，不触碰 v2 冷库）')
 
     const messages = [{ id: 'user-1', role: 'user', content: [{ type: 'text', text: '历史里写了什么？' }], source: { kind: 'user' } }]
     const warningsBefore = ctx._warnings.length
