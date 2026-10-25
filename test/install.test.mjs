@@ -316,8 +316,8 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   // 0.13.1 单引擎：只有一个降温、一个回注、一个工作状态注入，外加计划先行自动化钩子。
   // 旧断言是 6 个 / 两条 prepend（v1 与 v2 各一套）——0.13.0 删 v1 后这些数字就过期了，
   // 但因为本组三条用例一直 SKIP（见 SOURCE_ENTRY 的注释），过期断言**从未被执行**。
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 4,
-    '降温 + 回注 + 工作状态注入 + 计划先行自动化钩子（单引擎，v1 那一套已删）')
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 5,
+    '降温 + 回注 + 工作状态注入 + 计划先行自动化 + v3 影子摄入（0.14.0-beta.1 起）')
   assert.equal(ctx._listeners.get('domain/changed').length, 1)
   assert.deepEqual(ctx._prependEvents, ['agent/pre-step'], '只挂一个 prepend 回注（单引擎）')
 
@@ -365,7 +365,7 @@ test('拿不到 tools 服务时插件照常加载：只跳过工具注册并告�
   // 唯一命令、投影与全部钩子都必须在——插件不能因为缺 tools 整体挂掉。
   assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
   assert.deepEqual(ctx._projections.map((projection) => projection.key), ['memoryContextLab'])
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 4)
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 5)
   assert.equal(ctx._tools.length, 0, '拿不到 tools 时不应注册工具')
   assert.ok(
     ctx._warnings.some((warning) => warning.includes('ctx.tools.register')),
