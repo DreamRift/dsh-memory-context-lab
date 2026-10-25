@@ -189,6 +189,43 @@ export async function apply(ctx, config) {
   // v3 影子引擎（用户 2026-10-24 授权挂载）：只摄入落库（归一化→processTurn），
   // 不动表面、不注册命令、不改设置，v2 行为零改动。数据根与 v2 会话根隔离。
   const disposeV3Engine = attachV3Engine(ctx, { v3Root: join(labRoot, 'v3') })
+  const v3Engine = disposeV3Engine // 兼容旧名：返回的是完整 engine 对象（dispose/inspect/search/read）
+
+  /** v3 影子观察面（2026-10-25 开工授权，只读不动 v2）：status / recall / read。 */
+  async function v3Surface(invocation) {
+    const words = String(invocation?.rawInput ?? invocation?.input ?? '').trim().split(/\s+/)
+    const sub = (words[1] ?? '').toLowerCase()
+    const arg = words.slice(2).join(' ')
+    const sessionId = sessionIdOf(invocation?.agent?.session)
+    const ok = (text) => ({ kind: 'success', text })
+    const bad = (text) => ({ kind: 'error', code: 'EV3SURFACE', message: text, text })
+    try {
+      if (sub === 'status') {
+        const s = await v3Engine.inspect(sessionId)
+        if (!s) return ok('v3 影子库：本会话尚未摄入（发出任一消息后自动开始；影子模式不影响对话）。')
+        return ok('v3 影子库（只读观察面）：\n- 摄入位点 seq：' + s.lastSeq + (s.ingesting ? '（后台摄入进行中）' : '') + '\n- 健康：' + JSON.stringify(s.health))
+      }
+      if (sub === 'recall') {
+        if (!arg) return bad('用法：/memory-lab v3 recall <查询词>')
+        const r = await v3Engine.search(sessionId, arg, { limit: 5 })
+        if (r === null) return ok('v3 影子库：本会话尚未摄入（发出任一消息后自动开始）。')
+        if (r.busy) return ok('后台摄入进行中，稍后再试（摄入优先，观察面不抢写锁）。')
+        if (!r.display.length) return ok('无命中。' + (r.oovTerms.length ? '（词库里没有的词：' + r.oovTerms.join(', ') + '）' : ''))
+        const lines = r.display.map((d) => '- ' + d.id + '（score ' + d.score.toFixed(1) + '，回读 /memory-lab v3 read ' + d.id + '）')
+        return ok('命中 ' + r.display.length + ' 条：\n' + lines.join('\n'))
+      }
+      if (sub === 'read') {
+        if (!arg) return bad('用法：/memory-lab v3 read <记录ID>')
+        const r = await v3Engine.read(sessionId, arg)
+        if (r === null) return ok('v3 影子库：本会话尚未摄入。')
+        if (r.busy) return ok('后台摄入进行中，稍后再试。')
+        return ok(r.text)
+      }
+      return bad('用法：/memory-lab v3 status | v3 recall <查询词> | v3 read <记录ID>')
+    } catch (error) {
+      return bad('v3 观察面失败（失败关闭）：' + (error?.code ?? '') + ' ' + (error?.message ?? String(error)))
+    }
+  }
 
   /** 全局默认设置（设置页），与 normalizeSettings 同口径收敛。 */
   function resolveDefaultsSettings() {
@@ -349,6 +386,7 @@ export async function apply(ctx, config) {
   }
 
   async function commandHandler(invocation) {
+    if (operationOf(invocation) === 'v3') return await v3Surface(invocation)
     const pending = v2.commandHandler(invocation)
     activeOperations.add(pending)
     pending.finally(() => activeOperations.delete(pending)).catch(() => {})

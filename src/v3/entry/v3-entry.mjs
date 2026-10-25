@@ -131,7 +131,35 @@ export function attachV3Engine(ctx, options = {}) {
     return decision
   })
 
+  /** 观察面（2026-10-25 开工授权）：只读；摄入进行中如实回 busy，不抢写锁。 */
+  async function inspect(sessionId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (!entry) return null
+    let health = null
+    try { health = await entry.runtime.store.health() } catch (error) {
+      health = { healthy: false, damaged: true, error: error?.code ?? error?.message ?? String(error) }
+    }
+    return { lastSeq: entry.lastSeq, ingesting: entry.inflight !== null, health }
+  }
+
+  async function searchReadOnly(sessionId, query, opts = {}) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (!entry) return null
+    if (entry.inflight !== null) return { busy: true }
+    return await entry.runtime.provider.search(String(query), opts)
+  }
+
+  async function readReadOnly(sessionId, recordId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (!entry) return null
+    if (entry.inflight !== null) return { busy: true }
+    return await entry.runtime.provider.read(String(recordId))
+  }
+
   return {
+    inspect,
+    search: searchReadOnly,
+    read: readReadOnly,
     dispose() {
       disposed.value = true
       for (const { runtime } of runtimes.values()) {
