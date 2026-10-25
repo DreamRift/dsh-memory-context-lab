@@ -54,6 +54,23 @@ async function withStack(body) {
   }
 }
 
+test('查询覆盖门槛：靠单个高频低质词攒分的垃圾命中被拒（2026-10-25 拍板）', async () => {
+  await withStack(async ({ provider, port }) => {
+    // 长文里「面板/方面」等含「面」「机」高频，但对「揉面机面粉」只命中 2/9 词
+    await port.transaction([
+      record('v3r-0123456789abc100', '设置面板上面的层级压缩开关与读取租约的机器用法说明'.repeat(3)),
+      record('v3r-0123456789abc101', '揉面机面粉配比的心得记录'),
+    ])
+    const oovLike = await provider.search('揉面机面粉 配比')
+    // 目标文档命中大多数查询词；垃圾文档只命中零星单字 → 不进 display
+    assert.ok(oovLike.display.some((d) => d.id === 'v3r-0123456789abc101'), '真相关文档在')
+    assert.ok(!oovLike.display.some((d) => d.id === 'v3r-0123456789abc100'), '低覆盖垃圾命中被拒')
+    // 单词/双词查询不被误伤：至少命中 1 词即过
+    const narrow = await provider.search('层级')
+    assert.ok(narrow.display.length >= 1, '窄查询不受覆盖门槛误伤')
+  })
+})
+
 test('search：命中、OOV 披露、双面门槛、空查询拒绝', async () => {
   await withStack(async ({ provider, port }) => {
     await port.transaction([

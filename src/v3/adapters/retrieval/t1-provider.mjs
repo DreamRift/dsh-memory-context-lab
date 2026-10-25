@@ -37,10 +37,11 @@ export function createT1Provider({ port, store, metrics } = {}) {
     return index
   }
 
-  /** BM25 打分：OOV 词不进分母、单独披露。 */
+  /** BM25 打分：OOV 词不进分母、单独披露；同时统计每文档命中的不同查询词数。 */
   function scoreIndex(index, terms) {
     const N = index.indexedCount
     const scores = new Map()
+    const hitCounts = new Map()
     const oovTerms = []
     for (const term of terms) {
       const postings = index.terms[term]
@@ -55,9 +56,10 @@ export function createT1Provider({ port, store, metrics } = {}) {
         const norm = index.avgDocLength > 0 ? dl / index.avgDocLength : 1
         const score = idf * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * norm))
         scores.set(id, (scores.get(id) ?? 0) + score)
+        hitCounts.set(id, (hitCounts.get(id) ?? 0) + 1)
       }
     }
-    return { scores, oovTerms }
+    return { scores, hitCounts, oovTerms }
   }
 
   const impl = {
@@ -74,8 +76,14 @@ export function createT1Provider({ port, store, metrics } = {}) {
       if (terms.length === 0) {
         return { display: [], pack: [], dropped: [], oovTerms: [] } // 纯符号查询不造通配
       }
-      const { scores, oovTerms } = scoreIndex(index, terms)
-      const ranked = rankResults([...scores].map(([id, score]) => ({ id, score }))).slice(0, limit)
+      const { scores, hitCounts, oovTerms } = scoreIndex(index, terms)
+      // 查询覆盖门槛（2026-10-25 拍板）：至少命中半数查询词才进结果面——
+      // 绝对分数阈值对 BM25 分数量纲不设防，OOV 查询靠单个高频低质词（如「面」「机」）
+      // 也能攒出十几分垃圾；覆盖门槛按「命中的不同查询词数」判相关性，量纲无关。
+      const minHits = Math.max(1, Math.ceil(terms.length / 2))
+      const ranked = rankResults([...scores].map(([id, score]) => ({ id, score })))
+        .filter((r) => (hitCounts.get(r.id) ?? 0) >= minHits)
+        .slice(0, limit)
       const gated = applyMinScore(ranked, { resultMinScore, packMinScore })
       metrics?.counter?.('v3.t1.search', 1)
       return { ...gated, oovTerms }

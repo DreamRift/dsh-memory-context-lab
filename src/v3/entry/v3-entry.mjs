@@ -15,6 +15,9 @@ import { V3ContractViolation } from '../contracts/index.mjs'
 
 const MEMORY_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/call', 'tool/result'])
 
+/** 插件自有来源标识（index.mjs 写入 source.kind；2026-10-25 拍板：自家生成物不入影子库）。 */
+const OWN_SOURCE_KIND = 'dsh-memory-context-lab'
+
 /** 从 DSH 事件取正文（content[].text 连接；无正文返回空串）。 */
 export function textOfDshEvent(raw) {
   const content = raw?.data?.content
@@ -54,6 +57,9 @@ export function attachV3Engine(ctx, options = {}) {
     for (const raw of log) {
       if (disposed.value) return
       if (!MEMORY_EVENT_TYPES.has(raw?.type)) continue
+      // 自家生成物（工作状态卡/回执/回注包）不入库：每步一张、高度重复，
+      // 会以高频词霸占检索位（检索冒烟实测 31× 重复污染）。seq 照常推进。
+      if (raw?.data?.source?.kind === OWN_SOURCE_KIND) continue
       if (Number.isInteger(entry.lastSeq) && raw.seq <= entry.lastSeq) continue
       batch.push(raw)
       batchFirstSeq = batchFirstSeq ?? raw.seq

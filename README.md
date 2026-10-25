@@ -2,7 +2,7 @@
 
 按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2）与**计划先行**。安装、会话命令、图形入口与清理卸载的唯一操作说明都在这里。
 
-> **当前源码版本 0.14.0-beta.2（测试版；热修 beta.1 首发卡死）**：v3 影子线（beta.2：摄入后台异步+索引去 O(N²)）——八层架构、上界回注、影子挂载（v2 零改动）；详见 CHANGELOG。功能。与 0.13.1 的可观察差异见[变更记录](./CHANGELOG.md)与[进展卡（beta.1）](../docs/dev-0.13.2/进展卡.md)、[进展卡（beta.2）](../docs/dev-0.13.2/进展卡-beta.2.md)、[进展卡（beta.3）](../docs/dev-0.13.2/进展卡-beta.3.md)、[进展卡（beta.4）](../docs/dev-0.13.2/进展卡-beta.4.md)、[进展卡（beta.5）](../docs/dev-0.13.2/进展卡-beta.5.md)。命令面**没有变化**；beta.3 起设置页的「全历史记忆上下文」与「保留最近操作」真正生效（此前是空开关）；beta.4 起设置页保存不再抹掉 schema 里其它字段，`/memory-lab set` 的数字参数不再被静默截断；beta.5 起 `set autorestore off` 真正「只停用不恢复」（窗口守卫照常生效），设置页数字框与 `history` 的每页条数不再静默改值。
+> **当前源码版本 0.14.0-beta.4（测试版）**：v3 影子线——八层架构、上界回注、影子挂载（v2 零改动）；详见 CHANGELOG。与 0.13.1 的可观察差异见[变更记录](./CHANGELOG.md)与[进展卡（beta.1）](../docs/dev-0.13.2/进展卡.md)、[进展卡（beta.2）](../docs/dev-0.13.2/进展卡-beta.2.md)、[进展卡（beta.3）](../docs/dev-0.13.2/进展卡-beta.3.md)、[进展卡（beta.4）](../docs/dev-0.13.2/进展卡-beta.4.md)、[进展卡（beta.5）](../docs/dev-0.13.2/进展卡-beta.5.md)。命令面**没有变化**；beta.3 起设置页的「全历史记忆上下文」与「保留最近操作」真正生效（此前是空开关）；beta.4 起设置页保存不再抹掉 schema 里其它字段，`/memory-lab set` 的数字参数不再被静默截断；beta.5 起 `set autorestore off` 真正「只停用不恢复」（窗口守卫照常生效），设置页数字框与 `history` 的每页条数不再静默改值。
 
 ## 它做什么、不做什么
 
@@ -97,7 +97,7 @@
 
 ```text
 cd 记忆上下文/plugin && npm run test:all      # 118 套逐套汇总（推荐）
-cd 记忆上下文/plugin && npm test              # 与 test:all 同一批套件，失败即中断
+cd 记忆上下文/plugin && npm test              # 同 test:all，失败即中断
 cd 记忆上下文/plugin && npm run probe:host    # 宿主 schema 校验（需 DSH_ASAR；无参数 SKIP）
 cd 记忆上下文/plugin && npm run probe:revert  # 66 个回退场景，确认对应测试会失败
 cd 记忆上下文/plugin && npm run probe:lingshu # 隔离灵枢写入健康探测；不可用如实报环境原因

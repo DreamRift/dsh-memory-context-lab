@@ -16,7 +16,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, access as fs_access } from 'node:fs/promises'
+import { mkdtemp, rm, access as fs_access, readFile as fs_readFile, readdir as fs_readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -130,6 +130,24 @@ test('decision 原样返回；摄入抛错只告警', async () => {
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
+})
+
+test('自家生成物不入库（2026-10-25 拍板）：source.kind 匹配的 user 事件跳过，seq 照常推进', async () => {
+  await withEngine(async ({ ctx, engine, root }) => {
+    const session = fakeSession('s-own')
+    session.push('user/message', { data: { text: '真人消息' } })
+    session.push('user/message', { data: { text: '[工作状态·v2] 卡片正文', source: { kind: 'dsh-memory-context-lab', form: 'working-set' } }, source: { kind: 'dsh-memory-context-lab', form: 'working-set' } })
+    session.push('user/message', { data: { text: '又一条真人消息' } })
+    await ctx.callPreStep({ session }, { kind: 'enter' })
+    await engine._waitForIdle()
+    // 读该会话全部记录：只应有两条真人消息
+    const recDir = path.join(root, 'sessions', 's-own', 'records')
+    const files = await fs_readdir(recDir).catch(() => [])
+    const texts = []
+    for (const f of files) texts.push(JSON.parse(await fs_readFile(path.join(recDir, f), 'utf8')).payload.text)
+    assert.equal(files.length, 2, '卡不入库，真人消息照入')
+    assert.ok(!texts.some((x) => x.includes('工作状态')), '不得出现自家卡正文')
+  })
 })
 
 test('索引重建分寸：小增量不重建（首字不受 11.5MB 重建拖累），回填才重建', async () => {
