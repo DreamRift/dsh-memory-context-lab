@@ -1,3 +1,10 @@
+## 0.14.0-beta.6（2026-10-25，测试版；决策文档 P1 摄入修复批）
+
+- **修复：按宿主真实事件形状重写正文提取**（dsh-agent-loop 0.2.1-rc.3 源码核验）：`assistant/message` 与 `tool/result` 的正文在 `data.message.content`（此前读 `data.content` 致 154 条 assistant、346 条 operation 全空正文）；`reasoning/thinking/图片` 等非文本块不进正文。
+- **tool/call 结构化摄入**：工具名/callId/脱敏参数以确定性文本 + `structure` 字段入库；敏感字段（token/secret/password/credential/api-key/authorization）替换为 `[REDACTED]`，不静默保存凭据。
+- **metadata-only 合同**：空正文/不可提取事件标 `metaOnly`+原因落库（可回读、计数可对账），不进全文检索索引。
+- 新增守卫：`test/v3-p1-ingest.test.mjs`（真实形状 fixtures + 脱敏 + 端到端）。
+
 ## 0.14.0-beta.5（2026-10-25，测试版）
 
 - **新增：v3 影子观察面（只读，不动 v2）**——`/memory-lab v3 status`（摄入位点/健康）、`v3 recall <查询词>`（查影子库，命中带可回读句柄）、`v3 read <记录ID>`（精确回读）。未摄入会话给指引；后台摄入中如实回 busy 不抢写锁；失败关闭带 code。

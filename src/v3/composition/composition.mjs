@@ -43,12 +43,12 @@ export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsS
   const recall = createRecall({ provider, metrics, sessionKey: key })
   const executor = createSurfaceExecutor({ host, clock, metrics })
 
-  async function handleDshEvent(dshEvent, text) {
+  async function handleDshEvent(dshEvent, text, meta = {}) {
     const normalized = normalizeDshEvent(dshEvent, key)
     if (!normalized.ok) {
       return { status: 'not-memory-event', errors: normalized.errors }
     }
-    return processTurn({ event: normalized.event, text })
+    return processTurn({ event: normalized.event, text, meta })
   }
 
   return {

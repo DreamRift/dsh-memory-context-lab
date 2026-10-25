@@ -38,7 +38,7 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
 
   let turnState = { turn: 0, eventsInTurn: 0 }
 
-  return async function processTurn({ event, text }) {
+  return async function processTurn({ event, text, meta }) {
     // ① 归一化：非法事件失败关闭（不落库、不计量 applied）
     const validation = validateEvent(event)
     if (!validation.ok) {
@@ -58,7 +58,12 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
       kind: KIND_OF_TYPE[normalized.type],
       sessionKey: normalized.sessionKey,
       createdAt: now,
-      payload: { text: body, bytes: Buffer.byteLength(body, 'utf8') },
+      payload: {
+        text: body,
+        bytes: Buffer.byteLength(body, 'utf8'),
+        ...(meta?.metaOnly === true ? { metaOnly: true, metaReason: typeof meta.metaReason === 'string' ? meta.metaReason : 'unknown' } : {}),
+        ...(meta?.structure !== undefined ? { structure: meta.structure } : {}),
+      },
       provenance: {
         sourceEventId: normalized.id,
         sourceForm: normalized.source.form,

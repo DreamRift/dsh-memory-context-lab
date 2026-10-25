@@ -18,11 +18,58 @@ const MEMORY_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/c
 /** 插件自有来源标识（index.mjs 写入 source.kind；2026-10-25 拍板：自家生成物不入影子库）。 */
 const OWN_SOURCE_KIND = 'dsh-memory-context-lab'
 
-/** 从 DSH 事件取正文（content[].text 连接；无正文返回空串）。 */
-export function textOfDshEvent(raw) {
-  const content = raw?.data?.content
-  if (!Array.isArray(content)) return typeof raw?.data?.text === 'string' ? raw.data.text : ''
+/** 敏感字段脱敏（P1 摄入合同 4.1.3：凭据/令牌不静默入库）。 */
+const SENSITIVE_KEY = /token|secret|pass(word)?|credential|api[-_]?key|authorization/i
+function redactValue(value, depth = 0) {
+  if (depth > 6 || value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redactValue(v, depth + 1))
+  const out = {}
+  for (const [k, v] of Object.entries(value).slice(0, 50)) {
+    out[k] = SENSITIVE_KEY.test(k) ? '[REDACTED]' : redactValue(v, depth + 1)
+  }
+  return out
+}
+
+/** content 块数组取可见文本（type=text；reasoning/thinking/图片等非文本块不进正文）。 */
+function textOfBlocks(content) {
+  if (!Array.isArray(content)) return ''
   return content.filter((c) => c?.type === 'text').map((c) => c.text ?? '').join('\n')
+}
+
+/**
+ * 从 DSH 事件提取正文与结构（2026-10-25 P1 修正：按宿主源码核验的真实形状）。
+ * - user/message：data.content[].text / data.text（原有路径）；
+ * - assistant/message：正文在 data.message.content（dsh-agent-loop createAssistantMessage）；
+ * - tool/result：正文在 data.message.content（createToolResultMessage），错误态标注；
+ * - tool/call：无正文，确定性结构文本（工具名/callId/脱敏参数）+ structure 字段；
+ * - 提取不到正文 → metaOnly（记录原因；计数可对账；不进全文检索）。
+ */
+export function extractEventBody(raw) {
+  const data = raw?.data ?? {}
+  const type = raw?.type ?? ''
+  if (type === 'assistant/message') {
+    const text = textOfBlocks(data.message?.content) || textOfBlocks(data.content) || (typeof data.text === 'string' ? data.text : '')
+    return text ? { text } : { text: '', metaOnly: true, reason: 'assistant 无可见文本块' }
+  }
+  if (type === 'tool/result') {
+    const text = textOfBlocks(data.message?.content) || textOfBlocks(data.content)
+    if (data.error !== undefined && text) return { text: text + '\n[工具结果：错误态]' }
+    return text ? { text } : { text: '', metaOnly: true, reason: 'tool/result 无可读正文' }
+  }
+  if (type === 'tool/call') {
+    const structure = { name: typeof data.name === 'string' ? data.name : '', callId: typeof data.callId === 'string' ? data.callId : '', arguments: redactValue(data.arguments) }
+    let argsText = ''
+    try { argsText = JSON.stringify(structure.arguments) } catch { argsText = '[不可序列化参数]' }
+    if (argsText.length > 400) argsText = argsText.slice(0, 400) + '…'
+    return { text: '工具调用 ' + structure.name + '(' + structure.callId + ')：' + argsText, structure }
+  }
+  const text = textOfBlocks(data.content) || (typeof data.text === 'string' ? data.text : '')
+  return text ? { text } : { text: '', metaOnly: true, reason: type + ' 无可提取正文' }
+}
+
+/** 从 DSH 事件取正文（兼容旧签名：只返回文本）。 */
+export function textOfDshEvent(raw) {
+  return extractEventBody(raw).text
 }
 
 /**
@@ -39,7 +86,8 @@ export function attachV3Engine(ctx, options = {}) {
     throw new V3ContractViolation('v3 entry: v3Root 必传（由主入口解析数据根，v3 不依赖 v2 模块）')
   }
   const v3Root = options.v3Root
-  const runtimes = new Map() // sessionId → { runtime, lastSeq }
+  const runtimes = new Map()
+  const entryMetrics = new Map() // sessionId → { runtime, lastSeq }
   const makeRuntime = options.runtimeFactory ?? (async (dshSession, sessionId) => createV3Runtime({
     v3Root,
     dshSession,
@@ -83,11 +131,16 @@ export function attachV3Engine(ctx, options = {}) {
     }
   }
 
+  const bodyOf = (raw) => extractEventBody(raw)
+  function metricsNote(name) { entryMetrics.set(name, (entryMetrics.get(name) ?? 0) + 1) }
+
   async function ingestBatch(entry, batch, firstSeq) {
     try {
       let applied = 0
       for (const raw of batch) {
-        const result = await entry.runtime.handleDshEvent(raw, textOfDshEvent(raw))
+        const body = bodyOf(raw)
+        const result = await entry.runtime.handleDshEvent(raw, body.text, { metaOnly: body.metaOnly === true, metaReason: body.reason ?? '', structure: body.structure ?? undefined })
+        if (body.metaOnly === true) metricsNote('v3.ingest.metadataOnly')
         if (result?.status === 'applied' || result?.status === 'rejected') entry.lastSeq = raw.seq
         if (result?.status === 'applied') applied += 1
         if (result?.status === 'rejected') {
@@ -169,7 +222,7 @@ export function attachV3Engine(ctx, options = {}) {
       if (typeof off === 'function') off()
     },
     stats() {
-      const out = {}
+      const out = { ingestMetrics: Object.fromEntries(entryMetrics) }
       for (const [sessionId, { runtime, lastSeq, inflight }] of runtimes) {
         out[sessionId] = { lastSeq, ingesting: inflight !== null, metrics: runtime.metrics() }
       }

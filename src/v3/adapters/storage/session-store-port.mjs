@@ -27,8 +27,11 @@ export async function createSessionStorePort(root, sessionKey) {
     const forgotten = new Set(store.listForgotten())
     const ids = (await store.listRecordIds()).filter((id) => !forgotten.has(id))
     const entries = []
+    let metaOnlySkipped = 0
     for (const id of ids) {
       const record = await store.readRecord(id)
+      // metadata-only 不进全文检索（P1 摄入合同 4.1.5）：可回读、可对账，不占检索位
+      if (record.payload?.metaOnly === true) { metaOnlySkipped += 1; continue }
       entries.push({ id, text: record.payload.text })
     }
     const index = buildLexicalIndex(entries)
