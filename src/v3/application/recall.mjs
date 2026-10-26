@@ -91,18 +91,27 @@ export function createRecall({ provider, metrics, sessionKey } = {}) {
       headerLines.push('词表外词（未参与打分）：' + result.oovTerms.join('、'))
     }
     const hitLines = []
+    const hitTimes = [] // D-13 口径（2026-10-26 拍板「优先保最新的」）：截断丢最旧，不砍尾部
     for (const hit of result.pack) {
-      const { text } = await provider.read(hit.id)
+      const record = await provider.read(hit.id)
+      const text = record?.text ?? ''
       const preview = text.length > previewChars ? sliceByChars(text, previewChars) + '…' : text
       hitLines.push('· ' + hit.id + '（相关度 ' + hit.score.toFixed(3) + '）首部：' + preview)
+      hitTimes.push(Number.isFinite(record?.record?.createdAt) ? record.record.createdAt : 0)
     }
     // 注入上界（P0-4）：超出硬顶时保完整行截断，省略可见、可按 ID 回读——不静默缩每条。
     // 上界必须对**最终正文**成立：省略行与回读尾行都在预算内（H-05：旧实现先算长度再追加两行，
     // 结果超上限；省略条数还用 lines.length-2 硬编码「标题+OOV」两行，无 OOV 时多算一条）。
     const tailLine = '按 ID 精确回读全文：memory_lab_recall(record_ids=["' + result.pack[0].id + '", …])；丢弃不等于不存在。'
+    // 超预算时丢 createdAt 最旧的行（保显示分数序；丢弃集合按时间选出，省略行如实计数）
+    const orderToDrop = hitTimes
+      .map((at, n) => ({ at, n }))
+      .sort((a, b) => (a.at - b.at) || (a.n - b.n))
+      .map((x) => x.n)
     const compose = (keepCount) => {
+      const dropped = new Set(orderToDrop.slice(0, hitLines.length - keepCount))
       const omitted = hitLines.length - keepCount
-      const lines = [...headerLines, ...hitLines.slice(0, keepCount)]
+      const lines = [...headerLines, ...hitLines.filter((_, n) => !dropped.has(n))]
       if (omitted > 0) lines.push('注入上界：超出 ' + RECALL_PACK_MAX_CHARS + ' 字符的 ' + omitted + ' 条已省略（按 ID 回读全文）')
       lines.push(tailLine)
       return lines
