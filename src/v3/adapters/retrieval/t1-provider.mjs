@@ -71,6 +71,14 @@ export function createT1Provider({ port, store, metrics } = {}) {
       if (typeof query !== 'string' || query.length === 0) {
         throw new V3ContractViolation('v3 t1-provider: 查询必须是非空字符串（空查询失败关闭）')
       }
+      // limit 必须校验（H-38）：`slice(0, limit)` 对负数是从尾部切——limit=-1 实测返回
+      // 11/12 条（「几乎全量」），Infinity 返回全部。负数是「拒绝」还是「默认」都不成立，
+      // 它把「有界热上下文」这条硬不变量变成失败开放。这里失败关闭，不静默夹值
+      // （夹值会让调用方以为自己的数字生效了，与 N-10 同一条教训）。
+      if (!Number.isSafeInteger(limit) || limit < 0) {
+        // 用 String 而非 JSON.stringify：后者把 NaN/Infinity 都渲染成 "null"，诊断时分不清是哪个。
+        throw new V3ContractViolation('v3 t1-provider: limit 必须是 ≥0 的安全整数，得到 ' + String(limit))
+      }
       const index = await freshIndex()
       const terms = tokenizeQuery(query)
       if (terms.length === 0) {
@@ -89,17 +97,28 @@ export function createT1Provider({ port, store, metrics } = {}) {
       return { ...gated, oovTerms }
     },
 
-    /** 精确回读：顶层 text 恒非空（PTC 形态可读）。 */
+    /**
+     * 精确回读：顶层 text 恒非空（PTC 形态可读）。
+     *
+     * metadata-only 记录（P1 摄入合同 4.1.5：「可回读、可对账，不占检索位」）正文本来就是空的，
+     * 旧实现把它当成「不可读」并抛 EFORGOTTEN——**把非隐私条件伪装成隐私错误**，而且让
+     * 「可回读」的承诺落空（H-15）。现在按 payload.metaOnly 如实给占位正文（说明原因），
+     * 真正的数据异常（非 metaOnly 却空正文）报 ESTORE_CORRUPT，与遗忘彻底分开。
+     */
     async read(recordId) {
       if (typeof recordId !== 'string' || recordId.length === 0) {
         throw new V3ContractViolation('v3 t1-provider: recordId 必须是非空字符串')
       }
       const record = await port.readRecord(recordId)
       const text = typeof record?.payload?.text === 'string' ? record.payload.text : ''
-      if (text.length === 0) {
-        throw v3Error('EFORGOTTEN', '记录 ' + recordId + ' 正文为空或不可读（失败关闭，不返回空壳）')
+      if (text.length > 0) return { text, record }
+      if (record?.payload?.metaOnly === true) {
+        const reason = typeof record.payload.metaReason === 'string' && record.payload.metaReason.length > 0
+          ? record.payload.metaReason
+          : 'unknown'
+        return { text: '[metadata-only] 该记录无可读正文（原因：' + reason + '）；可按 ID 对账，不进全文检索。', record, metaOnly: true }
       }
-      return { text, record }
+      throw v3Error('ESTORE_CORRUPT', '记录 ' + recordId + ' 正文为空且未标记 metadata-only（数据异常，失败关闭）')
     },
 
     async health() {

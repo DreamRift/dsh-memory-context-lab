@@ -8,6 +8,9 @@
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
 
+/** 一次性闸门记忆窗口（键数上界；H-18：见 oncePerTurnGate）。 */
+export const GATE_WINDOW = 64
+
 /**
  * 判定事件是否真实用户事件。
  * @param {object} event 归一化事件（形状见 contracts/events.mjs）
@@ -54,6 +57,9 @@ export function oncePerTurnGate(seen, sessionKey, turn, category) {
   if (!(seen instanceof Set)) {
     throw new V3ContractViolation('v3 session/turn: seen 必须是 Set')
   }
+  // seen 必须**有界**（H-18）：旧实现每次返回「全部历史键 + 新键」的新 Set，键随回合数线性
+  // 增长、复制量随回合数平方增长（实测 2 万回合 20000 个键 / 2.0 秒）。回合号在会话内单调
+  // 递增，闸门只需要「本回合与近几个回合」的键——按 FIFO 只保留最近 GATE_WINDOW 个。
   if (typeof sessionKey !== 'string' || sessionKey.length === 0) {
     throw new V3ContractViolation('v3 session/turn: sessionKey 必须是非空字符串')
   }
@@ -67,5 +73,11 @@ export function oncePerTurnGate(seen, sessionKey, turn, category) {
   if (seen.has(key)) return { emit: false, seen }
   const next = new Set(seen)
   next.add(key)
+  // FIFO 裁剪：Set 保序，删除最老的键。窗口远大于「一个回合内的类目数」，
+  // 因此「同回合同类只一次」的语义不变；被裁掉的都是早已过去的回合。
+  while (next.size > GATE_WINDOW) {
+    const oldest = next.values().next().value
+    next.delete(oldest)
+  }
   return { emit: true, seen: next }
 }

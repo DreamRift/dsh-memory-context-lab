@@ -109,7 +109,12 @@ export function allocateBudget({ sections, budgetChars, now = null } = {}) {
     if (used + softUsed + s.chars <= budgetChars) {
       kept.add(s.category)
       softUsed += s.chars
+      continue
     }
+    // 「丢最旧保最新」= 只保留**后缀**（H-22）：一旦某段装不下，比它更旧的段也一律丢弃。
+    // 旧实现只 continue 跳过装不下的段、继续往前装更旧的段，于是「最新段太大」时
+    // 结果恰好相反——丢掉刚发出的、保住最旧的，正是 D-13 记录过的 v2 老毛病。
+    break
   }
   for (const s of soft) {
     if (kept.has(s.category)) included.push(s.category)

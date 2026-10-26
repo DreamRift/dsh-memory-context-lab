@@ -68,7 +68,9 @@ test('全量步：占位 + 全量 replace 都 applied；槽位推进', async () 
   })
   assert.equal(result.outcome.status, 'applied')
   assert.equal(result.outcome.totalEffects, 2)
-  assert.deepEqual(result.surfaceState, { fullSlotSeq: 102, deltaSlotSeq: null })
+  // H-17：执行顺序改为「先落卡、后落占位」，所以卡片拿到 101（旧实现按计划顺序先落占位 → 102）。
+  // 槽位只认卡片的 seq，与宿主分配顺序无关；这样卡片失败时面上零变化，旧 surfaceState 仍有效。
+  assert.deepEqual(result.surfaceState, { fullSlotSeq: 101, deltaSlotSeq: null })
   assert.equal(result.fallbacks.length, 0)
   const placeholderOp = host.ops.find((o) => o.targetEventId === 18)
   assert.match(placeholderOp.text, /占位/)

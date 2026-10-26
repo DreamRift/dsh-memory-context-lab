@@ -165,3 +165,20 @@ export async function withWriteLock(dir, body) {
   })
   return run
 }
+
+
+/**
+ * 跨进程写锁组合（H-10-a 接入，2026-10-26 拍板方案 A：每次事务取锁）：
+ * 进程内队列（同进程串行 + 重入）→ 跨进程文件锁（acquireWriteLock）→ body → release。
+ * 两 DSH 进程同写一会话目录时事务号与凭证不再相撞；锁等待 5s 内未取得抛 ELOCKED 失败关闭。
+ */
+export async function withCrossProcessWriteLock(dir, body) {
+  return withWriteLock(dir, async () => {
+    const lock = await acquireWriteLock(dir)
+    try {
+      return await body()
+    } finally {
+      await lock.release().catch(() => {})
+    }
+  })
+}

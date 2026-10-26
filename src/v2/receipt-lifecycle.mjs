@@ -54,8 +54,14 @@ export function parseDetailReceipt(text) {
   const body = String(text ?? '')
   const nodeIds = [...body.matchAll(/冷记录 (\S+)/g)].map((m) => m[1]).filter((id) => id !== '(unknown)')
   const spans = [...body.matchAll(/seq (\d+)[–-](\d+)/g)].map((m) => [Number(m[1]), Number(m[2])])
-  const seqStart = spans.length ? Math.min(...spans.map((s) => s[0])) : null
-  const seqEnd = spans.length ? Math.max(...spans.map((s) => s[1])) : null
+  // 不得用 Math.min(...arr) 展开参数（H-16）：回执正文规模不受控（逐条列 seq 的明细回执、
+  // 或用户/工具正文里出现大量 "seq a–b"），20 万段即 RangeError: Maximum call stack size exceeded。
+  let seqStart = null
+  let seqEnd = null
+  for (const [start, end] of spans) {
+    if (seqStart === null || start < seqStart) seqStart = start
+    if (seqEnd === null || end > seqEnd) seqEnd = end
+  }
   const tokens = [...body.matchAll(/原 ≈(\d+) token/g)].reduce((sum, m) => sum + Number(m[1]), 0)
   const head = /批次归档：本批 (\d+)\/(\d+)/.exec(body)
   const members = head ? Number(head[1]) : nodeIds.length

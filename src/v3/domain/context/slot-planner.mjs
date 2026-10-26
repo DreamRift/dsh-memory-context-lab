@@ -33,6 +33,17 @@ export function planSlots({ step, surfaceState, fullEvery = 20, truncated = fals
   if (surfaceState === null || typeof surfaceState !== 'object' || !('fullSlotSeq' in surfaceState) || !('deltaSlotSeq' in surfaceState)) {
     throw new V3ContractViolation('v3 slot-planner: surfaceState 必须含 fullSlotSeq/deltaSlotSeq')
   }
+  // 槽位 seq 的合法域（H-23）：null（无槽）或 **≥1 的整数**。
+  // 旧实现不校验，于是 deltaSlotSeq=0 会生成 `replace targetEventId: 0`——而宿主把
+  // surface 节点 0 当作**系统提示**（dsh types_surface.js assertSystemHeadRewrite）；
+  // seq 0 上不是 system/message 的会话里，这条 replace 会真的把系统提示折掉。
+  // 1.5 / "18" 这类值则一路漂到宿主才被拒，错误现场离根因很远。
+  for (const [name, value] of [['fullSlotSeq', surfaceState.fullSlotSeq], ['deltaSlotSeq', surfaceState.deltaSlotSeq]]) {
+    if (value === null) continue
+    if (!Number.isInteger(value) || value < 1) {
+      throw new V3ContractViolation('v3 slot-planner: surfaceState.' + name + ' 必须是 null 或 ≥1 的整数（得到 ' + JSON.stringify(value) + '）——seq 0 是宿主的系统提示节点')
+    }
+  }
   const isFull = step % fullEvery === 0 || truncated || surfaceState.fullSlotSeq === null
   if (isFull) {
     const ops = []

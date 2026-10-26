@@ -21,6 +21,23 @@ export const V3_PLUGIN_SOURCE_KIND = 'dsh-memory-context-lab'
 
 const DSH_USER_MESSAGE = 'user/message'
 
+/** 归一化事件 ID 的前缀（H-01：断点反推与归一化必须用同一份形态，不得各写一遍）。 */
+const DSH_EVENT_ID_PREFIX = 'dsh-'
+
+/** 宿主 seq → v3 事件 ID（唯一生成点）。 */
+export function dshEventIdOfSeq(seq) {
+  return DSH_EVENT_ID_PREFIX + String(seq)
+}
+
+/** v3 事件 ID → 宿主 seq；不是本形态一律返回 null（不猜、不静默归一）。 */
+export function seqOfDshEventId(id) {
+  if (typeof id !== 'string' || !id.startsWith(DSH_EVENT_ID_PREFIX)) return null
+  const raw = id.slice(DSH_EVENT_ID_PREFIX.length)
+  if (!/^\d+$/.test(raw)) return null
+  const seq = Number(raw)
+  return Number.isSafeInteger(seq) ? seq : null
+}
+
 /**
  * 把 DSH 原生事件归一化为 v3 事件合同的类型封闭集。
  * @returns {{ ok: true, event } | { ok: false, errors: string[] }}
@@ -41,7 +58,7 @@ export function normalizeDshEvent(raw, sessionKey) {
   }
   const source = raw.data?.source ?? {}
   return validateShape({
-    id: 'dsh-' + String(raw.seq ?? ''),
+    id: dshEventIdOfSeq(raw.seq),
     type,
     sessionKey,
     at: Number.isFinite(raw.at) ? raw.at : 0,

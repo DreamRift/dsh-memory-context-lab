@@ -36,7 +36,7 @@ function record(id, text) {
     sessionKey: SESSION_KEY,
     createdAt: 1792845000000,
     payload: { text, bytes: Buffer.byteLength(text, 'utf8') },
-    provenance: { sourceEventId: 'evt-1', sourceForm: 'tool/result', transactionId: 'tx-1' },
+    provenance: { sourceEventId: 'evt-' + id, sourceForm: 'tool/result', transactionId: 'tx-' + id },
   }
 }
 

@@ -55,6 +55,20 @@ export function createRecall({ provider, metrics, sessionKey } = {}) {
     if (!Number.isInteger(turn) || turn < 1) {
       throw new V3ContractViolation('v3 recall: turn 必须 ≥1（turn 0 不允许注入）')
     }
+    // H-47：切片长度必须落在 [0, +∞) 的整数域。旧实现直接拿调用方的值做
+    // `text.length > previewChars` 与 `slice(0, previewChars)`：
+    // - 负数 → slice(0,-1) 取「除最后一个字符外的全文」（越界**放宽**）；
+    // - NaN / Infinity / 非数字 → 比较恒为 false → 直接注入**全文**。
+    // 两者都绕过 N-03 的「定长首部切片」纪律：回注包不是摘要也不是全文，
+    // 而这两条路径把 800 字符正文原样塞进下一步的上下文。
+    if (!Number.isInteger(previewChars) || previewChars < 0) {
+      throw new V3ContractViolation('v3 recall: previewChars 必须是 ≥0 的整数（得到 ' + JSON.stringify(previewChars) + '）——负数会 slice(0,-1) 取到全文，NaN/Infinity 会让比较恒假')
+    }
+    // 切片长度超过整包硬顶没有意义（一条命中就撑满整个回注包，其余全被省略）：
+    // 这种参数不是「多要一点」，是配置错误。失败关闭而不是静默当成「全要」。
+    if (previewChars > RECALL_PACK_MAX_CHARS) {
+      throw new V3ContractViolation('v3 recall: previewChars 不得超过回注包硬顶 ' + RECALL_PACK_MAX_CHARS + '（得到 ' + previewChars + '）')
+    }
     const result = await provider.search(query, { limit, resultMinScore, packMinScore })
     if (result.pack.length === 0) {
       metrics?.counter?.('v3.recall.skipped', 1)
@@ -72,26 +86,47 @@ export function createRecall({ provider, metrics, sessionKey } = {}) {
     }
     seen = gate.seen
 
-    const lines = ['回注包（命中 ' + result.pack.length + ' 条；来源：本地词法索引）']
+    const headerLines = ['回注包（命中 ' + result.pack.length + ' 条；来源：本地词法索引）']
     if (result.oovTerms.length > 0) {
-      lines.push('词表外词（未参与打分）：' + result.oovTerms.join('、'))
+      headerLines.push('词表外词（未参与打分）：' + result.oovTerms.join('、'))
     }
+    const hitLines = []
     for (const hit of result.pack) {
       const { text } = await provider.read(hit.id)
       const preview = text.length > previewChars ? sliceByChars(text, previewChars) + '…' : text
-      lines.push('· ' + hit.id + '（相关度 ' + hit.score.toFixed(3) + '）首部：' + preview)
+      hitLines.push('· ' + hit.id + '（相关度 ' + hit.score.toFixed(3) + '）首部：' + preview)
     }
-    // 注入上界（P0-4）：超出硬顶时保完整行截断，省略可见、可按 ID 回读——不静默缩每条
-    let pack = lines.join('\n')
-    if (pack.length > RECALL_PACK_MAX_CHARS) {
-      while (lines.length > 1 && lines.join('\n').length > RECALL_PACK_MAX_CHARS) lines.pop()
-      lines.push('注入上界：超出 ' + RECALL_PACK_MAX_CHARS + ' 字符的 ' + (result.pack.length - (lines.length - 2)) + ' 条已省略（按 ID 回读全文）')
-      metrics?.counter?.('v3.recall.pack-truncated', 1)
-      pack = lines.join('\n')
+    // 注入上界（P0-4）：超出硬顶时保完整行截断，省略可见、可按 ID 回读——不静默缩每条。
+    // 上界必须对**最终正文**成立：省略行与回读尾行都在预算内（H-05：旧实现先算长度再追加两行，
+    // 结果超上限；省略条数还用 lines.length-2 硬编码「标题+OOV」两行，无 OOV 时多算一条）。
+    const tailLine = '按 ID 精确回读全文：memory_lab_recall(record_ids=["' + result.pack[0].id + '", …])；丢弃不等于不存在。'
+    const compose = (keepCount) => {
+      const omitted = hitLines.length - keepCount
+      const lines = [...headerLines, ...hitLines.slice(0, keepCount)]
+      if (omitted > 0) lines.push('注入上界：超出 ' + RECALL_PACK_MAX_CHARS + ' 字符的 ' + omitted + ' 条已省略（按 ID 回读全文）')
+      lines.push(tailLine)
+      return lines
     }
-    lines.push('按 ID 精确回读全文：memory_lab_recall(record_ids=["' + result.pack[0].id + '", …])；丢弃不等于不存在。')
+    let keep = hitLines.length
+    let lines = compose(keep)
+    while (lines.join('\n').length > RECALL_PACK_MAX_CHARS && keep > 0) {
+      keep -= 1
+      lines = compose(keep)
+    }
+    const pack = lines.join('\n')
+    // 头尾固定行本身超上限（previewChars 荒谬大 / OOV 词表极长）：如实标记，不静默当作已满足
+    const capExceeded = pack.length > RECALL_PACK_MAX_CHARS
+    if (keep < hitLines.length) metrics?.counter?.('v3.recall.pack-truncated', 1)
     metrics?.counter?.('v3.recall.injected', 1)
-    return { injected: true, text: lines.join('\n'), hits: result.pack, oovTerms: result.oovTerms }
+    return {
+      injected: true,
+      text: pack,
+      hits: result.pack,
+      injectedHits: keep,
+      omittedHits: hitLines.length - keep,
+      capExceeded,
+      oovTerms: result.oovTerms,
+    }
   }
   api.readByRef = readByRef
   return api

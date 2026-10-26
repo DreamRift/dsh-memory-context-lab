@@ -125,6 +125,7 @@ test('持久化失败：outcome failed、failures 如实、applied=0', async () 
       health: () => null,
       rebuildIndex: async () => null,
       listVouchers: () => [],
+      sourceEventIds: async () => [],
     }
     const failed = await recreate({
       store: failingStore, clock: fakeClock(), random: fakeRandom(), metrics: fakeMetrics(), ownSourceKinds: OWN,

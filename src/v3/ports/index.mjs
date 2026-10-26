@@ -15,6 +15,8 @@ export const PORT_METHODS = Object.freeze({
   HostSurface: Object.freeze(['events', 'surfaceOp', 'sessionInfo', 'tools', 'commands', 'settings']),
   SessionStore: Object.freeze([
     'transaction', 'readRecord', 'restore', 'forget', 'health', 'rebuildIndex', 'listVouchers',
+    // 持久断点依据（H-01）：已提交记录的来源事件 ID 清单——摄入断点不得只活在内存里
+    'sourceEventIds',
   ]),
   MemoryProvider: Object.freeze(['search', 'read', 'health', 'capabilities']),
   Clock: Object.freeze(['now']),

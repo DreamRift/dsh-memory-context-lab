@@ -50,13 +50,16 @@ function sessionDirOf(root, sessionKey) {
   return path.join(root, 'sessions', sessionKey)
 }
 
-/** 解析事务日志；返回 { lines, damaged, reason }。damaged 时 lines 为已解析前缀。 */
-async function parseTxnLog(filePath) {
+/**
+ * 解析 JSONL 日志；返回 { lines, damaged, reason, exists }。damaged 时 lines 为已解析前缀。
+ * `exists` 区分「日志不存在」（可能是全新会话）与「日志存在但为空」——对账要用（H-21）。
+ */
+async function parseTxnLog(filePath, label = path.basename(filePath)) {
   let text
   try {
     text = await readFile(filePath, 'utf8')
   } catch (error) {
-    if (error?.code === 'ENOENT') return { lines: [], damaged: false, reason: null }
+    if (error?.code === 'ENOENT') return { lines: [], damaged: false, reason: null, exists: false }
     throw error
   }
   const lines = []
@@ -68,10 +71,10 @@ async function parseTxnLog(filePath) {
       lines.push(JSON.parse(raw))
     } catch {
       // 任何不可解析行（含尾部半行）都判 damaged；文件字节不动
-      return { lines, damaged: true, reason: 'transactions.jsonl 第 ' + (i + 1) + ' 行不可解析' }
+      return { lines, damaged: true, reason: label + ' 第 ' + (i + 1) + ' 行不可解析', exists: true }
     }
   }
-  return { lines, damaged: false, reason: null }
+  return { lines, damaged: false, reason: null, exists: true }
 }
 
 /**
@@ -102,11 +105,25 @@ export async function openV3SessionStore(root, sessionKey) {
   }
 
   const logPath = path.join(dir, TXN_LOG)
-  const { lines, damaged, reason } = await parseTxnLog(logPath)
+  const parsedTxn = await parseTxnLog(logPath, TXN_LOG)
+  const lines = parsedTxn.lines
+  // 事务日志**缺失**但记录还在（H-21）：对账依据本身丢了，不能把「无法证明已提交」
+  // 当成「崩溃残留」——旧实现会把全部记录移进 quarantine，而 health 仍报 healthy，
+  // 等于静默全丢（实测 5 条记录 → records/ 清空、quarantine/ 5 条、healthy=true）。
+  // 这里判 damaged：读允许（记录字节完好）、写拒绝，交人工裁决；不销毁任何字节。
+  const recordsOnDisk = await readdir(path.join(dir, RECORDS_DIR))
+  // 同一根因的另一个分支：日志文件在、但内容被清空（0 字节 / 只剩空行），而记录与
+  // manifest.txnNext（>1，说明历史上确实提交过）都还在——这同样不是「崩溃残留」，
+  // 而是对账依据丢失。两种形态一起判 damaged，绝不销毁记录字节。
+  const commitLines = lines.filter((line) => line.action === 'commit').length
+  const logLostWithRecords = recordsOnDisk.length > 0
+    && commitLines === 0
+    && Number.isInteger(manifest.txnNext) && manifest.txnNext > 1
+  const reconciliationLost = (!parsedTxn.exists || logLostWithRecords) && recordsOnDisk.length > 0
   const vouchersPath = path.join(dir, VOUCHERS_LOG)
-  const vouchersParsed = await parseTxnLog(vouchersPath)
+  const vouchersParsed = await parseTxnLog(vouchersPath, VOUCHERS_LOG)
   const forgottenPath = path.join(dir, FORGOTTEN_LOG)
-  const forgottenParsed = await parseTxnLog(forgottenPath)
+  const forgottenParsed = await parseTxnLog(forgottenPath, FORGOTTEN_LOG)
   const forgotten = new Set(
     forgottenParsed.lines
       .filter((line) => line.action === 'forget' && typeof line.id === 'string')
@@ -121,10 +138,32 @@ export async function openV3SessionStore(root, sessionKey) {
       for (const id of line.recordIds ?? []) committedIds.add(id)
     }
   }
-  // 有 payload 无 commit 行 → 崩溃残留，移入 quarantine（对账即隔离，不静默复用）
+  // 有 payload 无 commit 行 → 崩溃残留，移入 quarantine（对账即隔离，不静默复用）。
+  // 反方向（H-55）：**有 commit 行、无 payload** 同样是账实不符，但旧实现完全没查——
+  // 对账只做「盘上多出来的」，不做「日志里有而盘上没有的」。后果：health 报 healthy=true、
+  // recordCount 把不存在的记录算进去（实测 3 条里删掉 1 条仍报 3），而 rebuildIndex 遍历
+  // listRecordIds 时读不到那条 → 抛 ESTORE_CORRUPT，整个索引重建面被一条缺失字节打挂；
+  // 写入却照常成功，缺口被固化。判据与 H-21 同口径：账实不符即 damaged（读允许、写拒绝），
+  // **不伪造、不删除任何字节**。
+  const idsOnDisk = new Set()
+  for (const name of recordsOnDisk) {
+    if (name.endsWith('.json')) idsOnDisk.add(name.slice(0, -5))
+  }
+  const missingPayload = [...committedIds].filter((id) => !idsOnDisk.has(id))
+  const ledgerMismatch = missingPayload.length > 0
+  // H-55：账实不符（commit 行在、payload 不在）与 H-21（对账依据丢失）同一处置：
+  // 判 damaged，读允许、写拒绝，交人工裁决。两者都**不销毁字节、不伪造记录**。
+  const ledgerMismatchReason = ledgerMismatch
+    ? TXN_LOG + ' 有 ' + missingPayload.length + ' 条 commit 但记录文件缺失（' + missingPayload.slice(0, 5).join('、') + (missingPayload.length > 5 ? ' 等' : '') + '）：账实不符，读允许、写拒绝，需人工确认'
+    : null
+  const damaged = parsedTxn.damaged || reconciliationLost || ledgerMismatch
+  const reason = ledgerMismatchReason
+    ?? (reconciliationLost
+      ? TXN_LOG + (parsedTxn.exists ? ' 无 commit 行' : ' 缺失') + '但记录仍在（' + recordsOnDisk.length + ' 条，manifest.txnNext=' + manifest.txnNext + '）：对账依据丢失，读允许、写拒绝，需人工确认'
+      : parsedTxn.reason)
   const orphaned = []
-  if (!damaged) {
-    for (const name of await readdir(path.join(dir, RECORDS_DIR))) {
+  if (!damaged && !ledgerMismatch) {
+    for (const name of recordsOnDisk) {
       const id = name.endsWith('.json') ? name.slice(0, -5) : null
       if (id !== null && !committedIds.has(id)) {
         await rename(path.join(dir, RECORDS_DIR, name), path.join(dir, QUARANTINE_DIR, name))
@@ -132,7 +171,14 @@ export async function openV3SessionStore(root, sessionKey) {
       }
     }
   }
-  if (manifest.txnNext <= maxTxn) {
+  // 事务号分配器自愈（H-56）：`txnNext` 必须是 **≥1 的整数**。
+  // 旧实现只比 `txnNext <= maxTxn`，于是 `1.5` / `"7"` / `undefined` 这类非法值
+  // 一路漏过打开期——open 成功、health 原样回显垃圾值（`txnNext: 1.5` / `"7"`），
+  // 而**每一次写入**都在 rereadManifestTxnNext 里抛 ESTORE_CORRUPT：
+  // 存储自称健康却永远写不进去，观察面也看不到根因。
+  // 自愈方向是确定的、可证明安全的：`maxTxn+1` 一定没被用过（maxTxn 取自事务日志）。
+  const txnNextValid = Number.isInteger(manifest.txnNext) && manifest.txnNext >= 1
+  if (!txnNextValid || manifest.txnNext <= maxTxn) {
     manifest = { ...manifest, txnNext: maxTxn + 1 }
     await writeFileAtomic(manifestPath, JSON.stringify(manifest) + '\n')
   }
@@ -141,16 +187,56 @@ export async function openV3SessionStore(root, sessionKey) {
   let writable = !damaged
   const vouchersDamaged = vouchersParsed.damaged
   const voucherLines = vouchersParsed.lines
+  // 遗忘账本损坏（H-09）：前缀之外可能有 forget 行读不到，「哪些被遗忘」不可判定。
+  // 此时读路径必须失败关闭——否则已遗忘正文重新可读（隐私面 fail-open）。
+  const forgottenDamaged = forgottenParsed.damaged
   const health = () => ({
-    healthy: !damaged && !vouchersDamaged,
-    damagedReason: damaged ? reason : (vouchersDamaged ? vouchersParsed.reason : null),
+    healthy: !damaged && !vouchersDamaged && !forgottenDamaged,
+    damagedReason: damaged
+      ? reason
+      : (vouchersDamaged ? vouchersParsed.reason : (forgottenDamaged ? forgottenParsed.reason : null)),
     txnNext: manifest.txnNext,
     recordCount: committedIds.size,
     orphanedAtOpen: orphaned,
     voucherCount: voucherLines.length,
     vouchersDamaged,
     forgottenCount: forgotten.size,
+    forgottenDamaged,
   })
+
+  /** 遗忘账本损坏时的读闸：读不到 ≠ 没遗忘（隐私面失败关闭）。 */
+  function assertForgottenReadable() {
+    if (forgottenDamaged) {
+      throw v3Error('ESTORE_DAMAGED', 'forgotten.jsonl 损坏：' + forgottenParsed.reason + '（无法判定哪些记录已被遗忘，读路径失败关闭；修复后重开）')
+    }
+  }
+
+  /**
+   * 重读盘上 manifest 的 txnNext（并把已提交集合补齐：别的句柄可能刚提交过）。
+   * 解析失败 → ESTORE_CORRUPT（不猜、不沿用过期值）。
+   */
+  async function rereadManifestTxnNext() {
+    let text
+    try {
+      text = await readFile(manifestPath, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT') throw v3Error('ESTORE_CORRUPT', 'manifest.json 缺失（无法分配事务号，失败关闭）')
+      throw error
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      throw v3Error('ESTORE_CORRUPT', 'manifest.json 不可解析（事务号不可判定，失败关闭）')
+    }
+    if (parsed?.sessionKey !== sessionKey || parsed?.schemaVersion !== SCHEMA_VERSION) {
+      throw v3Error('ESTORE_SESSION_MISMATCH', 'manifest 与请求会话不符（跨会话不串数据的第一道闸）')
+    }
+    if (!Number.isInteger(parsed.txnNext) || parsed.txnNext < 1) {
+      throw v3Error('ESTORE_CORRUPT', 'manifest.txnNext 非法：' + JSON.stringify(parsed.txnNext))
+    }
+    return { ...parsed }
+  }
 
   function assertWritable() {
     if (closed) {
@@ -178,6 +264,9 @@ export async function openV3SessionStore(root, sessionKey) {
           throw v3Error('ESTORE_TXN_CONFLICT', '记录已存在：' + id + '（重试须用新 ID/新事务，不覆盖）')
         }
       }
+      // 分配器必须**锁内重读**（H-10）：manifest.txnNext 是磁盘上的分配器，内存副本在
+      // 第二个句柄/进程写入后就过期了；沿用旧值会让事务号复用（号不复用是对账的前提）。
+      manifest = await rereadManifestTxnNext()
       const txn = manifest.txnNext
       const commitAt = Number.isFinite(at) && at >= 0 ? at : null
       // 步骤 2：逐条原子写 payload
@@ -200,6 +289,7 @@ export async function openV3SessionStore(root, sessionKey) {
       if (typeof id !== 'string' || id.length === 0) {
         throw new V3ContractViolation('v3 store: id 必须是非空字符串')
       }
+      assertForgottenReadable()
       if (forgotten.has(id)) {
         throw v3Error('EFORGOTTEN', '记录已遗忘：' + id + '（隐私面：不可按 ID 回读）')
       }
@@ -237,8 +327,13 @@ export async function openV3SessionStore(root, sessionKey) {
       if (voucher === null || typeof voucher !== 'object') {
         throw new V3ContractViolation('v3 store: voucher 必须是对象')
       }
-      if (!Array.isArray(voucher.recordIds) || voucher.recordIds.some((id) => typeof id !== 'string')) {
-        throw new V3ContractViolation('v3 store: voucher.recordIds 必须是字符串数组')
+      // H-54：元素必须是**非空**字符串（与 forget 的校验同口径）。旧实现只查 typeof，
+      // 空串能进账本，而账本里一条指向空 ID 的凭证在恢复面上永远不可能有资格，
+      // 却会占一个 voucherIndex（下标是恢复的唯一定位方式）。
+      // 注意：**空数组是合法的**——凭证可以只绑定 targetEventId 而不绑定任何 v3 记录
+      // （surface 恢复凭证就是这种形状，见 test/v3-session-lifecycle.test.mjs）。
+      if (!Array.isArray(voucher.recordIds) || voucher.recordIds.some((id) => typeof id !== 'string' || id.length === 0)) {
+        throw new V3ContractViolation('v3 store: voucher.recordIds 必须是非空字符串组成的数组')
       }
       if (typeof voucher.targetEventId !== 'string' || voucher.targetEventId.length === 0) {
         throw new V3ContractViolation('v3 store: voucher.targetEventId 必须是非空字符串')
@@ -259,7 +354,47 @@ export async function openV3SessionStore(root, sessionKey) {
       if (vouchersDamaged) {
         throw v3Error('ESTORE_DAMAGED', 'vouchers.jsonl 损坏：' + vouchersParsed.reason + '（恢复凭证不可用，修复后重开）')
       }
-      return [...voucherLines]
+      // H-53：返回**副本**，不是内部对象引用。旧实现 `[...voucherLines]` 只浅拷贝了数组，
+      // 元素还是同一个对象、`recordIds` 还是同一个数组——调用方（恢复命令面）改一下就
+      // 污染了内存态，而磁盘上还是旧值：内存与账本分叉，且下次 `restore` 按
+      // `voucher.receiptText` 做逐字节比对时会用一个**从没落过盘**的正文去比。
+      return voucherLines.map((voucher) => ({
+        ...voucher,
+        recordIds: Array.isArray(voucher.recordIds) ? [...voucher.recordIds] : voucher.recordIds,
+      }))
+    },
+
+    /**
+     * 只读来源元数据（不返回 payload）：摄入断点反推用。
+     * 刻意**不受遗忘隐藏**——遗忘是可见性，不是「从未摄入」；按可读集反推会让断点回退，
+     * 重放时把已遗忘正文重新落成新记录（隐私回退）。损坏同样失败关闭。
+     */
+    async readProvenance(id) {
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new V3ContractViolation('v3 store: id 必须是非空字符串')
+      }
+      let text
+      try {
+        text = await readFile(path.join(dir, RECORDS_DIR, id + '.json'), 'utf8')
+      } catch (error) {
+        if (error?.code === 'ENOENT') throw v3Error('ESTORE_CORRUPT', '记录不存在：' + id)
+        throw error
+      }
+      let record
+      try {
+        record = JSON.parse(text)
+      } catch {
+        throw v3Error('ESTORE_CORRUPT', '记录 ' + id + ' JSON 不可解析（损坏，失败关闭）')
+      }
+      const provenance = record?.provenance
+      if (provenance === null || typeof provenance !== 'object' || Array.isArray(provenance)) {
+        throw v3Error('ESTORE_CORRUPT', '记录 ' + id + ' 缺 provenance（结构非法，失败关闭）')
+      }
+      return {
+        sourceEventId: typeof provenance.sourceEventId === 'string' ? provenance.sourceEventId : null,
+        sourceForm: typeof provenance.sourceForm === 'string' ? provenance.sourceForm : null,
+        transactionId: typeof provenance.transactionId === 'string' ? provenance.transactionId : null,
+      }
     },
 
     /** 已提交记录 ID 清单（重建索引用；隔离区不算）。 */
@@ -283,8 +418,28 @@ export async function openV3SessionStore(root, sessionKey) {
       return { forgottenCount: forgotten.size }
     },
 
+    /** 列已遗忘 ID；账本损坏 → ESTORE_DAMAGED（与 listVouchers 同口径，不静默当空）。 */
     listForgotten() {
+      assertForgottenReadable()
       return [...forgotten]
+    },
+
+    // H-10-b：跨进程锁内的增量视图同步——重读事务日志，把其他句柄/进程
+    // 提交的新 commit 行并入本句柄内存视图（committedIds/maxTxn 纯增量，不清不改）。
+    // 没有它，第二个句柄的 rebuildIndex 会漏掉第一个句柄的新提交记录。
+    async syncFromLog() {
+      assertWritable()
+      const parsed = await parseTxnLog(path.join(dir, TXN_LOG), TXN_LOG)
+      let merged = 0
+      for (const line of parsed.lines) {
+        if (line.action === 'commit' && Number.isInteger(line.txn)) {
+          if (line.txn > maxTxn) maxTxn = line.txn
+          for (const id of line.recordIds ?? []) {
+            if (!committedIds.has(id)) { committedIds.add(id); merged += 1 }
+          }
+        }
+      }
+      return { mergedRecords: merged, maxTxn }
     },
 
     close() {

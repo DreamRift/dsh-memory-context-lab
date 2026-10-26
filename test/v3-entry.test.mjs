@@ -121,6 +121,8 @@ test('decision 原样返回；摄入抛错只告警', async () => {
     session.push('user/message')
     const decision = await ctx.callPreStep({ session }, { kind: 'enter', step: 42 })
     assert.deepEqual(decision, { kind: 'enter', step: 42 }, '影子不改宿主决策')
+    // H-19 之后建库在后台跑：告警异步到达，等空闲后再断言（语义不变：失败只告警）
+    await engine._waitForIdle()
     assert.ok(ctx.warnings.some((w) => /影子(摄入|调度)失败/.test(w)), '失败只告警（摄入批或调度层）')
     boom = false
     await ctx.callPreStep({ session })
@@ -215,7 +217,8 @@ test('事故修正（2026-10-25）：钩子不阻塞——大回填时 decision 
     const hookMs = Date.now() - t0
     assert.equal(decision.kind, 'enter', 'decision 立即可用')
     assert.ok(hookMs < 200, '钩子本身必须毫秒级返回（实测 ' + hookMs + 'ms）——摄入在后台')
-    assert.ok(engine.stats().big.ingesting === true || engine.stats().big.lastSeq >= 0, '后台摄入已启动或已完成')
+    // H-19：首次挂载的建库也移到了后台，钩子返回时 stats() 里可能还没有该会话条目
+    // （旧断言要求「已启动或已完成」，与「钩子立即返回」自相矛盾）。改为等空闲后核对终态。
     await engine._waitForIdle()
     assert.equal(engine.stats().big.lastSeq, 349, '350 条全部摄入（批 100）')
     assert.equal((await engine.stats().big.metrics.counters['v3.processTurn.applied']), 350)

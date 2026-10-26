@@ -49,17 +49,26 @@ export function createSessionLifecycle({ store, clock, random, metrics }) {
     const action = restoreActionOf(autoRestore, guardRefused) // Q-01 正交 + G3 unknown fail-closed
     const vouchers = store.listVouchers()
     const rows = []
-    for (const voucher of vouchers) {
+    for (const [index, voucher] of vouchers.entries()) {
       if (action.action === 'skip') {
         rows.push({ outcome: 'skipped', reason: action.reason })
         continue
       }
-      const { eligibility } = store.restore(vouchers.indexOf(voucher), surfaceTextOf(voucher))
-      rows.push(
-        eligibility.eligible
-          ? { outcome: 'restored' } // M5 在此执行真实 surface 恢复
-          : { outcome: 'skipped', reason: eligibility.reason },
-      )
+      // 单行异常只落该行 skipped（N-11，H-42）：surfaceTextOf 是调用方注入的，
+      // 凭证指向的事件可能已不存在、宿主可能拒绝访问——旧实现没有 try，一个抛错
+      // 就把整批恢复打挂（正是文档里写的「beta.3 曾把整批恢复打挂」那条又回来了）。
+      // 恢复是逐行独立的裁决：某一行取不到表面正文，不代表其余行不能恢复。
+      try {
+        const { eligibility } = store.restore(index, surfaceTextOf(voucher))
+        rows.push(
+          eligibility.eligible
+            ? { outcome: 'restored' } // M5 在此执行真实 surface 恢复
+            : { outcome: 'skipped', reason: eligibility.reason },
+        )
+      } catch (error) {
+        metrics?.counter?.('v3.lifecycle.restoreRowFailed', 1)
+        rows.push({ outcome: 'skipped', reason: 'internal-failure: ' + (error?.message ?? String(error)) })
+      }
     }
     const settled = settleRestore(rows) // N-11：三桶恒等，异常行只落 skipped
     const skippedByGuard = rows.filter((r) => r.reason === 'guard-refused').length

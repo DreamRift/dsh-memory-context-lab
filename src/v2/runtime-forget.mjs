@@ -199,22 +199,32 @@ export function createForgetDomain({
       }
     }
     // 行状态跟随账本（权威）：forgotten 行的 node 基名若已不再遗忘，放回 applied。
-    const forgetIndex = await getForgetIndex(record.directory)
+    //
+    // H-46：这一段**不能把异常抛给调用方**。调用方（forget undo）在这一步之前已经
+    // 用 applyUndo 提交了账本撤销——账本才是权威，undo 事实上已经生效。若这里抛错，
+    // 整条命令报「失败」，用户重试 undo 却会得到「已撤销」：账本成功被报成失败，
+    // 与 Y-25（表面失败被报成成功）是同一种不诚实的镜像。
+    // 现在结构性问题一律并入 failures 如实披露，命令仍报告「账本已撤销」。
     let changed = false
-    let bases = new Set()
-    if (forgetIndex.forgotten && forgetIndex.forgotten.size > 0) {
-      const entries = await collectForgetEntries(record)
-      bases = forgetNodeBasesOf(entries, [...forgetIndex.forgotten.keys()])
-    }
-    for (const row of rows) {
-      if (row?.status !== 'forgotten' || !row.nodeId) continue
-      if (!bases.has(nodeUnitBase(row.nodeId))) {
-        row.status = 'applied'
-        row.forgottenBy = null
-        changed = true
+    try {
+      const forgetIndex = await getForgetIndex(record.directory)
+      let bases = new Set()
+      if (forgetIndex.forgotten && forgetIndex.forgotten.size > 0) {
+        const entries = await collectForgetEntries(record)
+        bases = forgetNodeBasesOf(entries, [...forgetIndex.forgotten.keys()])
       }
+      for (const row of rows) {
+        if (row?.status !== 'forgotten' || !row.nodeId) continue
+        if (!bases.has(nodeUnitBase(row.nodeId))) {
+          row.status = 'applied'
+          row.forgottenBy = null
+          changed = true
+        }
+      }
+      if (changed) await writeV2SessionState(record.directory, record.state)
+    } catch (error) {
+      failures.push({ replacementSeq: null, scope: 'row-state', message: error?.message ?? String(error) })
     }
-    if (changed) await writeV2SessionState(record.directory, record.state)
     return { failures, restoredSurfaces }
   }
   return {
@@ -386,7 +396,14 @@ async function forgetCommand(invocation, args) {
         : '本会话的 v2 引擎未启用：只提交了账本级 undo，没有表面回执需要重建。',
     ]
     if (result.keptIds.length > 0) lines.push(`保持遗忘：${result.keptIds.join('、')}`)
-    if (surface?.failures.length > 0) lines.push(`表面恢复失败（可重试）：${surface.failures.map((f) => `seq${f.replacementSeq}(${f.message})`).join('、')}`)
+    if (surface?.failures.length > 0) {
+      // scope='row-state' 的条目没有 replacementSeq（H-46）：账本已撤销，只是本地行状态
+      // 没能同步——如实分开说，不打印 "seqnull"。
+      const surfaceOnly = surface.failures.filter((f) => f.scope !== 'row-state')
+      const rowStateOnly = surface.failures.filter((f) => f.scope === 'row-state')
+      if (surfaceOnly.length > 0) lines.push(`表面回执恢复失败（可重试）：${surfaceOnly.map((f) => `seq${f.replacementSeq}(${f.message})`).join('、')}`)
+      if (rowStateOnly.length > 0) lines.push(`⚠ 账本已撤销，但本地行状态同步失败（重试 undo 或下次 adopt 时会收敛）：${rowStateOnly.map((f) => f.message).join('、')}`)
+    }
     lines.push('原文回注（把内容重新注入热上下文）仍需显式 /memory-lab restore。')
     return { kind: 'success', text: lines.join('\n') }
   }
