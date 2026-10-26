@@ -89,6 +89,9 @@ export async function createSessionStorePort(root, sessionKey) {
     listVouchers() {
       return store.listVouchers()
     },
+
+    // 会话目录只读暴露（usage 聚合落盘/观察面 stats 用；不承诺更多）
+    directory: dir,
   }
 
   return { port: assertPort('SessionStore', impl), store }

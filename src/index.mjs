@@ -203,7 +203,8 @@ export async function apply(ctx, config) {
       if (sub === 'status') {
         const s = await v3Engine.inspect(sessionId)
         if (!s) return ok('v3 影子库：本会话尚未摄入（发出任一消息后自动开始；影子模式不影响对话）。')
-        return ok('v3 影子库（只读观察面）：\n- 摄入位点 seq：' + s.lastSeq + (s.ingesting ? '（后台摄入进行中）' : '') + '\n- 健康：' + JSON.stringify(s.health))
+        const usageLine = s.usage ? '\n- 占用（input+cacheRead tokens，' + s.usage.samples + ' 次采样' + (s.usage.badLines ? '，坏行 ' + s.usage.badLines : '') + '）：p50=' + s.usage.occupancy?.p50 + ' p90=' + s.usage.occupancy?.p90 + ' p95=' + s.usage.occupancy?.p95 + ' max=' + s.usage.occupancy?.max + ' 最新=' + s.usage.occupancy?.latest : ''
+        return ok('v3 影子库（只读观察面）：\n- 摄入位点 seq：' + s.lastSeq + (s.ingesting ? '（后台摄入进行中）' : '') + '\n- 健康：' + JSON.stringify(s.health) + usageLine)
       }
       if (sub === 'recall') {
         if (!arg) return bad('用法：/memory-lab v3 recall <查询词>')

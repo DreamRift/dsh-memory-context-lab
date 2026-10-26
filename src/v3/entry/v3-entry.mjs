@@ -1,3 +1,4 @@
+import { appendUsageLine, readUsageSummary } from '../adapters/storage/usage-log.mjs'
 /**
  * v3 引擎入口（v3/entry，M5 第三批）——影子模式挂载。
  *
@@ -9,6 +10,9 @@
  * - 数据根 v3Root 必传（v3 不 import v2 的 storage 模块——根路径由主入口给，装配解耦）。
  * 事件源：每次 pre-step 拉取 session.events，按 seq 增量摄入（断点续传，不重复落库）。
  */
+
+
+
 
 import { createV3Runtime } from '../composition/composition.mjs'
 import { V3ContractViolation } from '../contracts/index.mjs'
@@ -30,7 +34,32 @@ function redactValue(value, depth = 0) {
   return out
 }
 
-/** content 块数组取可见文本（type=text；reasoning/thinking/图片等非文本块不进正文）。 */
+/** 宿主 usage（dsh-llm：inputTokens/outputTokens/totalTokens/cacheReadTokens/reasoningTokens）。全字段缺省/非数字返回 null（不可观测不猜）。 */
+function usageOf(u) {
+  if (u === null || typeof u !== 'object') return null
+  const out = {}
+  for (const k of ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'reasoningTokens']) {
+    if (typeof u[k] === 'number' && Number.isFinite(u[k]) && u[k] >= 0) out[k] = u[k]
+  }
+  return Object.keys(out).length >= 2 ? out : null
+}
+
+/**
+ * usage 独立通道（P2 占用侧采集，2026-10-26）：sessions/<id>/usage.jsonl，append-only 聚合。
+ * 不进记录、不进索引、不影响记录对账；写入失败只告警（采集是观测，不阻塞摄入）。
+ */
+async function appendUsage(entry, raw, usage) {
+  try {
+    await appendUsageLine(entry.runtime.store.directory, raw?.seq, usage)
+  } catch {
+    // 静默失败可接受：usage 是聚合观测，缺几行不产生错误事实
+  }
+}
+async function usageSummary(entry) {
+  return readUsageSummary(entry.runtime.store.directory)
+}
+
+/** content 候块数组取可见文本（type=text；reasoning/thinking/图片等非文本块不进正文）。 */
 function textOfBlocks(content) {
   if (!Array.isArray(content)) return ''
   return content.filter((c) => c?.type === 'text').map((c) => c.text ?? '').join('\n')
@@ -49,7 +78,10 @@ export function extractEventBody(raw) {
   const type = raw?.type ?? ''
   if (type === 'assistant/message') {
     const text = textOfBlocks(data.message?.content) || textOfBlocks(data.content) || (typeof data.text === 'string' ? data.text : '')
-    return text ? { text } : { text: '', metaOnly: true, reason: 'assistant 无可见文本块' }
+    const body = text ? { text } : { text: '', metaOnly: true, reason: 'assistant 无可见文本块' }
+    const usage = usageOf(data.usage)
+    if (usage) body.usage = usage
+    return body
   }
   if (type === 'tool/result') {
     const text = textOfBlocks(data.message?.content) || textOfBlocks(data.content)
@@ -141,6 +173,7 @@ export function attachV3Engine(ctx, options = {}) {
         const body = bodyOf(raw)
         const result = await entry.runtime.handleDshEvent(raw, body.text, { metaOnly: body.metaOnly === true, metaReason: body.reason ?? '', structure: body.structure ?? undefined })
         if (body.metaOnly === true) metricsNote('v3.ingest.metadataOnly')
+        if (body.usage !== undefined) await appendUsage(entry, raw, body.usage)
         if (result?.status === 'applied' || result?.status === 'rejected') entry.lastSeq = raw.seq
         if (result?.status === 'applied') applied += 1
         if (result?.status === 'rejected') {
@@ -192,7 +225,8 @@ export function attachV3Engine(ctx, options = {}) {
     try { health = await entry.runtime.store.health() } catch (error) {
       health = { healthy: false, damaged: true, error: error?.code ?? error?.message ?? String(error) }
     }
-    return { lastSeq: entry.lastSeq, ingesting: entry.inflight !== null, health }
+    const usage = await usageSummary(entry).catch(() => null)
+    return { lastSeq: entry.lastSeq, ingesting: entry.inflight !== null, health, usage }
   }
 
   async function searchReadOnly(sessionId, query, opts = {}) {
