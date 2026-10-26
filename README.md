@@ -2,17 +2,17 @@
 
 按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2）与**计划先行**。安装、会话命令、图形入口与清理卸载的唯一操作说明都在这里。
 
-> **当前源码版本 0.14.0-beta.10（测试版；v3 转正首版：单引擎、v2 整体退场）CHANGELOG.md)与[进展卡（beta.1）](../docs/dev-0.13.2/进展卡.md)、[进展卡（beta.2）](../docs/dev-0.13.2/进展卡-beta.2.md)、[进展卡（beta.3）](../docs/dev-0.13.2/进展卡-beta.3.md)、[进展卡（beta.4）](../docs/dev-0.13.2/进展卡-beta.4.md)、[进展卡（beta.5）](../docs/dev-0.13.2/进展卡-beta.5.md)。命令面**没有变化**；beta.3 起设置页的「全历史记忆上下文」与「保留最近操作」真正生效（此前是空开关）；beta.4 起设置页保存不再抹掉 schema 里其它字段，`/memory-lab set` 的数字参数不再被静默截断；beta.5 起 `set autorestore off` 真正「只停用不恢复」（窗口守卫照常生效），设置页数字框与 `history` 的每页条数不再静默改值。
+> **当前源码版本 0.14.0-beta.10（测试版；v3 转正：单引擎）CHANGELOG.md)与[进展卡（beta.1）](../docs/历史归档/dev-0.13.2/进展卡.md)、[进展卡（beta.2）](../docs/历史归档/dev-0.13.2/进展卡-beta.2.md)、[进展卡（beta.3）](../docs/历史归档/dev-0.13.2/进展卡-beta.3.md)、[进展卡（beta.4）](../docs/历史归档/dev-0.13.2/进展卡-beta.4.md)、[进展卡（beta.5）](../docs/历史归档/dev-0.13.2/进展卡-beta.5.md)。命令面**没有变化**；beta.3 起设置页的「全历史记忆上下文」与「保留最近操作」真正生效（此前是空开关）；beta.4 起设置页保存不再抹掉 schema 里其它字段，`/memory-lab set` 的数字参数不再被静默截断；beta.5 起 `set autorestore off` 真正「只停用不恢复」（窗口守卫照常生效），设置页数字框与 `history` 的每页条数不再静默改值。
 
 ## 它做什么、不做什么
 
-**做**：归档完成的操作；**保留最近 N 个操作一直生效**（更旧的攒够批量阈值就归档）；按相关度回注归档要点；随时恢复原文、清空本会话隔离数据。
+**做**（beta.10 起单引擎）：按回合摄入会话事件入 v3 库；检索命中按预算回注（保最新、注入上界可见）；压力闸门按真实占用运转。命令面：`/memory-lab v3 status|recall|read`。
 
-**不做**：增删模型可见的工具（工具集一变就作废整段前缀缓存，省钱变赔钱）；改写 DSH 的 append-only 事件日志（归档走宿主表层替换，原始事件可恢复、可审计、可回放）。
+**不做**：增删模型可见的工具；改写 DSH 的 append-only 事件日志
 
 ## 缓存纪律
 
-在位置 i 替换内容，会让 i 之后一切按未命中价重算。插件据此**一批做够**（批次数才是代价来源）、**回注只落在批次尾部**、**工具集恒定**。见[架构与边界](../docs/架构与边界.md#前缀缓存纪律)。
+在位置 i 替换内容，会让 i 之后一切按未命中价重算。插件据此**一批做够**（批次数才是代价来源）、**回注只落在批次尾部**、**工具集恒定**。见[架构与边界](../docs/历史归档/v2机制文档/架构与边界.md#前缀缓存纪律)。
 
 ## 已核验范围
 
@@ -23,7 +23,7 @@
 | 冷库 | 复合后端：灵枢子进程（T2）/ 本地 Node store（T1） |
 | 会话目录 | `$DSH_HOME/.memory-context-lab/sessions/<session-id 的 sha256 前 24 位>/` |
 | 真实灵枢保护 | 启用期间按会话抑制 `dsh-memory` 的自动读写（不改动工具集）；`status` 有独立一行「真实灵枢抑制：已启用 / 未启用（原因）」 |
-| 依赖的宿主接口 | `agent/pre-step`、`session.surface`、`session.append`、`requestHeader()`、`requestContext()`、`tokenMeter`、`llm`、`sessionProjections`、`commands`；可选 `planMode`（缺失时如实降级）。详见[架构与边界](../docs/架构与边界.md) |
+| 依赖的宿主接口 | `agent/pre-step`、`session.surface`、`session.append`、`requestHeader()`、`requestContext()`、`tokenMeter`、`llm`、`sessionProjections`、`commands`；可选 `planMode`（缺失时如实降级）。详见[架构与边界](../docs/历史归档/v2机制文档/架构与边界.md) |
 
 冷库不可用不阻止启用（T1 兜底）：归档/回注失败关闭；占用率缺 `requestHeader()` / `tokenMeter.measure` / `contextWindow` 时**失败关闭**，原因见 `status` / `dry-run`。
 
@@ -57,7 +57,7 @@
 **卡片默认不复制正文**：摘录类值渲染成 `（正文摘录未共享）`，只留 entity、属性标签、极性/关系标签、来源 ID 与
 `expand` 入口；结构化属性（退出码、测试摘要、版本号）照常保留。`set sharel2content on` 才放摘录（默认 off、失败关闭）。
 
-**成员级排除**：一条成员被遗忘不再废掉整组——被遗忘者排除出参与集，其余照常压缩；全排除仍整组失败关闭。细节见[降温模式](../docs/降温模式.md)。
+**成员级排除**：一条成员被遗忘不再废掉整组——被遗忘者排除出参与集，其余照常压缩；全排除仍整组失败关闭。细节见[降温模式](../docs/历史归档/v2机制文档/降温模式.md)。
 
 ### 全历史记忆上下文（v2 模式开关）
 
@@ -103,7 +103,7 @@ cd 记忆上下文/plugin && npm run probe:revert  # 66 个回退场景，确认
 cd 记忆上下文/plugin && npm run probe:lingshu # 隔离灵枢写入健康探测；不可用如实报环境原因
 ```
 
-**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。0.13.2-beta.7 全套 **118 套**（全通过、0 跳过；Node v26.12.1），逐套件范围见[验证与评估](../docs/验证与评估.md)。
+**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。0.13.2-beta.7 全套 **118 套**（全通过、0 跳过；Node v26.12.1），逐套件范围见[验证与评估](../docs/历史归档/v2机制文档/验证与评估.md)。
 
 > 沙箱宿主里 `%TEMP%` 可能不可写（`mkdtemp` 报 `EPERM`）：环境限制，非缺陷；把 `TEMP`/`TMP`/`TMPDIR` 指到可写目录。
-`FakeSession` 按宿主真实折叠规则实现校验；契约忠实度见[验证与评估](../docs/验证与评估.md)。
+`FakeSession` 按宿主真实折叠规则实现校验；契约忠实度见[验证与评估](../docs/历史归档/v2机制文档/验证与评估.md)。
