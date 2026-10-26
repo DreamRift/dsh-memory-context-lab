@@ -390,6 +390,13 @@ export function attachV3Engine(ctx, options = {}) {
       pendingEntries.clear()
       if (typeof off === 'function') off()
     },
+    /** 转正回注（beta.10）：走 composition.recall——每回合一次门、上界装包、失败关闭。 */
+    async recallForInjection(sessionId, query, opts = {}) {
+      const entry = await entryOf(sessionId)
+      if (!entry) return null
+      if (entry.inflight !== null) return { busy: true }
+      return await entry.runtime.recall(String(query), opts)
+    },
     stats() {
       const out = { ingestMetrics: Object.fromEntries(entryMetrics) }
       for (const [sessionId, { runtime, lastSeq, inflight }] of runtimes) {

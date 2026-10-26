@@ -38,28 +38,10 @@ async function listSourceFiles(dir) {
  * 接线或删除后请把条目摘掉，白名单只缩不涨。
  */
 const EXPORT_WHITELIST = new Map(Object.entries({
+  apply: '宿主插件入口（DSH 经插件协议调用 apply，src 内零消费是协议必然）',
   evaluatePressureGate: '定案·白名单：闸门判定纯函数（v3-pressure-gate 套件锁 G1-G4 判据）；触发动作属①②④缓议项（2026-10-25 用户拍板），接线后摘除',
   isReadLeaseActive: '定案·白名单：租约判据助手（v3-context-budget 套件锁失败关闭口径）；allocateBudget 内联消费 leaseUntil 字段，读路径接线（recall 后记 lastReadAt）后摘除',
-  // —— 测试钩子（*ForTest），生产不消费是设计而非缺口 ——
-  __setHostSessionModuleForTest: '定案·白名单：测试钩子替换本模块内部 hostSessionModule 缓存，物理上不可外移 test-hooks（外移即失闭包触达）；ForTest 命名自解释',
-  resetHostSessionModuleCache: '定案·白名单：同上，操作本模块内部缓存',
-  WITHHELD_EXCERPT_MARK_FOR_TEST: '定案·白名单：脱敏占位符的测试别名，share-l2-content 套件消费；改名外移无增益',
-  // —— P0-4 待逐个三选一（接线/删除/白名单定案），见进展卡-beta.9 ——
-  CARD_FOLD_EXCLUDED_FORMS: '定案·白名单：折叠排除形态表，card-fold-recall-boundary 套件锁 recall 断组边界',
-  appendHierarchyEntry: '定案·白名单：层级账本追加原语，hierarchy 套件（并发/事务/边界）的写入口',
-  applyOneOperation: '定案·白名单：单操作应用原语，cooling（17 处）与 orphan-rebuild 套件的夹具基建',
-  auditPairingRecords: '定案·白名单：配对账本自检原语，guard/matrix 套件锁「归档跨度配对闭合」判据',
-  excerptLinesFor: '定案·白名单：摘录行选择器，compressor-program 套件锁「命中行优先/首尾退化」判据',
-  hardPortionOfCard: '定案·白名单：卡片硬段前缀的测试判据助手，card-budget 套件与渲染器互证',
-  hierarchyStatus: '定案·白名单：层级账本状态汇总，hierarchy-store 套件锁计数口径',
-  memoryContextLabProjection: '定案·白名单：插件未启用时的投影空形态，install 套件的安装面夹具依赖',
-  readWriteLockOwner: '定案·白名单：写锁自检诊断原语，锁语义套件（接管/越权/清扫）的唯一观测面',
-  recordsFromEvent: '定案·白名单：事件→记录草案归一原语，readback/retrieval/store/workingset 四套件的夹具基建',
-  resetForgetIndexCache: '定案·白名单：遗忘索引缓存清理，disposition 套件用例间隔离用',
-  resolveLeafRecordIds: '定案·白名单：L3→L0 叶子解析，hierarchy-store 套件锁解析与 missing 披露',
-  readModelUsageEntries: '费用账本读侧：写入面已接线（onUsage），展示出口属新产品面暂不建，JSONL 可人工审计；测试消费中',
-  withCommandSurface: '定案·白名单：命令面出口包裹原语，beta7 套件锁「抛出→错误结果」契约；生产在 runtime 装配处消费',
-  // —— v3 M0 骨架（dev-0.14.0/进展卡-M0）：M3 composition root 接线后逐项摘除 ——
+  // —— 测试钩子（*ForTest），生产不消费是设计而非缺口 ——  // —— P0-4 待逐个三选一（接线/删除/白名单定案），见进展卡-beta.9 ——  // —— v3 M0 骨架（dev-0.14.0/进展卡-M0）：M3 composition root 接线后逐项摘除 ——
   assertPort: 'v3 M0：装配期端口校验，消费者是 M3 的 index.mjs composition root（尚未入驻）；v3 套件锁「缺方法必点名」',
   isV3Error: 'v3 M0：错误信封判别，M3 边界转换消费；v3-session-isolation 套件锁信封形状',
   sessionIsolationKey: 'v3 M0：会话隔离键，M3 processTurn 消费；v3-session-isolation 套件锁归一与失败关闭',

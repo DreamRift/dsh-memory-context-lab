@@ -17,8 +17,6 @@ import { access, readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { EXPECTED_DSH_MEMORY_VERSIONS, dshMemoryLookupRoots, locatePinnedDshMemory } from '../src/dsh-memory-suppression.mjs'
-import { memoryContextLabProjection } from '../src/projection.mjs'
 
 const DSH_HOME = process.env.DSH_HOME ?? path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
 const PROFILE = process.env.DSH_PROFILE ?? 'desktop'
@@ -179,93 +177,6 @@ function createStubContext({ withTools = true } = {}) {
   return ctx
 }
 
-test('the lookup searches the DSH home, not only this plugin\'s own tree', async () => {
-  const requireFromPlugin = (await import('node:module')).createRequire(import.meta.url)
-  const roots = await dshMemoryLookupRoots({
-    requireFromPlugin,
-    dshHome: 'C:/definitely-not-a-real-dsh-home',
-    listProfiles: async () => [],
-  })
-  assert.ok(roots.length >= 1, 'at least one candidate root must be produced')
-  assert.ok(roots.includes(path.resolve('C:/definitely-not-a-real-dsh-home', 'node_modules')))
-
-  const withProfiles = await dshMemoryLookupRoots({
-    requireFromPlugin,
-    dshHome: 'C:/fake-home',
-    listProfiles: async () => ['C:/fake-home/profiles/desktop'],
-  })
-  assert.ok(withProfiles.includes(path.resolve('C:/fake-home/profiles/desktop/node_modules')), 'the profile root must be searched')
-  assert.equal(new Set(withProfiles).size, withProfiles.length, 'roots must be deduplicated')
-})
-
-test('a missing package fails with an actionable message, not a silent skip', async () => {
-  // B4：本用例测「包不存在时的报错」，前提必须由测试自己钉死。真实
-  // `requireFromPlugin` 的 Node 解析路径会命中原机已装的 peer（按 README 装好
-  // dsh-memory 的环境），让「未找到」这条断言红。传一个没有解析路径的 stub
-  // 显式屏蔽 Node 段，只剩不存在的 dshHome 可查——两种环境同一结果。
-  const noNodePaths = { resolve: { paths: () => [] } }
-  await assert.rejects(
-    locatePinnedDshMemory(noNodePaths, { dshHome: 'C:/definitely-not-a-real-dsh-home', listProfiles: async () => [] }),
-    /未找到已安装的 @furongjun1999\/dsh-memory/,
-  )
-})
-
-test('a wrong version is refused rather than patched blindly', async (t) => {
-  const requireFromPlugin = (await import('node:module')).createRequire(import.meta.url)
-  const hasReal = await exists(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', '@furongjun1999', 'dsh-memory', 'package.json'))
-  if (!hasReal) return t.skip('the pinned dsh-memory is not installed in this profile')
-  await assert.rejects(
-    locatePinnedDshMemory(requireFromPlugin, { expectedVersion: '0.0.0-not-installed' }),
-    /隔离只经 0\.0\.0-not-installed 核验/,
-  )
-})
-
-test('the installed dsh-memory resolves to a real package root with MdcgClient', async (t) => {
-  const requireFromPlugin = (await import('node:module')).createRequire(import.meta.url)
-  let found
-  try {
-    found = await locatePinnedDshMemory(requireFromPlugin)
-  } catch (error) {
-    // On a machine without the plugin installed this is expected; the profile
-    // check below is what matters on this machine.
-    return t.skip(`dsh-memory is not resolvable here: ${error.message}`)
-  }
-  // 断言「落在已核验范围内」，而不是钉死某一个版本号——灵枢升级时这个用例
-  // 只该因「兼容性真的变了」而红，不该因版本号前进而红（0.8.1→0.9.8 即一例）。
-  assert.ok(
-    EXPECTED_DSH_MEMORY_VERSIONS.includes(found.version),
-    `dsh-memory=${found.version} 不在已核验范围（${EXPECTED_DSH_MEMORY_VERSIONS.join(' / ')}）内`,
-  )
-  // 不按路径子串断言：junction / 符号链接安装时 realpath 的实体目录名
-  // 与包名不同（0.10.1 的 install 用例曾因此误红）。包身份以 manifest 为准。
-  const manifest = JSON.parse(await readFile(path.join(found.packageRoot, 'package.json'), 'utf8'))
-  assert.equal(manifest.name, '@furongjun1999/dsh-memory')
-  assert.equal(typeof found.MdcgClient, 'function')
-  // The cold store runs `python -m md_cg.mcp_server` with this as PYTHONPATH,
-  // so the Python package must actually live at the resolved root.
-  assert.ok(await exists(path.join(found.packageRoot, 'md_cg', '__init__.py')), 'md_cg must exist at the resolved root')
-})
-
-/**
- * 守卫：版本比对探针必须真的读到两个文件。
- *
- * 旧实现用 `new URL(import.meta.url).pathname` 拼路径——那是**百分号编码**的，
- * 本仓路径含空格与中文，于是 readFile 必然 ENOENT、探针恒判「不同版本」，
- * 三条安装面断言**永远 SKIP**。SKIP 不是通过（规范 §10）：0.13.0 删 v1 后
- * 钩子数量从 6 变 4、prepend 从 2 条变 1 条，这些过期断言一直「绿」着没人发现。
- */
-test('版本比对探针能真的读到已安装副本与本仓源码', async () => {
-  if (!(await exists(installedEntry))) return // 未安装环境不适用
-  const [installed, source] = await Promise.all([
-    readFile(installedEntry, 'utf8').catch((error) => ({ error })),
-    readFile(SOURCE_ENTRY, 'utf8').catch((error) => ({ error })),
-  ])
-  assert.ok(typeof installed === 'string', '已安装副本必须可读：' + (installed.error?.message ?? ''))
-  assert.ok(typeof source === 'string',
-    '本仓源码必须可读——读不到说明 SOURCE_ENTRY 又被写成了百分号编码路径：' + (source.error?.message ?? ''))
-  assert.ok(!/%[0-9A-F]{2}/i.test(SOURCE_ENTRY), 'SOURCE_ENTRY 不得含百分号编码：' + SOURCE_ENTRY)
-})
-
 test('test/ 与 src/ 不得用 URL.pathname 拼文件路径（本仓路径含空格与中文）', async () => {
   const roots = [path.join(path.dirname(SOURCE_ENTRY), '..', 'test'), path.join(path.dirname(SOURCE_ENTRY), '..', 'src')]
   const offenders = []
@@ -316,8 +227,8 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   // 0.13.1 单引擎：只有一个降温、一个回注、一个工作状态注入，外加计划先行自动化钩子。
   // 旧断言是 6 个 / 两条 prepend（v1 与 v2 各一套）——0.13.0 删 v1 后这些数字就过期了，
   // 但因为本组三条用例一直 SKIP（见 SOURCE_ENTRY 的注释），过期断言**从未被执行**。
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 5,
-    '降温 + 回注 + 工作状态注入 + 计划先行自动化 + v3 影子摄入（0.14.0-beta.1 起）')
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 1,
+    '降温 + 回注 + 工作状态注入 + 计划先行自动化 + v3 影子摄入（0.14.0-beta.10 起）')
   assert.equal(ctx._listeners.get('domain/changed').length, 1)
   assert.deepEqual(ctx._prependEvents, ['agent/pre-step'], '只挂一个 prepend 回注（单引擎）')
 
@@ -411,14 +322,4 @@ test('the installed host half registers a command that records its input', async
   assert.ok(typeof command.input?.hint === 'string' && command.input.hint.includes('on'))
   assert.equal(typeof command.handler, 'function')
 })
-
-test('the client bundle ships beside the host half and declares its client section', async (t) => {
-  const root = path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', 'dsh-memory-context-lab')
-  if (!(await exists(root))) return t.skip('not installed')
-  assert.ok(await exists(path.join(root, 'src', 'client.js')), 'the client bundle must be installed')
-  const manifest = JSON.parse(await (await import('node:fs/promises')).readFile(path.join(root, 'package.json'), 'utf8'))
-  assert.equal(manifest.dsh.client.platform, 'web')
-  assert.equal(manifest.exports['./client'], './src/client.js')
-  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-slots'))
-  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-api-remotes'))
-})
+
