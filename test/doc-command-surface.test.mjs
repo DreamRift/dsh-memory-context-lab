@@ -46,8 +46,11 @@ const skip = existsSync(DOCS) && existsSync(path.join(PROJECT, 'README.md'))
   ? false
   : '安装包内没有上层文档（只在开发树里跑）'
 
-const src = (rel) => readFile(path.join(SRC, rel), 'utf8')
-const doc = (rel) => readFile(path.join(PROJECT, rel), 'utf8')
+/** 以 LF 归一读取：本守卫按行首/代码块解析，CRLF 检出（Windows 默认 autocrlf=true）
+ *  会让 ```text 块与行首匹配全部失效，造成“干净克隆必红”的假缺陷。 */
+const readNormalized = async (file) => (await readFile(file, 'utf8')).replace(/\r\n/g, '\n')
+const src = (rel) => readNormalized(path.join(SRC, rel))
+const doc = (rel) => readNormalized(path.join(PROJECT, rel))
 
 function settingKeys(source) {
   const m = /export const SETTING_KEYS = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(source)
@@ -57,7 +60,8 @@ function settingKeys(source) {
 
 /** 解析 plugin/README.md 的第一个 text 代码块：子命令名与 set 键位。 */
 function readmeSurface(markdown) {
-  const block = /```text\n([\s\S]*?)```/.exec(markdown)
+  const text = String(markdown).replace(/\r\n/g, '\n')
+  const block = /```text\n([\s\S]*?)```/.exec(text)
   assert.ok(block, 'plugin/README.md 必须仍有一个 text 代码块列出命令（本守卫依赖该形态）')
   const ops = new Set()
   const keys = new Set()
@@ -89,7 +93,7 @@ test('量具自检：读到了键位权威与 README 命令块', async () => {
   const keys = settingKeys(await src('v2/runtime-settings.mjs'))
   assert.ok(keys.size >= 12, 'SETTING_KEYS 只解析出 ' + keys.size + ' 个键，扫描器可能失效')
   assert.ok(keys.has('autorestore') && keys.has('protect'))
-  const surface = readmeSurface(await readFile(path.join(PKG, 'README.md'), 'utf8'))
+  const surface = readmeSurface(await readNormalized(path.join(PKG, 'README.md')))
   assert.ok(surface.ops.has('restore') && surface.ops.has('status'),
     'README 命令块解析失败：' + [...surface.ops].join(','))
 })
@@ -110,18 +114,18 @@ test('帮助文本的键位表与 SETTING_KEYS 集合相等', async () => {
     '帮助文本与 SETTING_KEYS 不一致：缺 ' + missing.join(',') + ' 多 ' + extra.join(','))
 })
 
-test('README 的 set 键位表覆盖 SETTING_KEYS 全集', { skip }, async () => {
+test('README 的 set 键位表覆盖 SETTING_KEYS 全集', async () => {
   const keys = settingKeys(await src('v2/runtime-settings.mjs'))
-  const surface = readmeSurface(await readFile(path.join(PKG, 'README.md'), 'utf8'))
+  const surface = readmeSurface(await readNormalized(path.join(PKG, 'README.md')))
   const missing = [...keys].filter((k) => !surface.keys.has(k))
   assert.deepEqual(missing, [], 'plugin/README.md 的 set 键位表漏了：' + missing.join(','))
 })
 
-test('README 命令块里的每个子命令都在 dispatch 里有 case', { skip }, async () => {
+test('README 命令块里的每个子命令都在 dispatch 里有 case', async () => {
   const runtime = await src('v2/runtime.mjs')
   const cases = new Set([...runtime.matchAll(/case '([^']+)':/g)].map((m) => m[1]))
   const keys = settingKeys(await src('v2/runtime-settings.mjs'))
-  const surface = readmeSurface(await readFile(path.join(PKG, 'README.md'), 'utf8'))
+  const surface = readmeSurface(await readNormalized(path.join(PKG, 'README.md')))
   const dangling = [...surface.ops].filter((op) => !cases.has(op) && !keys.has(op) && op !== 'help')
   assert.deepEqual(dangling, [], 'README 写了没有实现的子命令：' + dangling.join(' / '))
 })
