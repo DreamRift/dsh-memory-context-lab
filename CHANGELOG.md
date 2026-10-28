@@ -2,23 +2,28 @@
 
 > 0.14.0-beta.7 ~ beta.10 未在本文件单独收录（当时以进展卡与转正方案为准）；beta.11 起恢复逐版记录。
 
-## 0.14.0-beta.44（2026-10-28，测试版；真实宿主事件形状修复：归档重新生效 + 设置/诊断/隐私收口）
+## 0.14.0-beta.44（2026-10-28，测试版）
 
-> 本轮是 0.14.0-beta.43 审计（`审计-beta.43-20261028`）的根因修复批；未安装、未重启、未推送。
+相比 0.14.0-beta.43：
 
-- **P1 真实 `tool/result` 形状让两种归档同时失效**：宿主 0.2.1-rc.3 把结果 callId 放在 `data.message.toolCallId` / `data.message.source.callId`，旧 `callIdOf` 只认 `data.callId` / `message.content[].callId`，于是每个工具调用都「未完成」，按轮与按步归档都被判死。现在事件形状只有一个读取点 `domain/archive/event-shape.mjs`，candidates/steps 共用；真实会话快照复跑：76/76 步 unfinished → 0，按步选择器返回 `seq 43–77（3 步/7 记录）`。
-- **P1 按步归档被首个用户锚点阻断**：真实 DSH 的 `user/message` 在 step 1 内（step/start 先于 user/message）。旧选择器在 `unit.hasHuman` 上 `break`，永远到不了第 2 步。现在**前导锚点整步跳过**，已开始选步后的锚点仍 `break`（不能跨过它拼接）；用户消息绝不进 span。
-- **P1 `autoRestore` 全局设置对已有会话失效**：旧实现把 `lastSeq>=0` 的会话强制 `autoRestore=true`，`off` 又只读冻结的 `state.autoRestore`。现在 `off` 每次读当前全局设置；`ensureStateSnapshot` 不再强制 true；状态投影报告当前生效值。会话建库后再改设置也生效。
-- **P1 脱敏漏常见凭据**：补 AWS access key（`AKIA/ASIA/...`）、GitHub（`ghp_/gho_/...`、`github_pat_`）、Slack、Google API key、Stripe、JWT。已知边界不变：宿主 append-only 日志仍有原文，脱敏保护插件副本/导出。
-- **P2 按步归档事实不可见**：新增 `surface.lastArchiveAt`（两种模式都推进），与回合级 `lastArchiveEndSeq` 分开；状态行、切模式确认、投影都用它。按步归档**不写** `lastArchiveEndSeq`（否则会成为按轮选择的永久下限）。
-- **P2 `control.json` 坏 JSON 失败开放**：新对话 `defaultEnabled=false`，损坏时旧实现回 `enabled=true`。现在损坏/非法形状按本会话默认回落；坏 JSON + 默认关 → `enabled=false` + `ECONTROL_CORRUPT`。
-- **P2 `status` 的「下一次归档」忽略冷却闸门**：抽出唯一的 `coolingGateOf()`，`archiveForStep` 与 `dryRunArchive` 共用；闸门未开时预览如实回 `cooling-closed`，并带占用/闸门值。
-- **P2 数字参数用 `Number()`**：新增 `parseStrictInteger`（只认 `/^\d+$/`），命令面 `set`/`restore` 与面板字段同口径；`0x10`、`1e1`、`5.0`、全角数字一律拒绝且不改写原值。
-- **P2 验证工具链**：删除已失效的 v2 工具 schema 探针（`src/v2/tool.mjs` 不存在）与未使用的 `lock-child.mjs`；`probe:host` 改为**宿主契约源码探针**（CommandResult / decision.messages / surfaceOp / toolCallId / sourceEventSeqs），6/6 PASS。`resolveT2Isolated` 增补 `$DSH_HOME/profiles/*` 搜索，源码树 `node scripts/t2-smoke.mjs` 无需 `--repo` 即可通过（0.9.10 / cg,stg）。
-- **P2 `planfirst approve` 展开风险**：`Math.max(...nodes)` 改为单遍循环，避免大活动面 `RangeError`。
-- **验证**：源码线 `node scripts/test-all.mjs` **96 套 / 435 通过 / 0 失败 / 4 skip**（安装前，4 条为安装面断言）；安装 beta.44 后 release 自测 **96 套 / 439 用例 / 439 通过 / 0 失败 / 0 skip**；`probe:host` 6/6；`t2-smoke` 通过；`check-docs` 0；新增 `v3-archive-event-shape`、`v3-autorestore`、`v3-number-input`、`v3-cooling-gate`，并加强 `v3-step-cooling`/`v3-client-chip`/`v3-ingest-redaction`/`v3-session-mode`/`v3-t2-environment`。
-- **发布**：GitHub `DreamRift/dsh-memory-context-lab` tag `v0.14.0-beta.44`（commit `e4f36b9`）；Release（Pre-release）asset `dsh-memory-context-lab-0.14.0-beta.44.tgz`——78 files / 277,060 B / sha256 `adf501b0ed13fc6ebb7c774e79e3d4aec310b3daf7296404eaf3b598df0bf95e`；profile 已安装同 tgz（`src/` 63/63 逐字节一致）。
-- **未做**：未重启 DSH（运行中的实例仍是 beta.43 内存态）；真实会话的命令面/UI 点击待重启后复验。
+### 修复
+
+- **工具会话归档恢复**：真实宿主的 `tool/result` 把 callId 放在 `data.message.toolCallId` / `data.message.source.callId`；归档选择器统一按真实形状配对工具调用，修复按轮/按步归档在含工具调用的会话中不生效。
+- **按步归档锚点**：真实 DSH 的 `user/message` 位于 step 1 内；遇到前导含用户消息的整步时跳过该步，不再阻断后续步骤，用户消息仍不会被压入 span。
+- **停用恢复**：`autoRestore` 每次读取当前全局设置，不再使用建库时的 state 快照。
+- **控制文件**：`control.json` 损坏或形状非法时按会话默认失败关闭；新对话默认关闭时不会因坏文件变为启用。
+- **数字参数**：命令面与面板字段只接受十进制整数；`0x10`、`1e1`、小数与全角数字一律拒绝且不改写原值。
+- **脱敏**：工具结果补充 AWS / GitHub / Slack / Google / Stripe / JWT 常见凭据格式。
+
+### 改进
+
+- 新增 `surface.lastArchiveAt`，按轮与按步归档都会推进；状态行、切模式确认与投影可感知按步归档，回合级 `lastArchiveEndSeq` 保持独立。
+- `status` 的「下一次归档」与真实执行共用冷却闸门，闸门未开时如实返回 `cooling-closed`。
+- `probe:host` 改为宿主契约源码探针；T2 环境解析支持 `$DSH_HOME/profiles/*`；源码树 `t2-smoke` 无需额外指定包根。
+
+### 升级
+
+- 替换 DSH profile 中的插件包并重启 DSH。测试：96 套 / 439 用例通过；`probe:host` 6/6；`t2-smoke` 通过。
 
 ## 0.14.0-beta.43（2026-10-28，测试版；切模式确认块收敛：没有归档就不问、按钮靠右、文案纠偏）
 
