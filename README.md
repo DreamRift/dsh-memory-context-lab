@@ -6,13 +6,10 @@
 
 ## 0.14.0-beta.44 本版行为
 
-- **归档选择器识别真实宿主形状**：`tool/result` 的 callId 在 `data.message.toolCallId` / `data.message.source.callId`；按轮与按步归档在真实工具会话恢复。
-- **按步锚点**：真实 DSH 的 `user/message` 在 step 1 内；前导含 human 的整步跳过，已开始选步后的锚点仍是硬边界。
-- **停用恢复**：`/memory-lab off` 读当前全局 `autoRestore`，不再读建库时冻结的 state 值。
-- **归档事实**：新增 `surface.lastArchiveAt`（按轮/按步都推进）；按步归档不写回合级 `lastArchiveEndSeq`。
-- **诊断与配置**：status 的「下一次归档」与执行共用冷却闸门；`control.json` 损坏按本会话默认失败关闭；数字参数只认十进制。
-- **脱敏**：补 AWS / GitHub / Slack / Google / Stripe / JWT 形态；宿主 append-only 日志仍有原文，脱敏保护插件副本与导出。
-- **验证**：96 套 / 439 用例 / 439 通过 / 0 失败（release 自测，安装 beta.44 后 0 skip）。
+- 归档选择器识别真实 `tool/result` 的 `data.message.toolCallId` / `data.message.source.callId`；按步归档跳过含用户锚点的前导整步。
+- `off` 读当前全局 `autoRestore`；新增 `surface.lastArchiveAt`；status 预览与执行共用冷却闸门。
+- `control.json` 损坏失败关闭；数字参数只认十进制；脱敏补 AWS/GitHub/Slack/Google/Stripe/JWT。
+- 验证：96 套 / 439 用例 / 439 通过 / 0 失败。
 
 ## 它做什么、不做什么
 
@@ -64,9 +61,7 @@
 /memory-lab help            本清单
 ```
 
-**本对话只覆盖 `limit` 与三个会话开关；其余在设置页。**
 
-handler 返回 `CommandResult`；失败带 `code`，不拿空文本糊过去。
 
 ## composer 面板（本对话控制）
 
@@ -138,8 +133,6 @@ composer 工具行左侧的「记忆上下文」chip（宿主 `conversation.inpu
 清数据：删除 $DSH_HOME/.memory-context-lab/v3/
 ```
 
-验证：`cd 记忆上下文/plugin && npm test`（套件按目录发现）。`%TEMP%` 不可写时先指到可写目录。T2 验收：`npm run t2:smoke` / `npm run t2:provider`。
 
 
 
-> 本仓库是源码线 `plugin/` 的发布镜像；开发文档与缺陷排查记录不随包分发。
