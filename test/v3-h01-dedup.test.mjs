@@ -13,7 +13,7 @@ function rec(id, text, ev) {
   return {
     id: 'v3r-' + String(id).padStart(16, '0'),
     kind: 'message-user',
-    sessionKey: 's-dedup',
+    sessionKey: 'session-h01', // 必须与 open 的会话一致（写入侧现在会校验归属）
     createdAt: 1770000000000 + seqN,
     payload: { text: body, bytes: Buffer.byteLength(body, 'utf8') },
     provenance: { sourceEventId: ev, sourceForm: null, transactionId: 'tx-dedup-' + String(seqN).padStart(6, '0') },

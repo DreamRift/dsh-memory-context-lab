@@ -25,6 +25,9 @@ export async function createSessionStorePort(root, sessionKey) {
   const dir = store.directory
 
   async function rebuildIndex() {
+    // 跨句柄一致性：重建前先把别的句柄/进程写入的 forget 行并进来，
+    // 否则已遗忘记录会被重新写进索引（隐私面回退，且 indexStale 不会再纠正）。
+    await store.refreshForgotten?.()
     const forgotten = new Set(store.listForgotten())
     const committedIds = await store.listRecordIds()
     // sourceCount 用**未过滤**的已提交数：它是新鲜度的比对基线（见 lexical-index 注释）
@@ -110,6 +113,21 @@ export async function createSessionStorePort(root, sessionKey) {
       return store.readRecord(id)
     },
 
+    /** 记录 ID 清单（归档需要宿主 seq → recordId；只给 ID，不读正文）。 */
+    async listRecordIds() {
+      return store.listRecordIds()
+    },
+
+    /** 单条 provenance（不读正文；来源事件 ID 反推/归档映射用）。 */
+    async readProvenance(id) {
+      return store.readProvenance(id)
+    },
+
+    /** 追加归档凭证（surface 回执 ↔ recordIds 的 durable 映射）。 */
+    async appendVoucher(voucher) {
+      return store.appendVoucher(voucher)
+    },
+
     /**
      * 恢复资格：按凭证下标取凭证，与调用方给的当前表面正文做逐字节比对
      * （domain/archive 的 restoreEligibilityOf——N-11b）。
@@ -163,6 +181,61 @@ export async function createSessionStorePort(root, sessionKey) {
         const index = await readLexicalIndex(store)
         return { forgottenCount: store.listForgotten().length, indexedCount: index?.indexedCount ?? 0 }
       })
+    },
+
+    /** 导入外部脱敏包（M5）：新 ID/新事务；导入后重建索引使检索可见。 */
+    async importRecords(records) {
+      const result = await store.importRecords(records)
+      try {
+        await rebuildIndex()
+      } catch {
+        // 索引可重建；导入事实已提交，不因派生物失败回滚
+      }
+      return result
+    },
+
+    /** 撤销遗忘（M3）：整批预检 + 逐条追加 revoke + 重建索引（失败也重建）。 */
+    async revokeForget(recordIds) {
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        throw new V3ContractViolation('v3 store: revokeForget 的 recordIds 必须是非空数组')
+      }
+      for (const id of recordIds) {
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new V3ContractViolation('v3 store: revokeForget 的每个 id 必须是非空字符串')
+        }
+      }
+      return withCrossProcessWriteLock(dir, async () => {
+        await store.syncFromLog()
+        const committed = new Set(await store.listRecordIds())
+        const missing = recordIds.filter((id) => !committed.has(id))
+        if (missing.length > 0) {
+          throw v3Error('ESTORE_TXN_CONFLICT', '撤销遗忘目标不存在或未提交（整批拒绝）：' + missing.join('、'))
+        }
+        try {
+          for (const id of recordIds) await store.revokeForget(id)
+        } finally {
+          await rebuildIndex()
+        }
+        const index = await readLexicalIndex(store)
+        return { forgottenCount: store.listForgotten().length, indexedCount: index?.indexedCount ?? 0 }
+      })
+    },
+
+    /** 列已遗忘 ID（状态面/forget status）。 */
+    listForgotten() {
+      return store.listForgotten()
+    },
+
+    /**
+     * 已提交记录数：同步、零 I/O、不读词法索引。
+     *
+     * 与 health() 的分工：health() 要读二十几 MB 的索引文件（观察面偶尔读一次没问题），
+     * 而 composer 状态条会在每个事件后被 view 读一次——这条路径不能背索引解析。
+     * 端口方法面（PORT_METHODS）不强制它：测试替身可以缺席，调用方回落 health()。
+     */
+    recordCount() {
+      const base = store.health()
+      return Number.isInteger(base?.recordCount) && base.recordCount >= 0 ? base.recordCount : null
     },
 
     async health() {

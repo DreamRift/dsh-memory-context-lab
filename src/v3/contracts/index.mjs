@@ -8,3 +8,5 @@ export { DECISION_KINDS, DECISION_FIELDS, EFFECT_KINDS, sealDecision, validateDe
 export { RECORD_KINDS, RECORD_FIELDS, assertValidRecord, validateRecord } from './records.mjs'
 export { OUTCOME_STATUSES, OUTCOME_FIELDS, validateOutcome } from './outcomes.mjs'
 export { REQUIRED_T2_TOOLS, TESTED_DSH_MEMORY_VERSIONS, negotiateMemoryProvider } from './capabilities.mjs'
+export { PLUGIN_SOURCE_KIND, HUMAN_SOURCE_KIND, RECALL_SOURCE_FORM } from './sources.mjs'
+export { T2_SMOKE_NODE_ID, T2_MIRROR_NODE_RE, T2_REJECTED_NODE_RE } from './t2.mjs'

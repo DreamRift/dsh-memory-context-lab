@@ -52,7 +52,7 @@ test('H-14 observe 有界：300 事件后明细不超过窗口（旧：300 条�
     const runtime = await createV3Runtime({ v3Root: root, dshSession: session, sessionKey: 's-metrics' })
     try {
       for (let i = 0; i < 300; i += 1) {
-        const event = { seq: i, type: 'user/message', at: i, data: { content: [{ type: 'text', text: '正文' + i }] } }
+        const event = { seq: i, type: 'user/message', at: i, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '正文' + i }] } }
         session.log.push(event)
         await runtime.handleDshEvent(event, '正文' + i)
       }
@@ -72,7 +72,7 @@ test('H-14 按名字聚合正确：count/last/min/max', async () => {
     const runtime = await createV3Runtime({ v3Root: root, dshSession: session, sessionKey: 's-metrics-2' })
     try {
       for (let i = 0; i < 5; i += 1) {
-        const event = { seq: i, type: 'user/message', at: i, data: { content: [{ type: 'text', text: '正文' + i }] } }
+        const event = { seq: i, type: 'user/message', at: i, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '正文' + i }] } }
         session.log.push(event)
         await runtime.handleDshEvent(event, '正文' + i)
       }
@@ -100,7 +100,7 @@ test('H-14 外部 sink 仍收到每一次 observe（有界只作用于内存快�
     })
     try {
       for (let i = 0; i < 200; i += 1) {
-        const event = { seq: i, type: 'user/message', at: i, data: { content: [{ type: 'text', text: '正文' + i }] } }
+        const event = { seq: i, type: 'user/message', at: i, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '正文' + i }] } }
         session.log.push(event)
         await runtime.handleDshEvent(event, '正文' + i)
       }

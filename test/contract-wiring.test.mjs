@@ -39,6 +39,7 @@ async function listSourceFiles(dir) {
  */
 const EXPORT_WHITELIST = new Map(Object.entries({
   apply: '宿主插件入口（DSH 经插件协议调用 apply，src 内零消费是协议必然）',
+  Config: '宿主设置页入口（dsh-settings 读 fiber.runtime.Config 生成表单，消费方在宿主侧；src 内零消费是协议必然）；v3-surface-contract 锁「五个 volatile 字段 + ~standard 默认值」',
   evaluatePressureGate: '定案·白名单：闸门判定纯函数（v3-pressure-gate 套件锁 G1-G4 判据）；触发动作属①②④缓议项（2026-10-25 用户拍板），接线后摘除',
   isReadLeaseActive: '定案·白名单：租约判据助手（v3-context-budget 套件锁失败关闭口径）；allocateBudget 内联消费 leaseUntil 字段，读路径接线（recall 后记 lastReadAt）后摘除',
   // —— 测试钩子（*ForTest），生产不消费是设计而非缺口 ——  // —— P0-4 待逐个三选一（接线/删除/白名单定案），见进展卡-beta.9 ——  // —— v3 M0 骨架（dev-0.14.0/进展卡-M0）：M3 composition root 接线后逐项摘除 ——

@@ -13,11 +13,17 @@
 import { randomUUID } from 'node:crypto'
 
 import { assertPort } from '../../ports/index.mjs'
-import { validateEvent as contractsValidateEvent, V3ContractViolation, v3Error } from '../../contracts/index.mjs'
+import { PLUGIN_SOURCE_KIND, validateEvent as contractsValidateEvent, V3ContractViolation, v3Error } from '../../contracts/index.mjs'
 
 /** v3 表面形态名（新引擎新号；v1 的 memory-lab2-* 是禁用符号）。 */
 export const V3_SURFACE_FORM = 'memory-lab3-surface'
-export const V3_PLUGIN_SOURCE_KIND = 'dsh-memory-context-lab'
+
+/**
+ * 插件自有 source.kind：**只有一个定义**，在 contracts/sources.mjs。
+ * 这里保留同名 re-export 只为兼容既有 import（适配器层不复制字面量，
+ * 否则「回注用哪个 kind」迟早与摄入跳过判据漂移）。
+ */
+export const V3_PLUGIN_SOURCE_KIND = PLUGIN_SOURCE_KIND
 
 const DSH_USER_MESSAGE = 'user/message'
 
@@ -57,11 +63,16 @@ export function normalizeDshEvent(raw, sessionKey) {
     return { ok: false, errors: ['DSH 事件类型不在 v3 归一化面：' + String(raw.type) + '（system/head 类不进记忆管线）'] }
   }
   const source = raw.data?.source ?? {}
+  // 宿主事件的时间字段是 `time`（dsh-session `append()`：{type, seq, time, data}），
+  // 不是 `at`。旧实现只读 `at`，于是每条归一化事件的 at 恒为 0——记录本身用
+  // clock.now() 另存 createdAt 才没暴露，但「事件时间」这个事实在入口就丢了。
+  // `at` 保留为兼容旧夹具/旧格式，两者都缺失才回落 0。
+  const at = Number.isFinite(raw.at) ? raw.at : (Number.isFinite(raw.time) ? raw.time : 0)
   return validateShape({
     id: dshEventIdOfSeq(raw.seq),
     type,
     sessionKey,
-    at: Number.isFinite(raw.at) ? raw.at : 0,
+    at,
     source: { kind: typeof source.kind === 'string' && source.kind.length > 0 ? source.kind : 'dsh', form: typeof source.form === 'string' ? source.form : null },
   })
 }
@@ -104,9 +115,33 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
     }
   }
 
+  function eventTextOf(event) {
+    if (event === null || typeof event !== 'object') return null
+    const message = event.data?.message
+    const content = message?.content ?? event.data?.content
+    if (Array.isArray(content)) {
+      const text = content
+        .map((part) => (part?.type === 'text' && typeof part.text === 'string' ? part.text : ''))
+        .join('')
+      return text.length > 0 ? text : null
+    }
+    if (typeof event.data?.text === 'string' && event.data.text.length > 0) return event.data.text
+    return null
+  }
+
+  function surfaceNodes() {
+    return Array.isArray(session.surface?.nodes) ? [...session.surface.nodes] : []
+  }
+
   const impl = {
-    /** 表面操作：append 或 replace（replace 带 surfaceOp + sourceEventSeqs，遮蔽区间可审计）。 */
-    async surfaceOp({ op, targetEventId, text } = {}) {
+    /**
+     * 表面操作：append 或 replace（replace 带 surfaceOp + sourceEventSeqs，遮蔽区间可审计）。
+     *
+     * 历史归档使用**区间 replace**：startSeq/endSeq 是 surface 节点；sourceEventSeqs 必须
+     * 密集覆盖被遮蔽的全部节点（宿主 dsh-session 的 assertSourceEventReferences 判据）。
+     * 单节点 replace 仍走 targetEventId，兼容既有卡片执行器。
+     */
+    async surfaceOp({ op, targetEventId, startSeq, endSeq, sourceEventSeqs, text } = {}) {
       if (typeof text !== 'string' || text.length === 0) {
         throw new V3ContractViolation('v3 dsh-host: text 必须是非空字符串')
       }
@@ -114,23 +149,69 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
         return { seq: appendReceipt(text) }
       }
       if (op === 'replace') {
-        if (!Number.isInteger(targetEventId) || targetEventId < 1) {
-          throw new V3ContractViolation('v3 dsh-host: replace 的 targetEventId 必须是 ≥1 的 seq')
+        let start = startSeq
+        let end = endSeq
+        let sources = sourceEventSeqs
+        if (start === undefined && end === undefined) {
+          if (!Number.isInteger(targetEventId) || targetEventId < 1) {
+            throw new V3ContractViolation('v3 dsh-host: replace 的 targetEventId 必须是 ≥1 的 seq')
+          }
+          start = targetEventId
+          end = targetEventId
+          sources = [targetEventId]
+        }
+        if (!Number.isInteger(start) || start < 0 || !Number.isInteger(end) || end < start) {
+          throw new V3ContractViolation('v3 dsh-host: replace 的 startSeq/endSeq 必须是 start≤end 的非负整数')
+        }
+        if (!Array.isArray(sources) || sources.length === 0
+          || sources.some((seq) => !Number.isInteger(seq) || seq < 0)
+          || new Set(sources).size !== sources.length) {
+          throw new V3ContractViolation('v3 dsh-host: replace 的 sourceEventSeqs 必须是非空、无重复的非负整数数组')
+        }
+        const nodes = surfaceNodes()
+        const startIdx = nodes.indexOf(start)
+        const endIdx = nodes.indexOf(end)
+        if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) {
+          throw new V3ContractViolation('v3 dsh-host: replace 的 startSeq/endSeq 不在当前活动面或顺序颠倒')
+        }
+        const shadowed = nodes.slice(startIdx, endIdx + 1)
+        const missing = shadowed.filter((seq) => !sources.includes(seq))
+        if (missing.length > 0) {
+          throw new V3ContractViolation('v3 dsh-host: sourceEventSeqs 未覆盖被遮蔽节点：' + missing.join(', '))
         }
         const seq = appendReceipt(text, {
-          surfaceOp: { op: 'replace', startSeq: targetEventId, endSeq: targetEventId },
-          sourceEventSeqs: [targetEventId],
+          surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
+          sourceEventSeqs: [...sources],
         })
-        // 确认面（apply-commit 同口径）：替换事件进面、目标出面
+        // 确认面（apply-commit 同口径）：替换事件进面、被遮蔽节点全部出面
         if (typeof session.eventAt === 'function' && session.eventAt(seq) === undefined) {
           throw v3Error('EINTERNAL', '替换事件未进入活动面（宿主确认失败）')
         }
-        if (Array.isArray(session.surface?.nodes) && session.surface.nodes.includes(targetEventId)) {
-          throw v3Error('EINTERNAL', '目标 seq ' + targetEventId + ' 仍在活动面（替换未生效）')
+        const after = surfaceNodes()
+        const stillThere = shadowed.filter((node) => after.includes(node))
+        if (stillThere.length > 0) {
+          throw v3Error('EINTERNAL', '被替换节点仍在活动面：' + stillThere.join(', '))
         }
         return { seq }
       }
       throw new V3ContractViolation('v3 dsh-host: op 必须是 append/replace')
+    },
+
+    /** 当前活动面节点（升序 seq）；历史归档按它选连续 span。 */
+    async surfaceNodes() {
+      return surfaceNodes()
+    },
+
+    /** 某个 surface 节点的当前正文；不存在/不是文本事件返回 null（不猜）。 */
+    async surfaceTextAt(seq) {
+      if (!Number.isInteger(seq) || typeof session.eventAt !== 'function') return null
+      return eventTextOf(session.eventAt(seq))
+    },
+
+    /** 任意日志事件正文（恢复/核证用）；不存在返回 null。 */
+    async eventTextAt(seq) {
+      if (!Number.isInteger(seq) || typeof session.eventAt !== 'function') return null
+      return eventTextOf(session.eventAt(seq))
     },
 
     /** 原生事件流（归一化经 normalizeDshEvent；这里只给原始面，由调用方逐个归一）。 */
@@ -140,7 +221,18 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
     },
 
     async sessionInfo() {
-      return { sessionKey }
+      const log = typeof session.events === 'function' ? session.events() : (session.events ?? session.log ?? [])
+      let contextWindow = null
+      if (Array.isArray(log)) {
+        for (let i = log.length - 1; i >= 0; i -= 1) {
+          if (log[i]?.type !== 'request/context') continue
+          const window = log[i]?.data?.contextWindow
+          if (Number.isFinite(window) && window > 0) contextWindow = window
+          break
+        }
+      }
+      const cwd = session.header?.cwd ?? session.meta?.cwd ?? (typeof session.cwd === 'string' ? session.cwd : null)
+      return { sessionKey, cwd, contextWindow }
     },
 
     async tools() { return [] },

@@ -16,7 +16,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, access as fs_access, readFile as fs_readFile, readdir as fs_readdir } from 'node:fs/promises'
+import { mkdtemp, rm, access as fs_access, stat as fs_stat, readFile as fs_readFile, readdir as fs_readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -123,7 +123,7 @@ test('decision 原样返回；摄入抛错只告警', async () => {
     assert.deepEqual(decision, { kind: 'enter', step: 42 }, '影子不改宿主决策')
     // H-19 之后建库在后台跑：告警异步到达，等空闲后再断言（语义不变：失败只告警）
     await engine._waitForIdle()
-    assert.ok(ctx.warnings.some((w) => /影子(摄入|调度)失败/.test(w)), '失败只告警（摄入批或调度层）')
+    assert.ok(ctx.warnings.some((w) => /(影子(摄入|调度)失败|建库失败)/.test(w)), '失败只告警（摄入批或调度层）')
     boom = false
     await ctx.callPreStep({ session })
     await engine._waitForIdle()
@@ -152,22 +152,39 @@ test('自家生成物不入库（2026-10-25 拍板）：source.kind 匹配的 us
   })
 })
 
-test('索引重建分寸：小增量不重建（首字不受 11.5MB 重建拖累），回填才重建', async () => {
+test('索引重建分寸：首次摄入建索引；陈化的小增量不重建；回填必重建', async () => {
+  // 「分寸」的判断对象是**重建成本**：陈化的小增量若触发重建，就要重读全部记录
+  // 重写十几 MB（真机实测 645ms～2s），而它落在首字路径上——这才是要禁的事。
+  // 首次摄入时库里只有几条记录，重建成本 O(几条)，与「十几 MB」不是同一件事：
+  // 恰恰相反，**不建**会让新会话头几步的回注全部 skipped（热路径已禁止重建，
+  // 索引又根本不存在，没有任何东西可检索）。
   await withEngine(async ({ ctx, engine, root }) => {
     const session = fakeSession('s-idx')
-    // 1) 小增量（2 条 < 100）：摄入但不建索引文件
+    const sessionDir = path.join(root, 'sessions', 's-idx')
+    const idxSmall = path.join(sessionDir, 'lexical-index.json')
+    const idxExists = () => fs_access(idxSmall).then(() => true, () => false)
+
+    // 1) 首次摄入（库从空到有）：必须建出索引，否则首屏回注结构性失效
     session.push('user/message', { data: { text: '第一条' } })
     session.push('user/message', { data: { text: '第二条' } })
     await ctx.callPreStep({ session }, { kind: 'enter' })
     await engine._waitForIdle()
-    const sessionDir = path.join(root, 'sessions', 's-idx')
-    const idxSmall = path.join(sessionDir, 'lexical-index.json')
-    assert.equal(await fs_access(idxSmall).then(() => true, () => false), false, '小增量不得触发全量索引重建')
-    // 2) 回填（≥100 条）：批量化摄入后重建一次
+    assert.equal(await idxExists(), true, '首次摄入必须建索引（否则新会话头几步回注必然 skipped）')
+
+    // 2) 陈化的小增量：记录索引文件的「内容戳」，摄入后它不得变化
+    const stampOf = async () => { const i = await fs_stat(idxSmall); return i.mtimeMs + ':' + i.size }
+    const before = await stampOf()
+    session.push('user/message', { data: { text: '第三条' } })
+    session.push('user/message', { data: { text: '第四条' } })
+    await ctx.callPreStep({ session }, { kind: 'enter' })
+    await engine._waitForIdle()
+    assert.equal(await stampOf(), before, '陈化的小增量不得触发全量索引重建（首字不受十几 MB 重建拖累）')
+
+    // 3) 回填（≥100 条）：批量化摄入后重建一次
     for (let i = 0; i < 150; i += 1) session.push('user/message', { data: { text: '回填' + i } })
     await ctx.callPreStep({ session }, { kind: 'enter' })
     await engine._waitForIdle()
-    assert.equal(await fs_access(idxSmall).then(() => true, () => false), true, '回填完成后应重建一次索引')
+    assert.notEqual(await stampOf(), before, '回填完成后应重建一次索引')
   })
 })
 

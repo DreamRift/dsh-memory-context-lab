@@ -64,7 +64,8 @@ test('H-57 dispose 落在建库窗口内：runtime 被 close 一次、不入表�
     await new Promise((r) => setTimeout(r, 120))
 
     assert.equal(h.state.closed, 1, '泄漏的 runtime 必须被关掉（旧实现为 0）')
-    assert.deepEqual(Object.keys(engine.stats()).filter((k) => k !== 'ingestMetrics'), [], 'dispose 后不得有会话残留在表里')
+    // stats() 里恒有两个**引擎级**键（ingestMetrics / injection），除此之外只能是会话条目。
+    assert.deepEqual(Object.keys(engine.stats()).sort(), ['ingestMetrics', 'injection'], 'dispose 后不得有会话残留在表里')
     assert.equal(await engine.inspect('sess-1'), null, 'dispose 后观察面不得再读到已关闭的 runtime')
     assert.ok(h.logs.some((m) => m.includes('dispose 之后完成建库')), '丢弃事实要留告警，不静默')
   } finally {

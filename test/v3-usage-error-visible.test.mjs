@@ -30,11 +30,14 @@ test('H-51 inspect 不再把 usage 读失败吞成 null', async () => {
   const source = await readFile(ENTRY, 'utf8')
   assert.equal(/usageSummary\(entry\)\.catch\(\(\) => null\)/.test(source), false, '旧写法必须消失')
   assert.match(source, /usageError/, 'inspect 必须返回 usageError')
-  assert.match(source, /return \{ lastSeq: entry\.lastSeq, ingesting: entry\.inflight !== null, health, usage, usageError \}/)
+  // 返回值是对象字面量，字段增减（如 beta.10 追加的 injection 观测）不该让守卫变红；
+  // 判据是「这次 return 里带着 usageError」，而不是字段顺序或整行逐字相等。
+  assert.match(source, /return \{[^}]*\busageError\b[^}]*\}/s, 'inspect 的返回值必须把 usageError 交给观察面')
 })
 
 test('H-51 status 面把 usageError 如实说出来', async () => {
   const source = await readFile(INDEX, 'utf8')
-  assert.match(source, /usageError \? '\\n- 占用：读取失败/, 'status 必须区分「读失败」与「没有样本」')
-  assert.match(source, /这不是「没有样本」/)
+  assert.match(source, /state\.usageError/, 'status 必须真的读 inspect 返回的 usageError（不是注释里提一句）')
+  assert.match(source, /这不是「没有样本」/, '必须区分「读失败」与「没有样本」')
+  assert.match(source, /读取失败/, '读失败要有明确措辞')
 })

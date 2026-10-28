@@ -89,3 +89,22 @@ test('H-06 超长参数按码点截断，不留半个代理对', () => {
   assert.ok(!(lastUnit >= 0xd800 && lastUnit <= 0xdbff), '不得以孤立高位代理结尾')
   assert.equal([...withoutEllipsis].length, 400, '恰好保留 400 个码点')
 })
+
+
+test('0.14.0-beta.44：tool/result 的常见云/代码托管凭据也必须脱敏', () => {
+  const secrets = [
+    'AKIAIOSFODNN7EXAMPLE',
+    'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+    'github_pat_11ABCDEFG0123456789_abcdefghijklmnop',
+    'xoxb-1234567890-abcdefghij',
+    'AIzaSyA1234567890abcdefghijklmnopqrstuv',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    'sk_live_1234567890abcdef',
+  ]
+  const body = extractEventBody({
+    type: 'tool/result',
+    data: { message: { role: 'tool', content: [{ type: 'text', text: '输出：' + secrets.join(' | ') }] } },
+  })
+  for (const secret of secrets) assert.ok(!body.text.includes(secret), '不得原样入库：' + secret)
+  assert.ok(body.text.includes('[REDACTED]'))
+})

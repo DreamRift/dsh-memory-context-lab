@@ -8,10 +8,13 @@
  * 时间/随机经端口注入（Date.now/randomUUID 只出现在这里）。
  */
 import { createHash, randomUUID } from 'node:crypto'
+import { join } from 'node:path'
 
 import { createDshHostAdapter, normalizeDshEvent, V3_PLUGIN_SOURCE_KIND } from '../adapters/host/dsh-host.mjs'
 import { createSessionStorePort } from '../adapters/storage/session-store-port.mjs'
-import { createT1Provider } from '../adapters/retrieval/t1-provider.mjs'
+import { negotiateMemoryBackend } from '../adapters/retrieval/backend-negotiation.mjs'
+import { probeT2Isolated } from '../adapters/retrieval/t2-probe.mjs'
+import { createT2IsolatedProvider } from '../adapters/retrieval/t2-isolated-provider.mjs'
 import { createProcessTurn } from '../application/process-turn.mjs'
 import { createSessionLifecycle } from '../application/session-lifecycle.mjs'
 import { createRecall } from '../application/recall.mjs'
@@ -25,11 +28,17 @@ import { sessionIsolationKey } from '../domain/session/isolation-key.mjs'
  * @param {object} deps.dshSession DSH session 对象（真实契约见 adapters/host/dsh-host.mjs）
  * @param {string} [deps.sessionKey] 会话隔离键；缺省由 dshSession 派生（M6 接宿主真实键源）
  * @param {object} [deps.metricsSink] { counter(name,value), observe(name,value) } 外部计量槽
+ * @param {object} [deps.t2Isolated] { repoRoot, python, version } 隔离 MCP 环境事实；
+ *   缺省不启用 T2（fail-closed 走 T1）。只有会话已启用才会创建 runtime，因此
+ *   新对话默认关闭时不会启动任何 Python 子进程。
+ * @param {Function} [deps.t2ProviderFactory] 测试注入；缺省用隔离 provider
  */
-export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsSink } = {}) {
+export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsSink, ownSourceKinds, memoryProbe, t2ProviderFactory, t2Isolated } = {}) {
   if (typeof v3Root !== 'string' || v3Root.length === 0) {
     throw new V3ContractViolationOfRoot()
   }
+  // 自有来源集合：装配期定死，摄入跳过与回合判定共用同一份（不得各写一遍）。
+  const ownKinds = Array.isArray(ownSourceKinds) && ownSourceKinds.length > 0 ? Object.freeze([...ownSourceKinds]) : Object.freeze([V3_PLUGIN_SOURCE_KIND])
   // 隔离键必须**一律**过校验：旧实现只在缺省时调 sessionIsolationKey，
   // 显式传入的 sessionKey（v3-entry 就是这样传的）绕过整道闸（H-08 路径穿越）。
   const originalId = String(sessionKey ?? dshSession?.id ?? 'unknown')
@@ -56,32 +65,122 @@ export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsS
   }
   const clock = { now: () => Date.now() }
   const random = { uuid: () => randomUUID() }
-  const provider = createT1Provider({ port, store, metrics })
-  const processTurn = createProcessTurn({ store: port, clock, random, metrics, ownSourceKinds: [V3_PLUGIN_SOURCE_KIND] })
+  // 隔离 T2：每会话独立 MDCG_ROOT（不共享、不落正式灵枢根）；探测失败只回落 T1。
+  // root 放在 store.directory 下——会话目录已被隔离键校验，天然不越根。
+  const isolatedRoot = t2Isolated === undefined || t2Isolated === null
+    ? null
+    : join(store.directory, 't2-mdcg')
+  const probe = isolatedRoot === null
+    ? memoryProbe
+    : async () => probeT2Isolated({
+      root: isolatedRoot,
+      repoRoot: t2Isolated.repoRoot,
+      python: t2Isolated.python,
+      version: t2Isolated.version,
+      env: t2Isolated.env,
+    })
+  const factory = isolatedRoot === null
+    ? t2ProviderFactory
+    : async (described, { t1 }) => {
+      if (described?.handle === undefined || described.handle === null) {
+        throw new Error('隔离 T2 探测没有交回已握手的 MCP client')
+      }
+      return createT2IsolatedProvider({
+        t1,
+        client: described.handle,
+        sessionKey: key,
+        metrics,
+        root: isolatedRoot,
+      })
+    }
+  // M6 T2 能力门：默认 T1；只有探测通过且宿主注入 T2 工厂才升 T2，否则如实回落。
+  const { provider, decision: providerDecision } = await negotiateMemoryBackend({
+    port,
+    store,
+    metrics,
+    probe,
+    t2ProviderFactory: factory,
+  })
+  const processTurn = createProcessTurn({ store: port, clock, random, metrics, ownSourceKinds: ownKinds })
   const lifecycle = createSessionLifecycle({ store: port, clock, random, metrics })
   const recall = createRecall({ provider, metrics, sessionKey: key })
   const executor = createSurfaceExecutor({ host, clock, metrics })
 
-  async function handleDshEvent(dshEvent, text, meta = {}) {
-    const normalized = normalizeDshEvent(dshEvent, key)
-    if (!normalized.ok) {
-      return { status: 'not-memory-event', errors: normalized.errors }
+  /**
+   * 批量摄入：一段事件 → 一笔存储事务。
+   *
+   * 逐事件事务在回填时是 O(N) 次取锁/同步日志/原子写（实测 1500 条约 45 秒），
+   * 期间 `inflight` 一直非空、回注被 busy 挡住。批量化后同一批共用一笔事务，
+   * 记录仍是一事件一条，own-source / 非记忆事件在这里一并裁决。
+   *
+   * @param {Array<{event: object, text?: string, meta?: object}>} items
+   * @returns {Promise<Array<object>>} 与入参同序的 status 列表
+   */
+  async function handleDshEventBatch(items) {
+    if (!Array.isArray(items)) {
+      throw new V3ContractViolationOfRoot('v3 composition: handleDshEventBatch 需要数组')
     }
-    return processTurn({ event: normalized.event, text, meta })
+    const results = new Array(items.length)
+    const normalized = []
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index]
+      const raw = item?.event
+      const sourceKind = raw?.data?.source?.kind
+      if (typeof sourceKind === 'string' && ownKinds.includes(sourceKind)) {
+        results[index] = { status: 'own-source', sourceKind }
+        continue
+      }
+      const normalizedEvent = normalizeDshEvent(raw, key)
+      if (!normalizedEvent.ok) {
+        results[index] = { status: 'not-memory-event', errors: normalizedEvent.errors }
+        continue
+      }
+      normalized.push({ index, event: normalizedEvent.event, text: item.text, meta: item.meta })
+    }
+    if (normalized.length === 0) return results
+    const outcomes = await processTurn.many({ items: normalized })
+    for (let i = 0; i < outcomes.length; i += 1) {
+      results[normalized[i].index] = outcomes[i]
+    }
+    // T2 镜像（beta.35）：已提交记录交给 provider 的后台队列；失败只计数，
+    // 不回滚本地事务。放在 composition 而不是某个调用方，保证命令面/入口/测试
+    // 走同一条路径（否则「直接调 runtime」会绕过镜像）。
+    if (typeof provider.mirrorRecord === 'function') {
+      for (const outcome of outcomes) {
+        if (outcome.status !== 'applied' || outcome.record === undefined) continue
+        try {
+          provider.mirrorRecord(outcome.record)
+        } catch {
+          metrics.counter('v3.t2.mirrorEnqueueFailed', 1)
+        }
+      }
+    }
+    return results
+  }
+
+  async function handleDshEvent(dshEvent, text, meta = {}) {
+    const [result] = await handleDshEventBatch([{ event: dshEvent, text, meta }])
+    return result
   }
 
   return {
     sessionKey: key,
-    host, store: port, provider,
+    ownSourceKinds: ownKinds,
+    host, store: port, provider, providerDecision,
+    t2: isolatedRoot === null ? null : { isolated: true, root: isolatedRoot, python: t2Isolated.python, version: t2Isolated.version },
     processTurn, lifecycle, recall, executor,
     handleDshEvent,
+    handleDshEventBatch,
     metrics: metrics.snapshot,
-    close() { store.close() },
+    close() {
+      try { void provider.close?.() } catch { /* 关闭失败不改变 store 关闭 */ }
+      store.close()
+    },
   }
 }
 
-function V3ContractViolationOfRoot() {
-  const e = new Error('v3 composition: v3Root 必须是非空字符串')
+function V3ContractViolationOfRoot(message = 'v3 composition: v3Root 必须是非空字符串') {
+  const e = new Error(message)
   e.name = 'V3ContractViolation'
   return e
 }

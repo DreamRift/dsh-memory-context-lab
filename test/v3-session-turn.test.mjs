@@ -20,21 +20,26 @@ import { isRealUserEvent, nextTurnState, oncePerTurnGate } from '../src/v3/domai
 
 const OWN = ['dsh-memory-context-lab']
 
-function userEvent(sourceKind = 'dsh') {
+function userEvent(sourceKind = 'user') {
   return { id: 'e1', type: 'user', sessionKey: 's1', at: 1, source: { kind: sourceKind, form: null } }
 }
 
-test('真实用户 = type user 且非插件自有来源；插件注入不算', () => {
-  assert.equal(isRealUserEvent(userEvent('dsh'), OWN), true)
+test('真实用户 = type user 且 source.kind 为宿主的人类输入约定 user；插件与其它生产者注入都不算', () => {
+  assert.equal(isRealUserEvent(userEvent('user'), OWN), true)
   assert.equal(isRealUserEvent(userEvent('dsh-memory-context-lab'), OWN), false)
   assert.equal(isRealUserEvent({ ...userEvent(), type: 'assistant' }, OWN), false)
+  // 宿主每步追加的运行时上下文也是 role:user 的 user/message——它不是人类说的话。
+  // 旧判据「kind 不在插件自有集合内」会把它算成新回合，turn 因此虚高。
+  assert.equal(isRealUserEvent(userEvent('runtime-context'), OWN), false, 'runtime-context 不是人类回合')
+  assert.equal(isRealUserEvent(userEvent('model-selection'), OWN), false, '插件通知不是人类回合')
+  assert.equal(isRealUserEvent(userEvent('plan-mode'), OWN), false, '计划模式注入不是人类回合')
 })
 
 test('回合折叠：真实用户开新回合，其余计入当前回合；不修改入参', () => {
   let state = { turn: 0, eventsInTurn: 0 }
   state = nextTurnState(state, userEvent(), OWN)
   assert.deepEqual(state, { turn: 1, eventsInTurn: 1 })
-  state = nextTurnState(state, { type: 'tool-call', source: { kind: 'dsh' } }, OWN)
+  state = nextTurnState(state, { type: 'tool-call', source: { kind: 'assistant' } }, OWN)
   assert.deepEqual(state, { turn: 1, eventsInTurn: 2 })
   state = nextTurnState(state, userEvent('dsh-memory-context-lab'), OWN)
   assert.deepEqual(state, { turn: 1, eventsInTurn: 3 }, '插件注入不推进回合')

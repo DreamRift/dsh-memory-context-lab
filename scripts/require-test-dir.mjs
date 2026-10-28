@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `npm test` / `npm run probe:host` 的前置检查：`test/` 目录必须存在。
+ * `npm test` 的前置检查：`test/` 目录必须存在（probe:host 也从 test/helpers 运行）。
  *
  * 背景（0.13.2 E-02）：发布包的 `files` 只有 `["src","scripts","README.md",
  * "CHANGELOG.md","cordis.patch.yml"]`，而这两个脚本都指向 `test/…`。在解包/安装后的

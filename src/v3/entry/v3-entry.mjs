@@ -1,4 +1,6 @@
 import { appendUsageLine, readUsageSummary } from '../adapters/storage/usage-log.mjs'
+import { readExportBundle, writeExportBundle } from '../adapters/storage/export-writer.mjs'
+import { buildExportBundle } from '../domain/export/bundle.mjs'
 /**
  * v3 引擎入口（v3/entry，M5 第三批）——影子模式挂载。
  *
@@ -17,11 +19,26 @@ import { appendUsageLine, readUsageSummary } from '../adapters/storage/usage-log
 import { createV3Runtime } from '../composition/composition.mjs'
 import { V3ContractViolation } from '../contracts/index.mjs'
 import { seqOfDshEventId } from '../adapters/host/dsh-host.mjs'
+import { RECALL_RESULT_MIN_SCORE } from '../application/recall.mjs'
+import { readSessionControl, writeSessionControl } from '../adapters/storage/session-control.mjs'
+import { readSessionState, writeSessionState } from '../adapters/storage/session-state.mjs'
+import { emptySessionControl, patchSessionControl } from '../domain/session/session-control.mjs'
+import { emptySessionState, modeForMigratedSession, modeForNewSession, patchSessionState } from '../domain/session/mode.mjs'
+import { evaluatePressureGate } from '../domain/session/pressure-gate.mjs'
+import { createArchiveService } from '../application/archive.mjs'
+import { readBackfillState, writeBackfillState } from '../adapters/storage/t2-backfill-state.mjs'
+import { mirrorRootOf, scanMirrorableRecords, scanMirroredNodes } from '../adapters/storage/mirror-inventory.mjs'
+import { parseBackfillLimit, planBackfill, runBackfill } from '../application/t2-backfill.mjs'
+import { clearArchiveIntent, readArchiveIntent, writeArchiveIntent } from '../adapters/storage/archive-intent.mjs'
+import {
+  captureFileReference,
+  isStaleFileReference,
+  readFileReferences,
+  verifyFileReference,
+  writeFileReferences,
+} from '../adapters/storage/file-references.mjs'
 
 const MEMORY_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/call', 'tool/result'])
-
-/** 插件自有来源标识（index.mjs 写入 source.kind；2026-10-25 拍板：自家生成物不入影子库）。 */
-const OWN_SOURCE_KIND = 'dsh-memory-context-lab'
 
 /** 敏感字段脱敏（P1 摄入合同 4.1.3：凭据/令牌不静默入库）。 */
 const SENSITIVE_KEY = /token|secret|pass(word|wd)?|credential|api[-_]?key|auth|cookie|session[-_]?id|bearer|密钥|密码|令牌|凭据|凭证/i
@@ -55,8 +72,21 @@ const SENSITIVE_VALUE_PATTERNS = Object.freeze([
   [/\b(authorization\s*[:=]\s*)(bearer|basic|token)?\s*([A-Za-z0-9._~+/=-]{8,})/gi, '$1[REDACTED]'],
   // key=value / key: value 形态的常见凭据名
   [/\b(api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)\b(\s*[:=]\s*)(["']?)([^\s"',&;]{4,})\3/gi, '$1$2$3[REDACTED]$3'],
-  // sk- 开头的常见密钥前缀
+  // sk- 开头的常见密钥前缀（OpenAI/Anthropic 等）
   [/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]'],
+  // AWS access key ID（AKIA/ASIA/AIDA/AROA/... + 16 位大写字母数字）
+  [/\b(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[0-9A-Z]{16}\b/g, '[REDACTED]'],
+  // GitHub token（ghp_/gho_/ghu_/ghs_/ghr_ 与细粒度 github_pat_）
+  [/\bgh[pousr]_[A-Za-z0-9]{36,}\b/g, '[REDACTED]'],
+  [/\bgithub_pat_[A-Za-z0-9_]{22,}\b/g, '[REDACTED]'],
+  // Slack token
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED]'],
+  // Google API key
+  [/\bAIza[0-9A-Za-z_-]{35}\b/g, '[REDACTED]'],
+  // Stripe secret/restricted key
+  [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}\b/g, '[REDACTED]'],
+  // JWT（三段式；只匹配足够长的段，避免误伤普通点号文本）
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[REDACTED]'],
   // CLI 形态 --password=xxx
   [/(--?(?:password|passwd|token|secret|api[-_]?key)\s*[= ]\s*)([^\s"']{4,})/gi, '$1[REDACTED]'],
 ])
@@ -133,8 +163,15 @@ export function extractEventBody(raw) {
     return body
   }
   if (type === 'tool/result') {
-    const text = textOfBlocks(data.message?.content) || textOfBlocks(data.content)
-    if (data.error !== undefined && text) return { text: text + '\n[工具结果：错误态]' }
+    // 正文走脱敏：工具输出是**外部数据**（env、curl 头、配置文件内容），
+    // 凭据泄漏最常见的落点就在正文里；只有 tool/call 参数过脱敏等于只挡了一半。
+    const text = redactText(textOfBlocks(data.message?.content) || textOfBlocks(data.content))
+    // 错误态的权威标志是 `message.isError === true`（dsh-session 校验：error 字段可缺省）。
+    // 旧实现只看 `data.error !== undefined`，于是「非 HarnessError 的普通异常」
+    // 产生 isError=true 且无 error 的结果时，失败被记成成功正文。
+    const failed = data?.message?.isError === true || data?.error !== undefined
+    if (failed && text) return { text: text + '\n[工具结果：错误态]' }
+    if (failed) return { text: '[工具结果：错误态，无可读正文]', metaOnly: true, reason: 'tool/result 错误态且无可读正文' }
     return text ? { text } : { text: '', metaOnly: true, reason: 'tool/result 无可读正文' }
   }
   if (type === 'tool/call') {
@@ -176,6 +213,9 @@ export function attachV3Engine(ctx, options = {}) {
     throw new V3ContractViolation('v3 entry: v3Root 必传（由主入口解析数据根，v3 不依赖 v2 模块）')
   }
   const v3Root = options.v3Root
+  // 全局设置的同步读取器（由 index.mjs 注入）。没有注入时按产品默认 full-history。
+  const settingsNow = typeof options.settingsNow === 'function' ? options.settingsNow : () => ({})
+  const defaultModeNow = () => modeForNewSession(settingsNow().fullHistory !== false)
   const runtimes = new Map()
   // 首次挂载的建库任务（H-19）：建 runtime + 断点反推是 O(记录数) 磁盘活
   // （open 读全部日志、resumeCheckpointOf 逐条读 provenance）。旧实现把它 await 在
@@ -183,12 +223,702 @@ export function attachV3Engine(ctx, options = {}) {
   // 「钩子阻塞首字」的形态。现在改为后台建库、钩子立即返回，下一步/建好后续传摄入。
   const pendingEntries = new Map() // sessionId → Promise<entry>
   const entryMetrics = new Map() // sessionId → { runtime, lastSeq }
+  /** 显式 T2 回填任务：sessionId → { controller, state, promise }。空表 = 没有在跑的回填。 */
+  const backfillJobs = new Map()
+  /**
+   * 建库失败存档（beta.11）：失败必须可判读，而不是伪装成「本会话尚未摄入」。
+   * 旧实现把 ensureEntry 的拒绝吞成 null，`/memory-lab status` 于是对**确定性失败**
+   * （目录不可写、manifest 损坏）也回「先发一条消息试试」——用户永远等不到库。
+   */
+  const entryFailures = new Map() // sessionId → { code, message, at, count }
+  const failureWarnAt = new Map() // sessionId → 上次告警时刻（同会话 60s 一条）
+  function noteEntryFailure(sessionId, error) {
+    const previous = entryFailures.get(sessionId)
+    entryFailures.set(sessionId, {
+      code: error?.code ?? 'EINTERNAL',
+      message: error instanceof Error ? error.message : String(error),
+      at: Date.now(),
+      count: (previous?.count ?? 0) + 1,
+    })
+    const now = Date.now()
+    if (now - (failureWarnAt.get(sessionId) ?? 0) < 60000) return
+    failureWarnAt.set(sessionId, now)
+    ctx.logger?.warn?.('memory-context-lab-v3: 建库失败（' + (error?.code ?? 'EINTERNAL') + '）：'
+      + (error instanceof Error ? error.message : String(error)) + '（同会话每分钟最多一条）')
+  }
+  /**
+   * 回注观测（beta.10）：每种结局都计数。
+   * 「回注 0 次却没人发现」正是旧实现只 dispatch 一条 warn 的直接后果——
+   * 失败必须能被 /memory-lab status 读到，而不是只留在日志里。
+   */
+  //
+  // 按会话分桶：计数是「本会话的回注观测」，不是进程级合计——否则 A 会话的失败会
+  // 出现在 B 会话的 /memory-lab status 里，归因完全错位。
+  const injectionBySession = new Map()
+  const emptyInjection = () => ({
+    attempted: 0,
+    injected: 0,
+    skipped: 0,
+    failed: 0,
+    lastStatus: null,
+    lastReason: null,
+    lastError: null,
+    lastInjectedAt: null,
+    lastHits: null,
+  })
+  function countersOf(sessionId) {
+    const key = String(sessionId ?? '')
+    let counters = injectionBySession.get(key)
+    if (counters === undefined) {
+      counters = emptyInjection()
+      injectionBySession.set(key, counters)
+    }
+    return counters
+  }
+  function injectionSnapshot(sessionId) {
+    if (sessionId !== undefined && sessionId !== null) return { ...countersOf(sessionId) }
+    const total = emptyInjection()
+    for (const counters of injectionBySession.values()) {
+      total.attempted += counters.attempted
+      total.injected += counters.injected
+      total.skipped += counters.skipped
+      total.failed += counters.failed
+      if (counters.lastInjectedAt !== null && (total.lastInjectedAt === null || counters.lastInjectedAt > total.lastInjectedAt)) {
+        total.lastInjectedAt = counters.lastInjectedAt
+        total.lastStatus = counters.lastStatus
+        total.lastReason = counters.lastReason
+        total.lastHits = counters.lastHits
+      }
+      if (counters.lastError !== null && (total.lastError === null || counters.lastError.at > total.lastError.at)) total.lastError = counters.lastError
+    }
+    return total
+  }
+  /**
+   * 只读回注计数（不创建桶）。statusOf 会被会话投影对**每个已挂载会话**调用；
+   * 旧写法走 countersOf 会顺手为每个会话建一个空桶，等于把读模型变成无界增长的内存表。
+   */
+  function injectionOf(sessionId) {
+    const counters = injectionBySession.get(String(sessionId ?? ''))
+    return counters === undefined ? emptyInjection() : { ...counters }
+  }
+
   const makeRuntime = options.runtimeFactory ?? (async (dshSession, sessionId) => createV3Runtime({
     v3Root,
     dshSession,
     sessionKey: sessionId,
+    memoryProbe: options.memoryProbe,
+    t2ProviderFactory: options.t2ProviderFactory,
+    t2Isolated: options.t2Isolated,
   }))
   const disposed = { value: false }
+
+  /**
+   * 会话级控制（2026-10-27 用户口径）：插件设置页管全局默认，本对话只看这里。
+   * 同步读（pre-step 每步调用）；文件损坏时按默认继续，但把 error 带进状态面。
+   */
+  function controlOf(sessionId) {
+    const defaultEnabled = options.defaultEnabled !== false
+    try {
+      return readSessionControl(v3Root, String(sessionId ?? ''), { defaultEnabled })
+    } catch (error) {
+      return { ...emptySessionControl(), enabled: defaultEnabled, error: error?.code ?? 'ECONTROL_UNREADABLE' }
+    }
+  }
+
+  /**
+   * 写会话控制（命令面专用；原子写 + 校验失败关闭）。
+   * @param {string} sessionId 会话 id
+   * @param {object} patch { enabled?, recall?, overrides?: { limit: number|null } }
+   */
+  async function setControl(sessionId, patch) {
+    const current = controlOf(sessionId)
+    const base = {
+      schemaVersion: 1,
+      enabled: current.enabled !== false,
+      recall: current.recall !== false,
+      overrides: current.overrides ?? {},
+    }
+    const next = patchSessionControl(base, patch)
+    return await writeSessionControl(v3Root, String(sessionId ?? ''), next)
+  }
+
+  /**
+   * 会话引擎状态（同步读；state.json 不存在时返回默认 mode）。
+   * 注意：默认 mode 只是「还没建 state」时的占位；ensureEntry 会在建库时把旧会话迁移成
+   * recall-only、新会话按 fullHistory 默认落盘，之后这里读到的就是快照。
+   */
+  function stateOf(sessionId) {
+    return readSessionState(v3Root, String(sessionId ?? ''), { defaultMode: defaultModeNow() })
+  }
+
+  /** 写会话引擎状态（命令面/归档/恢复共用；patch 校验失败关闭）。 */
+  async function setState(sessionId, patch) {
+    const current = stateOf(sessionId)
+    const next = patchSessionState(current, patch)
+    return await writeSessionState(v3Root, String(sessionId ?? ''), next)
+  }
+
+  /**
+   * 每步归档评估（M2）：只做一次有界 span，失败只告警、不阻塞用户回合。
+   * recall-only / plan-first / cooling 未开闸 → no-op。
+   */
+  function pinnedSeqsOf(entry, state) {
+    const pinned = new Set()
+    const now = Date.now()
+    const protectedIds = new Set(Array.isArray(state?.pins) ? state.pins : [])
+    for (const lease of state?.readLease ?? []) {
+      if (typeof lease?.recordId === 'string' && Number.isFinite(lease?.expiresAt) && lease.expiresAt > now) protectedIds.add(lease.recordId)
+    }
+    if (protectedIds.size === 0) return pinned
+    for (const [seq, recordId] of entry.seqToRecordId) {
+      if (protectedIds.has(recordId)) pinned.add(seq)
+    }
+    return pinned
+  }
+
+  /** 读租约：最近读过的记录在 TTL 内作为归档软边界（不是永久 pin）。 */
+  async function markReadLease(sessionId, recordIds, ttlMs = 5 * 60 * 1000) {
+    if (!Array.isArray(recordIds) || recordIds.length === 0) return
+    const state = stateOf(sessionId)
+    const now = Date.now()
+    const map = new Map((state.readLease ?? []).filter((row) => Number.isFinite(row?.expiresAt) && row.expiresAt > now).map((row) => [row.recordId, row.expiresAt]))
+    for (const id of recordIds) if (typeof id === 'string' && id.length > 0) map.set(id, now + ttlMs)
+    const readLease = [...map.entries()].slice(-200).map(([recordId, expiresAt]) => ({ recordId, expiresAt }))
+    await setState(sessionId, { readLease }).catch(() => {})
+  }
+
+  /**
+   * 冷却闸门事实（只读计算，不落盘）。archiveForStep 负责按需持久化；
+   * dryRunArchive 用它保证 status 的「下一次归档」与真实执行同一判据。
+   * 读不到占用 = 不可判定 → 失败关闭（不开闸）。
+   */
+  async function coolingGateOf(entry, state, settings) {
+    let opened = state.cooling?.open === true
+    let occupancy = null
+    try {
+      const info = await entry.runtime.host.sessionInfo()
+      const usage = await usageSummary(entry)
+      const latest = usage?.occupancy?.latest
+      if (Number.isFinite(info?.contextWindow) && info.contextWindow > 0 && Number.isFinite(latest) && latest >= 0) {
+        occupancy = latest / info.contextWindow
+        // 闸门可配（/memory-lab set gate N，0–95，0 = 每步都判断）；非法值回落 20%。
+        const gatePercent = Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20
+        const enterThreshold = Math.min(0.95, Math.max(0, gatePercent / 100))
+        opened = evaluatePressureGate({ occupancy, enterThreshold, currentlyOpen: opened }).open
+      }
+    } catch { /* 读不到占用 = 不可判定 → 不开闸 */ }
+    return { opened, occupancy, gate: Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20 }
+  }
+
+  async function archiveForStep(sessionId, session, settings = {}, options = {}) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined || entry.inflight !== null) return { status: 'busy-or-not-ready' }
+    if (entry.archive === null) return { status: 'host-no-surface' }
+    let state = stateOf(sessionId)
+    if (state.mode === 'recall-only' || state.planFirst === true) return { status: 'paused' }
+    if (state.mode === 'cooling') {
+      // 压力闸门：occupancy = 最近 input+cacheRead / contextWindow；未知一律失败关闭。
+      const gate = await coolingGateOf(entry, state, settings)
+      const { opened, occupancy } = gate
+      if (state.cooling?.open !== opened || state.cooling?.lastOccupancy !== occupancy) {
+        state = await setState(sessionId, { cooling: { open: opened, lastOccupancy: occupancy, lastRunAt: Date.now(), lastReason: opened ? 'gate-open' : 'gate-closed' } })
+      }
+      if (!opened) return { status: 'cooling-closed', occupancy, gate: gate.gate }
+    }
+    const host = entry.runtime.host
+    if (typeof host.surfaceNodes !== 'function') return { status: 'host-no-surface' }
+    const surfaceNodes = await host.surfaceNodes()
+    const events = Array.isArray(session?.log) ? session.log : (typeof session?.events === 'function' ? session.events() : null)
+    if (!Array.isArray(events) || surfaceNodes.length === 0) return { status: 'no-surface' }
+    // 两种模式的分工（beta.40）：
+    // - full-history：回合级，只压已完成回合（当前回合永不归档）——长程多轮；
+    // - cooling：步骤级，在当前回合内实时压掉不再需要的旧步骤——长步数少轮，
+    //   retainOperations 在这里当「工作集保留的步骤数」（模型刚用过的结果不能撤）。
+    const result = state.mode === 'cooling'
+      ? await entry.archive.archiveStepOnce({
+        sessionId,
+        events,
+        surfaceNodes,
+        seqToRecordId: entry.seqToRecordId,
+        retainSteps: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 4,
+        maxSteps: 3,
+        pinnedSeqs: pinnedSeqsOf(entry, state),
+        summary: options?.compact === true,
+        txn: 1,
+      })
+      : await entry.archive.archiveOnce({
+        sessionId,
+        events,
+        surfaceNodes,
+        seqToRecordId: entry.seqToRecordId,
+        mode: state.mode,
+        retainOperations: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 5,
+        lastArchiveEndSeq: Number.isInteger(state.surface?.lastArchiveEndSeq) ? state.surface.lastArchiveEndSeq : -1,
+        maxOperations: 1,
+        pinnedSeqs: pinnedSeqsOf(entry, state),
+        minStartSeq: Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1,
+        summary: options?.compact === true,
+        txn: 1,
+      })
+    if (result.status === 'archived') {
+      // 两种模式都记 lastArchiveAt（供状态行与切模式确认）；lastArchiveEndSeq 只给
+      // 回合级选择器用，按步归档绝不能写它——否则会成为 full-history 的永久下限。
+      const surface = state.mode === 'cooling'
+        ? { lastArchiveAt: Date.now() }
+        : { lastArchiveEndSeq: result.endSeq, lastArchiveAt: Date.now() }
+      try {
+        await setState(sessionId, { surface })
+      } catch (error) {
+        ctx.logger?.warn?.('memory-context-lab-v3: 归档后 state 写入失败（voucher 已落盘）：' + (error?.message ?? String(error)))
+      }
+    }
+    return result
+  }
+
+  async function dryRunArchive(sessionId, session, settings = {}) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { status: 'not-ready' }
+    if (entry.archive === null) return { status: 'host-no-surface' }
+    const state = stateOf(sessionId)
+    if (state.mode === 'recall-only' || state.planFirst === true) return { status: 'paused' }
+    const host = entry.runtime.host
+    if (typeof host.surfaceNodes !== 'function') return { status: 'host-no-surface' }
+    const surfaceNodes = await host.surfaceNodes()
+    const events = Array.isArray(session?.log) ? session.log : (typeof session?.events === 'function' ? session.events() : null)
+    if (!Array.isArray(events)) return { status: 'no-surface' }
+    if (state.mode === 'cooling') {
+      // 预览必须与真正会执行的选择器**和闸门**一致，否则 status 会骗人。
+      const gate = await coolingGateOf(entry, state, settings)
+      if (!gate.opened) return { status: 'cooling-closed', occupancy: gate.occupancy, gate: gate.gate }
+      const planned = await entry.archive.planSteps({
+        sessionId,
+        events,
+        surfaceNodes,
+        seqToRecordId: entry.seqToRecordId,
+        retainSteps: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 4,
+        maxSteps: 3,
+        pinnedSeqs: pinnedSeqsOf(entry, state),
+      })
+      if (planned === null) return { status: 'no-candidate' }
+      return { status: planned.status ?? 'planned', ...planned }
+    }
+    return await entry.archive.dryRun({
+      sessionId,
+      events,
+      surfaceNodes,
+      seqToRecordId: entry.seqToRecordId,
+      mode: state.mode,
+      retainOperations: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 5,
+      lastArchiveEndSeq: Number.isInteger(state.surface?.lastArchiveEndSeq) ? state.surface.lastArchiveEndSeq : -1,
+      maxOperations: 1,
+      pinnedSeqs: pinnedSeqsOf(entry, state),
+      minStartSeq: Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1,
+    })
+  }
+
+  /** 历史凭证（只读；供 /memory-lab history 与面板）。 */
+  async function historyOf(sessionId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { total: 0, rows: [], busy: pendingEntries.has(String(sessionId ?? '')) }
+    if (entry.archive === null) return { total: 0, rows: [], error: { code: 'EHOST_NO_SURFACE' } }
+    return entry.archive.history()
+  }
+
+  /** 恢复一个/全部凭证（M2）。 */
+  async function restoreHistory(sessionId, { index = null, maxChars = 16000 } = {}) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    if (entry.archive === null) return { error: 'host-no-surface' }
+    if (index === null) return await entry.archive.restoreAll({ maxChars })
+    return await entry.archive.restoreVoucher(index, { maxChars })
+  }
+
+  /** 显式 pin：这些记录所在的 surface 节点作为归档硬边界（pin 记录本身不归档）。 */
+  async function pinRecords(sessionId, recordIds, { remove = false } = {}) {
+    if (!Array.isArray(recordIds) || recordIds.length === 0) throw new V3ContractViolation('v3 entry: pin 需要非空 recordIds')
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    const state = stateOf(sessionId)
+    const pins = new Set(state.pins)
+    for (const id of recordIds) {
+      if (remove) { pins.delete(id); continue }
+      const record = await entry.runtime.store.readRecord(id) // 不存在/已遗忘 → 失败关闭
+      if (record?.id !== id) throw new V3ContractViolation('v3 entry: pin 目标不是本会话记录')
+      pins.add(id)
+    }
+    const next = await setState(sessionId, { pins: [...pins] })
+    return { pins: next.pins }
+  }
+
+  /** 遗忘预览：只读检查与已遗忘状态，不写账本。 */
+  async function forgetPreview(sessionId, recordIds) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    const forgotten = new Set(typeof entry.runtime.store.listForgotten === 'function' ? entry.runtime.store.listForgotten() : [])
+    const rows = []
+    for (const id of recordIds) {
+      let status = 'committed'
+      try { await entry.runtime.store.readRecord(id) } catch (error) {
+        status = error?.code === 'EFORGOTTEN' ? 'forgotten' : (error?.code ?? 'unreadable')
+      }
+      if (forgotten.has(id)) status = 'forgotten'
+      rows.push({ id, status })
+    }
+    return { rows }
+  }
+
+  /** 遗忘/撤销遗忘：走端口批量预检 + 索引重建。 */
+  async function forgetRecords(sessionId, recordIds, { undo = false } = {}) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    if (undo) {
+      if (typeof entry.runtime.store.revokeForget !== 'function') return { error: 'store-no-undo' }
+      const result = await entry.runtime.store.revokeForget(recordIds)
+      await refreshSearchable(entry)
+      // 恢复本地记录后重建镜像：遗忘时镜像已被删，不重建会让 T2 检索永久少这些记录。
+      if (typeof entry.runtime.provider?.mirrorRecord === 'function') {
+        for (const id of recordIds) {
+          try {
+            const record = await entry.runtime.store.readRecord(id)
+            if (record !== null) entry.runtime.provider.mirrorRecord(record, { undo: true })
+          } catch (error) {
+            ctx.logger?.warn?.('memory-context-lab-v3: 撤销遗忘后镜像失败（本地已恢复）：' + (error?.message ?? String(error)))
+          }
+        }
+      }
+      const vouchers = entry.runtime.store.listVouchers()
+      for (let index = 0; index < vouchers.length; index += 1) {
+        if ((vouchers[index].recordIds ?? []).some((id) => recordIds.includes(id))) {
+          await entry.archive.unredactVoucher(index).catch(() => {})
+        }
+      }
+      return { ...result, undone: true }
+    }
+    const result = await entry.runtime.store.forget(recordIds)
+    await refreshSearchable(entry)
+    // 本地隐私面先生效；镜像遗忘失败只告警（不回滚本地、也不谎报已全忘）。
+    if (typeof entry.runtime.provider?.forgetRecords === 'function') {
+      try {
+        const mirror = await entry.runtime.provider.forgetRecords(recordIds)
+        if (mirror.failed > 0) {
+          ctx.logger?.warn?.('memory-context-lab-v3: T2 镜像遗忘部分失败（本地已遗忘）：' + mirror.failed + ' 条')
+        }
+      } catch (error) {
+        ctx.logger?.warn?.('memory-context-lab-v3: T2 镜像遗忘失败（本地已遗忘）：' + (error?.message ?? String(error)))
+      }
+    }
+    const vouchers = entry.runtime.store.listVouchers()
+    for (let index = 0; index < vouchers.length; index += 1) {
+      if ((vouchers[index].recordIds ?? []).some((id) => recordIds.includes(id))) {
+        await entry.archive.redactVoucher(index).catch(() => {})
+      }
+    }
+    // 已遗忘记录不再需要 pin；避免 state 里留下不可用 ID。
+    const state = stateOf(sessionId)
+    const pins = state.pins.filter((id) => !recordIds.includes(id))
+    if (pins.length !== state.pins.length) await setState(sessionId, { pins }).catch(() => {})
+    return { ...result, undone: false }
+  }
+
+  /**
+ * 当前工作集：当前回合（最后一个真人 user 起）的 surface 节点 → v3 记录。
+ * 只读；不触发归档，不改变 surface。
+ */
+async function workingSet(sessionId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    if (typeof entry.runtime.host.surfaceNodes !== 'function') return { error: 'host-no-surface' }
+    const surfaceNodes = await entry.runtime.host.surfaceNodes()
+    const events = await entry.runtime.host.events()
+    const bySeq = new Map(events.map((event) => [event.seq, event]))
+    let start = 0
+    for (const seq of surfaceNodes) {
+      const event = bySeq.get(seq)
+      if (event?.type === 'user/message' && (event?.data?.source?.kind ?? event?.source?.kind) === 'user') start = seq
+    }
+    const rows = []
+    for (const seq of surfaceNodes) {
+      if (seq < start) continue
+      const recordId = entry.seqToRecordId.get(seq)
+      if (typeof recordId === 'string') rows.push({ seq, recordId })
+    }
+    return { startSeq: start, rows }
+  }
+
+  /** 本地红导出：写入 v3Root/exports/；已遗忘正文不导出。 */
+async function exportSession(sessionId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    const ids = await entry.runtime.store.listRecordIds()
+    const forgotten = typeof entry.runtime.store.listForgotten === 'function' ? entry.runtime.store.listForgotten() : []
+    const records = []
+    for (const id of ids) {
+      try {
+        const record = await entry.runtime.store.readRecord(id)
+        if (record !== null) records.push(record)
+      } catch (error) {
+        if (error?.code !== 'EFORGOTTEN') return { error: error?.code ?? 'record-read-failed' }
+      }
+    }
+    const exportedAt = Date.now()
+    const bundle = buildExportBundle({
+      sessionKey: String(sessionId),
+      exportedAt,
+      records,
+      forgotten,
+      vouchers: entry.runtime.store.listVouchers(),
+      state: stateOf(sessionId),
+    })
+    const file = await writeExportBundle(v3Root, String(sessionId), bundle)
+    return { file, counts: bundle.counts }
+  }
+
+/** 导入导出包到**空会话**（fork/share 的落地）；不覆盖已有记录。 */
+async function importSession(sessionId, fileName, session = null) {
+    let entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) {
+      if (session === null) return { error: 'not-ready' }
+      entry = await ensureEntry(session, String(sessionId ?? ''))
+    }
+    const existing = await entry.runtime.store.listRecordIds()
+    if (existing.length > 0) return { error: 'session-not-empty' }
+    if (typeof entry.runtime.store.importRecords !== 'function') return { error: 'store-no-import' }
+    const bundle = await readExportBundle(v3Root, fileName)
+    const inputs = bundle.records.filter((record) => record !== null && typeof record === 'object' && typeof record.payload?.text === 'string')
+    if (inputs.length === 0) return { error: 'bundle-empty' }
+    const result = await entry.runtime.store.importRecords(inputs)
+    await refreshSearchable(entry)
+    return { imported: result.recordIds?.length ?? inputs.length, sessionKey: bundle.sessionKey }
+  }
+
+/** 原生 fork 后把父会话正文复制到当前空子会话（不复制父 surface/凭证）。 */
+async function adoptFrom(sessionId, parentSessionId, session = null) {
+    if (String(sessionId) === String(parentSessionId)) return { error: 'same-session' }
+    let child = runtimes.get(String(sessionId ?? ''))
+    if (child === undefined) {
+      if (session === null) return { error: 'not-ready' }
+      child = await ensureEntry(session, String(sessionId ?? ''))
+    }
+    const parent = runtimes.get(String(parentSessionId ?? ''))
+    if (parent === undefined) return { error: 'parent-not-ready' }
+    if (typeof child.runtime.store.importRecords !== 'function') return { error: 'store-no-import' }
+    const existing = await child.runtime.store.listRecordIds()
+    if (existing.length > 0) return { error: 'session-not-empty' }
+    const ids = await parent.runtime.store.listRecordIds()
+    const records = []
+    for (const id of ids) {
+      try {
+        const record = await parent.runtime.store.readRecord(id)
+        if (record !== null) records.push(record)
+      } catch (error) {
+        if (error?.code !== 'EFORGOTTEN') return { error: error?.code ?? 'record-read-failed' }
+      }
+    }
+    if (records.length === 0) return { error: 'parent-empty' }
+    const result = await child.runtime.store.importRecords(records)
+    await refreshSearchable(child)
+    return { imported: result.recordIds?.length ?? records.length, parentSessionId }
+  }
+
+/** 文件引用清单（只读；账本损坏时 error 如实返回）。 */
+async function fileStatus(sessionId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    if (entry.fileRefsError !== null) return { error: entry.fileRefsError, refs: [] }
+    return { refs: entry.fileRefs.map((ref) => ({ ...ref })) }
+  }
+
+/** 显式核验：只核选中的引用；不后台扫描、不改记录正文。 */
+  async function verifyFiles(sessionId, { all = false, id = null, recordId = null } = {}) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    if (entry.fileRefsError !== null) return { error: entry.fileRefsError }
+    const targets = entry.fileRefs.filter((ref) => all || (id !== null && ref.id === id) || (recordId !== null && ref.recordId === recordId))
+    if (targets.length === 0) return { error: 'no-matching-reference', refs: [] }
+    const rows = []
+    for (const ref of targets) {
+      const verified = await verifyFileReference(ref)
+      const index = entry.fileRefs.findIndex((item) => item.id === ref.id)
+      if (index >= 0) entry.fileRefs[index] = verified
+      rows.push({ id: verified.id, recordId: verified.recordId, path: verified.path, status: verified.status, reason: verified.reason ?? null })
+    }
+    try {
+      await writeFileReferences(entry.runtime.store.directory, entry.fileRefs)
+    } catch (error) {
+      return { error: 'write-failed: ' + (error?.message ?? String(error)), rows }
+    }
+    return { rows }
+  }
+
+  /**
+   * 显式 T2 回填（P1，0.14.0-beta.38）。
+   *
+   * 同步只做「计划 + 落状态 + 启动后台任务」，命令立即返回计划量；镜像走 provider 的
+   * 串行队列，不占 pre-step。幂等判据是隔离根里真实存在的 v3r-* 节点（不是内存游标），
+   * 因此进程重启后重复执行也不会重复写、重复计数。
+   */
+  async function startT2Backfill(sessionId, rawLimit) {
+    const key = String(sessionId ?? '')
+    const parsed = parseBackfillLimit(rawLimit)
+    if (parsed.ok !== true) return { error: 'invalid-limit', message: parsed.message }
+    const entry = await entryOf(key)
+    if (entry === null) return { error: 'not-ready' }
+    const provider = entry.runtime.provider
+    let tier = null
+    try { tier = provider?.capabilities?.()?.tier ?? null } catch { tier = null }
+    if (tier !== 'T2' || typeof provider.mirrorRecord !== 'function') {
+      // 明确失败：T2 不可用时不偷偷回 T1 假装成功（T1 没有镜像面）。
+      return {
+        error: 't2-unavailable',
+        reason: String(entry.runtime.providerDecision?.reason ?? '当前后端不是 T2（隔离 MCP）'),
+      }
+    }
+    const existing = backfillJobs.get(key)
+    if (existing !== undefined) return { alreadyRunning: true, planned: existing.state.planned, state: existing.state }
+    const inventory = await scanMirrorableRecords(entry.runtime.store)
+    const root = t2RootOf(entry)
+    const mirrored = await scanMirroredNodes(root)
+    const plan = planBackfill({ records: inventory.records, mirroredIds: mirrored.nodes, limit: parsed.limit })
+    const facts = {
+      records: {
+        total: inventory.total,
+        mirrorable: inventory.mirrorable,
+        metaOnly: inventory.metaOnly,
+        emptyText: inventory.emptyText,
+        forgotten: inventory.forgotten,
+      },
+      mirrored: {
+        state: mirrored.state,
+        mirrored: mirrored.mirrored,
+        smoke: mirrored.smoke,
+        rejected: mirrored.rejected,
+        other: mirrored.other,
+      },
+    }
+    if (plan.pending.length === 0) {
+      const state = {
+        status: 'done', limit: parsed.limit, planned: 0, pendingTotal: plan.pendingTotal,
+        processed: 0, mirrored: 0, failed: 0, dropped: 0,
+        startedAt: Date.now(), finishedAt: Date.now(), reason: 'nothing-to-do',
+      }
+      await writeBackfillState(entry.runtime.store.directory, state)
+      return { planned: 0, pendingTotal: plan.pendingTotal, ...facts }
+    }
+    const directory = entry.runtime.store.directory
+    const controller = { aborted: false }
+    const job = {
+      controller,
+      state: {
+        status: 'running', limit: parsed.limit, planned: plan.pending.length, pendingTotal: plan.pendingTotal,
+        processed: 0, mirrored: 0, failed: 0, dropped: 0, startedAt: Date.now(),
+      },
+      promise: null,
+    }
+    await writeBackfillState(directory, job.state)
+    backfillJobs.set(key, job)
+    job.promise = (async () => {
+      try {
+        const result = await runBackfill({
+          provider,
+          records: plan.pending,
+          signal: controller,
+          onProgress: async (progress) => {
+            job.state = {
+              ...job.state,
+              processed: progress.processed,
+              mirrored: progress.mirrored,
+              failed: progress.failed,
+              dropped: progress.dropped,
+            }
+            await writeBackfillState(directory, job.state).catch(() => {})
+          },
+        })
+        // 收尾对账：以磁盘上真实存在的节点为准（计数器只用于进度）。
+        let present = null
+        try {
+          const after = await scanMirroredNodes(root)
+          present = plan.pending.filter((record) => after.nodes.has(record.id)).length
+        } catch {
+          present = null
+        }
+        job.state = {
+          ...job.state,
+          status: result.status === 'cancelled' ? 'cancelled' : 'done',
+          processed: plan.pending.length,
+          mirrored: present === null ? result.mirrored : present,
+          failed: present === null ? result.failed : plan.pending.length - present,
+          dropped: result.dropped,
+          finishedAt: Date.now(),
+        }
+        await writeBackfillState(directory, job.state)
+      } catch (error) {
+        job.state = {
+          ...job.state,
+          status: 'failed',
+          lastError: (error?.code ?? 'EBACKFILL') + ' ' + (error instanceof Error ? error.message : String(error)),
+          finishedAt: Date.now(),
+        }
+        await writeBackfillState(directory, job.state).catch(() => {})
+      } finally {
+        backfillJobs.delete(key)
+      }
+    })()
+    return { planned: plan.pending.length, pendingTotal: plan.pendingTotal, ...facts, state: job.state }
+  }
+
+  /** 请求中断回填：只在批间生效，不杀在飞的单条写。 */
+  function cancelT2Backfill(sessionId) {
+    const key = String(sessionId ?? '')
+    const job = backfillJobs.get(key)
+    if (job === undefined) return { cancelled: false, reason: 'not-running' }
+    job.controller.aborted = true
+    return { cancelled: true }
+  }
+
+  /** 清理冒烟节点（P2）：不是回填，不影响真实镜像计数。 */
+  async function cleanupSmokeNode(sessionId) {
+    const entry = await entryOf(String(sessionId ?? ''))
+    if (entry === null) return { error: 'not-ready' }
+    const provider = entry.runtime.provider
+    if (typeof provider.cleanupSmoke !== 'function') return { error: 't2-unavailable' }
+    return await provider.cleanupSmoke()
+  }
+
+  /** 已遗忘 ID 列表（forget status）。 */
+  async function listForgotten(sessionId) {
+    const entry = runtimes.get(String(sessionId ?? ''))
+    if (entry === undefined) return { error: 'not-ready' }
+    if (typeof entry.runtime.store.listForgotten !== 'function') return { error: 'store-no-list' }
+    return { ids: entry.runtime.store.listForgotten() }
+  }
+
+  /**
+   * 首次建库时落 mode 快照（D-15）：
+   * - 已有记录但没有 state → recall-only（旧会话不静默接管）；
+   * - 无记录的新会话 → fullHistory 默认（full-history / cooling）。
+   * 写失败只告警：stateOf 仍能按默认工作，但不把失败伪装成已落盘。
+   */
+  async function ensureStateSnapshot(sessionId, lastSeq) {
+    const current = stateOf(sessionId)
+    if (current.exists === true) return current
+    const mode = lastSeq >= 0 ? modeForMigratedSession() : defaultModeNow()
+    const settings = settingsNow()
+    const initial = {
+      ...emptySessionState(mode),
+      modeSource: lastSeq >= 0 ? 'migration' : 'default',
+      // 计划先行只作用于新会话；停用恢复是**全局设置**，不得在 state 里冻结（
+      // 旧实现把 lastSeq>=0 的会话强制成 true，设置页关掉后 off 仍恢复原文）。
+      planFirst: lastSeq >= 0 ? false : settings.planFirst === true,
+      autoRestore: settings.autoRestore !== false,
+      updatedAt: Date.now(),
+    }
+    try {
+      return await writeSessionState(v3Root, String(sessionId ?? ''), initial)
+    } catch (error) {
+      ctx.logger?.warn?.('memory-context-lab-v3: state.json 初始化失败（继续按默认模式）：' + (error?.message ?? String(error)))
+      return current
+    }
+  }
 
   // 摄入批大小：回填按批走事务；新事件通常 1-3 条一批
   const INGEST_BATCH = 100
@@ -200,28 +930,45 @@ export function attachV3Engine(ctx, options = {}) {
     for (const raw of log) {
       if (disposed.value) return
       if (!MEMORY_EVENT_TYPES.has(raw?.type)) continue
-      // 自家生成物（工作状态卡/回执/回注包）不入库：每步一张、高度重复，
-      // 会以高频词霸占检索位（检索冒烟实测 31× 重复污染）。seq 照常推进。
-      if (raw?.data?.source?.kind === OWN_SOURCE_KIND) continue
       if (Number.isInteger(entry.lastSeq) && raw.seq <= entry.lastSeq) continue
       batch.push(raw)
       batchFirstSeq = batchFirstSeq ?? raw.seq
       if (batch.length >= INGEST_BATCH) {
-        await ingestBatch(entry, batch, batchFirstSeq)
-        ingested += batch.length
+        ingested += await ingestBatch(entry, batch, batchFirstSeq)
         batch = []
         batchFirstSeq = null
       }
     }
     if (batch.length > 0 && !disposed.value) {
-      await ingestBatch(entry, batch, batchFirstSeq)
-      ingested += batch.length
+      ingested += await ingestBatch(entry, batch, batchFirstSeq)
     }
     // 只有回填（大批量）才在这里重建索引；每步 1-3 条的小增量留 stale，
-    // 检索时懒重建——否则每步全量重建 11.5MB 索引会卡住宿主事件循环（首字慢）。
+    // 检索时懒重建——否则每步全量重建二十几 MB 索引会卡住宿主事件循环（首字慢）。
     if (!disposed.value && ingested >= INGEST_BATCH) {
-      try { await entry.runtime.store.rebuildIndex() } catch (error) {
+      try {
+        await entry.runtime.store.rebuildIndex()
+        await refreshSearchable(entry)
+      } catch (error) {
         ctx.logger?.warn?.('memory-context-lab-v3: 索引重建失败（检索时会自动重试）：' + (error?.message ?? String(error)))
+      }
+    } else if (!disposed.value && ingested > 0) {
+      // 小增量：回注路径不允许重建（会在 pre-step 里做 O(N) 全量活），
+      // 因此改为摄入后**延迟后台重建**——空闲时做，索引在下一回合前追上。
+      //
+      // 例外：**索引根本不存在**时不能等防抖。那样新会话的头几步（用户发第一条消息、
+      // 模型刚回第一个回合）会落在「索引还没生成」的窗口里，而回注热路径已禁止重建，
+      // 只能回 skipped——首屏回注必然失效，直到 1.5s 后防抖任务跑过。
+      // 这里仍在**摄入任务**里（不是 pre-step 钩子），重建不挡首字，只是把
+      // 「首次可检索」提前到第一次摄入完成时。
+      if (await isIndexAbsent(entry)) {
+        try {
+          await entry.runtime.store.rebuildIndex()
+          await refreshSearchable(entry)
+        } catch (error) {
+          ctx.logger?.warn?.('memory-context-lab-v3: 首次索引重建失败（检索会回 skipped）：' + (error?.message ?? String(error)))
+        }
+      } else {
+        scheduleIndexRebuild(entry)
       }
     }
   }
@@ -232,11 +979,108 @@ export function attachV3Engine(ctx, options = {}) {
    */
   async function resumeCheckpointOf(runtime) {
     let last = -1
+    const seqToRecordId = new Map()
+    // 归档需要「宿主 seq → v3 记录 ID」；sourceEventIds 只给来源 ID，不能直接当记录 ID。
+    // listRecordIds + readProvenance 是现有端口的最小组合，只在建库后台任务里跑一次。
+    if (typeof runtime.store.listRecordIds === 'function' && typeof runtime.store.readProvenance === 'function') {
+      for (const recordId of await runtime.store.listRecordIds()) {
+        const provenance = await runtime.store.readProvenance(recordId)
+        const sourceEventId = provenance?.sourceEventId
+        const seq = seqOfDshEventId(sourceEventId)
+        if (seq === null) continue
+        if (seq > last) last = seq
+        seqToRecordId.set(seq, recordId)
+      }
+      return { lastSeq: last, seqToRecordId }
+    }
     for (const sourceEventId of await runtime.store.sourceEventIds()) {
       const seq = seqOfDshEventId(sourceEventId)
-      if (seq !== null && seq > last) last = seq
+      if (seq === null) continue
+      if (seq > last) last = seq
     }
-    return last
+    return { lastSeq: last, seqToRecordId }
+  }
+
+  /**
+   * 隔离根（t2-mdcg）：优先用 runtime 记录的隔离根，其次 provider 能力面声明的根，
+   * 最后回落到会话目录下的 t2-mdcg。三条都是同一目录，用于覆盖率/回填扫描。
+   */
+  function t2RootOf(entry) {
+    if (typeof entry?.runtime?.t2?.root === 'string' && entry.runtime.t2.root.length > 0) return entry.runtime.t2.root
+    try {
+      const declared = entry?.runtime?.provider?.capabilities?.()?.root
+      if (typeof declared === 'string' && declared.length > 0) return declared
+    } catch { /* 能力面不可读就回落默认目录 */ }
+    return mirrorRootOf(entry?.runtime?.store?.directory)
+  }
+
+  /**
+   * 索引统计（命令/诊断路径）：复用 provider 的索引解析缓存；失败返回三态，
+   * 由调用方显示「未知」，绝不用 0 冒充可检索数。
+   */
+  async function indexStatsOf(entry) {
+    try {
+      if (typeof entry?.runtime?.provider?.indexStats === 'function') return await entry.runtime.provider.indexStats()
+      return { state: 'unavailable', reason: 'provider 未提供索引统计' }
+    } catch (error) {
+      return { state: 'error', code: error?.code ?? 'EINDEX', message: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * 覆盖率事实：可镜像（payload.text 非空、未遗忘）与隔离根里真实存在的镜像节点。
+   * 只在命令/诊断路径调用；失败时抛错，由命令面显示「未知」（不拿 0 冒充）。
+   */
+  async function coverageOf(entry, { collectRecords = false } = {}) {
+    const records = await scanMirrorableRecords(entry.runtime.store, { collectRecords })
+    const mirrored = await scanMirroredNodes(t2RootOf(entry))
+    return {
+      records: {
+        total: records.total,
+        mirrorable: records.mirrorable,
+        metaOnly: records.metaOnly,
+        emptyText: records.emptyText,
+        forgotten: records.forgotten,
+      },
+      mirrored: {
+        state: mirrored.state,
+        files: mirrored.files,
+        mirrored: mirrored.mirrored,
+        smoke: mirrored.smoke,
+        rejected: mirrored.rejected,
+        other: mirrored.other,
+      },
+      recordsList: collectRecords ? records.records : null,
+      nodes: mirrored.nodes,
+    }
+  }
+
+  /**
+   * 把「可检索」数字刷新进 entry（同步投影 statusOf 的唯一来源）。
+   * 只在后台任务/命令路径调用——投影每个事件都会读 statusOf，那里不能碰磁盘。
+   * 读不到保持 null（未知），不把 failure 说成 0。
+   */
+  async function refreshSearchable(entry) {
+    try {
+      const stats = await indexStatsOf(entry)
+      if (stats.state === 'ok' && Number.isInteger(stats.indexedCount)) entry.searchable = stats.indexedCount
+      else if (stats.state === 'absent') entry.searchable = null
+    } catch {
+      // 保留旧值：索引统计失败不等同于「可检索归零」
+    }
+  }
+
+  /** 回填状态（只读；坏文件如实回 error，不拿 0 冒充）。 */
+  async function backfillStateOf(sessionId) {
+    const key = String(sessionId ?? '')
+    const entry = runtimes.get(key)
+    const running = backfillJobs.has(key)
+    if (entry === undefined) return { running, state: null, error: null }
+    try {
+      return { running, state: await readBackfillState(entry.runtime.store.directory), error: null }
+    } catch (error) {
+      return { running, state: null, error: error?.code ?? error?.message ?? String(error) }
+    }
   }
 
   /**
@@ -260,16 +1104,140 @@ export function attachV3Engine(ctx, options = {}) {
         throw new V3ContractViolation('v3 entry 在 dispose 之后完成建库，已丢弃')
       }
       if (disposed.value) discard()
-      const lastSeq = await resumeCheckpointOf(runtime)
+      const checkpoint = await resumeCheckpointOf(runtime)
       if (disposed.value) discard()
-      const entry = { runtime, lastSeq, inflight: null }
+      await ensureStateSnapshot(sessionId, checkpoint.lastSeq)
+      if (runtime?.providerDecision !== undefined && typeof runtime.providerDecision?.tier === 'string') {
+        try {
+          await setState(sessionId, {
+            provider: { tier: runtime.providerDecision.tier, reason: String(runtime.providerDecision.reason ?? '') },
+          })
+        } catch (error) {
+          ctx.logger?.warn?.('memory-context-lab-v3: provider 决策落盘失败（继续按实际后端）：' + (error?.message ?? String(error)))
+        }
+      }
+      if (disposed.value) discard()
+      // 状态条需要「已摄入 N 条」（0.14.0-beta.15）。优先用端口的同步 recordCount()
+      // （零 I/O、不读二十几 MB 索引）；旧端口/测试替身没有它时回落 health()。
+      // 仍在**建库后台任务**里，不进 pre-step 热路径。读不到就记 null——
+      // 「条数未知」必须与「0 条」区分开，不能把失败说成空库。
+      let records = null
+      try {
+        const count = typeof runtime.store.recordCount === 'function'
+          ? await runtime.store.recordCount()
+          : (await runtime.store.health())?.recordCount
+        if (Number.isInteger(count) && count >= 0) records = count
+      } catch (error) {
+        ctx.logger?.warn?.('memory-context-lab-v3: 记录计数不可读（状态条显示未知）：' + (error?.message ?? String(error)))
+      }
+      // 可检索数（P0，0.14.0-beta.38）：建库后台任务里读一次索引统计，供同步投影显示
+      // 「已摄入 N · 可检索 M」。投影每事件都会读 statusOf，那里不能碰 22MB 索引；
+      // 这里读不到就保持 null（未知），不把失败写成 0。
+      let searchable = null
+      try {
+        const stats = await indexStatsOf({ runtime })
+        if (stats.state === 'ok' && Number.isInteger(stats.indexedCount)) searchable = stats.indexedCount
+      } catch (error) {
+        ctx.logger?.warn?.('memory-context-lab-v3: 索引统计不可读（可检索显示未知）：' + (error?.message ?? String(error)))
+      }
+      const archive = runtime.store !== undefined && runtime.host !== undefined
+        ? createArchiveService({
+          store: runtime.store,
+          host: runtime.host,
+          clock: { now: () => Date.now() },
+          intent: {
+            write: (data) => writeArchiveIntent(v3Root, sessionId, data),
+            read: () => readArchiveIntent(v3Root, sessionId),
+            clear: () => clearArchiveIntent(v3Root, sessionId),
+          },
+        })
+        : null
+      let fileRefs = []
+      let fileRefsError = null
+      try {
+        const ledger = await readFileReferences(runtime.store.directory)
+        fileRefs = ledger.refs
+      } catch (error) {
+        fileRefsError = error?.message ?? String(error)
+        ctx.logger?.warn?.('memory-context-lab-v3: file-references 不可读（文件核证失败关闭）：' + fileRefsError)
+      }
+      const entry = {
+        runtime,
+        lastSeq: checkpoint.lastSeq,
+        records,
+        inflight: null,
+        seqToRecordId: checkpoint.seqToRecordId,
+        searchable,
+        archive,
+        cwd: session?.header?.cwd ?? session?.cwd ?? null,
+        fileRefs,
+        fileRefsError,
+      }
       runtimes.set(sessionId, entry)
       pendingEntries.delete(sessionId)
+      if (archive !== null && typeof runtime.host.surfaceNodes === 'function') {
+        try {
+          const nodes = await runtime.host.surfaceNodes()
+          const recovered = await archive.recoverIntent({
+            sessionId,
+            surfaceNodes: nodes,
+            surfaceTextOf: (seq) => runtime.host.surfaceTextAt(seq),
+          })
+          if (recovered.recovered === true && Number.isInteger(recovered.endSeq)) {
+            const current = stateOf(sessionId)
+            await writeSessionState(v3Root, String(sessionId), patchSessionState(current, { surface: { lastArchiveEndSeq: recovered.endSeq, lastArchiveAt: Date.now() } }))
+          }
+        } catch (error) {
+          ctx.logger?.warn?.('memory-context-lab-v3: 归档意图对账失败（保留 intent）：' + (error?.message ?? String(error)))
+        }
+      }
       return entry
     })()
     promise.catch(() => { pendingEntries.delete(sessionId) })
     pendingEntries.set(sessionId, promise)
     return promise
+  }
+
+  /**
+   * 小增量后的延迟后台重建（防抖）。回注路径禁止重建（O(N) 全量活不得进 pre-step），
+   * 但索引必须能在下一回合前追上，否则检索面会越来越旧。
+   */
+  const INDEX_REBUILD_DELAY_MS = 1500
+  const rebuildTimers = new Map() // entry → timer
+
+  /**
+   * 索引文件是否**尚不存在**（与「陈化」是两种事实）。
+   *
+   * 陈化可以等防抖——旧索引仍可用，只是不含最新几条。**不存在则完全没得检索**：
+   * 回注热路径已禁止重建（见 t1-provider 的 allowRebuild 分支），若不在摄入侧补上，
+   * 新会话的头几步（用户刚发第一条消息、模型刚回第一个回合）必然回 skipped，
+   * 首屏回注永远拿不到东西。这里仍在**后台摄入任务**里，不进 pre-step 钩子，
+   * 因此不阻塞首字，只是把「首次可检索」提前到第一次摄入完成时。
+   *
+   * @returns {Promise<boolean>} 读戳失败按「不存在」处理（重建一次无害；失败另有告警）
+   */
+  async function isIndexAbsent(entry) {
+    try {
+      const { indexStampOf } = await import('../adapters/storage/lexical-index.mjs')
+      return (await indexStampOf(entry.runtime.store)) === 'absent'
+    } catch {
+      return true
+    }
+  }
+
+  function scheduleIndexRebuild(entry) {
+    if (disposed.value || rebuildTimers.has(entry)) return
+    const timer = setTimeout(() => {
+      rebuildTimers.delete(entry)
+      if (disposed.value) return
+      const rebuild = entry.runtime?.store?.rebuildIndex
+      if (typeof rebuild !== 'function') return
+      Promise.resolve(rebuild.call(entry.runtime.store))
+        .then(() => refreshSearchable(entry))
+        .catch((error) => ctx.logger?.warn?.('memory-context-lab-v3: 后台索引重建失败（检索回退旧索引）：' + (error?.message ?? String(error))))
+    }, INDEX_REBUILD_DELAY_MS)
+    timer.unref?.()
+    rebuildTimers.set(entry, timer)
   }
 
   /** 后台摄入（单飞行防重入；新事件由下一次 pre-step 续传）。 */
@@ -295,17 +1263,58 @@ export function attachV3Engine(ctx, options = {}) {
   function metricsNote(name) { entryMetrics.set(name, (entryMetrics.get(name) ?? 0) + 1) }
 
   async function ingestBatch(entry, batch, firstSeq) {
+    let applied = 0
+    let refsChanged = false
     try {
-      let applied = 0
-      for (const raw of batch) {
-        const body = bodyOf(raw)
-        const result = await entry.runtime.handleDshEvent(raw, body.text, { metaOnly: body.metaOnly === true, metaReason: body.reason ?? '', structure: body.structure ?? undefined })
+      // 一批一笔事务（beta.11）：逐事件事务在回填时是 10+ 次 fs/条 + 每笔同步全量事务日志，
+      // 实测 1500 条约 45 秒、5000 条约 8 分钟；这段时间 inflight 恒非空，回注被 busy 挡住。
+      const bodies = batch.map((raw) => bodyOf(raw))
+      const results = await entry.runtime.handleDshEventBatch(batch.map((raw, index) => ({
+        event: raw,
+        text: bodies[index].text,
+        meta: { metaOnly: bodies[index].metaOnly === true, metaReason: bodies[index].reason ?? '', structure: bodies[index].structure ?? undefined },
+      })))
+      for (let index = 0; index < batch.length; index += 1) {
+        // dispose 落在批内：store 已 close，本批取消，断点停在上一批（下一批失败关闭并告警）
+        if (disposed.value) break
+        const raw = batch[index]
+        const body = bodies[index]
+        const result = results[index] ?? { status: 'not-memory-event' }
         if (body.metaOnly === true) metricsNote('v3.ingest.metadataOnly')
         if (body.usage !== undefined) await appendUsage(entry, raw, body.usage)
-        if (result?.status === 'applied' || result?.status === 'rejected') entry.lastSeq = raw.seq
-        if (result?.status === 'applied') applied += 1
-        if (result?.status === 'rejected') {
+        // own-source 也推进断点：否则尾部注入事件每次重启都被重扫（断点语义不完整）
+        if (result.status === 'applied' || result.status === 'rejected' || result.status === 'own-source') entry.lastSeq = raw.seq
+        if (result.status === 'applied') {
+          applied += 1
+          // 只有真正提交的记录才计入「已摄入」；own-source / rejected / not-memory-event 不计。
+          // records 为 null 表示建库时计数不可读，保持未知而不是从 0 重来。
+          if (Number.isInteger(entry.records)) entry.records += 1
+          if (typeof result.recordId === 'string' && result.recordId.length > 0) entry.seqToRecordId.set(raw.seq, result.recordId)
+          if (raw?.type === 'tool/call' && typeof result.recordId === 'string' && entry.cwd !== null && entry.fileRefsError === null) {
+            try {
+              const ref = await captureFileReference({ event: raw, recordId: result.recordId, cwd: entry.cwd })
+              if (ref !== null) {
+                const index = entry.fileRefs.findIndex((item) => item.id === ref.id)
+                if (index >= 0) entry.fileRefs[index] = ref
+                else entry.fileRefs.push(ref)
+                if (entry.fileRefs.length > 500) entry.fileRefs = entry.fileRefs.slice(-500)
+                refsChanged = true
+              }
+            } catch (error) {
+              ctx.logger?.warn?.('memory-context-lab-v3: 文件引用采集失败（不影响摄入）：' + (error?.message ?? String(error)))
+            }
+          }
+        }
+        if (result.status === 'own-source') metricsNote('v3.ingest.ownSourceSkipped')
+        if (result.status === 'rejected') {
           ctx.logger?.warn?.('memory-context-lab-v3: 事件被拒绝 seq=' + raw.seq + '：' + (result.errors ?? []).join('；'))
+        }
+      }
+      if (refsChanged) {
+        try {
+          await writeFileReferences(entry.runtime.store.directory, entry.fileRefs)
+        } catch (error) {
+          ctx.logger?.warn?.('memory-context-lab-v3: file-references 写入失败（核证面暂不可用）：' + (error?.message ?? String(error)))
         }
       }
       ctx.logger?.info?.('memory-context-lab-v3: 摄入批完成（起 seq=' + firstSeq + '，' + applied + '/' + batch.length + ' 条）')
@@ -313,6 +1322,8 @@ export function attachV3Engine(ctx, options = {}) {
       // 影子模式不干扰宿主：摄入失败只告警，断点停在已完成处，下一步续传
       ctx.logger?.warn?.('memory-context-lab-v3: 影子摄入失败（seq 起 ' + firstSeq + '）：' + (error?.message ?? String(error)))
     }
+    // 返回真正落库的条数：own-source / not-memory-event 不算「摄入」
+    return applied
   }
 
   const off = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
@@ -323,6 +1334,9 @@ export function attachV3Engine(ctx, options = {}) {
       const session = agent?.session
       const sessionId = String(session?.id ?? '')
       if (!sessionId) return decision
+      // 会话级总开关：停用时本对话不再摄入（已有记录/索引不动）。
+      const control = controlOf(sessionId)
+      if (control.enabled === false) return decision
       // 真实宿主：session.log 数组（dsh-session 源码核验 2026-10-24）；替身：events() 函数
       const log = Array.isArray(session?.log) ? session.log : (typeof session?.events === 'function' ? session.events() : null)
       if (log === null) return decision
@@ -330,8 +1344,11 @@ export function attachV3Engine(ctx, options = {}) {
       if (entry === undefined) {
         // 首次挂载：建库在后台跑，**本步不 await**（H-19：钩子必须毫秒级返回）。
         ensureEntry(session, sessionId)
-          .then((created) => { startIngest(created, session) })
-          .catch((error) => ctx.logger?.warn?.('memory-context-lab-v3: 影子调度失败（建库）：' + (error?.message ?? String(error))))
+          .then((created) => {
+            entryFailures.delete(sessionId)
+            startIngest(created, session)
+          })
+          .catch((error) => noteEntryFailure(sessionId, error))
         return decision
       }
       // 2026-10-25 事故修正：摄入**后台异步**执行（历史大会话回填实测 10 分钟），
@@ -359,7 +1376,127 @@ export function attachV3Engine(ctx, options = {}) {
     try { usage = await usageSummary(entry) } catch (error) {
       usageError = error?.code ?? error?.message ?? String(error)
     }
-    return { lastSeq: entry.lastSeq, ingesting: entry.inflight !== null, health, usage, usageError }
+    const rawControl = controlOf(sessionId)
+    const control = {
+      enabled: rawControl.enabled !== false,
+      recall: rawControl.recall !== false,
+      overrides: rawControl.overrides ?? {},
+      error: rawControl.error ?? null,
+    }
+    // 覆盖事实（P0）：命令面异步路径，失败如实回 error，由 /memory-lab status 显示「未知」。
+    let coverage = null
+    let coverageError = null
+    try {
+      const facts = await coverageOf(entry)
+      coverage = { records: facts.records, mirrored: facts.mirrored }
+    } catch (error) {
+      coverageError = error?.code ?? error?.message ?? String(error)
+    }
+    const searchable = await indexStatsOf(entry)
+    return {
+      lastSeq: entry.lastSeq,
+      ingesting: entry.inflight !== null,
+      health,
+      usage,
+      usageError,
+      injection: injectionSnapshot(sessionId),
+      control,
+      records: Number.isInteger(entry.records) ? entry.records : null,
+      searchable,
+      coverage,
+      coverageError,
+    }
+  }
+
+  /**
+   * 同步状态（0.14.0-beta.15，composer 状态条的数据源）。
+   *
+   * 客户端读不到宿主进程里的对象；投影的 wire.view 需要一个**同步、零 I/O、绝不抛错**的
+   * 读取器，否则每步都要等文件系统。本函数全部走内存表：
+   * - 已建库：lastSeq / records / ingesting / 本会话回注计数；
+   * - 建库中：pending；
+   * - 建库失败：failed + code（与 /memory-lab status 的失败关闭口径一致，不伪装成「尚未摄入」）；
+   * - 未触发过：absent。
+   *
+   * 注意：这里**不**返回 health/usage（那两条要读盘，属于 /memory-lab status 的职责）。
+   * @param {string} sessionId 会话 id
+   * @returns {object} 固定形状的只读状态（未知字段用 null，不用 0 冒充实测值）
+   */
+  function statusOf(sessionId) {
+    const key = String(sessionId ?? '')
+    const injection = injectionOf(key)
+    const rawControl = controlOf(key)
+    const control = {
+      enabled: rawControl.enabled !== false,
+      recall: rawControl.recall !== false,
+      overrides: rawControl.overrides ?? {},
+      error: rawControl.error ?? null,
+    }
+    const engineState = stateOf(key)
+    const lifecycle = {
+      mode: engineState.mode,
+      modeSource: engineState.modeSource,
+      planFirst: engineState.planFirst === true,
+      // 停用恢复是全局设置：投影必须报告当前生效值，不能报告建库时冻结的 state 值。
+      autoRestore: settingsNow().autoRestore !== false,
+      surface: {
+        lastArchiveEndSeq: Number.isInteger(engineState.surface?.lastArchiveEndSeq) ? engineState.surface.lastArchiveEndSeq : -1,
+        lastArchiveAt: Number.isFinite(engineState.surface?.lastArchiveAt) ? engineState.surface.lastArchiveAt : null,
+      },
+      cooling: {
+        open: engineState.cooling?.open === true,
+        lastOccupancy: typeof engineState.cooling?.lastOccupancy === 'number' ? engineState.cooling.lastOccupancy : null,
+        lastRunAt: typeof engineState.cooling?.lastRunAt === 'number' ? engineState.cooling.lastRunAt : null,
+        lastReason: typeof engineState.cooling?.lastReason === 'string' ? engineState.cooling.lastReason : null,
+      },
+      provider: {
+        tier: engineState.provider?.tier === 'T2' ? 'T2' : 'T1',
+        reason: typeof engineState.provider?.reason === 'string' ? engineState.provider.reason : null,
+      },
+      stateError: engineState.error ?? null,
+    }
+    const counts = {
+      attempted: injection.attempted,
+      injected: injection.injected,
+      skipped: injection.skipped,
+      failed: injection.failed,
+      lastStatus: injection.lastStatus,
+      lastReason: injection.lastReason,
+      lastInjectedAt: injection.lastInjectedAt,
+      lastErrorCode: injection.lastError?.code ?? null,
+    }
+    const entry = runtimes.get(key)
+    if (entry !== undefined) {
+      return {
+        state: 'ready',
+        ingested: Number.isInteger(entry.records) ? entry.records : null,
+        searchable: Number.isInteger(entry.searchable) ? entry.searchable : null,
+        lastSeq: Number.isInteger(entry.lastSeq) ? entry.lastSeq : null,
+        ingesting: entry.inflight !== null,
+        control,
+        ...lifecycle,
+        ...counts,
+      }
+    }
+    const failure = entryFailures.get(key)
+    if (failure !== undefined) {
+      return {
+        state: 'failed',
+        ingested: null,
+        searchable: null,
+        lastSeq: null,
+        ingesting: false,
+        errorCode: failure.code,
+        errorMessage: failure.message,
+        control,
+        ...lifecycle,
+        ...counts,
+      }
+    }
+    if (pendingEntries.has(key)) {
+      return { state: 'pending', ingested: null, searchable: null, lastSeq: null, ingesting: true, control, ...lifecycle, ...counts }
+    }
+    return { state: 'absent', ingested: null, searchable: null, lastSeq: null, ingesting: false, control, ...lifecycle, ...counts }
   }
 
   async function searchReadOnly(sessionId, query, opts = {}) {
@@ -373,15 +1510,81 @@ export function attachV3Engine(ctx, options = {}) {
     const entry = await entryOf(sessionId)
     if (!entry) return null
     if (entry.inflight !== null) return { busy: true }
-    return await entry.runtime.provider.read(String(recordId))
+    const result = await entry.runtime.provider.read(String(recordId))
+    await markReadLease(sessionId, [String(recordId)])
+    return result
   }
 
   return {
     inspect,
+    statusOf,
+    controlOf,
+    setControl,
+    stateOf,
+    setState,
+    archiveForStep,
+    dryRunArchive,
+    historyOf,
+    restoreHistory,
+    pinRecords,
+    forgetPreview,
+    forgetRecords,
+    listForgotten,
+    workingSet,
+    exportSession,
+    importSession,
+    adoptFrom,
+    fileStatus,
+    verifyFiles,
+    startT2Backfill,
+    cancelT2Backfill,
+    t2BackfillState: backfillStateOf,
+    cleanupSmokeNode,
+    /**
+     * T2 隔离诊断（/memory-lab t2 用）：只报环境事实与实际决策，不返回令牌。
+     * configured=false 表示未找到 dsh-memory/MDcg 环境；active=false 时 decision.reason
+     * 就是真实的回落原因（探测失败/版本未实测/冒烟未过），不是「没试」。
+     */
+    async t2Info(sessionId) {
+      const key = String(sessionId ?? '')
+      const entry = runtimes.get(key)
+      const base = {
+        configured: options.t2Isolated !== undefined && options.t2Isolated !== null,
+        repoRoot: options.t2Isolated?.repoRoot ?? null,
+        python: options.t2Isolated?.python ?? null,
+        version: options.t2Isolated?.version ?? null,
+        active: entry?.runtime.providerDecision?.tier === 'T2',
+        decision: entry?.runtime.providerDecision ?? null,
+        isolatedRoot: entry === undefined ? null : t2RootOf(entry),
+        mirror: typeof entry?.runtime.provider?.mirrorStats === 'function'
+          ? entry.runtime.provider.mirrorStats()
+          : null,
+      }
+      if (entry === undefined) {
+        return { ...base, coverage: null, coverageError: null, backfill: await backfillStateOf(key) }
+      }
+      let coverage = null
+      let coverageError = null
+      try {
+        const facts = await coverageOf(entry)
+        coverage = { records: facts.records, mirrored: facts.mirrored }
+      } catch (error) {
+        coverageError = error?.code ?? error?.message ?? String(error)
+      }
+      return { ...base, coverage, coverageError, backfill: await backfillStateOf(key) }
+    },
+    failureOf(sessionId) {
+      return entryFailures.get(String(sessionId ?? '')) ?? null
+    },
     search: searchReadOnly,
     read: readReadOnly,
     dispose() {
       disposed.value = true
+      // 在飞回填：置中断位（批间生效），不再等待；已写入的节点在磁盘上仍然幂等。
+      for (const job of backfillJobs.values()) job.controller.aborted = true
+      backfillJobs.clear()
+      for (const timer of rebuildTimers.values()) clearTimeout(timer)
+      rebuildTimers.clear()
       for (const { runtime } of runtimes.values()) {
         try { runtime.close() } catch {}
       }
@@ -390,17 +1593,98 @@ export function attachV3Engine(ctx, options = {}) {
       pendingEntries.clear()
       if (typeof off === 'function') off()
     },
-    /** 转正回注（beta.10）：走 composition.recall——每回合一次门、上界装包、失败关闭。 */
+    /**
+     * 转正回注（beta.10）：走 composition.recall——每回合一次门、上界装包、失败关闭。
+     *
+     * 契约（beta.10 修复）：`recall` 用例的入参是**一个对象**且 `turn` 必填（≥1）。
+     * 旧实现写成 `recall(String(query), opts)`——字符串被对象解构后 query 恒为
+     * undefined，回注 100% 抛 V3ContractViolation，再被入口 catch 成一条 warn：
+     * 功能 0 生效而观察面全绿。这里把 `{ query, turn }` 拼装收在入口这一层，
+     * 并且**把每种结局都变成可判读的 status**，不再用 `null` / `busy:true` /
+     * `injected:false` 三种形状让调用方猜。
+     *
+     * @returns {{status:'injected'|'skipped'|'busy'|'no-session'|'empty-query'|'invalid-turn'|'failed', ...}}
+     */
     async recallForInjection(sessionId, query, opts = {}) {
+      const injection = countersOf(sessionId)
+      injection.attempted += 1
+      if (typeof query !== 'string' || query.trim().length === 0) {
+        injection.skipped += 1
+        injection.lastStatus = 'empty-query'
+        return { status: 'empty-query' }
+      }
+      const turn = opts?.turn
+      if (!Number.isInteger(turn) || turn < 1) {
+        // 宿主 turn 从 1 起（dsh-agent-loop 核验）；拿不到 turn 是调用方契约破坏，
+        // 不是「本回合不注入」——如实记失败，不静默当作没命中。
+        injection.failed += 1
+        injection.lastStatus = 'invalid-turn'
+        injection.lastError = { code: 'EINVALID_TURN', message: 'turn 必须是 ≥1 的整数（得到 ' + String(turn) + '）', at: Date.now() }
+        return { status: 'invalid-turn', error: injection.lastError }
+      }
       const entry = await entryOf(sessionId)
-      if (!entry) return null
-      if (entry.inflight !== null) return { busy: true }
-      return await entry.runtime.recall(String(query), opts)
+      if (!entry) {
+        injection.skipped += 1
+        injection.lastStatus = 'no-session'
+        return { status: 'no-session' }
+      }
+      if (entry.inflight !== null) {
+        injection.skipped += 1
+        injection.lastStatus = 'busy'
+        return { status: 'busy' }
+      }
+      let outcome
+      try {
+        // 热路径不重建索引：全量重建是 O(N) 次 readFile + 11MB 写，实测 200ms–2s，
+        // 而这里就在 pre-step 的 awaited 路径上。索引陈化时用旧索引（历史检索不受影响），
+        // 由摄入后的后台重建把新记录补进去。
+        //
+        // 检索参数来自设置页（回注条数/装包阈/首部长度/查询上限）。查询词按**码点**截断：
+        // 用户贴一整篇日志当消息时，整条当查询会把覆盖门槛抬到「必须命中整句」。
+        const queryMaxChars = Number.isInteger(opts?.queryMaxChars) && opts.queryMaxChars > 0 ? opts.queryMaxChars : null
+        const chars = [...query]
+        const boundedQuery = queryMaxChars !== null && chars.length > queryMaxChars ? chars.slice(0, queryMaxChars).join('') : query
+        // 两面阈值必须成对给：applyMinScore 的不变量是「装包面 ⊆ 结果面」
+        // （packMinScore ≥ resultMinScore），而设置页只暴露装包阈且允许 0
+        // （文案「0 表示不过滤」）。只透传 packMinScore 会让 0.05 / 0 这类**合法配置**
+        // 每步都抛 V3ContractViolation，被记成 failed——功能整体失效而观察面只显示失败计数。
+        // 因此结果面下限跟着用户设置一起降：用户说「不过滤」，两面都不过滤。
+        const packMin = Number.isFinite(opts?.packMinScore) && opts.packMinScore >= 0 ? opts.packMinScore : null
+        const staleRecordIds = new Set((entry.fileRefs ?? []).filter(isStaleFileReference).map((ref) => ref.recordId))
+        outcome = await entry.runtime.recall({
+          query: boundedQuery,
+          turn,
+          allowRebuild: false,
+          ...(staleRecordIds.size > 0 ? { excludeRecordIds: staleRecordIds } : {}),
+          ...(Number.isInteger(opts?.limit) && opts.limit >= 1 ? { limit: opts.limit } : {}),
+          ...(packMin === null ? {} : { packMinScore: packMin, resultMinScore: Math.min(RECALL_RESULT_MIN_SCORE, packMin) }),
+          ...(Number.isInteger(opts?.previewChars) && opts.previewChars >= 0 ? { previewChars: opts.previewChars } : {}),
+        })
+      } catch (error) {
+        // 边界记录点，不是吞错：错误原样放进 outcome 返回，由入口限流告警 + status 暴露。
+        // 回注失败不得打断用户这一回合（宿主契约：钩子抛错会中止本步）。
+        injection.failed += 1
+        injection.lastStatus = 'failed'
+        injection.lastError = { code: error?.code ?? 'EINTERNAL', message: error?.message ?? String(error), at: Date.now() }
+        return { status: 'failed', error: injection.lastError }
+      }
+      if (outcome?.injected === true && typeof outcome.text === 'string' && outcome.text.length > 0) {
+        injection.injected += 1
+        injection.lastInjectedAt = Date.now()
+        injection.lastStatus = 'injected'
+        injection.lastHits = outcome.hits?.length ?? null
+        await markReadLease(sessionId, (outcome.hits ?? []).map((hit) => hit.id))
+        return { status: 'injected', text: outcome.text, hits: outcome.hits, omittedHits: outcome.omittedHits }
+      }
+      injection.skipped += 1
+      injection.lastStatus = 'skipped'
+      injection.lastReason = outcome?.reason ?? 'unknown'
+      return { status: 'skipped', reason: injection.lastReason }
     },
     stats() {
-      const out = { ingestMetrics: Object.fromEntries(entryMetrics) }
-      for (const [sessionId, { runtime, lastSeq, inflight }] of runtimes) {
-        out[sessionId] = { lastSeq, ingesting: inflight !== null, metrics: runtime.metrics() }
+      const out = { ingestMetrics: Object.fromEntries(entryMetrics), injection: injectionSnapshot() }
+      for (const [sessionId, { runtime, lastSeq, records, inflight }] of runtimes) {
+        out[sessionId] = { lastSeq, records, ingesting: inflight !== null, metrics: runtime.metrics() }
       }
       return out
     },
@@ -411,6 +1695,11 @@ export function attachV3Engine(ctx, options = {}) {
         const creating = [...pendingEntries.values()]
         if (creating.length > 0) {
           await Promise.allSettled(creating)
+          continue
+        }
+        const backfills = [...backfillJobs.values()].map((job) => job.promise).filter((promise) => promise !== null)
+        if (backfills.length > 0) {
+          await Promise.allSettled(backfills)
           continue
         }
         const busy = [...runtimes.values()].filter((e) => e.inflight !== null)

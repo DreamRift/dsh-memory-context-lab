@@ -110,3 +110,25 @@ test('H-41 遗忘后索引重建一次即稳定（不会永久 stale）', async 
     } finally { runtime.close() }
   })
 })
+
+test('跨句柄遗忘必须立刻生效：另一句柄 forget 后，本句柄读路径 fail-closed（隐私面）', async () => {
+  await withRoot(async (root) => {
+    const runtime = await createV3Runtime({ v3Root: root, dshSession: dshSession(), sessionKey: 'k' })
+    const [id] = await seed(runtime, ['秘密 跨句柄 正文'])
+    // 第二个句柄：指向同一目录，open 时拿到的遗忘集合是「还没有 forget」的快照
+    const other = await openV3SessionStore(root, 'k')
+    try {
+      assert.ok((await other.readRecord(id)).payload.text.includes('跨句柄'), '前提：遗忘前可读')
+      await runtime.store.forget([id]) // 第一个句柄遗忘
+      // 旧实现：other 的内存集合是旧的 → 照常返回正文（已遗忘内容重新可见）
+      await assert.rejects(
+        () => other.readRecord(id),
+        (error) => error?.code === 'EFORGOTTEN',
+        '另一个句柄遗忘后，本句柄必须拒绝回读',
+      )
+    } finally {
+      other.close()
+      runtime.close()
+    }
+  })
+})

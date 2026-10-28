@@ -22,6 +22,7 @@ export const ERROR_CODES = Object.freeze([
   'ESTORE_CLOSED',
   'ELOCKED',
   'EFORGOTTEN',
+  'ECONTROL_RANGE',
 ])
 
 const CODE_KIND = new Map([
@@ -34,6 +35,7 @@ const CODE_KIND = new Map([
   ['ESTORE_CLOSED', 'unavailable'],
   ['ELOCKED', 'conflict'],
   ['EFORGOTTEN', 'unavailable'],
+  ['ECONTROL_RANGE', 'invalid'],
 ])
 
 /**

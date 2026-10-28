@@ -120,7 +120,10 @@ test('recall：注入（首部切片+可执行句柄）；同回合拒、新回�
     assert.equal(first.injected, true)
     assert.ok(first.text.includes('回注包（命中 1 条'))
     assert.ok(first.text.includes('首部：'))
-    assert.ok(first.text.includes('memory_lab_recall(record_ids='))
+    // 句柄必须指向**真实存在**的入口：本版没有注册模型可见工具，
+    // 旧文案 `memory_lab_recall(record_ids=…)` 会让模型去调一个不存在的工具。
+    assert.ok(first.text.includes('/memory-lab read'), '句柄必须是实际存在的命令')
+    assert.equal(first.text.includes('memory_lab_recall('), false, '不得再印不存在的工具形态')
     assert.ok(first.text.length < 800, '回注包有界')
     const again = await recall({ query: '正文 切片', turn: 1 })
     assert.equal(again.injected, false)
@@ -143,7 +146,10 @@ test('recall：无命中与纯壳不注入；turn 0 拒', async () => {
     await port.transaction([record('v3r-0123456789abc000', '记忆插件正文')])
     const none = await recall({ query: '毫不相关词组', turn: 1 })
     assert.equal(none.injected, false)
-    assert.equal(none.reason, '无命中')
+    // 全 OOV 时最需要披露的就是那些词（旧实现只回「无命中」，返回里的 oovTerms 无人读）
+    assert.match(none.reason, /^无命中/)
+    assert.match(none.reason, /词表外词/)
+    assert.ok(none.oovTerms.length > 0)
     const weak = await recall({ query: '记忆', turn: 1, packMinScore: 999 })
     assert.equal(weak.injected, false)
     assert.match(weak.reason, /纯壳不注入/)

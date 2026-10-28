@@ -2,11 +2,16 @@
  * 回合判定（domain/session 纯函数，M1）：真实用户回合计数 + 会话分桶（P3——
  * 提醒、回注包、槽位更新按真实用户回合计数，命中只出现一步）。
  *
- * 「真实用户」判据：type === 'user' 且 source.kind 不在插件自有来源集合内——
- * 插件自己注入的 user/message（source.kind = 包名）不推进回合（v2 实证：注入
- * 累积的成因之一就是把插件注入当成了新回合）。
+ * 「真实用户」判据是宿主对人类输入的约定 `source.kind === 'user'`（dsh-api-session-controller
+ * 写入 user/message 时使用），**不是**「kind 不在本插件自有集合内」。
+ *
+ * 旧口径（`!ownSourceKinds.includes(kind)`）把宿主与其它插件注入的 user 消息也算成人类回合：
+ * `runtime-context`（宿主每步追加的运行时上下文，role 仍是 user）、`plan-mode`、`team-message`、
+ * `goal`、`subagent-settled` 等二十余种来源都会把 turn 推高。后果是**回合语义错位**：回合计数（当前喂给 metrics 观测，接闸门/槽位后即为账本依据）
+ * 与真实人类轮次脱节。注：记录本身不写 turn，影响面仅在计数与将来的账本。
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
+import { HUMAN_SOURCE_KIND } from '../../contracts/sources.mjs'
 
 /** 一次性闸门记忆窗口（键数上界；H-18：见 oncePerTurnGate）。 */
 export const GATE_WINDOW = 64
@@ -14,7 +19,8 @@ export const GATE_WINDOW = 64
 /**
  * 判定事件是否真实用户事件。
  * @param {object} event 归一化事件（形状见 contracts/events.mjs）
- * @param {string[]} ownSourceKinds 插件自有 source.kind 集合（注入方身份，调用方注入）
+ * @param {string[]} ownSourceKinds 插件自有 source.kind 集合（保留入参：调用方仍需声明身份，
+ *   但判据不再依赖「非自有即人类」这种否定式推理）
  */
 export function isRealUserEvent(event, ownSourceKinds) {
   if (event === null || typeof event !== 'object') {
@@ -23,8 +29,7 @@ export function isRealUserEvent(event, ownSourceKinds) {
   if (!Array.isArray(ownSourceKinds) || ownSourceKinds.some((k) => typeof k !== 'string')) {
     throw new V3ContractViolation('v3 session/turn: ownSourceKinds 必须是字符串数组')
   }
-  const kind = event?.source?.kind
-  return event.type === 'user' && typeof kind === 'string' && !ownSourceKinds.includes(kind)
+  return event.type === 'user' && event?.source?.kind === HUMAN_SOURCE_KIND
 }
 
 /**

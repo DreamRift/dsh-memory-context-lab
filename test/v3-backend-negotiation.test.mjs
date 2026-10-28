@@ -1,5 +1,5 @@
 /**
- * v3 后端协商测试（M5 尾批）。
+ * v3 后端协商测试（M5 尾批 + beta.35 隔离 T2）。
  *
  * ## 判据来源
  * D3（能力协商失败关闭）、retrieval-provider D1（报实际生效不是期望）、
@@ -8,11 +8,13 @@
  * ## 断言组
  * - 无探测 → T1 + fail-closed reason；
  * - 探测非 dsh-memory / 缺工具 / 冒烟未过 / 版本未实测 → T1（合同语义逐条）；
- * - TESTED 清单为空的当前态：即使探测全绿也回 T1（设计而非缺陷）；
- * - T2 工厂缺位/抛错 → 如实回落 T1 且 reason 说明（不静默）。
+ * - 探测抛错 → T1（**不得炸装配**：一次 Python 启动失败不能让整个会话建库失败）；
+ * - T2 被选中且工厂存在 → 返回 T2 provider；工厂缺位/抛错 → 如实回落 T1 且 reason 说明；
+ * - 探测携带的 handle 只在 T2 工厂接管时保留，其余路径必须关闭（不泄漏子进程）。
  *
  * ## 不适用条件与已知边界
- * 真实 dsh-memory 探测（版本/工具/冒烟）在 M6 真机执行后登记 TESTED 清单。
+ * 本套件用替身验证装配语义；真实 MCP 握手/冒烟由 `scripts/t2-smoke.mjs` 与
+ * `v3-t2-*.test.mjs` 覆盖。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -22,7 +24,6 @@ import path from 'node:path'
 
 import { negotiateMemoryBackend } from '../src/v3/adapters/retrieval/backend-negotiation.mjs'
 import { createSessionStorePort } from '../src/v3/adapters/storage/session-store-port.mjs'
-import { TESTED_DSH_MEMORY_VERSIONS } from '../src/v3/contracts/capabilities.mjs'
 
 async function withBackend(body) {
   const root = await mkdtemp(path.join(tmpdir(), 'mcl-v3-be-'))
@@ -35,11 +36,19 @@ async function withBackend(body) {
   }
 }
 
+const TESTED_VERSION = '0.9.10'
 const FULL = {
   name: '@furongjun1999/dsh-memory',
-  version: '0.9.12',
+  version: TESTED_VERSION,
   tools: ['memory_store', 'memory_search', 'memory_read'],
   smokePassed: true,
+}
+
+function handleSpy() {
+  return {
+    closed: 0,
+    async close() { this.closed += 1 },
+  }
 }
 
 test('无探测 → T1 fail-closed', async () => {
@@ -68,27 +77,94 @@ test('探测各失败分支 → T1（合同语义逐条）', async () => {
   })
 })
 
-test('TESTED 清单为空的当前态：探测全绿也回 T1（设计而非缺陷）', async () => {
+test('探测抛错 → T1（不炸装配，reason 带原始错误）', async () => {
   await withBackend(async ({ port, store }) => {
-    assert.equal(TESTED_DSH_MEMORY_VERSIONS.length, 0, '前置：清单为空（M6 实测后才登记）')
-    const { decision } = await negotiateMemoryBackend({ port, store, probe: async () => FULL })
+    const { provider, decision } = await negotiateMemoryBackend({
+      port, store,
+      probe: async () => { throw new Error('python 不存在') },
+    })
     assert.equal(decision.tier, 'T1')
-    assert.match(decision.reason, /版本未实测/)
+    assert.match(decision.reason, /探测抛错回落 T1/)
+    assert.match(decision.reason, /python 不存在/)
+    assert.equal(typeof provider.search, 'function')
   })
 })
 
-test('T2 分支当前不可达（TESTED 为空）——工厂回落语义待 M6 登记后覆盖', async () => {
+test('T2 被选中：工厂拿到 t1 与探测结果，返回 T2 provider', async () => {
   await withBackend(async ({ port, store }) => {
-    // T2 选中前提是版本进 TESTED 清单（M6 实测登记）；当前清单为空，
-    // 任何探测都回 T1——工厂缺位/抛错的回落分支因此暂不可达。
-    // 这里锁住可达性前提，防止清单被预先填上（禁止预先登记）：
-    assert.equal(TESTED_DSH_MEMORY_VERSIONS.length, 0)
-    const { decision, provider } = await negotiateMemoryBackend({
+    const t2 = { marker: 't2-provider' }
+    let received = null
+    const { provider, decision } = await negotiateMemoryBackend({
       port, store,
       probe: async () => ({ ...FULL }),
-      t2ProviderFactory: async () => { throw new Error('不应被调用：T1 时代 T2 工厂必须缺席') },
+      t2ProviderFactory: async (described, deps) => {
+        received = { described, deps }
+        return t2
+      },
+    })
+    assert.equal(decision.tier, 'T2')
+    assert.equal(provider, t2)
+    assert.equal(received.described.version, TESTED_VERSION)
+    assert.equal(typeof received.deps.t1.search, 'function')
+  })
+})
+
+test('T2 工厂缺位 → 如实回落 T1 并关闭探测句柄', async () => {
+  await withBackend(async ({ port, store }) => {
+    const handle = handleSpy()
+    const { provider, decision } = await negotiateMemoryBackend({
+      port, store,
+      probe: async () => ({ ...FULL, handle }),
     })
     assert.equal(decision.tier, 'T1')
+    assert.match(decision.reason, /工厂缺位/)
+    assert.equal(handle.closed, 1)
     assert.equal(typeof provider.search, 'function')
+  })
+})
+
+test('T2 工厂抛错 → 回落 T1 且关闭探测句柄（不泄漏子进程）', async () => {
+  await withBackend(async ({ port, store }) => {
+    const handle = handleSpy()
+    const { decision } = await negotiateMemoryBackend({
+      port, store,
+      probe: async () => ({ ...FULL, handle }),
+      t2ProviderFactory: async () => { throw new Error('工厂坏了') },
+    })
+    assert.equal(decision.tier, 'T1')
+    assert.match(decision.reason, /T2 工厂失败回落 T1/)
+    assert.equal(handle.closed, 1)
+  })
+})
+
+test('T1 裁决也关闭探测句柄：版本未实测时不得留着已启动的 Python', async () => {
+  await withBackend(async ({ port, store }) => {
+    const handle = handleSpy()
+    const { decision } = await negotiateMemoryBackend({
+      port, store,
+      probe: async () => ({ ...FULL, version: '0.0.1', handle }),
+    })
+    assert.equal(decision.tier, 'T1')
+    assert.match(decision.reason, /版本未实测/)
+    assert.equal(handle.closed, 1)
+  })
+})
+
+test('隔离探测：cg 工具面 + isolated=true 升 T2 isolated', async () => {
+  await withBackend(async ({ port, store }) => {
+    const { decision } = await negotiateMemoryBackend({
+      port, store,
+      probe: async () => ({
+        name: '@furongjun1999/dsh-memory',
+        version: TESTED_VERSION,
+        tools: ['cg', 'stg'],
+        smokePassed: true,
+        isolated: true,
+        root: '/tmp/session/t2-mdcg',
+      }),
+      t2ProviderFactory: async () => ({ marker: 'isolated' }),
+    })
+    assert.equal(decision.tier, 'T2')
+    assert.equal(decision.provider, 'dsh-memory-isolated')
   })
 })

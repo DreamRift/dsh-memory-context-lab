@@ -1,109 +1,145 @@
 # dsh-memory-context-lab
 
-按 **DSH 会话** 启用的上下文管理插件：基础是**上下文降温**（把执行完的操作沉入隔离冷库、用极小回执替换），0.9.0 起扩展**全历史记忆上下文**（v2）与**计划先行**。安装、会话命令、图形入口与清理卸载的唯一操作说明都在这里。
+按 **DSH 会话** 启用的上下文管理插件（**v3 单引擎**）：把会话事件摄入本会话的隔离影子库，在每一步按当前用户输入检索历史、把命中要点回注到本步上下文；同时提供只读观察命令与 composer 侧的 chip + 弹层面板；面板只保留**本对话控制**（启用/回注/计划/模式/条数），底层参数留在插件设置页。
 
-> **当前源码版本 0.14.0-beta.10（测试版；v3 转正：单引擎）CHANGELOG.md)与[进展卡（beta.1）](../docs/历史归档/dev-0.13.2/进展卡.md)、[进展卡（beta.2）](../docs/历史归档/dev-0.13.2/进展卡-beta.2.md)、[进展卡（beta.3）](../docs/历史归档/dev-0.13.2/进展卡-beta.3.md)、[进展卡（beta.4）](../docs/历史归档/dev-0.13.2/进展卡-beta.4.md)、[进展卡（beta.5）](../docs/历史归档/dev-0.13.2/进展卡-beta.5.md)。命令面**没有变化**；beta.3 起设置页的「全历史记忆上下文」与「保留最近操作」真正生效（此前是空开关）；beta.4 起设置页保存不再抹掉 schema 里其它字段，`/memory-lab set` 的数字参数不再被静默截断；beta.5 起 `set autorestore off` 真正「只停用不恢复」（窗口守卫照常生效），设置页数字框与 `history` 的每页条数不再静默改值。
+> **当前源码版本 0.14.0-beta.44（M0–M7 + T2：模式/归档/恢复/保护/降温/核证/导入/fork/计划冻结/面板/默认关 + 覆盖率标注/回填 + 回注包不锁归档 + 步骤级压缩）**。唯一命令是 `/memory-lab`，子命令见下。开发决策见余项决策与完整实施方案，版本变化见[变更记录](./CHANGELOG.md)，缺陷与处置见缺陷排查记录。
+
+## 0.14.0-beta.44 本版行为
+
+- **归档选择器识别真实宿主形状**：`tool/result` 的 callId 在 `data.message.toolCallId` / `data.message.source.callId`；按轮与按步归档在真实工具会话恢复。
+- **按步锚点**：真实 DSH 的 `user/message` 在 step 1 内；前导含 human 的整步跳过，已开始选步后的锚点仍是硬边界。
+- **停用恢复**：`/memory-lab off` 读当前全局 `autoRestore`，不再读建库时冻结的 state 值。
+- **归档事实**：新增 `surface.lastArchiveAt`（按轮/按步都推进）；按步归档不写回合级 `lastArchiveEndSeq`。
+- **诊断与配置**：status 的「下一次归档」与执行共用冷却闸门；`control.json` 损坏按本会话默认失败关闭；数字参数只认十进制。
+- **脱敏**：补 AWS / GitHub / Slack / Google / Stripe / JWT 形态；宿主 append-only 日志仍有原文，脱敏保护插件副本与导出。
+- **验证**：96 套 / 439 用例 / 439 通过 / 0 失败（release 自测，安装 beta.44 后 0 skip）。
 
 ## 它做什么、不做什么
 
-**做**（beta.10 起单引擎）：按回合摄入会话事件入 v3 库；检索命中按预算回注（保最新、注入上界可见）；压力闸门按真实占用运转。命令面：`/memory-lab v3 status|recall|read`。
+**做**：
 
-**不做**：增删模型可见的工具；改写 DSH 的 append-only 事件日志
+- **摄入**：每个 `agent/pre-step` 把本会话新增的 `user/message`、`assistant/message`、`tool/call`、`tool/result` 归一化后写入隔离影子库（后台异步、单飞行、可中断；钩子毫秒级返回，不阻塞首字）；
+- **回注**：以**人类本回合输入**为查询词检索影子库，命中足够时把「命中 ID + 相关度 + 定长首部切片」组成有上界的回注包，追加到本步消息批次末尾（每回合同类只注入一次）；
+- **观察**：`/memory-lab status | t2 | recall | read` 只读查看摄入位点、库健康、占用样本、T2 后端与回注观测；
+- **composer 面板**：工具行左侧 chip + 向上弹层；只改**本对话**（启用/自动回注/条数），底层参数在插件设置页统一配置。
 
-## 缓存纪律
+**不做**：
 
-在位置 i 替换内容，会让 i 之后一切按未命中价重算。插件据此**一批做够**（批次数才是代价来源）、**回注只落在批次尾部**、**工具集恒定**。见[架构与边界](../docs/历史归档/v2机制文档/架构与边界.md#前缀缓存纪律)。
+- 不增删模型可见的工具（工具集一变就作废整段前缀缓存）；
+- 不改写 DSH 的 append-only 会话日志与命令审计；
+- **T2 只写本会话隔离根**：不把实验文本写进正式灵枢根；T1 始终独立可用，T2 失败不阻塞摄入/回注；
+- **不接管 composer**：全局设置走**插件页自带的配置块**；composer 只有本对话控制，不放装包阈/首部/查询上限这些底层参数。
 
 ## 已核验范围
 
 | 项目 | 值 |
 |---|---|
-| DSH Desktop | `0.2.0-rc.2` |
-| `dsh-memory`（**可选**） | `0.8.1` / `0.9.8` / `0.9.10`（三个版本都做过抑制补丁核验）；缺席或版本不在范围内时独立模式运行，**抑制不启用**并在 `on` 回执与 `status` 里如实说明 |
-| 冷库 | 复合后端：灵枢子进程（T2）/ 本地 Node store（T1） |
-| 会话目录 | `$DSH_HOME/.memory-context-lab/sessions/<session-id 的 sha256 前 24 位>/` |
-| 真实灵枢保护 | 启用期间按会话抑制 `dsh-memory` 的自动读写（不改动工具集）；`status` 有独立一行「真实灵枢抑制：已启用 / 未启用（原因）」 |
-| 依赖的宿主接口 | `agent/pre-step`、`session.surface`、`session.append`、`requestHeader()`、`requestContext()`、`tokenMeter`、`llm`、`sessionProjections`、`commands`；可选 `planMode`（缺失时如实降级）。详见[架构与边界](../docs/历史归档/v2机制文档/架构与边界.md) |
-
-冷库不可用不阻止启用（T1 兜底）：归档/回注失败关闭；占用率缺 `requestHeader()` / `tokenMeter.measure` / `contextWindow` 时**失败关闭**，原因见 `status` / `dry-run`。
+| DSH Desktop | `0.2.0-rc.2`（宿主契约按 `app.asar` 内 `dsh-commands` / `dsh-agent-loop` / `cordis` / `dsh-client-modules` / `dsh-settings` 源码核验） |
+| 数据根 | `$DSH_HOME/.memory-context-lab/v3/sessions/<会话隔离键>/`（非常规会话 id 用 `hash-<sha256 前 16>`，原名存 `session-manifest.json`） |
+| 检索后端 | 本地 Node store + 本地词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10（含 `md_cg/`）且 Python 可用时，按会话启动**独立 MDCG_ROOT 的隔离 MCP**（T2），搜索融合本地与隔离灵枢；探测/冒烟失败如实回 T1 |
+| 依赖的宿主接口 | `agent/pre-step`、`commands.register`、`ctx.effect`、`dsh-settings`、`dsh-client-modules`、`dsh-session-projection`、`dsh-client-ui-conversation`、`ctx.remote.commands.execute`；写入经 `decision.messages`，由宿主 `session.append` 落面 |
+| 消息来源标识 | 插件写入的消息 `source.kind = dsh-memory-context-lab`（与包名一致，摄入侧据此跳过自家生成物） |
 
 ## 使用
 
-**唯一命令是 `/memory-lab`**（0.13.1 起 v1 引擎与 `/memory-lab2` 已删除）。日常面：
-
 ```text
-/memory-lab on | off          启用 / 停用（停用保留冷库，释放投影所有权）
-/memory-lab status            引擎状态、记录数、最近动作、占用率、单批释放上限、成本账本
-/memory-lab restore           恢复全部可恢复回执的原文，引擎保持启用（不停用）
-/memory-lab now | dry-run     走一次「测量→门禁→提交→替换」；dry-run 零副作用
-/memory-lab read <记录ID…>    回读原文（精确 ID / 冷节点基名 / callId 均可）
-/memory-lab set <键> <值>     auto | recall | autorestore | batch | retain | readlease | pressure | protect |
-                             fullhistory | compress | compressmodel | sharel2content | planfirst
-/memory-lab card | cost       工作状态卡 / 成本账本（都是顶层子命令，没有 debug 分组）
-/memory-lab recall <查询词> · verify | mark-stale | relations | history | working-set | index
-/memory-lab forget preview|apply|undo|status · compress preview|run|status · expand <凭证ID>
-/memory-lab fork <子会话ID> | fork-status | fork-reset <子会话ID>
-/memory-lab clean confirm delete-session   丢弃本会话隔离冷库（不可撤销；须先 off）
-/memory-lab help              本帮助（按「生命周期 / 回读检索 / 证据 / 遗忘 / 压缩 / 迁移 / 设置」分组）
+/memory-lab status          位点/健康/本对话/回注/T2
+/memory-lab t2 [backfill [N]|backfill cancel|backfill status|cleanup]
+                            T2 诊断 / 覆盖率 / 显式回填（默认 200，上限 2000）
+/memory-lab on|off          本对话启用/停用
+/memory-lab inject on|off   本对话自动回注
+/memory-lab set|unset limit <1-20> 本对话条数覆盖/清除
+/memory-lab reset           本对话控制恢复默认
+/memory-lab mode 按轮归档|按步归档|仅回注   本对话模式
+/memory-lab planfirst on|off|approve  计划期间暂停归档/回注
+/memory-lab now|compact|dry-run  归档/摘要/预览
+/memory-lab history|working-set  列凭证/当前工作集
+/memory-lab export|adopt|adopt-from  导出/导入/父复制
+/memory-lab file-status|verify <ID|all>  文件核证
+/memory-lab restore [序号|all]  恢复回执为原文
+/memory-lab pin|unpin <ID>、pins  保护/取消保护记录
+/memory-lab forget preview|apply|undo|status <ID…>  遗忘/撤销
+/memory-lab recall <词>     检索影子库（最多 10 条）
+/memory-lab read <ID>       精确回读（有上界）
+/memory-lab help            本清单
 ```
 
-模型可见的只读工具是 `memory_lab_recall(record_ids=[…])`——回执的「可回读」行直接给这个调用，照抄即可。
+**本对话只覆盖 `limit` 与三个会话开关；其余在设置页。**
 
-**0.13.1 不兼容**：`/memory-lab2` 已删除；旧会话目录 `sessions/<key>/state.json` 不再被读取
-（不删不迁移）。已归档原文仍在磁盘，确认不需要后可手动删除 `$DSH_HOME/.memory-context-lab/sessions/`。
+handler 返回 `CommandResult`；失败带 `code`，不拿空文本糊过去。
 
-### 层级卡脱敏与成员级排除（0.11.0）
+## composer 面板（本对话控制）
 
-**卡片默认不复制正文**：摘录类值渲染成 `（正文摘录未共享）`，只留 entity、属性标签、极性/关系标签、来源 ID 与
-`expand` 入口；结构化属性（退出码、测试摘要、版本号）照常保留。`set sharel2content on` 才放摘录（默认 off、失败关闭）。
+composer 工具行左侧的「记忆上下文」chip（宿主 `conversation.input.left`）；点开是向上弹层。**只放每个对话可不同的控制**：
 
-**成员级排除**：一条成员被遗忘不再废掉整组——被遗忘者排除出参与集，其余照常压缩；全排除仍整组失败关闭。细节见[降温模式](../docs/历史归档/v2机制文档/降温模式.md)。
+| 项 | 作用 | 默认 |
+|---|---|---|
+| 本对话启用 | 关掉后这个对话不再摄入/回注 | 开 |
+| 自动回注 | 只关回注，摄入照常 | 开 |
+| 计划先行 | 计划期间暂停归档/回注；开启后可批准 | 关 |
+| 模式 | 按轮归档 / 按步归档 / 仅回注；切换前确认 | 跟随 state |
+| 每次回注条数 | 本对话覆盖全局条数（1–20）；留空 = 跟随全局 | 留空 |
 
-### 全历史记忆上下文（v2 模式开关）
+- **全局默认在插件设置页**：回注开关、模式、恢复默认、条数、装包阈、首部、查询上限。
+- **数据**：投影 `memoryContextLabStatus`；state 只存 `{ sessionId, tick }`，计数在 `wire.view` 读 `statusOf()`。
+- **写入**：`/memory-lab on|off|inject|planfirst|set limit|unset limit`；控制文件是每会话 `control.json`。
+- **边界**：不接管 `conversation.composer`；弹层只放本对话开关与条数。
 
-`/memory-lab set fullhistory on` 后，插件切换为**全历史模式**：完整留下 system 头、**全部人类用户消息**、**退热凭证本身**与计划工件；其余沉入隔离 ArchiveStore 并自动启动隔离灵枢后端、按批增量同步索引（插件来源不进索引、不被回注）。「保留最近操作」失效（面板变灰），去留由**活跃证据保护层**（`protection.mjs`，与降温管线共用）裁决；软保留受 `set protect <预算>`（默认 32768）与 TTL 约束。
+## 设置
 
-### 计划先行（planfirst）
+**设置界面在插件页**。侧边栏「**插件**」→ `dsh-memory-context-lab`：
 
-打开后，**全新对话**第一条消息前自动进入 DSH 计划模式（服务可用走服务，否则落账 `plan/mode`）：AI 先产出计划，**用户批准的瞬间自动启用降温**（免敲 `/memory-lab on`）。计划期间降温/回注/工作状态卡挂起（手动命令仍可用）；**计划全文终生保留**，不可退热。已有历史的会话不自动进入（提示 `/plan`）；缺投影时如实报错。插件级默认 `planFirst: true`，可按会话覆盖。
+- **bundle 详情页**：说明与「包含的组件」之间就是本插件的设置块（宿主 `plugins.bundle.config` 槽位，按包名键控）；
+- **组件行 →「配置」**：同一张表单的独立页（宿主 `plugins.row.config` 槽位，键为 `dsh-memory-context-lab#memory-context-lab`）。
 
-**关闭即退出（rc.5）**：`set planfirst off` 同时退出本会话仍处 active/pending 的计划模式。
+宿主 `describe()` 只把 `Config` 投影成数据行；页面由 `ui-plugin-manager` 按本包注册的槽位渲染——没有槽位注册就没有界面。所以设置界面 = `Config` + 本包 `client.js`。
 
-图形入口与设置：composer 权限控件右侧的「降温」触发器（同一套设置与动作）；**状态、全历史、计划先行三行摘要与最近一次输出**显示在弹层底部。全局默认与预设在 设置 → 组件 → 「记忆上下文」。
+表单与 `Config` 同域（`v3-client-surface` 逐项钉住）；只有 `.volatile()` 字段进表单，改完即时生效。
 
-**停用或归档都会把会话送回正常。** `/memory-lab off` 或面板拨关都走停用路径（先恢复原文，再解除抑制、删隔离目录）；关「全历史」同样先恢复再翻位。恢复放不进窗口时如实拒绝（原文留冷库可回读）；仍有未恢复回执时不删。插件只清理 `$DSH_HOME/.memory-context-lab/` 自有数据，**从不写真实灵枢**，也不改写会话日志与命令审计。
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `enabled` | `true` | 全局回注；新对话默认关闭，需本对话开启 |
+| `fullHistory` | `true` | 新会话默认「按轮归档」；关闭后走「按步归档」（按步归档仍受占用闸门约束） |
+| `planFirst` | `false` | 计划期间暂停归档与自动回注 |
+| `autoRestore` | `true` | 停用/恢复时把回执还原为原文 |
+| `limit` | `10` | 新会话默认条数；本对话可在面板覆盖（1–20） |
+| `packMinScore` | `0.5` | 装包阈值：低于此分的命中不进回注包（0 表示不过滤） |
+| `previewChars` | `160` | 每条命中在回注包里的首部字符数（40–4000） |
+| `queryMaxChars` | `512` | 查询词只取用户消息前 N 个字符（整条长消息会把覆盖门槛抬到「必须命中整句」） |
 
-### 单一触发线怎么算
+「恢复默认」= 对该字段发 `unset`（撤掉用户层覆盖，回落到 schema 默认值）；越界值在本地拦下并就地提示，
+不会发一次注定被宿主 schema 拒绝的写请求。当前生效值也会打印在 `/memory-lab status` 的「回注设置」一行——
+设置页与命令面说的必须是同一件事。
 
-「保留最近 N 个操作」一直生效，只受批量阈值约束（窗口外攒够 `batch` 个才提交一批）；硬保护只有 system 指令节点与最新用户消息。提交按**相邻性**切段：受保护/不够格/冷写失败的单元会切段，回执 N 可小于阈值。
+## 回注的判据
+
+- 查询词只取 `payload.messages` 里 `source.kind === 'user'` 的人类输入——**不看** `decision.messages`（那里已混入宿主的 `runtime-context` 与其它插件的追加物）；
+- 每回合（`turn`）同类回注只放行一次；同一会话的闸门键有界（FIFO 64）；
+- 回注包硬顶 4000 字符，超预算时按 `createdAt` 丢最旧、省略条数如实列出，尾行给可照抄的回读形态；
+- 回注失败**不阻塞用户这一回合**，但必须可观测：失败计数与上次错误进 `/memory-lab status`，日志按会话限流输出。
+
+## T2 隔离 MCP
+
+装 dsh-memory **0.9.10** 且 Python 可用时，已启用会话在后台启动**独立 `MDCG_ROOT`** 的 MCP（`<会话>/t2-mdcg`，独立令牌与策略），四步冒烟通过才升 T2；失败如实回 T1。镜像按记录 ID 写入，检索与 T1 融合，`forget` 同步删除。`/memory-lab t2` 显示「可镜像 / 已镜像 / 覆盖率」（排除 `mcl-smoke` 冒烟节点）；T2 启用前的历史用 `/memory-lab t2 backfill [N]` 显式回填（默认 200、上限 2000、按磁盘节点幂等）。真实进程验收 `npm run t2:smoke` / `npm run t2:provider` / `npm run t2:backfill`。细节见设计文档。
 
 ## 安全边界
 
-- 归档前正文写入隔离冷库并**回读校验 hash**；失败/缺失/hash 不符一律保留原文并报出阶段。超过单节点上限时**按码点分块**，每块校验后再校验整篇。
-- 回执文本只由稳定标识符构成，逐字节稳定，不扰动缓存；归档是表层替换，`restore` 按原字节写回、可逆。
-- `clean` 在仍有未恢复回执时拒绝删除；冷库删除只能删本插件自有目录，且拒绝含链接的路径。
-- **并发与持久化**：第二个写句柄得 `ELOCKED`（15s 心跳 / 60s TTL / stale 接管，只读不取锁）；fsync 只覆盖原文、事务、manifest、engine 与 disposition，派生缓存只保证原子替换可重建。锁是互斥而非事务，跨文件读改写仍靠 revision CAS 与失败关闭。
+- 敏感字段（token/secret/password/credential/api-key/authorization/中文密钥类）与「凭据形态的值」在摄入前脱敏；脱敏函数的失败模式是**更严**（超深度整体 `[REDACTED:depth]`），不是放行原值；
+- 自家生成物（回注包等）在装配层（`composition.handleDshEvent`）裁决为 `own-source`，不入库、不消耗回合计数；
+- 写事务走每会话跨进程写锁（`.write-lock/`）；账本与派生索引的原子写用 `randomUUID` 临时名 + rename，崩溃残留可重建；
+- 插件只清理 `$DSH_HOME/.memory-context-lab/` 自有数据，从不写正式灵枢根；T2 的令牌、镜像与冒烟节点都只落在本会话的 `t2-mdcg/`。
 
 ## 安装与卸载
 
-插件已作为 bundle 安装在 desktop profile；改宿主侧源码需重启 DSH，改 `src/client.js` 刷新页面即可。
+插件以 bundle 形式装在 desktop profile（补丁见 `cordis.patch.yml`）。改宿主半需重启 DSH；改 `src/client.js` 后等下一次装配/HMR 重建，刷新页面即可。
 
 ```text
 卸载：plugin_manager remove_bundle dsh-memory-context-lab
-清数据：删除 $DSH_HOME/.memory-context-lab/（或在每个会话执行 /memory-lab clean）
+清数据：删除 $DSH_HOME/.memory-context-lab/v3/
 ```
 
-## 验证
+验证：`cd 记忆上下文/plugin && npm test`（套件按目录发现）。`%TEMP%` 不可写时先指到可写目录。T2 验收：`npm run t2:smoke` / `npm run t2:provider`。
 
-```text
-cd 记忆上下文/plugin && npm run test:all      # 118 套逐套汇总（推荐）
-cd 记忆上下文/plugin && npm test              # 同 test:all，失败即中断
-cd 记忆上下文/plugin && npm run probe:host    # 宿主 schema 校验（需 DSH_ASAR；无参数 SKIP）
-cd 记忆上下文/plugin && npm run probe:revert  # 66 个回退场景，确认对应测试会失败
-cd 记忆上下文/plugin && npm run probe:lingshu # 隔离灵枢写入健康探测；不可用如实报环境原因
-```
 
-**`npm test` 第一项是 `entry-coverage`**：比对磁盘 `test/*.test.mjs` 与 `scripts.test` 链，防止「写了测试却没接线」。0.13.2-beta.7 全套 **118 套**（全通过、0 跳过；Node v26.12.1），逐套件范围见[验证与评估](../docs/历史归档/v2机制文档/验证与评估.md)。
 
-> 沙箱宿主里 `%TEMP%` 可能不可写（`mkdtemp` 报 `EPERM`）：环境限制，非缺陷；把 `TEMP`/`TMP`/`TMPDIR` 指到可写目录。
-`FakeSession` 按宿主真实折叠规则实现校验；契约忠实度见[验证与评估](../docs/历史归档/v2机制文档/验证与评估.md)。
+> 本仓库是源码线 `plugin/` 的发布镜像；开发文档与缺陷排查记录不随包分发。

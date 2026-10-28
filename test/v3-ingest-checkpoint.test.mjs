@@ -93,11 +93,15 @@ test('H-01 重放幂等：同一数据根二次装载不再重复落库', async 
     }
     const first = await mountAndIngest(root, session)
     assert.equal(first.engine.stats()['s-replay'].lastSeq, 4, '首装摄入到 seq=4')
-    assert.deepEqual(await countsOf(root, 's-replay'), { records: 5, txn: 5 })
+    // 批量提交（beta.11）：5 条事件共用一笔事务，所以事务行数不是 5。
+    // 幂等判据是「重载前后完全相同」，不是某个固定数字。
+    const firstCounts = await countsOf(root, 's-replay')
+    assert.equal(firstCounts.records, 5)
+    assert.equal(firstCounts.txn, 1, '一批事件共用一笔事务（逐事件事务在回填时是 O(N) 次写）')
     first.engine.dispose()
 
     const second = await mountAndIngest(root, session)
-    assert.deepEqual(await countsOf(root, 's-replay'), { records: 5, txn: 5 }, '重载后不得重复落库')
+    assert.deepEqual(await countsOf(root, 's-replay'), firstCounts, '重载后不得重复落库')
     assert.equal(second.engine.stats()['s-replay'].lastSeq, 4, '断点从库反推（不是 -1）')
     second.engine.dispose()
   })
@@ -109,12 +113,16 @@ test('H-01 断点不过冲：重载后新到事件仍摄入', async () => {
     session.push('user/message', { data: { text: '旧一' } })
     session.push('assistant/message', { data: { content: [{ type: 'text', text: '旧二' }] } })
     const first = await mountAndIngest(root, session)
-    assert.deepEqual(await countsOf(root, 's-resume'), { records: 2, txn: 2 })
+    const firstCounts = await countsOf(root, 's-resume')
+    assert.equal(firstCounts.records, 2)
+    assert.equal(firstCounts.txn, 1, '一批事件共用一笔事务')
     first.engine.dispose()
 
     session.push('tool/result', { data: { content: [{ type: 'text', text: '新三' }] } })
     const second = await mountAndIngest(root, session)
-    assert.deepEqual(await countsOf(root, 's-resume'), { records: 3, txn: 3 }, '新事件必须落库（断点不得跳过）')
+    const resumed = await countsOf(root, 's-resume')
+    assert.equal(resumed.records, 3, '新事件必须落库（断点不得跳过）')
+    assert.equal(resumed.txn, firstCounts.txn + 1, '新事件单独一批事务')
     assert.equal(second.engine.stats()['s-resume'].lastSeq, 2)
     second.engine.dispose()
   })

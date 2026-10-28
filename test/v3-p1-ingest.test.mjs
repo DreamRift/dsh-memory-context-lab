@@ -79,3 +79,21 @@ test('P1 端到端：metadata-only 落库可回读、不进检索索引', async 
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+test('P1 提取：错误态以 message.isError 为准（data.error 可缺省）', () => {
+  // 宿主真实形态：非 HarnessError 的普通异常 → isError=true 且 **没有** data.error。
+  // 旧实现只看 data.error，于是这类失败被记成成功正文。
+  const tr = extractEventBody({ type: 'tool/result', data: { message: { isError: true, content: [{ type: 'text', text: 'Error: boom' }] } } })
+  assert.ok(tr.text.includes('Error: boom'))
+  assert.ok(tr.text.includes('错误态'), 'isError=true 必须标注错误态')
+  const ok = extractEventBody({ type: 'tool/result', data: { message: { isError: false, content: [{ type: 'text', text: 'fine' }] } } })
+  assert.equal(ok.text.includes('错误态'), false, '成功结果不得误标错误')
+})
+
+test('P1 提取：tool/result 正文过脱敏（凭据不得随工具输出入库）', () => {
+  // 工具输出是外部数据：env / curl 头 / 配置文件里的凭据最常见的落点就是正文。
+  const tr = extractEventBody({ type: 'tool/result', data: { message: { content: [{ type: 'text', text: 'OPENAI_KEY=sk-live-abcdef123456\nAuthorization: Bearer abcdefghijklmnop' }] } } })
+  assert.equal(tr.text.includes('sk-live-abcdef123456'), false, 'sk- 形态必须脱敏')
+  assert.equal(tr.text.toLowerCase().includes('bearer abcdefghijklmnop'), false, 'Authorization 头必须脱敏')
+  assert.ok(tr.text.includes('[REDACTED]'))
+})

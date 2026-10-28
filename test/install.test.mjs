@@ -13,7 +13,8 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { access, readFile, readdir } from 'node:fs/promises'
+import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -21,6 +22,21 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const DSH_HOME = process.env.DSH_HOME ?? path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh')
 const PROFILE = process.env.DSH_PROFILE ?? 'desktop'
 const installedEntry = path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', 'dsh-memory-context-lab', 'src', 'index.mjs')
+
+/**
+ * 数据根隔离：`apply()` 内部按 `$DSH_HOME/.memory-context-lab/v3` 解析数据根。
+ * 安装面测试只验「宿主能不能装起来」，绝不能把测试数据写进真实 DSH home——
+ * 一旦某条用例真的驱动了 pre-step，它会打开真实会话库并拿写锁。
+ * installedEntry 已经从**原始** env 算好，这里再改 env 只影响插件内部的运行时解析。
+ */
+const realDshHome = process.env.DSH_HOME
+const testDshHome = await mkdtemp(path.join(tmpdir(), 'mcl-install-home-'))
+process.env.DSH_HOME = testDshHome
+test.after(async () => {
+  if (realDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = realDshHome
+  await rm(testDshHome, { recursive: true, force: true }).catch(() => {})
+})
 
 /**
  * 已安装副本与本仓源码是否同版。
@@ -101,6 +117,10 @@ function createStubContext({ withTools = true } = {}) {
   const tools = []
   const warnings = []
   const toolService = { register: (definition) => { tools.push(definition); return () => {} } }
+  // 0.14.0-beta.15：宿主提供 sessionProjections 时，插件注册只读状态投影。
+  // 这里把服务同时挂成可注入依赖（get）——安装面测试要真的走到注册回调，
+  // 否则「投影注册」这条新面在安装副本上完全没有覆盖。
+  const projectionService = { register: (definition) => { projections.push(definition); return () => {} } }
   const ctx = {
     logger: { info() {}, warn: (m) => warnings.push(String(m)), error: (m) => warnings.push(String(m)) },
     get(name) {
@@ -112,6 +132,7 @@ function createStubContext({ withTools = true } = {}) {
         }
       }
       if (name === 'llm') return { resolveModelInfo: async () => ({ context: { contextWindow: 100000 } }) }
+      if (name === 'sessionProjections') return projectionService
       return undefined
     },
     on(event, handler, options) {
@@ -142,7 +163,7 @@ function createStubContext({ withTools = true } = {}) {
       return () => { for (const cleanup of local.splice(0).reverse()) cleanup?.() }
     },
     commands: { register: (definition) => { commands.push(definition); return () => {} } },
-    sessionProjections: { register: (definition) => { projections.push(definition); return () => {} } },
+    sessionProjections: projectionService,
     // 反应式注入替身：依赖齐了就立刻回调（传一个带 effect 的作用域），否则不回调。
     // 真实 cordis 是反应式的（服务后到会再回调），这里只覆盖「立即可用」这一支。
     // 回调收到的作用域**已注入 tools**，所以那一侧 `ctx.tools` 是可读的。
@@ -208,13 +229,17 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   }
   const module = await import(pathToFileURL(installedEntry).href)
   assert.equal(module.name, 'memory-context-lab')
-  assert.deepEqual(module.inject, ['commands', 'sessionProjections'], '不得硬依赖 tools，否则拿不到时整个插件会挂')
+  assert.deepEqual(module.inject, ['commands'], '只声明真正使用的服务：多一个硬依赖就多一条「服务缺席→插件不启动」的路')
 
   const ctx = createStubContext()
-  await module.apply(ctx)
+  await module.apply(ctx, {})
 
   assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
-  assert.deepEqual(ctx._projections.map((projection) => projection.key), ['memoryContextLab'])
+  assert.equal(ctx._projections.length, 1, '宿主提供 sessionProjections 时必须注册只读状态投影')
+  assert.equal(ctx._projections[0].key, 'memoryContextLabStatus', '客户端 dock 读的就是这个 key')
+  assert.equal(ctx._projections[0].stateVersion, 1)
+  assert.equal(typeof ctx._projections[0].wire?.view, 'function')
+  assert.equal(typeof ctx._projections[0].wire?.viewSchema?.parse, 'function')
   // Both features ride `agent/pre-step`: the cooler delegates then cools, and
   // recall is prepended so it can fold into the downstream enter decision —
   // the same seam the shipped `time-context` plugin uses. Nothing listens on
@@ -223,65 +248,43 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   // `domain/changed` is the archive signal: the archive set is the `workspace`
   // domain's global singleton, so watching it catches every archive — including an
   // idle session, which never dispatches `workspace/session-stop`.
-  assert.deepEqual([...ctx._listeners.keys()].sort(), ['agent/pre-step', 'domain/changed'])
-  // 0.13.1 单引擎：只有一个降温、一个回注、一个工作状态注入，外加计划先行自动化钩子。
-  // 旧断言是 6 个 / 两条 prepend（v1 与 v2 各一套）——0.13.0 删 v1 后这些数字就过期了，
-  // 但因为本组三条用例一直 SKIP（见 SOURCE_ENTRY 的注释），过期断言**从未被执行**。
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 1,
-    '降温 + 回注 + 工作状态注入 + 计划先行自动化 + v3 影子摄入（0.14.0-beta.10 起）')
-  assert.equal(ctx._listeners.get('domain/changed').length, 1)
-  assert.deepEqual(ctx._prependEvents, ['agent/pre-step'], '只挂一个 prepend 回注（单引擎）')
+  assert.deepEqual([...ctx._listeners.keys()].sort(), ['agent/pre-step'])
+  // v3 单引擎：两个 pre-step 监听——引擎摄入（push，最内）与回注（prepend，最外）。
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 2,
+    '摄入 + 回注：两个监听，缺一个都意味着 v3 少了半条链路')
+  assert.deepEqual(ctx._prependEvents, ['agent/pre-step'], '只有回注需要 prepend（先于内层拿到 decision 再追加）')
 
-  // 固定注册的只读召回工具：恰好一个，名字与参数契约固定，不随引擎开关增删。
-  assert.equal(ctx._tools.length, 1, '只注册一个模型可见工具')
-  assert.equal(ctx._tools[0].name, 'memory_lab_recall')
-  assert.deepEqual(Object.keys(ctx._tools[0].parameters.properties).sort(), ['budget_tokens', 'cursor', 'query', 'record_ids'])
-  assert.equal(ctx._tools[0].parameters.type, 'object')
-  assert.equal(ctx._tools[0].parameters.additionalProperties, false, '参数必须关死未知键')
-  assert.equal(typeof ctx._tools[0].execute, 'function', '工具必须自带 execute（只读路径）')
+  // v3 不注册模型可见工具（工具集恒定是缓存纪律，不是「暂时没做」）。
+  assert.equal(ctx._tools.length, 0, 'v3 单引擎不增删模型可见工具')
 
   // The whole point of the DSH-home fallback: no compatibility warning here.
-  assert.deepEqual(ctx._warnings, [], `the installed load must resolve dsh-memory cleanly, got: ${ctx._warnings.join(' | ')}`)
+  assert.deepEqual(ctx._warnings, [], `the installed load must resolve cleanly, got: ${ctx._warnings.join(' | ')}`)
 
-  // The client-facing view must be plain JSON with no undefined holes.
-  const projection = ctx._projections[0]
-  const view = projection.wire.view(projection.init())
-  // 视图契约以**工作区源码**为准，不以「安装态当前是什么版本」为准：
-  // 0.10.1 的旧用例把键清单写死在测试里，安装版一升级就必红（issue #2 同类）。
-  // 安装版与源码版本一致时做精确比对；不一致时只验 JSON 安全并跳过形状比对，
-  // 让开发态（安装包落后于源码）不产生假红，发布态仍能抓住字段漂移。
-  const workspaceManifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-  const installedManifest = JSON.parse(await readFile(path.join(path.dirname(installedEntry), '..', 'package.json'), 'utf8'))
-  const workspaceView = memoryContextLabProjection.wire.view(memoryContextLabProjection.init())
-  for (const [key, value] of Object.entries(view)) {
-    assert.notEqual(value, undefined, `${key} must not be undefined`)
-  }
-  assert.deepEqual(JSON.parse(JSON.stringify(view)), view)
-  if (installedManifest.version === workspaceManifest.version) {
-    assert.deepEqual(Object.keys(view).sort(), Object.keys(workspaceView).sort(), '安装版投影字段必须与工作区源码一致')
-  } else {
-    t.diagnostic(`installed ${installedManifest.version} != workspace ${workspaceManifest.version}；跳过字段清单精确比对`)
-  }
+  // 命令结果必须是宿主 CommandResult：返回裸字符串会被 normalizeResult 抛 TypeError。
+  const result = await ctx._commands[0].handler({
+    agent: { session: { id: 'install-test-session' } },
+    rawInput: 'status',
+  })
+  assert.equal(result.kind, 'success', `status 必须返回 CommandResult，实际：${JSON.stringify(result)}`)
+  assert.equal(typeof result.text, 'string')
+  assert.ok(result.text.length > 0)
 })
 
-test('拿不到 tools 服务时插件照常加载：只跳过工具注册并告警', async (t) => {
+test('不依赖 tools：拿不到 tools 服务时插件照常加载', async (t) => {
   if (!(await installedMatchesSource())) {
     return t.skip('profile 安装的版本与本仓源码不同（升级前），安装面断言留待安装后验证')
   }
   if (!(await exists(installedEntry))) return t.skip('not installed')
   const module = await import(pathToFileURL(installedEntry).href)
   const ctx = createStubContext({ withTools: false })
-  await module.apply(ctx)
+  await module.apply(ctx, {})
 
-  // 唯一命令、投影与全部钩子都必须在——插件不能因为缺 tools 整体挂掉。
+  // v3 根本不碰 tools：唯一命令与两个钩子必须在，且不应产生任何告警。
   assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
-  assert.deepEqual(ctx._projections.map((projection) => projection.key), ['memoryContextLab'])
-  assert.equal(ctx._listeners.get('agent/pre-step').length, 5)
-  assert.equal(ctx._tools.length, 0, '拿不到 tools 时不应注册工具')
-  assert.ok(
-    ctx._warnings.some((warning) => warning.includes('ctx.tools.register')),
-    `必须如实告警，实际告警：${ctx._warnings.join(' | ') || '(无)'}`,
-  )
+  assert.equal(ctx._projections.length, 1, '不依赖 tools 不影响状态投影注册')
+  assert.equal(ctx._listeners.get('agent/pre-step').length, 2)
+  assert.equal(ctx._tools.length, 0, 'v3 不注册工具')
+  assert.deepEqual(ctx._warnings, [], `v3 不依赖 tools，不应有告警：${ctx._warnings.join(' | ')}`)
 })
 
 test('不得读 ctx.config：config 只走 apply 的第二参数（0.9.0 加载失败回归）', async (t) => {
@@ -291,9 +294,9 @@ test('不得读 ctx.config：config 只走 apply 的第二参数（0.9.0 加载�
   if (!(await exists(installedEntry))) return t.skip('not installed')
 
   // 静态面：源码里任何 `ctx.config` 读取都是缺陷。宿主 cordis 的 context 代理对
-  // 未注入属性抛错（`cannot get property "config" without inject`），而本插件的
-  // `inject` 只有 commands/sessionProjections——读它等于让整个插件加载失败，
-  // 插件页显示「异常」。`?.` 拦不住代理抛错，所以这条只能靠不写来保证。
+  // 未注入属性抛错（`cannot get property "config" without inject`），而本插件
+  // `inject` 只有 commands——读它等于让整个插件加载失败，插件页显示「异常」。
+  // `?.` 拦不住代理抛错，所以这条只能靠不写来保证。
   const source = await readFile(path.join(path.dirname(installedEntry), 'index.mjs'), 'utf8')
   const offenders = source
     .split('\n')
@@ -305,21 +308,30 @@ test('不得读 ctx.config：config 只走 apply 的第二参数（0.9.0 加载�
   // 退回到 `ctx.config`，下面的 apply 就会当场炸掉，而不是静默通过。
   const module = await import(pathToFileURL(installedEntry).href)
   const ctx = createStubContext()
-  await module.apply(ctx)
+  await module.apply(ctx, {})
   assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
 })
 
 test('the installed host half registers a command that records its input', async (t) => {
+  // 与 test 2/3/4 同一道版本闸：安装副本落后于源码时，断言的是**另一个版本**的形态，
+  // 判红只会掩盖真正的回归（本组 0.13.1 就因为这道闸缺失，拿旧副本跑了新断言）。
+  if (!(await installedMatchesSource())) {
+    return t.skip('profile 安装的版本与本仓源码不同（升级前），安装面断言留待安装后验证')
+  }
   if (!(await exists(installedEntry))) return t.skip('not installed')
   const module = await import(pathToFileURL(installedEntry).href)
   const ctx = createStubContext()
   await module.apply(ctx)
   const command = ctx._commands[0]
   assert.equal(command.definitionId, 'dsh-memory-context-lab/control')
-  // `recordInput` must stay unset: the default writes the raw line to
-  // `command/run`, and the session projection folds exactly that record.
+  // `recordInput` 保持未设：默认行为会把整行写进 `command/run`。
   assert.equal(command.recordInput, undefined)
-  assert.ok(typeof command.input?.hint === 'string' && command.input.hint.includes('on'))
+  // hint 必须反映**现存**命令面（v2 的 on/off/restore 已随单引擎退场；
+  // 旧断言写的是 includes('on')，在 hint 里出现 'on' 纯属 'status' 里没有——
+  // 它当年能过，只是因为断言对象是 v2 的 hint）。
+  assert.ok(typeof command.input?.hint === 'string' && command.input.hint.includes('status'))
   assert.equal(typeof command.handler, 'function')
+  assert.equal(typeof command.description, 'string')
+  assert.ok(command.description.trim().length > 0, '宿主强制 description 非空')
 })
 

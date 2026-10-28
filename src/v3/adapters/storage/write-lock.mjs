@@ -25,6 +25,8 @@ const OWNER_FILE = 'owner.json'
 const DEFAULT_TTL_MS = 60000
 const DEFAULT_WAIT_MS = 5000
 const RETRY_BACKOFF_MS = 25
+/** 续约间隔：TTL 的三分之一（60s TTL → 20s 一次），足以在两次续约之间容忍一次抖动。 */
+const HEARTBEAT_INTERVAL_MS = Math.max(1000, Math.floor(DEFAULT_TTL_MS / 3))
 
 async function exists(p) {
   try { await stat(p); return true } catch { return false }
@@ -156,7 +158,9 @@ export async function withWriteLock(dir, body) {
   const inner = reentry.getStore()
   if (inner !== undefined && inner.has(dir)) return body()
   let chain = dirChains.get(dir) ?? Promise.resolve()
-  const run = chain.then(async () => reentry.run(new Set([dir]), body))
+  // 帧必须**继承上层已持有的目录**：旧实现只放当前 dir（`new Set([dir])`），
+  // A 锁 → B 锁 → 再 A 锁时 `has(A)` 为假，于是在同一条队列上等自己（自死锁）。
+  const run = chain.then(async () => reentry.run(new Set([...(inner ?? []), dir]), body))
   const next = run.then(() => {}, () => {})
   dirChains.set(dir, next)
   next.then(() => {
@@ -175,9 +179,15 @@ export async function withWriteLock(dir, body) {
 export async function withCrossProcessWriteLock(dir, body) {
   return withWriteLock(dir, async () => {
     const lock = await acquireWriteLock(dir)
+    // 事务期间必须**续约**：TTL 默认 60s，而一次回填批或索引重建可能更久。
+    // 旧实现从不调用 heartbeat，`owner.heartbeatAt` 恒等于 acquiredAt——超过 TTL 的
+    // 事务会被另一进程判定 stale 并接管，两个写者同时进临界区（且旧持有者不会停）。
+    const renew = setInterval(() => { lock.heartbeat().catch(() => {}) }, HEARTBEAT_INTERVAL_MS)
+    renew.unref?.()
     try {
       return await body()
     } finally {
+      clearInterval(renew)
       await lock.release().catch(() => {})
     }
   })

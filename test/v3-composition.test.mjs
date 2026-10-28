@@ -111,7 +111,8 @@ test('recall 检到；forget 后隐私面贯通', async () => {
     await runtime.lifecycle.forget({ recordIds: [applied.recordId] })
     const after = await runtime.recall({ query: '双槽 占位', turn: 2 })
     assert.equal(after.injected, false)
-    assert.equal(after.reason, '无命中', '遗忘后检索面不可见')
+    // 遗忘后整库无该词，检索面必须不可见；reason 现在会附带 OOV 披露（同一条事实更具体）
+    assert.match(after.reason, /^无命中/, '遗忘后检索面不可见')
   })
 })
 
@@ -132,4 +133,67 @@ test('executor 经真实 DSH 契约替换槽位；metrics 全程可见', async (
     assert.ok(snap.counters['v3.processTurn.applied'] >= 1)
     assert.ok(snap.counters['v3.t1.search'] >= 1 || snap.counters['v3.recall.injected'] >= 1 || true)
   })
+})
+
+test('T2 能力门：dsh-memory 工具面为 cg/stg 时如实回落 T1', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-v3-gate-'))
+  const dshSession = fakeDshSession()
+  const runtime = await createV3Runtime({
+    v3Root: root,
+    dshSession,
+    sessionKey: 's-gate',
+    memoryProbe: async () => ({
+      name: '@furongjun1999/dsh-memory',
+      version: '0.9.10',
+      tools: ['cg', 'stg'],
+      smokePassed: false,
+    }),
+  })
+  try {
+    assert.equal(runtime.providerDecision.tier, 'T1')
+    assert.match(runtime.providerDecision.reason, /缺必需工具/)
+    assert.equal(runtime.provider.capabilities().tier, 'T1')
+  } finally {
+    runtime.close()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+test('T2 已选中：摄入 applied 后把记录交给 provider.mirrorRecord', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-v3-t2-mirror-'))
+  const dshSession = fakeDshSession()
+  const mirrored = []
+  const fakeT2 = {
+    async search() { return { display: [], pack: [], dropped: [], oovTerms: [] } },
+    async read(id) { return { text: 't2 ' + id, record: { id, createdAt: 1 } } },
+    async health() { return { healthy: true } },
+    capabilities() { return { name: 'fake-t2', tier: 'T2' } },
+    mirrorRecord(record) { mirrored.push(record) },
+  }
+  const runtime = await createV3Runtime({
+    v3Root: root,
+    dshSession,
+    sessionKey: 's-t2',
+    memoryProbe: async () => ({
+      name: '@furongjun1999/dsh-memory',
+      version: '0.9.10',
+      tools: ['memory_store', 'memory_search', 'memory_read'],
+      smokePassed: true,
+    }),
+    t2ProviderFactory: async () => fakeT2,
+  })
+  try {
+    assert.equal(runtime.providerDecision.tier, 'T2')
+    const result = await runtime.handleDshEvent(
+      { seq: 0, type: 'user/message', at: 1, data: { source: { kind: 'user', form: null } } },
+      '需要镜像的正文',
+    )
+    assert.equal(result.status, 'applied')
+    assert.equal(mirrored.length, 1, 'applied 记录必须交给 T2 镜像')
+    assert.equal(mirrored[0].id, result.recordId)
+    assert.equal(mirrored[0].payload.text, '需要镜像的正文')
+  } finally {
+    runtime.close()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
 })

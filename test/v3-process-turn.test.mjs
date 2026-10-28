@@ -48,7 +48,7 @@ function fakeMetrics() {
   }
 }
 
-function userEvent(sourceKind = 'dsh') {
+function userEvent(sourceKind = 'user') {
   return { id: 'evt-1', type: 'user', sessionKey: 'sess-a', at: 1792845000000, source: { kind: sourceKind, form: null } }
 }
 

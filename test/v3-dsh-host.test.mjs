@@ -117,6 +117,15 @@ test('归一化：四类映射；system/head 拒绝；非法入参拒绝', () =>
   assert.equal(sys.ok, false)
   const noSeq = normalizeDshEvent({ type: 'user/message', data: {} }, 'sess-a')
   assert.equal(noSeq.ok, false)
+  // 宿主真实形状用 `time` 而不是 `at`（dsh-session append：{type, seq, time, data}）。
+  // 只读 `at` 会让每条归一化事件的 at 恒为 0——事件时间在入口就丢了。
+  const realShape = normalizeDshEvent({ seq: 10, type: 'user/message', time: 1792845000123, data: { source: { kind: 'user' } } }, 'sess-a')
+  assert.equal(realShape.ok, true)
+  assert.equal(realShape.event.at, 1792845000123, '真实宿主形状（time）必须被读取')
+  const legacyAt = normalizeDshEvent({ seq: 11, type: 'user/message', at: 42, data: { source: { kind: 'user' } } }, 'sess-a')
+  assert.equal(legacyAt.event.at, 42, 'at 保留为兼容旧夹具/旧格式')
+  const noTime = normalizeDshEvent({ seq: 12, type: 'user/message', data: { source: { kind: 'user' } } }, 'sess-a')
+  assert.equal(noTime.event.at, 0, '两者都缺失才回落 0（不猜）')
 })
 
 test('组合：真实形状下 surface-executor R4 全链路成立', async () => {

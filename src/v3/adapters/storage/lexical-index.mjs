@@ -90,6 +90,22 @@ export async function writeLexicalIndex(store, index) {
 }
 
 /** 读取索引；缺失返回 null（可重建），损坏抛 ESTORE_CORRUPT（不静默重建掩盖）。 */
+/**
+ * 索引文件戳（mtimeMs + size）：检索侧缓存解析结果的唯一判据。
+ * 索引是派生文件，写入走原子 rename——戳变化即「有别的写入者换了内容」。
+ * @returns {Promise<string>} 不存在返回 'absent'（与「读失败」区分）
+ */
+export async function indexStampOf(store) {
+  const { stat } = await import('node:fs/promises')
+  try {
+    const info = await stat(path.join(store.directory, INDEX_FILE))
+    return info.mtimeMs + ':' + info.size
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 'absent'
+    throw error
+  }
+}
+
 export async function readLexicalIndex(store) {
   let text
   try {

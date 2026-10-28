@@ -19,7 +19,7 @@
  *   - transactions.jsonl 解析失败（含尾部半行）→ 存储判 damaged：读允许、写拒绝，
  *     文件字节不动（disposition-integrity 保留判据：读路径不得改写日志）。
  */
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 
@@ -34,10 +34,22 @@ const FORGOTTEN_LOG = 'forgotten.jsonl'
 const RECORDS_DIR = 'records'
 const QUARANTINE_DIR = 'quarantine'
 
-/** 原子写：同目录 randomUUID 临时名 + rename（G8：禁止 tmp-<pid>-<Date.now()>）。 */
+/** 原子写：同目录 randomUUID 临时名 + fsync + rename（G8：禁止 tmp-<pid>-<Date.now()>）。
+ *
+ * fsync 不能省：rename 只是目录项操作，数据块可能还在页缓存里。断电后会出现
+ * 「文件名合法、内容 0 字节/半条」的记录文件——它会被 readdir 认成已提交记录，
+ * 然后在 readRecord 抛 ESTORE_CORRUPT，整个索引重建面被打挂。
+ * Windows 不支持目录 fsync，这里只保证文件内容落盘（目录项的持久化交给 NTFS 日志）。
+ */
 export async function writeFileAtomic(filePath, data) {
   const tmp = path.join(path.dirname(filePath), '.' + path.basename(filePath) + '.' + randomUUID() + '.tmp')
-  await writeFile(tmp, data, 'utf8')
+  const handle = await open(tmp, 'w')
+  try {
+    await handle.writeFile(data, 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
   try {
     await rename(tmp, filePath)
   } catch (error) {
@@ -124,11 +136,12 @@ export async function openV3SessionStore(root, sessionKey) {
   const vouchersParsed = await parseTxnLog(vouchersPath, VOUCHERS_LOG)
   const forgottenPath = path.join(dir, FORGOTTEN_LOG)
   const forgottenParsed = await parseTxnLog(forgottenPath, FORGOTTEN_LOG)
-  const forgotten = new Set(
-    forgottenParsed.lines
-      .filter((line) => line.action === 'forget' && typeof line.id === 'string')
-      .map((line) => line.id),
-  )
+  const forgotten = new Set()
+  for (const line of forgottenParsed.lines) {
+    if (typeof line.id !== 'string') continue
+    if (line.action === 'forget') forgotten.add(line.id)
+    else if (line.action === 'revoke') forgotten.delete(line.id)
+  }
 
   const committedIds = new Set()
   let maxTxn = 0
@@ -189,12 +202,15 @@ export async function openV3SessionStore(root, sessionKey) {
   const voucherLines = vouchersParsed.lines
   // 遗忘账本损坏（H-09）：前缀之外可能有 forget 行读不到，「哪些被遗忘」不可判定。
   // 此时读路径必须失败关闭——否则已遗忘正文重新可读（隐私面 fail-open）。
-  const forgottenDamaged = forgottenParsed.damaged
+  let forgottenDamaged = forgottenParsed.damaged
+  let forgottenReason = forgottenParsed.reason ?? null
+  // 文件戳：别的句柄/进程追加 forget 行后，本句柄必须能察觉（见 refreshForgotten）。
+  let forgottenStamp = await fileStampOf(forgottenPath)
   const health = () => ({
     healthy: !damaged && !vouchersDamaged && !forgottenDamaged,
     damagedReason: damaged
       ? reason
-      : (vouchersDamaged ? vouchersParsed.reason : (forgottenDamaged ? forgottenParsed.reason : null)),
+      : (vouchersDamaged ? vouchersParsed.reason : (forgottenDamaged ? forgottenReason : null)),
     txnNext: manifest.txnNext,
     recordCount: committedIds.size,
     orphanedAtOpen: orphaned,
@@ -204,10 +220,33 @@ export async function openV3SessionStore(root, sessionKey) {
     forgottenDamaged,
   })
 
+  /**
+   * 遗忘集合读前刷新（隐私面跨句柄一致性）。
+   *
+   * 遗忘集合在 open 时解析一次，之后只由本句柄的 `forget()` 追加。另一个句柄/进程
+   * forget 之后，本句柄的集合是旧的：`readRecord` 会把已遗忘正文照常返回，
+   * `rebuildIndex` 会把已遗忘记录重新写进索引——「已忘内容重新可见」。
+   * 判据用文件戳（mtimeMs+size），未变化时成本只有一次 stat。
+   */
+  async function refreshForgotten() {
+    const stamp = await fileStampOf(forgottenPath)
+    if (stamp === forgottenStamp) return
+    const parsed = await parseTxnLog(forgottenPath, FORGOTTEN_LOG)
+    forgotten.clear()
+    for (const line of parsed.lines) {
+      if (typeof line.id !== 'string') continue
+      if (line.action === 'forget') forgotten.add(line.id)
+      else if (line.action === 'revoke') forgotten.delete(line.id)
+    }
+    forgottenDamaged = parsed.damaged
+    forgottenReason = parsed.reason ?? null
+    forgottenStamp = stamp
+  }
+
   /** 遗忘账本损坏时的读闸：读不到 ≠ 没遗忘（隐私面失败关闭）。 */
   function assertForgottenReadable() {
     if (forgottenDamaged) {
-      throw v3Error('ESTORE_DAMAGED', 'forgotten.jsonl 损坏：' + forgottenParsed.reason + '（无法判定哪些记录已被遗忘，读路径失败关闭；修复后重开）')
+      throw v3Error('ESTORE_DAMAGED', 'forgotten.jsonl 损坏：' + (forgottenReason ?? '未给出原因') + '（无法判定哪些记录已被遗忘，读路径失败关闭；修复后重开）')
     }
   }
 
@@ -256,7 +295,14 @@ export async function openV3SessionStore(root, sessionKey) {
       if (!Array.isArray(records) || records.length === 0) {
         throw new V3ContractViolation('v3 store: 事务必须包含至少一条记录')
       }
-      for (const record of records) assertValidRecord(record)
+      for (const record of records) {
+        assertValidRecord(record)
+        // 写入侧也守会话归属：结构合法不等于属于本会话。放进来之后读路径才拒，
+        // 等于先污染再报错——账本里会永远躺着一条本会话无法解释的记录。
+        if (record.sessionKey !== sessionKey) {
+          throw v3Error('ESTORE_SESSION_MISMATCH', '记录 ' + record.id + ' 属于会话 ' + JSON.stringify(record.sessionKey) + '，拒绝写入本会话 ' + JSON.stringify(sessionKey))
+        }
+      }
       const ids = records.map((r) => r.id)
       // 已存在（已提交）的 ID → 冲突拒绝（重试须用新事务，不得覆盖）
       for (const id of ids) {
@@ -284,11 +330,39 @@ export async function openV3SessionStore(root, sessionKey) {
       return { txn, recordIds: [...ids] }
     },
 
+    /** 导入（M5 fork/share 的落地）：把外部脱敏包正文写成**新记录**，不保留外部 ID/事务号。 */
+    async importRecords(inputs) {
+      assertWritable()
+      if (!Array.isArray(inputs) || inputs.length === 0) {
+        throw new V3ContractViolation('v3 store: importRecords 必须是非空数组')
+      }
+      const at = Date.now()
+      const prepared = inputs.map((input, index) => {
+        const text = input?.payload?.text
+        if (typeof input?.kind !== 'string' || typeof text !== 'string') {
+          throw new V3ContractViolation('v3 store: importRecords 每条需要 kind 与 payload.text')
+        }
+        return {
+          id: 'v3r-' + randomUUID().replace(/-/g, '').slice(0, 16),
+          kind: input.kind,
+          sessionKey,
+          createdAt: at + index,
+          payload: { text, bytes: Buffer.byteLength(text, 'utf8') },
+          provenance: { sourceEventId: null, sourceForm: 'import', transactionId: 'import-' + randomUUID() },
+        }
+      })
+      return await this.submitTransaction(prepared, { at })
+    },
+
     /** 精确回读：JSON 解析失败或结构非法 → ESTORE_CORRUPT（失败关闭，不静默当空）。 */
     async readRecord(id) {
       if (typeof id !== 'string' || id.length === 0) {
         throw new V3ContractViolation('v3 store: id 必须是非空字符串')
       }
+      // 遗忘集合必须**读前刷新**：另一个句柄/进程刚 forget 过的记录，本句柄若只用手里的
+      // 旧集合判定，就会把已遗忘的正文照常返回——这是「已忘内容重新可见」的隐私回退。
+      // 判据用文件戳（mtime+size），没变化时只多一次 stat。
+      await refreshForgotten()
       assertForgottenReadable()
       if (forgotten.has(id)) {
         throw v3Error('EFORGOTTEN', '记录已遗忘：' + id + '（隐私面：不可按 ID 回读）')
@@ -316,6 +390,11 @@ export async function openV3SessionStore(root, sessionKey) {
       if (!validation.ok) {
         throw v3Error('ESTORE_CORRUPT', '记录 ' + id + ' 结构非法：' + validation.errors.join('；'))
       }
+      // 跨会话记录不得被当作本会话事实：记录被拷进来/ID 被换成另一条合法记录时，
+      // 结构性校验照样通过。会话隔离是硬不变量，读路径必须自己确认归属。
+      if (record.sessionKey !== sessionKey) {
+        throw v3Error('ESTORE_SESSION_MISMATCH', '记录 ' + id + ' 属于会话 ' + JSON.stringify(record.sessionKey) + '，不是本会话 ' + JSON.stringify(sessionKey))
+      }
       return record
     },
 
@@ -324,6 +403,12 @@ export async function openV3SessionStore(root, sessionKey) {
     /** 追加恢复凭证：归档裁决的 durable 映射（recordIds ↔ targetEventId ↔ 回执正文）。 */
     async appendVoucher(voucher) {
       assertWritable()
+      // 账本自己损坏时拒绝追加：新行会落在坏行之后，解析器遇首个坏行即停，
+      // 于是「写成功、永不可读」，而健康面还报 healthy。账本不可判定 = 不许产生新事实。
+      // 注意这**只**挡凭证写入：记录写入与遗忘账本是独立故障面（H-09 口径）。
+      if (vouchersDamaged) {
+        throw v3Error('ESTORE_DAMAGED', 'vouchers.jsonl 损坏（' + (vouchersParsed.reason ?? '未给出原因') + '）：拒绝追加凭证，修复后重开')
+      }
       if (voucher === null || typeof voucher !== 'object') {
         throw new V3ContractViolation('v3 store: voucher 必须是对象')
       }
@@ -335,11 +420,26 @@ export async function openV3SessionStore(root, sessionKey) {
       if (!Array.isArray(voucher.recordIds) || voucher.recordIds.some((id) => typeof id !== 'string' || id.length === 0)) {
         throw new V3ContractViolation('v3 store: voucher.recordIds 必须是非空字符串组成的数组')
       }
-      if (typeof voucher.targetEventId !== 'string' || voucher.targetEventId.length === 0) {
-        throw new V3ContractViolation('v3 store: voucher.targetEventId 必须是非空字符串')
+      // v2：历史 span 回执用数字 seq；v1 的 surface 恢复凭证用字符串事件 ID。
+      const target = voucher.targetEventId
+      const targetOk = (typeof target === 'string' && target.length > 0)
+        || (Number.isInteger(target) && target >= 1)
+      if (!targetOk) {
+        throw new V3ContractViolation('v3 store: voucher.targetEventId 必须是非空字符串或 ≥1 的整数 seq')
       }
       if (typeof voucher.receiptText !== 'string' || voucher.receiptText.length === 0) {
         throw new V3ContractViolation('v3 store: voucher.receiptText 必须是非空字符串')
+      }
+      for (const key of ['sourceEventSeqs', 'startSeq', 'endSeq']) {
+        if (voucher[key] === undefined) continue
+        if (key === 'sourceEventSeqs') {
+          if (!Array.isArray(voucher.sourceEventSeqs)
+            || voucher.sourceEventSeqs.some((seq) => !Number.isInteger(seq) || seq < 0)) {
+            throw new V3ContractViolation('v3 store: voucher.sourceEventSeqs 必须是非负整数数组')
+          }
+        } else if (!Number.isInteger(voucher[key]) || voucher[key] < 0) {
+          throw new V3ContractViolation('v3 store: voucher.' + key + ' 必须是非负整数')
+        }
       }
       if (!Number.isInteger(voucher.txn) || voucher.txn < 1) {
         throw new V3ContractViolation('v3 store: voucher.txn 必须是 ≥1 整数')
@@ -361,6 +461,7 @@ export async function openV3SessionStore(root, sessionKey) {
       return voucherLines.map((voucher) => ({
         ...voucher,
         recordIds: Array.isArray(voucher.recordIds) ? [...voucher.recordIds] : voucher.recordIds,
+        ...(Array.isArray(voucher.sourceEventSeqs) ? { sourceEventSeqs: [...voucher.sourceEventSeqs] } : {}),
       }))
     },
 
@@ -405,6 +506,10 @@ export async function openV3SessionStore(root, sessionKey) {
     /** 主动遗忘：幂等（重复遗忘同一 ID 不报错不重复记账）；未提交过的 ID 拒绝。 */
     async forget(id) {
       assertWritable()
+      // 同上：向已损坏的遗忘账本追加只会产生不可读行（遗忘不生效但看着像成功）
+      if (forgottenDamaged) {
+        throw v3Error('ESTORE_DAMAGED', 'forgotten.jsonl 损坏（' + (forgottenReason ?? '未给出原因') + '）：拒绝追加遗忘，修复后重开')
+      }
       if (typeof id !== 'string' || id.length === 0) {
         throw new V3ContractViolation('v3 store: forget 的 id 必须是非空字符串')
       }
@@ -418,11 +523,39 @@ export async function openV3SessionStore(root, sessionKey) {
       return { forgottenCount: forgotten.size }
     },
 
+    /**
+     * 撤销遗忘（M3）：追加 `action:'revoke'` 行；幂等（未遗忘时无操作）。
+     * 不物理删除记录；读路径按账本顺序让 revoke 覆盖 forget。
+     */
+    async revokeForget(id) {
+      assertWritable()
+      if (forgottenDamaged) {
+        throw v3Error('ESTORE_DAMAGED', 'forgotten.jsonl 损坏（' + (forgottenReason ?? '未给出原因') + '）：拒绝撤销，修复后重开')
+      }
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new V3ContractViolation('v3 store: revokeForget 的 id 必须是非空字符串')
+      }
+      if (!committedIds.has(id)) {
+        throw v3Error('ESTORE_TXN_CONFLICT', '撤销遗忘目标不存在或未提交：' + id)
+      }
+      if (forgotten.has(id)) {
+        await appendLine(forgottenPath, { action: 'revoke', id, at: null })
+        forgotten.delete(id)
+      }
+      return { forgottenCount: forgotten.size }
+    },
+
     /** 列已遗忘 ID；账本损坏 → ESTORE_DAMAGED（与 listVouchers 同口径，不静默当空）。 */
     listForgotten() {
       assertForgottenReadable()
       return [...forgotten]
     },
+
+    /**
+     * 读前刷新遗忘集合（跨句柄一致性）。索引重建必须调用它：
+     * 否则另一个句柄刚 forget 的记录会被重新写进索引，检索面重新可见。
+     */
+    refreshForgotten,
 
     // H-10-b：跨进程锁内的增量视图同步——重读事务日志，把其他句柄/进程
     // 提交的新 commit 行并入本句柄内存视图（committedIds/maxTxn 纯增量，不清不改）。
@@ -461,6 +594,21 @@ async function fileExists(filePath) {
     return true
   } catch {
     return false
+  }
+}
+
+/**
+ * 文件戳（mtimeMs + size）：用来判「别的句柄有没有改过这本账」。
+ * 文件不存在也是一种稳定状态（'absent'），不能返回 null 让调用方无法区分。
+ */
+async function fileStampOf(filePath) {
+  const { stat } = await import('node:fs/promises')
+  try {
+    const info = await stat(filePath)
+    return info.mtimeMs + ':' + info.size
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 'absent'
+    throw error
   }
 }
 
