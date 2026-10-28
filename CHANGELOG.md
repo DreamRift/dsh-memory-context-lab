@@ -17,7 +17,8 @@
 - **P2 验证工具链**：删除已失效的 v2 工具 schema 探针（`src/v2/tool.mjs` 不存在）与未使用的 `lock-child.mjs`；`probe:host` 改为**宿主契约源码探针**（CommandResult / decision.messages / surfaceOp / toolCallId / sourceEventSeqs），6/6 PASS。`resolveT2Isolated` 增补 `$DSH_HOME/profiles/*` 搜索，源码树 `node scripts/t2-smoke.mjs` 无需 `--repo` 即可通过（0.9.10 / cg,stg）。
 - **P2 `planfirst approve` 展开风险**：`Math.max(...nodes)` 改为单遍循环，避免大活动面 `RangeError`。
 - **验证**：源码线 `node scripts/test-all.mjs` **96 套 / 435 通过 / 0 失败 / 4 skip**（安装前，4 条为安装面断言）；安装 beta.44 后 release 自测 **96 套 / 439 用例 / 439 通过 / 0 失败 / 0 skip**；`probe:host` 6/6；`t2-smoke` 通过；`check-docs` 0；新增 `v3-archive-event-shape`、`v3-autorestore`、`v3-number-input`、`v3-cooling-gate`，并加强 `v3-step-cooling`/`v3-client-chip`/`v3-ingest-redaction`/`v3-session-mode`/`v3-t2-environment`。
-- **未做**：未安装到 profile、未重启 DSH、未推送、未打 tag；真实会话的命令面/UI 点击待重启后复验。
+- **发布**：GitHub `DreamRift/dsh-memory-context-lab` tag `v0.14.0-beta.44`（commit `e4f36b9`）；Release（Pre-release）asset `dsh-memory-context-lab-0.14.0-beta.44.tgz`——78 files / 277,060 B / sha256 `adf501b0ed13fc6ebb7c774e79e3d4aec310b3daf7296404eaf3b598df0bf95e`；profile 已安装同 tgz（`src/` 63/63 逐字节一致）。
+- **未做**：未重启 DSH（运行中的实例仍是 beta.43 内存态）；真实会话的命令面/UI 点击待重启后复验。
 
 ## 0.14.0-beta.43（2026-10-28，测试版；切模式确认块收敛：没有归档就不问、按钮靠右、文案纠偏）
 
