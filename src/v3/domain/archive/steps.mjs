@@ -82,7 +82,16 @@ export function buildStepUnits(events) {
  * @param {Set<number>} [input.pinnedSeqs] pin 的 seq（整步边界）
  * @returns {null | {startSeq:number,endSeq:number,sourceEventSeqs:number[],recordSeqs:number[],operations:number,steps:number}}
  */
-export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set() } = {}) {
+export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), onReject = null } = {}) {
+  // 拒绝出口与回合级同形（0.14.0-beta.45）：契约仍是 null，原因只走观察回调。
+  const reject = (row) => {
+    // 兼容传裸字符串的调用点：原因码永远不丢（宁可归一化，也不让 UI 印出 undefined）。
+    const rejection = typeof row === 'string' ? { reason: row } : row
+    if (typeof onReject === 'function') {
+      try { onReject(rejection) } catch { /* 观察面不得左右判据 */ }
+    }
+    return null
+  }
   if (!Array.isArray(surfaceNodes) || !Array.isArray(events)) {
     throw new V3ContractViolation('v3 archive/steps: surfaceNodes/events 必须是数组')
   }
@@ -92,42 +101,49 @@ export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 
     .filter((unit) => unit.complete === true)
     .map((unit) => ({ ...unit, surfaceSeqs: unit.seqs.filter((seq) => onSurface.has(seq)) }))
     .filter((unit) => unit.surfaceSeqs.length > 0)
-  if (units.length === 0) return null
+  if (units.length === 0) return reject({ reason: 'no-completed-step' })
   const keep = Math.max(1, Number.isInteger(retainSteps) ? retainSteps : 4)
   const eligible = units.slice(0, Math.max(0, units.length - keep))
-  if (eligible.length === 0) return null
+  if (eligible.length === 0) return reject({ reason: 'retention-window', retained: units.length })
   const limit = Math.max(1, Number.isInteger(maxSteps) ? maxSteps : 3)
   const selected = []
   let turn = null
+  // 与回合级一致：break 只是「不再往后拼」，已选中的步骤照常压；
+  // 诊断只在一步都没选到时上报。
+  let stop = null
   for (const unit of eligible) {
     if (selected.length >= limit) break
     // 跨回合即停：回合锚点（用户消息/运行期上下文）绝不能被卷进 span。
     if (turn === null) turn = unit.turn
-    else if (unit.turn !== turn) break
+    else if (unit.turn !== turn) { stop = { reason: 'turn-boundary', seq: unit.startSeq }; break }
     // 前导锚点（用户消息所在的 step 1）只跳过，不阻断后续步骤：真实 DSH 的
     // user/message 就在 step 1 里（step/start 先于 user/message），若在这里 break，
     // 按步归档永远到不了第 2 步。一旦已经开始选步，锚点仍是硬边界（不能跨过它拼接）。
-    if (unit.hasPlugin || unit.hasUnfinished === true) break
+    if (unit.hasPlugin) { stop = { reason: 'plugin-boundary', seq: unit.endSeq }; break }
+    if (unit.hasUnfinished === true) { stop = { reason: 'unfinished-tool', seq: unit.endSeq }; break }
     if (unit.hasHuman) {
       if (selected.length === 0) continue
+      stop = { reason: 'turn-anchor', seq: unit.startSeq }
       break
     }
-    if (unit.surfaceSeqs.some((seq) => pinnedSeqs.has(seq))) break
-    if (unit.surfaceSeqs.some((seq) => !unit.transient.includes(seq) && !hasRecord(seq))) break
+    const pinned = unit.surfaceSeqs.filter((seq) => pinnedSeqs.has(seq))
+    if (pinned.length > 0) { stop = { reason: 'pinned', seqs: pinned, count: pinned.length }; break }
+    const missing = unit.surfaceSeqs.filter((seq) => !unit.transient.includes(seq) && !hasRecord(seq))
+    if (missing.length > 0) { stop = { reason: 'missing-record', seqs: missing, count: missing.length }; break }
     selected.push(unit)
   }
-  if (selected.length === 0) return null
+  if (selected.length === 0) return reject(stop ?? { reason: 'no-candidate' })
   const wanted = selected.flatMap((unit) => unit.surfaceSeqs)
   const startSeq = wanted[0]
   const endSeq = wanted[wanted.length - 1]
   const startIdx = surfaceNodes.indexOf(startSeq)
   const endIdx = surfaceNodes.indexOf(endSeq)
-  if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return null
+  if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
   const shadowed = surfaceNodes.slice(startIdx, endIdx + 1)
   // 必须密集覆盖且顺序一致：宿主 range replace 的硬前提，也保证不会吞掉锚点。
-  if (shadowed.length !== wanted.length || shadowed.some((seq, index) => seq !== wanted[index])) return null
+  if (shadowed.length !== wanted.length || shadowed.some((seq, index) => seq !== wanted[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
   const transient = new Set(selected.flatMap((unit) => unit.transient))
   const recordSeqs = shadowed.filter((seq) => !transient.has(seq))
-  if (recordSeqs.length === 0) return null
+  if (recordSeqs.length === 0) return reject({ reason: 'empty-records', seqs: shadowed, count: shadowed.length })
   return { startSeq, endSeq, sourceEventSeqs: shadowed, recordSeqs, operations: selected.length, steps: selected.length }
 }

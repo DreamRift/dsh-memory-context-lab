@@ -49,18 +49,17 @@ test('pre-step：full-history 新会话归档第一个完成操作并推进 stat
     assert.equal(engine.statusOf('session-fake').mode, 'full-history')
     assert.deepEqual(await session.surface.nodes, [0, 1, 2], '首次 pre-step 不归档（entry 尚未就绪）')
 
-    // 读租约：最近读过 assistant1 的记录在 TTL 内保护整个完成操作。
+    // 读租约（AUD-09，0.14.0-beta.45）：租约只保护**工作集**——按轮归档只压已完成回合，
+    // 当前回合本就被排除，所以租约不得再把上一轮钉住（旧行为会钉最长 5 分钟）。
+    // 显式 pin 仍是硬边界，见 test/v3-archive-lease.test.mjs。
     const beforeLease = await engine.workingSet('session-fake')
     const assistantRow = beforeLease.rows.find((row) => row.seq === 1)
     assert.ok(assistantRow, '第一答应有记录')
     await engine.setState('session-fake', { readLease: [{ recordId: assistantRow.recordId, expiresAt: Date.now() + 60000 }] })
-    const leased = await engine.archiveForStep('session-fake', session, {})
-    assert.equal(leased.status, 'no-candidate', '读租约内的操作不得归档')
-    await engine.setState('session-fake', { readLease: [] })
 
     // 直接调 engine.archiveForStep（index.mjs 的 pre-step 只是这个用例的调度壳）。
     const archived = await engine.archiveForStep('session-fake', session, {})
-    assert.equal(archived.status, 'archived', JSON.stringify(archived))
+    assert.equal(archived.status, 'archived', '读租约不得钉住已完成回合：' + JSON.stringify(archived))
     const nodes = await session.surface.nodes
     assert.deepEqual(ctx.warnings, [], '归档不得告警失败')
     assert.equal(nodes.length, 2, '回执替换了第一个完成操作的两个节点；nodes=' + JSON.stringify(nodes))

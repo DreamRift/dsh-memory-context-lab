@@ -362,12 +362,26 @@ export function attachV3Engine(ctx, options = {}) {
    * 每步归档评估（M2）：只做一次有界 span，失败只告警、不阻塞用户回合。
    * recall-only / plan-first / cooling 未开闸 → no-op。
    */
-  function pinnedSeqsOf(entry, state) {
+  /**
+   * 归档保护集。两种保护语义不同，**不得混用**（0.14.0-beta.45，AUD-09）：
+   *
+   * - **显式 pin**（`/memory-lab pin`）= 用户意图，永久硬边界，两种归档都挡；
+   * - **读租约**（回注/显式 read 写的 TTL 租约）= 「刚读过，先别折叠」，只对
+   *   **当前工作集**有意义。按轮归档只压已完成回合，当前回合本就被排除，
+   *   把租约当整组硬边界会让上一轮被钉住最长 5 分钟——这正是 AUD-09 的
+   *   「新一轮开头占用不降、过几分钟突然掉一大截」。
+   *
+   * 因此 `includeLease` 由调用方按模式给：按轮归档 `false`，按步归档 `true`
+   * （步骤级会压当前回合内的旧步骤，刚读过的记录确实不能撤）。
+   */
+  function pinnedSeqsOf(entry, state, { includeLease = true } = {}) {
     const pinned = new Set()
     const now = Date.now()
     const protectedIds = new Set(Array.isArray(state?.pins) ? state.pins : [])
-    for (const lease of state?.readLease ?? []) {
-      if (typeof lease?.recordId === 'string' && Number.isFinite(lease?.expiresAt) && lease.expiresAt > now) protectedIds.add(lease.recordId)
+    if (includeLease) {
+      for (const lease of state?.readLease ?? []) {
+        if (typeof lease?.recordId === 'string' && Number.isFinite(lease?.expiresAt) && lease.expiresAt > now) protectedIds.add(lease.recordId)
+      }
     }
     if (protectedIds.size === 0) return pinned
     for (const [seq, recordId] of entry.seqToRecordId) {
@@ -442,7 +456,8 @@ export function attachV3Engine(ctx, options = {}) {
         seqToRecordId: entry.seqToRecordId,
         retainSteps: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 4,
         maxSteps: 3,
-        pinnedSeqs: pinnedSeqsOf(entry, state),
+        // 按步归档在**当前回合内**压缩：刚读过的记录必须留在工作集里（租约生效）。
+        pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
         summary: options?.compact === true,
         txn: 1,
       })
@@ -455,7 +470,8 @@ export function attachV3Engine(ctx, options = {}) {
         retainOperations: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 5,
         lastArchiveEndSeq: Number.isInteger(state.surface?.lastArchiveEndSeq) ? state.surface.lastArchiveEndSeq : -1,
         maxOperations: 1,
-        pinnedSeqs: pinnedSeqsOf(entry, state),
+        // 按轮归档只压已完成回合（当前回合已排除）：读租约不再钉住上一轮（AUD-09）。
+        pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: false }),
         minStartSeq: Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1,
         summary: options?.compact === true,
         txn: 1,
@@ -497,9 +513,9 @@ export function attachV3Engine(ctx, options = {}) {
         seqToRecordId: entry.seqToRecordId,
         retainSteps: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 4,
         maxSteps: 3,
-        pinnedSeqs: pinnedSeqsOf(entry, state),
+        pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
       })
-      if (planned === null) return { status: 'no-candidate' }
+      // 预期与真实执行同一份判据：no-candidate 的 reason 由选择器给出，原样透出。
       return { status: planned.status ?? 'planned', ...planned }
     }
     return await entry.archive.dryRun({
@@ -511,7 +527,8 @@ export function attachV3Engine(ctx, options = {}) {
       retainOperations: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 5,
       lastArchiveEndSeq: Number.isInteger(state.surface?.lastArchiveEndSeq) ? state.surface.lastArchiveEndSeq : -1,
       maxOperations: 1,
-      pinnedSeqs: pinnedSeqsOf(entry, state),
+      // 与 archiveForStep 的按轮分支同口径（AUD-09）：租约只保护工作集，不挡已完成回合。
+      pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: false }),
       minStartSeq: Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1,
     })
   }

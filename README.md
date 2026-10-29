@@ -4,7 +4,7 @@
 
 插件只改模型可见的**投影**，不改写 DSH 的 append-only 会话日志与命令审计。原始历史始终留在会话日志里，回执可按凭证恢复。
 
-> 当前源码版本 0.14.0-beta.44（测试版）。
+> 当前源码版本 0.14.0-beta.45（测试版）。
 
 ## 功能
 
@@ -14,20 +14,17 @@
   - **按轮归档**：回合结束后压缩已完成回合，适合长程多轮；
   - **按步归档**：同一回合内实时压缩已完成且不在工作集的旧步骤，适合长步数任务，受上下文占用闸门控制。
 - **可恢复**：每次压缩生成带记录 ID / 原序号的回执；`/memory-lab restore [序号|all]` 按回执正文定位并恢复原文。
-- **保护边界**：当前回合/步骤、未完成工具对、插件回执、pin 记录与最近读取租约不会被压缩。
+- **保护边界**：当前回合/步骤、未完成工具对、插件回执、pin 记录不会被压缩；读租约只保护当前工作集（按步归档），不拖住已完成的上一轮。
 - **T1 / T2 双后端**：默认本地 Node store + 词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10 且 Python 可用时，按会话启动独立 `MDCG_ROOT` 的隔离 MCP（T2），检索融合本地与隔离灵枢；T2 不可用时如实回 T1。
 - **图形入口**：composer 工具行 chip + 弹层控制本对话启用/回注/计划/模式/条数；全局参数在插件设置页。
 - **可观测**：`/memory-lab status | t2 | history | working-set | file-status` 只读查看摄入、索引、归档、T2 与回注观测。
 
-## 0.14.0-beta.44 更新（相比 beta.43）
+## 0.14.0-beta.45 更新（相比 beta.44）
 
-- 归档选择器适配真实宿主的 `tool/result` 形状（callId 在 `data.message.toolCallId` / `data.message.source.callId`），修复工具会话里按轮/按步归档不生效。
-- 按步归档遇到 step 1 内的用户消息时跳过该前导整步，不再阻断后续步骤。
-- `autoRestore` 读取当前全局设置；停用恢复不再使用建库时快照。
-- 新增 `surface.lastArchiveAt`，状态行/切模式确认/投影可感知按步归档；按步归档不写回合级 `lastArchiveEndSeq`。
-- `status` 的「下一次归档」与真实执行共用冷却闸门；`control.json` 损坏按会话默认失败关闭；数字参数只接受十进制整数。
-- 工具结果脱敏补充 AWS / GitHub / Slack / Google / Stripe / JWT 常见格式。
-- `probe:host` 改为宿主契约源码探针；T2 环境解析支持 `$DSH_HOME/profiles/*`。
+- 修复会话级「按步归档闸门」覆盖在 composer 弹层不可见：状态投影与覆盖键集合同源（`limit` + `gate`），写入的值能回显、清空能真正移除覆盖。
+- 按轮归档不再被读租约钉住：回注命中的上一轮在下一个 pre-step 照常归档，不再等 5 分钟；按步归档与显式 `pin` 的保护不变。
+- `/memory-lab status` 的「下一次归档」、`now`、`dry-run` 直接说明没归档的原因（当前回合 / 工作集 / pin / 无记录 / 未完成工具 / 不连续）。
+- 状态行「生效回注设置」显示会话覆盖的闸门，不再恒为全局默认 20%。
 
 完整历史见 [CHANGELOG](./CHANGELOG.md)。
 
@@ -46,7 +43,7 @@
 
 ```text
 cd "$DSH_HOME/profiles/<profile>"
-pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.44.tgz"
+pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.45.tgz"
 ```
 
 或把 tgz 路径写进 profile 的 `package.json` 后执行 `pnpm install`。安装后**重启 DSH**，服务端半才会加载新版本；客户端半在页面刷新后重新装配。

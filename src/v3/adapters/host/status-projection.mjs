@@ -34,12 +34,20 @@
  * 见 `dsh-session-projection/lib/index.js`。这里用最小的严格校验器（不引入 zod 依赖）：
  * 任一字段不合法即抛 TypeError——失败关闭，不静默归一。state 拒绝多余字段，正是为了
  * 钉住「引擎计数不得进 state」这条不变量（测试 `v3-client-dock` 会改回去必红）。
+ *
+ * `control.overrides` 的键集合必须与 domain 真源**逐键相等**（AUD-01 的守卫面）：
+ * 少一个键客户端就永远读不到该覆盖；多一个键则说明有人又写了一份白名单。
  */
+import { SESSION_OVERRIDE_KEYS } from '../../domain/session/session-control.mjs'
 
 /** 投影 key（客户端 `useProjection` 读同一个字符串；测试交叉核对）。 */
 export const STATUS_PROJECTION_KEY = 'memoryContextLabStatus'
-/** 状态结构变化时递增；检查点版本不匹配会被宿主丢弃并重折。 */
-export const STATUS_PROJECTION_VERSION = 1
+/**
+ * 状态结构变化时递增；检查点版本不匹配会被宿主丢弃并重折。
+ * v2（0.14.0-beta.45）：`control.overrides` 增加 `gate` 键（AUD-01）。
+ * 旧检查点只有 `{sessionId, tick}`，重折无成本，故直接丢弃重建。
+ */
+export const STATUS_PROJECTION_VERSION = 2
 
 /** 视图允许的状态枚举（封闭集；未知状态按 failed 处理，不伪装成 ready）。 */
 const VIEW_STATES = new Set(['ready', 'pending', 'absent', 'failed', 'unavailable'])
@@ -68,8 +76,16 @@ const nullableInt = (value, minimum) => (Number.isInteger(value) && value >= min
 const nullableNumber = (value) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null)
 const nullableString = (value) => (typeof value === 'string' && value.length > 0 ? value : null)
 
-/** 会话控制的客户端视图：四项数值覆盖固定为 null（未覆盖）或数字。 */
-const CONTROL_KEYS = Object.freeze(['limit'])
+/**
+ * 会话控制的客户端视图：每个可覆盖项固定为 null（未覆盖）或数字。
+ *
+ * **键集合只有一个真源**（AUD-01，0.14.0-beta.45）：直接复用 domain 的
+ * `SESSION_OVERRIDE_KEYS`。旧实现自己写死 `['limit']`，于是会话级 `gate`
+ * 已写进 `control.json` 并真实生效，投影却把它静默丢掉——弹层永远显示「跟随全局」。
+ * 新增覆盖项只改 `session-control.mjs` 的 `SESSION_OVERRIDE_BOUNDS`，这里自动跟上。
+ */
+export const PROJECTION_CONTROL_KEYS = SESSION_OVERRIDE_KEYS
+const CONTROL_KEYS = PROJECTION_CONTROL_KEYS
 function controlViewOf(raw) {
   const overrides = Object.fromEntries(CONTROL_KEYS.map((key) => [key, null]))
   const out = { enabled: true, recall: true, overrides, error: null }
@@ -194,8 +210,10 @@ export const statusViewSchema = Object.freeze({
     if (control.overrides === null || typeof control.overrides !== 'object' || Array.isArray(control.overrides)) {
       invalid('view.control.overrides', control.overrides)
     }
-    if (Object.keys(control.overrides).length !== CONTROL_KEYS.length || !CONTROL_KEYS.every((key) => Object.hasOwn(control.overrides, key))) {
-      invalid('view.control.overrides.keys', Object.keys(control.overrides))
+    // 键集合必须与真源逐键相等：长度相等 + 全部在册（不依赖硬编码的两键字面量）。
+    const overrideKeys = Object.keys(control.overrides)
+    if (overrideKeys.length !== CONTROL_KEYS.length || !CONTROL_KEYS.every((key) => Object.hasOwn(control.overrides, key))) {
+      invalid('view.control.overrides.keys', overrideKeys)
     }
     for (const key of CONTROL_KEYS) {
       const entry = control.overrides[key]

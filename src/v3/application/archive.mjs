@@ -22,6 +22,16 @@ function textOfRecord(record) {
   return typeof text === 'string' ? text : ''
 }
 
+/**
+ * 「没有候选」也是一个**结果**，不是空值（0.14.0-beta.45，AUD-09 附带项）：
+ * 带上选择器给的 reason，status 才能说清是当前回合 / 工作集 / pin / 无记录 / 未完成工具对，
+ * 而不是只印一句「暂无可归档」，让用户只能靠反推。
+ */
+function noCandidate(rejection) {
+  const reason = typeof rejection?.reason === 'string' && rejection.reason.length > 0 ? rejection.reason : 'no-candidate'
+  return { ...(rejection ?? {}), status: 'no-candidate', reason }
+}
+
 export function createArchiveService({ store, host, clock, intent = null } = {}) {
   if (store === null || typeof store !== 'object') throw new V3ContractViolation('v3 archive: 需要 store')
   if (host === null || typeof host !== 'object') throw new V3ContractViolation('v3 archive: 需要 host')
@@ -42,6 +52,8 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
   async function plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, summary = false }) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
+    // 拒绝原因（AUD-09 附带项）：选择器只回 null，原因经 onReject 带出，供 status 直读。
+    let rejection = null
     const span = selectArchiveSpan({
       surfaceNodes,
       events,
@@ -52,8 +64,9 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       pinnedSeqs,
       minStartSeq,
       hasRecord: (seq) => seqToRecordId.has(seq),
+      onReject: (row) => { rejection = rejection ?? row },
     })
-    if (span === null) return null
+    if (span === null) return noCandidate(rejection)
     return await makePlan(span, { summary, seqToRecordId })
   }
 
@@ -82,6 +95,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
   async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), summary = false } = {}) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
+    let rejection = null
     const span = selectStepSpan({
       surfaceNodes,
       events,
@@ -89,15 +103,16 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       maxSteps,
       pinnedSeqs,
       hasRecord: (seq) => seqToRecordId.has(seq),
+      onReject: (row) => { rejection = rejection ?? row },
     })
-    if (span === null) return null
+    if (span === null) return noCandidate(rejection)
     return await makePlan(span, { summary, seqToRecordId })
   }
 
   /** 只预览，不触碰 surface/store。 */
   async function dryRun(input) {
     const planned = await plan(input)
-    if (planned === null) return { status: 'no-candidate' }
+    if (planned === null) return { status: 'no-candidate', reason: 'no-candidate' }
     return { status: planned.status ?? 'planned', ...planned }
   }
 
@@ -119,8 +134,9 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
 
   /** 落面 + 记 voucher（失败保留 intent，绝不假装成功）。 */
   async function commitPlanned({ sessionId, planned, txn = 1 }) {
-    if (planned === null) return { status: 'no-candidate' }
-    if (planned.status === 'failed' || planned.status === 'not-worth') return planned
+    if (planned === null) return { status: 'no-candidate', reason: 'no-candidate' }
+    // no-candidate 现在带 reason（选择器拒绝原因），必须原样透传，不能在这里重新拼成空对象。
+    if (planned.status === 'no-candidate' || planned.status === 'failed' || planned.status === 'not-worth') return planned
     const intent = {
       schemaVersion: 1,
       sessionId,

@@ -755,7 +755,9 @@ export async function apply(ctx, config) {
       + ' 字符；查询上限 ' + settings.queryMaxChars + ' 字符'
       + '；全历史默认 ' + (settings.fullHistory === false ? '关' : '开')
       + '；计划先行默认 ' + (settings.planFirst === true ? '开' : '关')
-      + '；按步闸门 ' + (Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20) + '%'
+      // 合并后的设置里字段名是 gate；直接读 coolingGate 会恒回落 20%，把会话覆盖显示错（AUD-04）。
+      + '；按步闸门 ' + (Number.isFinite(settings.gate) ? settings.gate
+        : (Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20)) + '%'
       + '；停用恢复 ' + (settings.autoRestore === false ? '关' : '开')
   }
 
@@ -780,6 +782,41 @@ export async function apply(ctx, config) {
     return parts.join('；')
   }
 
+  /**
+   * 归档选择器拒绝原因 → 中文说明（0.14.0-beta.45，AUD-09 附带项）。
+   * 选择器只给机器码，这里只做展示；未知码原样印出，不吞掉新原因。
+   */
+  const ARCHIVE_REASON_LABELS = Object.freeze({
+    'recall-only': '仅回注模式不归档',
+    'no-completed-group': '只有当前回合（当前回合永不归档）',
+    'no-completed-step': '没有完整步骤',
+    'retention-window': '候选都在工作集保留范围内',
+    'turn-boundary': '下一组属于别的回合（不跨回合）',
+    'turn-anchor': '用户消息锚点不能进 span',
+    'plugin-boundary': '插件回执/恢复节点是整组硬边界',
+    'unfinished-tool': '有未完成的工具调用',
+    pinned: '被 pin 保护',
+    'missing-record': '有活动面节点没有记录',
+    'not-dense': '活动面不连续',
+    'empty-records': '整段没有可恢复记录',
+    'no-candidate': '没有候选',
+  })
+
+  /** 把拒绝原因压成一行可读文本：原因 + 计数 + 前几个 seq + 保留量。 */
+  function archiveReasonText(result) {
+    const reason = typeof result.reason === 'string' ? result.reason : ''
+    const parts = []
+    if (reason.length > 0) parts.push(ARCHIVE_REASON_LABELS[reason] ?? reason)
+    if (Number.isInteger(result.count) && result.count > 0) parts.push(result.count + ' 条')
+    if (Array.isArray(result.seqs) && result.seqs.length > 0) {
+      const shown = result.seqs.slice(0, 5).map((seq) => String(seq)).join('/')
+      parts.push('seq ' + shown + (result.seqs.length > 5 ? '…' : ''))
+    }
+    if (Number.isInteger(result.seq)) parts.push('seq ' + result.seq)
+    if (Number.isInteger(result.retained)) parts.push('保留 ' + result.retained + ' 组')
+    return parts.join('；')
+  }
+
   /** 归档命令结果：不把 no-op 说成已归档，也不把失败说成候选为空。 */
   function archiveLine(result) {
     if (result === null || typeof result !== 'object') return '归档：无结果'
@@ -788,7 +825,10 @@ export async function apply(ctx, config) {
     }
     if (result.status === 'planned') return '候选：seq ' + result.startSeq + '–' + result.endSeq + '（' + result.recordIds.length + ' 条；dry-run 未写入）'
     if (result.status === 'not-worth') return '不归档：回执 ' + result.receiptChars + ' 字 ≥ 原文 ' + result.sourceChars + ' 字（净收益为负）'
-    if (result.status === 'no-candidate') return '暂无可归档的完成操作（当前回合/保护集/无记录节点不归档）。'
+    if (result.status === 'no-candidate') {
+      const reason = archiveReasonText(result)
+      return '暂无可归档的完成操作' + (reason.length > 0 ? '（' + reason + '）' : '') + '。'
+    }
     if (result.status === 'paused') return '当前模式暂停归档（recall-only 或 plan-first）。'
     if (result.status === 'cooling-closed') {
       const gate = Number.isFinite(result.gate) ? result.gate : 20

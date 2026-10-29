@@ -147,7 +147,8 @@ const READY_STATUS = {
   lastStatus: 'injected', lastReason: null, lastInjectedAt: 1, lastErrorCode: null, errorCode: null,
   control: {
     enabled: true, recall: true,
-    overrides: { limit: null },
+    // 真实投影的形状（beta.45 起 overrides 与 SESSION_OVERRIDE_KEYS 同源，恒含两键）。
+    overrides: { limit: null, gate: null },
     error: null,
   },
 }
@@ -479,6 +480,28 @@ test('弹层：数值覆盖 set/unset；越界不发命令', async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(run.commands.length, before, '越界不得发命令')
   assert.match(findElement(panel.get(), (node) => node.props?.className === 'mcl-error').children, /invalid/)
+})
+
+test('弹层：按步归档下闸门覆盖值必须回显，清空即 unset（AUD-01 界面端）', async () => {
+  const entry = await loadClient()
+  const run = runApply(entry)
+  const cooling = {
+    ...READY_STATUS,
+    mode: 'cooling',
+    control: { enabled: true, recall: true, overrides: { limit: null, gate: 5 }, error: null },
+  }
+  const pop = openPanel(run, {}, cooling)
+  const panel = run.bind(pop.type, pop.props)
+  const inputOf = () => findElement(panel.get(), (node) => node.type === 'input' && node.props?.['data-mcl-override'] === 'gate')
+  assert.ok(inputOf(), '按步归档下必须渲染闸门输入行')
+  assert.equal(inputOf().props.value, '5',
+    '会话级 gate 必须回显：空白 + 占位「跟随全局」= AUD-01 的用户可见症状')
+  assert.equal(inputOf().props.placeholder, 'overridePlaceholder')
+
+  inputOf().props.onChange({ target: { value: '' } })
+  inputOf().props.onBlur()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(run.commands.at(-1).line, '/memory-lab unset gate', '输入框为空时失焦必须能真正清除覆盖')
 })
 
 test('弹层：无 remote 时控件禁用并说明，不抛错', async () => {
