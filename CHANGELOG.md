@@ -35,7 +35,12 @@
 
 - 新增 `v3-store-repair`（4 条：尾部半行 dry-run/apply/审计/自动修复、中段不动、EACCES 失败关闭）与 `v3-restore-toolcalls`（2 条：structure 脱敏/去重、restore 带回工具名与参数）。
 - 扩展 `v3-archive-e2e`（intent.mode/txn）、`v3-compact`（pin 保留、隐私面可见、undo）、`v3-property`（真中段损坏夹具）、`v3-file-references`（log-only 调用不在工作集）。
-- 全量 101 套 / 468 用例 / 464 通过 / 4 安装面 skip / 0 失败（4 skip = profile 仍是 beta.46 副本，装 beta.48 后真跑）。
+- 全量 101 套 / 468 用例 / 468 通过 / 0 失败 / 0 skip（安装 beta.48 后安装面 5 条全部真跑）。
+
+### 发布
+
+- tag `v0.14.0-beta.48`（commit `82764d4`）；GitHub Release（Pre-release）asset 78 files / 241,227 B / sha256 `4131f77d137f6cbacc69ce83185857b614afbc4d454ac9284686d7f49e028c0c`（远端 digest 已核对）。
+- profile 依赖切到 `记忆上下文/dist/dsh-memory-context-lab-0.14.0-beta.48.tgz` 并 `pnpm install`；安装副本 `src/` 63 文件与 release 逐字节一致（唯一差异是发布侧镜像标记行）；安装面 5/5 真跑通过。**未重启 DSH**。
 
 ## 0.14.0-beta.47（2026-10-29，测试版）
 
