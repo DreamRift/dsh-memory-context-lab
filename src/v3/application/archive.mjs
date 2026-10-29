@@ -92,7 +92,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
    * 步骤级计划（普通降温 / 实时压缩）：在当前回合内压已完成步骤。
    * 与回合级共用回执与净收益口径，只是候选选择换成 steps.mjs。
    */
-  async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), summary = false } = {}) {
+  async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false } = {}) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
     let rejection = null
@@ -102,6 +102,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       retainSteps,
       maxSteps,
       pinnedSeqs,
+      minStartSeq,
       hasRecord: (seq) => seqToRecordId.has(seq),
       onReject: (row) => { rejection = rejection ?? row },
     })
@@ -127,8 +128,8 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
    * 与回合级共用宿主 range replace、voucher 与失败语义；不推进 lastArchiveEndSeq
    * （那是回合级位点，步骤级用磁盘上的真实节点判幂等，重复压缩不会重复计费）。
    */
-  async function archiveStepOnce({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), summary = false, txn = 1 } = {}) {
-    const planned = await planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps, maxSteps, pinnedSeqs, summary })
+  async function archiveStepOnce({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false, txn = 1 } = {}) {
+    const planned = await planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps, maxSteps, pinnedSeqs, minStartSeq, summary })
     return await commitPlanned({ sessionId, planned, txn })
   }
 

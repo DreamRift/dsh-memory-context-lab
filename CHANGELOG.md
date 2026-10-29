@@ -2,6 +2,26 @@
 
 > 0.14.0-beta.7 ~ beta.10 未在本文件单独收录（当时以进展卡与转正方案为准）；beta.11 起恢复逐版记录。
 
+## 0.14.0-beta.46（2026-10-29，测试版）
+
+相比 0.14.0-beta.45：
+
+### 修复
+
+- **判负（not-worth）的按步 span 永久堵死队头（P1）**：真实会话 55cc43c5 中 seq 930–946（3 步）的记录正文只有 105 字（assistant 消息 metaOnly、`payload.text` 为空，tool-call 参数不在记录正文里），回执 186 字，`makePlan` 判 `not-worth`；而 `selectStepSpan` 永远从最老 span 开始、`archiveStepOnce` 遇 `not-worth` 直接返回，于是该 span 之后 119 步 / 50 个请求零归档，末步占用涨到 23.2%。
+- 修法只动「非安全边界」：选择器新增 `minStartSeq`（只考虑 startSeq 大于游标的步骤）；入口把判负 span 的 `endSeq` 记进进程内游标 `entry.notWorthThroughSeq`，下一次从它之后继续选；单步最多连续跳 16 段。**pin / 未完成工具对 / 无记录 / 插件回执仍由选择器照常 break**，判负 span 留在活动面上不被误压。`status` 的「下一次归档」用同一游标（只读，不推进）。
+- 未改净收益判据、未引入缓存成本模型、未改摄入正文（metaOnly 仍不进索引）；回合级选择器未动。
+
+### 升级
+
+- 替换 DSH profile 中的插件包并重启 DSH（宿主半与客户端半都要重新装配）。
+
+### 测试
+
+- 新增 `test/v3-archive-not-worth.test.mjs`（判负队头 → 预览与执行都越过它、第二段继续归档、判负 span 仍在面上）；`v3-step-cooling` 增 `minStartSeq` 选择器用例。
+- 红色对照：临时去掉 `minStartSeq` 过滤后，两条新用例均实测必红（not-worth 卡在 seq 3–12 / 6 条记录、sourceChars 6 < receiptChars 183），复原后转绿。
+- 全量 99 套 / 452 用例 / 448 通过 / 0 失败 / 4 安装面 skip（源码 beta.46 尚未安装到 profile，按设计 skip）。
+
 ## 0.14.0-beta.45（2026-10-29，测试版）
 
 相比 0.14.0-beta.44：

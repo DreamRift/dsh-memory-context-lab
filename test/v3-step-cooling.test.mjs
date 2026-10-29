@@ -174,3 +174,16 @@ test('锚点出现在已开始选步之后仍是硬边界：不得跨过它拼�
   assert.ok(span)
   assert.equal(span.endSeq, 2, '只压锚点之前的 step 1')
 })
+
+// —— 0.14.0-beta.46 根因守卫：判负 span 不能永久挡住它后面的步骤 ——
+
+test('minStartSeq：跳过已判负的队头 span，从它之后继续选', () => {
+  const events = [...step(1, 1, 1), ...step(1, 2, 4), ...step(1, 3, 7), ...step(1, 4, 10), ...step(1, 5, 13)]
+  const surface = surfaceOf(events)
+  const first = selectStepSpan({ surfaceNodes: surface, events, hasRecord, retainSteps: 2, maxSteps: 1 })
+  assert.ok(first)
+  assert.equal(first.startSeq, 2)
+  const next = selectStepSpan({ surfaceNodes: surface, events, hasRecord, retainSteps: 2, maxSteps: 1, minStartSeq: first.endSeq })
+  assert.ok(next, '判负 span 之后仍有可压步骤时必须继续选，而不是 null')
+  assert.equal(next.startSeq, 5, '从判负 span 的 endSeq 之后开始')
+})

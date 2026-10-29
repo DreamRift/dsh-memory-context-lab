@@ -4,7 +4,7 @@
 
 插件只改模型可见的**投影**，不改写 DSH 的 append-only 会话日志与命令审计。原始历史始终留在会话日志里，回执可按凭证恢复。
 
-> 当前源码版本 0.14.0-beta.45（测试版）。
+> 当前源码版本 0.14.0-beta.46（测试版）。
 
 ## 功能
 
@@ -18,6 +18,12 @@
 - **T1 / T2 双后端**：默认本地 Node store + 词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10 且 Python 可用时，按会话启动独立 `MDCG_ROOT` 的隔离 MCP（T2），检索融合本地与隔离灵枢；T2 不可用时如实回 T1。
 - **图形入口**：composer 工具行 chip + 弹层控制本对话启用/回注/计划/模式/条数；全局参数在插件设置页。
 - **可观测**：`/memory-lab status | t2 | history | working-set | file-status` 只读查看摄入、索引、归档、T2 与回注观测。
+
+## 0.14.0-beta.46 更新（相比 beta.45）
+
+- 修复按步归档的「停摆」：某段 span 因记录正文过小被判「净收益为负」后，它后面的步骤再也压不动。现在判负的 span 会被跳过（保持在活动面上、不压缩），归档从它之后继续。
+- 只跳过「不划算」这一种情况；pin / 未完成工具对 / 无记录 / 插件回执仍是硬边界，照常拦住。
+- `/memory-lab status` 的「下一次归档」与真实执行使用同一判据，预览不会再显示一个压不了的候选。
 
 ## 0.14.0-beta.45 更新（相比 beta.44）
 
@@ -43,7 +49,7 @@
 
 ```text
 cd "$DSH_HOME/profiles/<profile>"
-pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.45.tgz"
+pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.46.tgz"
 ```
 
 或把 tgz 路径写进 profile 的 `package.json` 后执行 `pnpm install`。安装后**重启 DSH**，服务端半才会加载新版本；客户端半在页面刷新后重新装配。

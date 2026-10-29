@@ -80,9 +80,11 @@ export function buildStepUnits(events) {
  * @param {number} [input.retainSteps] 工作集保留的最近步骤数（默认 4）
  * @param {number} [input.maxSteps] 单次最多压缩的步骤数（默认 3）
  * @param {Set<number>} [input.pinnedSeqs] pin 的 seq（整步边界）
+ * @param {number} [input.minStartSeq] 只考虑 startSeq 大于该 seq 的步骤（跳过已判负的队头 span；
+ *   只用于「净收益为负」这种非安全边界，不得用来跳过 pin/未完成工具对/无记录等硬边界）
  * @returns {null | {startSeq:number,endSeq:number,sourceEventSeqs:number[],recordSeqs:number[],operations:number,steps:number}}
  */
-export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), onReject = null } = {}) {
+export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, onReject = null } = {}) {
   // 拒绝出口与回合级同形（0.14.0-beta.45）：契约仍是 null，原因只走观察回调。
   const reject = (row) => {
     // 兼容传裸字符串的调用点：原因码永远不丢（宁可归一化，也不让 UI 印出 undefined）。
@@ -104,6 +106,7 @@ export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 
   if (units.length === 0) return reject({ reason: 'no-completed-step' })
   const keep = Math.max(1, Number.isInteger(retainSteps) ? retainSteps : 4)
   const eligible = units.slice(0, Math.max(0, units.length - keep))
+    .filter((unit) => unit.startSeq > minStartSeq)
   if (eligible.length === 0) return reject({ reason: 'retention-window', retained: units.length })
   const limit = Math.max(1, Number.isInteger(maxSteps) ? maxSteps : 3)
   const selected = []

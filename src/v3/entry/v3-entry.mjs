@@ -424,6 +424,29 @@ export function attachV3Engine(ctx, options = {}) {
     return { opened, occupancy, gate: Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20 }
   }
 
+  /**
+   * 「净收益为负」的步骤 span 不是安全边界，不能把队头之后的归档全部堵死
+   * （0.14.0-beta.46，真实会话 55cc43c5：seq 930–946 的记录正文仅 105 字、回执 186 字，
+   * 被判 not-worth 后 119 步 / 50 个请求零归档）。判负的 span 记进进程内游标，
+   * 下一次从它之后继续选；游标只跳过「不划算」的 span，pin / 未完成工具对 / 无记录
+   * 仍由选择器照常 break。进程重建后游标归零，最多重扫一次判负队头。
+   */
+  const MAX_NOT_WORTH_SKIPS = 16
+
+  /** 连续跳过判负 span（单步最多扫 MAX_NOT_WORTH_SKIPS 段）；返回最终结果与最新游标。 */
+  async function skipNotWorthSpans(entry, run) {
+    let cursor = Number.isInteger(entry.notWorthThroughSeq) ? entry.notWorthThroughSeq : -1
+    let result = null
+    for (let round = 0; round < MAX_NOT_WORTH_SKIPS; round += 1) {
+      result = await run(cursor)
+      if (result?.status !== 'not-worth') break
+      const endSeq = result.span?.endSeq
+      if (!Number.isInteger(endSeq)) break
+      cursor = endSeq
+    }
+    return { result, cursor }
+  }
+
   async function archiveForStep(sessionId, session, settings = {}, options = {}) {
     const entry = runtimes.get(String(sessionId ?? ''))
     if (entry === undefined || entry.inflight !== null) return { status: 'busy-or-not-ready' }
@@ -448,8 +471,9 @@ export function attachV3Engine(ctx, options = {}) {
     // - full-history：回合级，只压已完成回合（当前回合永不归档）——长程多轮；
     // - cooling：步骤级，在当前回合内实时压掉不再需要的旧步骤——长步数少轮，
     //   retainOperations 在这里当「工作集保留的步骤数」（模型刚用过的结果不能撤）。
-    const result = state.mode === 'cooling'
-      ? await entry.archive.archiveStepOnce({
+    let result
+    if (state.mode === 'cooling') {
+      const stepArgs = {
         sessionId,
         events,
         surfaceNodes,
@@ -460,8 +484,14 @@ export function attachV3Engine(ctx, options = {}) {
         pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
         summary: options?.compact === true,
         txn: 1,
-      })
-      : await entry.archive.archiveOnce({
+      }
+      const skipped = await skipNotWorthSpans(entry, (minStartSeq) => entry.archive.archiveStepOnce({ ...stepArgs, minStartSeq }))
+      result = skipped.result
+      if (skipped.cursor > (Number.isInteger(entry.notWorthThroughSeq) ? entry.notWorthThroughSeq : -1)) {
+        entry.notWorthThroughSeq = skipped.cursor
+      }
+    } else {
+      result = await entry.archive.archiveOnce({
         sessionId,
         events,
         surfaceNodes,
@@ -476,6 +506,7 @@ export function attachV3Engine(ctx, options = {}) {
         summary: options?.compact === true,
         txn: 1,
       })
+    }
     if (result.status === 'archived') {
       // 两种模式都记 lastArchiveAt（供状态行与切模式确认）；lastArchiveEndSeq 只给
       // 回合级选择器用，按步归档绝不能写它——否则会成为 full-history 的永久下限。
@@ -506,7 +537,7 @@ export function attachV3Engine(ctx, options = {}) {
       // 预览必须与真正会执行的选择器**和闸门**一致，否则 status 会骗人。
       const gate = await coolingGateOf(entry, state, settings)
       if (!gate.opened) return { status: 'cooling-closed', occupancy: gate.occupancy, gate: gate.gate }
-      const planned = await entry.archive.planSteps({
+      const stepArgs = {
         sessionId,
         events,
         surfaceNodes,
@@ -514,7 +545,9 @@ export function attachV3Engine(ctx, options = {}) {
         retainSteps: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 4,
         maxSteps: 3,
         pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
-      })
+      }
+      // 预览与执行同一游标：判负的队头 span 不参与「下一次归档」，否则 status 会显示一个永远执行不了的候选。
+      const { result: planned } = await skipNotWorthSpans(entry, (minStartSeq) => entry.archive.planSteps({ ...stepArgs, minStartSeq }))
       // 预期与真实执行同一份判据：no-candidate 的 reason 由选择器给出，原样透出。
       return { status: planned.status ?? 'planned', ...planned }
     }
@@ -1184,6 +1217,9 @@ async function fileStatus(sessionId) {
         records,
         inflight: null,
         seqToRecordId: checkpoint.seqToRecordId,
+        // 按步归档的「判负跳过」游标（0.14.0-beta.46）：只跳过净收益为负的 span，
+        // 不是持久化位点——进程重建后归零，最多重扫一次判负队头。
+        notWorthThroughSeq: -1,
         searchable,
         archive,
         cwd: session?.header?.cwd ?? session?.cwd ?? null,
