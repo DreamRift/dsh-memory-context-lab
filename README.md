@@ -4,7 +4,7 @@
 
 插件只改模型可见的**投影**，不改写 DSH 的 append-only 会话日志与命令审计。原始历史始终留在会话日志里，回执可按凭证恢复。
 
-> 当前源码版本 0.14.0-beta.48（测试版）。
+> 当前源码版本 0.14.0-beta.50（测试版）。
 
 ## 功能
 
@@ -18,6 +18,14 @@
 - **T1 / T2 双后端**：默认本地 Node store + 词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10 且 Python 可用时，按会话启动独立 `MDCG_ROOT` 的隔离 MCP（T2），检索融合本地与隔离灵枢；T2 不可用时如实回 T1。
 - **图形入口**：composer 工具行 chip + 弹层控制本对话启用/回注/计划/模式/条数；全局参数在插件设置页。
 - **可观测**：`/memory-lab status | t2 | history | working-set | file-status` 只读查看摄入、索引、归档、T2 与回注观测。
+
+## 0.14.0-beta.50 更新（相比 beta.48）
+
+- **按轮归档在 dsh 判定下恢复连续可用**（beta.49 + beta.50）：滞后 `currentTurn` 不再把整段历史误判为当前轮；系统提示 / 开发者消息作为结构边界不参与轮组，归档回执也不再把下一轮永久堵死。
+- **空正文回合不再净增**：净收益门槛覆盖 0 字正文，这类回合保留在活动面。
+- **脱敏补漏**：补前缀键、PEM 私钥、全角冒号与 URL 编码；导出对已遗忘 / 已清除凭证剥离回执正文，保留 `metaOnly` / `structure` 往返。
+- **状态更诚实**：回执按「回合数 / 步骤数」写；判负原因对 `status` / `dry-run` 可见，`/memory-lab now` 可显式重试。
+- 兼容性不变：v3 单引擎、命令与设置项不变，升级后重启 DSH 生效。
 
 ## 0.14.0-beta.48 更新（相比 beta.46）
 
@@ -57,7 +65,7 @@
 
 ```text
 cd "$DSH_HOME/profiles/<profile>"
-pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.48.tgz"
+pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.50.tgz"
 ```
 
 或把 tgz 路径写进 profile 的 `package.json` 后执行 `pnpm install`。安装后**重启 DSH**，服务端半才会加载新版本；客户端半在页面刷新后重新装配。

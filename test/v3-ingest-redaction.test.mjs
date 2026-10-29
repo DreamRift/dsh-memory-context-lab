@@ -111,3 +111,34 @@ test('0.14.0-beta.44：tool/result 的常见云/代码托管凭据也必须脱�
   for (const secret of secrets) assert.ok(!body.text.includes(secret), '不得原样入库：' + secret)
   assert.ok(body.text.includes('[REDACTED]'))
 })
+
+/**
+ * AUD48-02-04：旧值规则依赖 \b 词边界，前缀键（AWS_SECRET_ACCESS_KEY / MY_API_KEY /
+ * DB_PASSWORD / SERVICE_TOKEN）在 _ 处不成立；PEM 私钥无规则；全角冒号与 URL 编码
+ * 分隔符也不认。修法：键名允许 . _ - 连接，分隔符收全角/百分号编码，PEM 整段替换。
+ * 夹具字面量拆开拼接，避免被秘密扫描器整串误报（仓库卫生纪律）。
+ */
+test('AUD48-02-04：前缀键、PEM、全角冒号、URL 编码的凭据也必须脱敏', () => {
+  const fake = (...parts) => parts.join('')
+  const awsSecret = fake('wJalrXUtnFEMI', '/K7MDENG/bPxRfiCY', 'EXAMPLEKEY')
+  const pem = fake('-----BEGIN RSA ', 'PRIVATE KEY-----\n')
+    + fake('MIIEow', 'IBAAKCAQEAfake', '\n')
+    + fake('-----END RSA ', 'PRIVATE KEY-----')
+  const text = '输出：'
+    + 'AWS_SECRET_ACCESS_KEY=' + awsSecret + ' '
+    + 'MY_API_KEY=abcd1234efgh '
+    + 'DB_PASSWORD=hunter2pass '
+    + 'SERVICE_TOKEN=TOPSECRET123 '
+    + 'token：秘密口令1234 '
+    + 'token%3Durlsecret1234\n'
+    + pem
+  const body = extractEventBody({
+    type: 'tool/result',
+    data: { message: { role: 'tool', content: [{ type: 'text', text }] } },
+  })
+  for (const secret of [awsSecret, 'abcd1234efgh', 'hunter2pass', 'TOPSECRET123', '秘密口令1234', 'urlsecret1234', 'MIIEow']) {
+    assert.ok(!body.text.includes(secret), '不得原样入库：' + secret + ' / 实际：' + body.text)
+  }
+  assert.equal(body.text.includes('BEGIN RSA'), false, 'PEM 头不得保留：' + body.text)
+  assert.ok(body.text.includes('[REDACTED]'))
+})

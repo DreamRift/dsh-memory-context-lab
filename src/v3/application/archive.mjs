@@ -103,22 +103,25 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       onReject: (row) => { rejection = rejection ?? row },
     })
     if (span === null) return noCandidate(rejection)
-    return await makePlan(span, { summary, seqToRecordId })
+    return await makePlan(span, { summary, seqToRecordId, unitLabel: mode === 'cooling' ? '步骤数' : '回合数' })
   }
 
   /**
    * span → 回执计划（回合级与步骤级共用）。
    * 净收益门槛在这里只有一处：回执本身也是上下文税，小段（回执比原文长）归档会让占用变大。
    */
-  async function makePlan(span, { summary = false, seqToRecordId } = {}) {
+  async function makePlan(span, { summary = false, seqToRecordId, unitLabel = '操作数' } = {}) {
     const recordIds = span.recordSeqs.map((seq) => seqToRecordId.get(seq))
     if (recordIds.some((id) => typeof id !== 'string' || id.length === 0)) return null
     const loaded = await recordsOf(recordIds)
     if (!loaded.ok) return { status: 'failed', reason: 'record-read-failed', error: loaded.error, span, recordIds }
     const summaryText = summary === true ? summarizeRecords(loaded.rows) : ''
-    const receiptText = renderArchiveReceipt({ startSeq: span.startSeq, endSeq: span.endSeq, recordIds, operations: span.operations, summary: summaryText })
+    const receiptText = renderArchiveReceipt({ startSeq: span.startSeq, endSeq: span.endSeq, recordIds, operations: span.operations, unitLabel, summary: summaryText })
     const sourceChars = loaded.rows.reduce((sum, row) => sum + textOfRecord(row).length, 0)
-    if (sourceChars > 0 && receiptText.length >= sourceChars) {
+    // AUD48-04-01：sourceChars === 0（空正文/纯 metaOnly 回合）时旧条件被短路，160 字回执
+    // 替换 0 字正文 → 活动面净增。回执本身也是上下文税，0 源必须判负；结构（toolCalls）
+    // 的可恢复性不改变「可见正文为 0」这一事实，不能拿它给负收益开绿灯。
+    if (receiptText.length >= sourceChars) {
       return { status: 'not-worth', span, recordIds, receiptText, sourceChars, receiptChars: receiptText.length }
     }
     return { ...span, recordIds, receiptText, summaryText }
@@ -143,7 +146,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       onReject: (row) => { rejection = rejection ?? row },
     })
     if (span === null) return noCandidate(rejection)
-    return await makePlan(span, { summary, seqToRecordId })
+    return await makePlan(span, { summary, seqToRecordId, unitLabel: '步骤数' })
   }
 
   /** 只预览，不触碰 surface/store。 */

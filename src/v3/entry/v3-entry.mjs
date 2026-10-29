@@ -68,10 +68,15 @@ function parseJsonishArguments(value) {
  * 只改匹配到的凭据片段，不整段吞掉用户正文（保持可读性与对账价值）。
  */
 const SENSITIVE_VALUE_PATTERNS = Object.freeze([
+  // PEM 私钥（RSA/EC/OPENSSH/PKCS8 等）：整段替换，避免 base64 段被当成普通文本。
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED]'],
   // Authorization: Bearer xxx / Basic xxx
   [/\b(authorization\s*[:=]\s*)(bearer|basic|token)?\s*([A-Za-z0-9._~+/=-]{8,})/gi, '$1[REDACTED]'],
-  // key=value / key: value 形态的常见凭据名
-  [/\b(api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)\b(\s*[:=]\s*)(["']?)([^\s"',&;]{4,})\3/gi, '$1$2$3[REDACTED]$3'],
+  // key=value / key: value / key：value / key%3Dvalue 形态的常见凭据名。
+  // AUD48-02-04：旧式的 \b 边界在 AWS_SECRET_ACCESS_KEY / MY_API_KEY 这类**前缀/后缀键**
+  // 上不成立（_ 是词字符），全角冒号与 URL 编码分隔符也不认；键名允许由 . _ - 连接，
+  // 保留键名本身、只替换值（可读性与对账价值不丢）。
+  [/\b([A-Za-z0-9_.-]*(?:api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)[A-Za-z0-9_.-]*)(\s*[:=：]\s*|%3[dDaA])(["']?)([^\s"',&;]{4,})\3/gi, '$1$2$3[REDACTED]$3'],
   // sk- 开头的常见密钥前缀（OpenAI/Anthropic 等）
   [/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]'],
   // AWS access key ID（AKIA/ASIA/AIDA/AROA/... + 16 位大写字母数字）
@@ -476,17 +481,39 @@ export function attachV3Engine(ctx, options = {}) {
    * 游标按模式分开存：按步 span 与回合 span 的判负结论互不蕴含，共用一个游标会让
    * 一次模式切换把「没评估过」的回合当成「判负过」跳过（静默不归档，安全但无效）。
    */
-  async function skipNotWorthSpans(entry, run, cursorField = 'notWorthThroughSeq') {
-    let cursor = Number.isInteger(entry[cursorField]) ? entry[cursorField] : -1
+  async function skipNotWorthSpans(entry, run, cursorField = 'notWorthThroughSeq', { startCursor = null, fallback = null } = {}) {
+    let cursor = Number.isInteger(startCursor)
+      ? startCursor
+      : (Number.isInteger(entry[cursorField]) ? entry[cursorField] : -1)
     let result = null
+    let lastNotWorth = fallback
+    let encountered = false
     for (let round = 0; round < MAX_NOT_WORTH_SKIPS; round += 1) {
       result = await run(cursor)
       if (result?.status !== 'not-worth') break
+      lastNotWorth = result
+      encountered = true
       const endSeq = result.span?.endSeq
       if (!Number.isInteger(endSeq)) break
       cursor = endSeq
     }
+    // AUD48-11-01：判负 span 之后已经没有任何可归档候选时，最后一次结果是
+    // no-candidate / no-completed-group——旧实现把「不划算」掩成「只有当前回合」，
+    // status 与第二次 now 都看不出真实原因。保留最近一次判负事实（带 span 与游标），
+    // 仍然不冲掉真正的安全边界原因（pinned / missing-record / plugin-boundary 等）。
+    if (lastNotWorth !== null && result?.status === 'not-worth') {
+      // 已经返回判负本身，无需替换；保留 lastNotWorth 供调用方记账。
+    } else if (lastNotWorth !== null && result?.status === 'no-candidate' && result.reason === 'no-completed-group') {
+      result = { ...lastNotWorth, skippedToSeq: cursor, cached: encountered === false }
+    }
     return { result, cursor }
+  }
+
+  /** 记住最近一次判负事实（AUD48-11-01）：供 status/第二次 now 显示真实原因；归档成功后清。 */
+  function rememberNotWorth(entry, field, result) {
+    if (entry.lastNotWorth === undefined || entry.lastNotWorth === null) entry.lastNotWorth = {}
+    if (result?.status === 'not-worth') entry.lastNotWorth[field] = result
+    else if (result?.status === 'archived') delete entry.lastNotWorth[field]
   }
 
   async function archiveForStep(sessionId, session, settings = {}, options = {}) {
@@ -537,11 +564,19 @@ export function attachV3Engine(ctx, options = {}) {
         summary: options?.compact === true,
         txn: 1,
       }
-      const skipped = await skipNotWorthSpans(entry, (minStartSeq) => entry.archive.archiveStepOnce({ ...stepArgs, minStartSeq }))
+      const notWorthField = 'notWorthThroughSeq'
+      const priorNotWorth = entry.lastNotWorth?.[notWorthField] ?? null
+      const skipped = await skipNotWorthSpans(
+        entry,
+        (minStartSeq) => entry.archive.archiveStepOnce({ ...stepArgs, minStartSeq }),
+        notWorthField,
+        { startCursor: options?.resetNotWorth === true ? -1 : null, fallback: priorNotWorth },
+      )
       result = skipped.result
       if (skipped.cursor > (Number.isInteger(entry.notWorthThroughSeq) ? entry.notWorthThroughSeq : -1)) {
         entry.notWorthThroughSeq = skipped.cursor
       }
+      rememberNotWorth(entry, notWorthField, result)
     } else {
       // 回合级判负同样是**非安全边界**：不回执、不遮蔽、留在活动面，但也不能把队头
       // 之后的已完成回合永久堵死（与按步 beta.46 同一判据，游标分开存）。
@@ -564,15 +599,18 @@ export function attachV3Engine(ctx, options = {}) {
         summary: options?.compact === true,
         txn: 1,
       }
+      const priorNotWorth = entry.lastNotWorth?.[turnCursorField] ?? null
       const skipped = await skipNotWorthSpans(
         entry,
         (cursor) => entry.archive.archiveOnce({ ...turnArgs, minStartSeq: Math.max(planFloor, cursor) }),
         turnCursorField,
+        { startCursor: options?.resetNotWorth === true ? -1 : null, fallback: priorNotWorth },
       )
       result = skipped.result
       if (skipped.cursor > (Number.isInteger(entry[turnCursorField]) ? entry[turnCursorField] : -1)) {
         entry[turnCursorField] = skipped.cursor
       }
+      rememberNotWorth(entry, turnCursorField, result)
     }
     if (result.status === 'archived') {
       // 两种模式都记 lastArchiveAt（供状态行与切模式确认）；lastArchiveEndSeq 只给
@@ -616,7 +654,13 @@ export function attachV3Engine(ctx, options = {}) {
         pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
       }
       // 预览与执行同一游标：判负的队头 span 不参与「下一次归档」，否则 status 会显示一个永远执行不了的候选。
-      const { result: planned } = await skipNotWorthSpans(entry, (minStartSeq) => entry.archive.planSteps({ ...stepArgs, minStartSeq }))
+      const priorNotWorth = entry.lastNotWorth?.['notWorthThroughSeq'] ?? null
+      const { result: planned } = await skipNotWorthSpans(
+        entry,
+        (minStartSeq) => entry.archive.planSteps({ ...stepArgs, minStartSeq }),
+        'notWorthThroughSeq',
+        { fallback: priorNotWorth },
+      )
       // 预期与真实执行同一份判据：no-candidate 的 reason 由选择器给出，原样透出。
       return { status: planned.status ?? 'planned', ...planned, gate: gate.gate, occupancy: gate.occupancy, opened: gate.opened }
     }
@@ -639,10 +683,12 @@ export function attachV3Engine(ctx, options = {}) {
       turnBasis,
       currentTurn: Number.isInteger(options?.turn) ? options.turn : null,
     }
+    const priorNotWorth = entry.lastNotWorth?.[turnCursorField] ?? null
     const { result: planned } = await skipNotWorthSpans(
       entry,
       (cursor) => entry.archive.dryRun({ ...turnArgs, minStartSeq: Math.max(planFloor, cursor) }),
       turnCursorField,
+      { fallback: priorNotWorth },
     )
     return { status: planned.status ?? 'planned', ...planned }
   }
@@ -824,12 +870,23 @@ async function exportSession(sessionId) {
       }
     }
     const exportedAt = Date.now()
+    // AUD48-08-02：清除账本读不到 = 无法判定哪些回执该剥正文，导出必须失败关闭，
+    // 不能把可能已清除的 receiptText/summaryText 照常打包。
+    let redactedVoucherIds = []
+    try {
+      redactedVoucherIds = typeof entry.runtime.store.redactedVoucherIds === 'function'
+        ? entry.runtime.store.redactedVoucherIds()
+        : []
+    } catch (error) {
+      return { error: error?.code ?? 'redactions-unreadable' }
+    }
     const bundle = buildExportBundle({
       sessionKey: String(sessionId),
       exportedAt,
       records,
       forgotten,
       vouchers: entry.runtime.store.listVouchers(),
+      redactedVoucherIds,
       state: stateOf(sessionId),
     })
     const file = await writeExportBundle(v3Root, String(sessionId), bundle)

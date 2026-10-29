@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { buildExportBundle } from '../src/v3/domain/export/bundle.mjs'
+import { openV3SessionStore } from '../src/v3/adapters/storage/session-store.mjs'
 import { attachV3Engine } from '../src/v3/entry/v3-entry.mjs'
 import { createFakeSession } from './helpers/fake-session.mjs'
 
@@ -63,6 +64,79 @@ test('engine.exportSession：写文件；遗忘正文不进包', async () => {
   } finally {
     await engine._waitForIdle().catch(() => {})
     engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+/**
+ * AUD48-08-02：导出旧实现原样复制 vouchers，compact 摘要（原文首部 ≤220 字）在
+ * forget/redact 之后仍随包导出；修法：redactions 命中或 recordIds 与 forgotten
+ * 相交的凭证剥掉 receiptText/summaryText。
+ * AUD48-08-03：导出/导入保留 metaOnly / structure，否则导入后「仅元数据」记录
+ * 被当成空正文损坏、工具调用参数丢失。
+ */
+test('buildExportBundle：已遗忘/已清除凭证不带走摘要；metaOnly/structure 保留', () => {
+  const bundle = buildExportBundle({
+    sessionKey: 's',
+    records: [
+      {
+        id: 'v3r-keep',
+        kind: 'message-assistant',
+        createdAt: 1,
+        payload: {
+          text: '',
+          bytes: 0,
+          metaOnly: true,
+          metaReason: 'empty',
+          structure: { toolCalls: [{ name: 'run', arguments: '{"x":1}' }] },
+        },
+        provenance: { sourceEventId: null, sourceForm: null, transactionId: null },
+      },
+      { id: 'v3r-gone', kind: 'message-user', createdAt: 2, payload: { text: 'secret body', bytes: 11 }, provenance: {} },
+    ],
+    forgotten: ['v3r-gone'],
+    vouchers: [
+      { voucherId: 'v1', recordIds: ['v3r-gone'], receiptText: '摘要 secret body', summaryText: '摘要 secret body' },
+      { voucherId: 'v2', recordIds: ['v3r-keep'], receiptText: '待清除回执', summaryText: '' },
+    ],
+    redactedVoucherIds: ['v2'],
+  })
+  assert.equal(bundle.records.length, 1)
+  assert.equal(bundle.records[0].payload.metaOnly, true)
+  assert.equal(bundle.records[0].payload.metaReason, 'empty')
+  assert.equal(bundle.records[0].payload.structure.toolCalls[0].name, 'run')
+  const v1 = bundle.vouchers.find((row) => row.voucherId === 'v1')
+  const v2 = bundle.vouchers.find((row) => row.voucherId === 'v2')
+  assert.equal(v1.receiptText, '', '遗忘记录的摘要不得导出')
+  assert.equal(v1.summaryText, '', '遗忘记录的摘要不得导出')
+  assert.equal(v1.redacted, true)
+  assert.equal(v2.receiptText, '', '已清除凭证的回执不得导出')
+  assert.equal(v2.redacted, true)
+  assert.equal(bundle.counts.redactedVouchers, 2)
+  assert.equal(JSON.stringify(bundle).includes('secret body'), false)
+})
+
+test('importRecords：导入保留 metaOnly / structure（AUD48-08-03）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-import-fields-'))
+  const store = await openV3SessionStore(root, 'sess-import')
+  try {
+    const result = await store.importRecords([{
+      kind: 'message-assistant',
+      payload: {
+        text: '',
+        metaOnly: true,
+        metaReason: 'empty',
+        structure: { toolCalls: [{ name: 'run', callId: 'c1', arguments: '{"x":1}' }] },
+      },
+    }])
+    assert.equal(result.recordIds.length, 1)
+    const record = await store.readRecord(result.recordIds[0])
+    assert.equal(record.payload.metaOnly, true, 'metaOnly 必须保留：' + JSON.stringify(record.payload))
+    assert.equal(record.payload.metaReason, 'empty')
+    assert.equal(record.payload.structure.toolCalls[0].name, 'run')
+    assert.equal(record.payload.structure.toolCalls[0].arguments, '{"x":1}')
+  } finally {
+    store.close?.()
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })

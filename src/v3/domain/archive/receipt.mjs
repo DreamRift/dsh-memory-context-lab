@@ -17,10 +17,10 @@ function sampleIds(recordIds) {
 
 /**
  * 生成回执正文。
- * @param {{startSeq:number,endSeq:number,recordIds:string[],operations?:number}} input
+ * @param {{startSeq:number,endSeq:number,recordIds:string[],operations?:number,unitLabel?:string}} input
  * @returns {string}
  */
-export function renderArchiveReceipt({ startSeq, endSeq, recordIds, operations = 0, summary = '' } = {}) {
+export function renderArchiveReceipt({ startSeq, endSeq, recordIds, operations = 0, unitLabel = '操作数', summary = '' } = {}) {
   if (!Number.isInteger(startSeq) || startSeq < 0 || !Number.isInteger(endSeq) || endSeq < startSeq) {
     throw new V3ContractViolation('v3 archive/receipt: startSeq/endSeq 非法')
   }
@@ -34,7 +34,10 @@ export function renderArchiveReceipt({ startSeq, endSeq, recordIds, operations =
     '记录 ID：' + ids.join('、') + (ids.length < count ? '…' : ''),
     '恢复：/memory-lab restore；检索：/memory-lab recall <词>；原文仍在会话日志，可按 ID 回读。',
   ]
-  if (Number.isInteger(operations) && operations > 0) lines.splice(1, 0, '操作数：' + operations + '。')
+  // AUD48-04-02：按轮归档的 operations 是「回合数」、按步归档是「步骤数」；旧文案恒写
+  // 「操作数」会让用户把 1 个回合误读成 1 次操作（真实凭证 54/14/74 条全是「操作数：1」）。
+  const label = typeof unitLabel === 'string' && unitLabel.length > 0 ? unitLabel : '操作数'
+  if (Number.isInteger(operations) && operations > 0) lines.splice(1, 0, label + '：' + operations + '。')
   if (typeof summary === 'string' && summary.length > 0) lines.splice(1, 0, '摘要：' + summary)
   const text = lines.join('\n')
   return text.length <= RECEIPT_MAX_CHARS ? text : text.slice(0, RECEIPT_MAX_CHARS - 1) + '…'

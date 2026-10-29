@@ -156,3 +156,43 @@ test('按轮归档：判负回合不再堵死后续回合', async () => {
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+/**
+ * AUD48-04-01：sourceChars === 0（空正文完成回合）时旧判据被短路，160 字回执
+ * 替换 0 字正文，活动面净增。修法：回执长度 >= 原文长度一律判负（含 0）。
+ * AUD48-11-01：判负之后没有别的候选时，status / 第二次 now 不得把原因掩成
+ * no-completed-group；now 显式忽略游标重试一次。
+ */
+test('空正文回合必须判负；status 与 now 如实报 not-worth（AUD48-04-01/11-01）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-empty-turn-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  const id = 's-empty-turn'
+  try {
+    const session = createFakeSession({ id })
+    session.pushUser('')
+    session.pushAssistant('')
+    session.pushUser('当前回合')
+    session.pushAssistant('当前回合答')
+    await ctx.callPreStep(session)
+    await settle(engine)
+
+    const first = await engine.archiveForStep(id, session, {}, { resetNotWorth: true })
+    assert.equal(first.status, 'not-worth', '空正文不得被压成净增回执：' + JSON.stringify(first))
+    assert.equal(first.sourceChars, 0, '本用例必须命中 sourceChars === 0 的旧漏洞：' + JSON.stringify(first))
+    assert.equal((await engine.historyOf(id)).total, 0)
+
+    const dry = await engine.dryRunArchive(id, session, {})
+    assert.equal(dry.status, 'not-worth', 'status 不能把判负掩成只有当前回合：' + JSON.stringify(dry))
+    assert.ok(Number.isInteger(dry.span?.endSeq) && dry.span.endSeq >= 1, 'status 仍应带判负 span')
+
+    const second = await engine.archiveForStep(id, session, {}, { resetNotWorth: true })
+    assert.equal(second.status, 'not-worth', 'now 应能重试并如实报判负：' + JSON.stringify(second))
+
+    assert.deepEqual(await session.surface.nodes, [0, 1, 2, 3], '判负回合必须留在活动面，不得被遮蔽')
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})

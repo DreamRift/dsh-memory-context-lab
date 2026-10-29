@@ -40,6 +40,12 @@ export function createFakeSession({ cwd = 'C:\\workspace', contextWindow = 10000
       const endIdx = nodes.indexOf(op.endSeq)
       if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) throw new Error('fake session: replace range 不在 surface')
       const shadowed = nodes.slice(startIdx, endIdx + 1)
+      // 真实宿主规则：surface node 0 是系统提示，只能由 system/message 原节点改写；
+      // 归档回执是 user/message，跨 node 0 的 replace 必然被拒绝（AUD48-04-04 的第二重机制）。
+      const startEvent = bySeq.get(op.startSeq)
+      if (startIdx === 0 && startEvent?.type === 'system/message') {
+        throw new Error('fake session: surface replace 不得从 node 0（系统提示）开始')
+      }
       const sources = Array.isArray(options.sourceEventSeqs) ? options.sourceEventSeqs : []
       const missing = shadowed.filter((node) => !sources.includes(node))
       if (missing.length > 0) throw new Error('fake session: sourceEventSeqs 未覆盖被遮蔽节点 ' + missing.join(','))
@@ -73,6 +79,15 @@ export function createFakeSession({ cwd = 'C:\\workspace', contextWindow = 10000
     pushUser(text) {
       // 真实 DSH user/message 正文在 data.content；assistant/tool 才在 data.message.content。
       return append('user/message', { content: [{ type: 'text', text }], source: { kind: 'user' } })
+    },
+    /** 真实宿主的系统提示：会进活动面，但插件摄入封闭集不含 system/message（无 v3 记录）。 */
+    pushSystem(text) {
+      SURFACE_TYPES.add('system/message')
+      try {
+        return append('system/message', { message: { role: 'system', content: [{ type: 'text', text }] }, source: { kind: 'system' } })
+      } finally {
+        SURFACE_TYPES.delete('system/message')
+      }
     },
     pushAssistant(text) {
       return append('assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text }] }, source: { kind: 'assistant' } })

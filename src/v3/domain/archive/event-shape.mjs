@@ -53,6 +53,18 @@ export function isPluginSurfaceEvent(event) {
 }
 
 /**
+ * 结构性活动面节点（system/message、developer/message）：插件**不摄入**（摄入封闭集只含
+ * user/assistant/tool），因此永远没有 v3 记录；宿主还规定 node 0（系统提示）只能由
+ * system/message 原节点改写，user 回执不得覆盖它。归档选择器把这类节点当**边界**：
+ * 不纳入任何轮组（留在活动面上），也不让它们把后续轮堵死（AUD48-04-04）。
+ *
+ * 只在这里定义一次——candidates（回合级）与后续按步选择器都从这里取判据。
+ */
+export function isStructuralSurfaceEvent(event) {
+  return event?.type === 'system/message' || event?.type === 'developer/message';
+}
+
+/**
  * 回注包（form 'recall'）：不是回执，不遮蔽历史、不写 v3 记录。
  * 按透明节点处理：不阻断、不要求记录；被遮蔽时随 span 消失，恢复时不偿还。
  */

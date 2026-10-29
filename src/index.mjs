@@ -621,7 +621,9 @@ export async function apply(ctx, config) {
           if (sub === 'now' || sub === 'dry-run') {
             const effectiveSettings = effectiveSettingsOf(sessionId)
             const run = sub === 'now'
-              ? await engine.archiveForStep(sessionId, invocation?.agent?.session, effectiveSettings)
+              // now 是显式动作：忽略进程内「判负跳过」游标，重试一次队头 span（AUD48-11-01）。
+              // 若仍判负，回执会显示 not-worth，而不是把原因掩成 no-completed-group。
+              ? await engine.archiveForStep(sessionId, invocation?.agent?.session, effectiveSettings, { resetNotWorth: true })
               : await engine.dryRunArchive(sessionId, invocation?.agent?.session, effectiveSettings)
             return ok(archiveLine(run))
           }

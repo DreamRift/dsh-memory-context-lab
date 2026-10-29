@@ -9,7 +9,7 @@
  * - full-history：所有已完成操作；cooling：只保留最近 retainOperations 个完成操作，等压力闸门。
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
-import { callIdOf, isHumanUserEvent, isPluginSurfaceEvent, isRecallPackEvent } from './event-shape.mjs'
+import { callIdOf, isHumanUserEvent, isPluginSurfaceEvent, isRecallPackEvent, isStructuralSurfaceEvent } from './event-shape.mjs'
 
 function eventAtOf(events) {
   const map = new Map()
@@ -58,6 +58,11 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
   let lastTurn = null
   for (const event of events) {
     if (!Number.isInteger(event?.seq)) continue
+    // 非回注的插件节点（归档回执/恢复）是表面分隔，不是轮次成员：给它打 turn 会让
+    // 回执在下一轮被当成「插件边界」，把那一轮整组挡住（真实形状：回执替换了上一段后
+    // 落在下一轮第一个节点之前，turn/start 已把它的 seq 归到下一轮）。让它在下面走
+    // turn === undefined 的 finish/跳过分支，轮组从回执之后重新开始。
+    if (isPluginSurfaceEvent(event) && !isRecallPackEvent(event)) continue
     // turn/start 与 step/start 都带 turn；step/start 覆盖「turn 内每一步」，更细。
     if (event.type === 'turn/start' || event.type === 'step/start') {
       if (Number.isInteger(event?.data?.turn)) lastTurn = event.data.turn
@@ -77,10 +82,14 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
     groups.push(group)
   }
   for (const seq of surfaceNodes) {
-    const turn = turnAt.get(seq)
-    if (turn === undefined) { finish(current); current = null; continue }
     const event = bySeq.get(seq)
     if (event === undefined) continue
+    // 结构性节点（system/developer）没有 v3 记录、宿主要求 node 0 只能由系统消息改写：
+    // 不纳入轮组，作为边界留在活动面（AUD48-04-04）。它出现在组头时，组从下一个节点开始；
+    // 组中段出现时切段（不跨它拼 span），后续轮仍可继续。
+    if (isStructuralSurfaceEvent(event)) { finish(current); current = null; continue }
+    const turn = turnAt.get(seq)
+    if (turn === undefined) { finish(current); current = null; continue }
     if (current === null || current.turn !== turn) {
       finish(current)
       current = { startSeq: seq, endSeq: seq, seqs: [seq], turn, current: false, hasPlugin: false, transient: [], calls: new Set(), results: new Set() }
@@ -99,9 +108,14 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
   finish(current)
   if (groups.length === 0) return groups
   // 当前轮 = 宿主说正在跑的那一轮；没有 payload.turn 时退回「最后一组」。
-  // 若 payload.turn 比日志里的最大轮还超前一步以上（日志滞后/异常），
-  // 不猜——按「最后一组是当前轮」保守处理，宁可少压也不压活动内容。
-  const canTrustTurn = Number.isInteger(currentTurn) && Number.isInteger(lastTurn) && currentTurn <= lastTurn + 1
+  //
+  // 只有 payload.turn 与日志最大轮**同步**（lastTurn）或刚开下一轮（lastTurn + 1）才可信。
+  // 旧实现只挡住「超前」，没挡「滞后」：目标自动继续 / 子代理 / 旧宿主若把 turn 传成 1
+  // （日志已经到 3），"group.turn >= 1" 会把**所有已完成轮**都标成当前轮，按轮归档
+  // 从此对整段历史 no-candidate——这就是 beta.47 真机上「切到 dsh 后反而不归档」的形状。
+  // 滞后与超前都不可信：退回「最后一组是当前轮」，宁可晚压一轮，也不能把活动内容压掉。
+  const canTrustTurn = Number.isInteger(currentTurn) && Number.isInteger(lastTurn)
+    && currentTurn >= lastTurn && currentTurn <= lastTurn + 1
   if (canTrustTurn) {
     for (const group of groups) group.current = group.turn >= currentTurn
   } else {
@@ -124,6 +138,8 @@ function groupByHumanTurn({ surfaceNodes, bySeq }) {
   for (const seq of surfaceNodes) {
     const event = bySeq.get(seq)
     if (event === undefined) continue
+    // 结构性节点与 dsh 分组同口径：不纳入回合、作为边界留在活动面（不跨它拼 span）。
+    if (isStructuralSurfaceEvent(event)) { finish(current); current = null; continue }
     if (isHumanUserEvent(event)) {
       finish(current)
       current = { startSeq: seq, endSeq: seq, seqs: [seq], current: false, hasPlugin: false, transient: [], calls: new Set(), results: new Set() }

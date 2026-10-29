@@ -241,3 +241,145 @@ test('按轮归档：切到 DSH 轮次判定后，目标自动继续前的上一
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+/**
+ * 0.14.0-beta.49：滞后的 payload.turn 不得把所有已完成轮都标成当前轮。
+ *
+ * 触发形状：日志已经到第 3 轮，但宿主交回的 currentTurn 仍是 1（目标自动继续、
+ * 子代理或旧宿主都可能这样）。旧判据只挡「超前」，'group.turn >= 1' 于是把第 1/2 轮
+ * 也标成 current，按轮归档对整段历史返回 no-candidate；本用例在修前必红。
+ */
+test('按轮归档：currentTurn 滞后于日志最大轮时，仍按最后一组为当前轮归档', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-stale-turn'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  try {
+    const session = createFakeSession({ cwd: 'C:\\ws', contextWindow: 100000 })
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    session.pushUser('第一轮真人'.repeat(50))
+    session.pushAssistant('第一轮输出'.repeat(50))
+    session.append('step/end', { turn: 1, step: 1 })
+    session.append('turn/start', { turn: 2 })
+    session.append('step/start', { turn: 2, step: 1 })
+    session.append('user/message', { source: { kind: 'goal' }, content: [{ type: 'text', text: '自动继续二'.repeat(30) }] })
+    session.pushAssistant('第二轮输出'.repeat(50))
+    session.append('step/end', { turn: 2, step: 1 })
+    session.append('turn/start', { turn: 3 })
+    session.append('step/start', { turn: 3, step: 1 })
+    session.append('user/message', { source: { kind: 'goal' }, content: [{ type: 'text', text: '自动继续三'.repeat(30) }] })
+    session.pushAssistant('第三轮输出'.repeat(50))
+    session.append('step/end', { turn: 3, step: 1 })
+    // 先 recall-only 建库，避免 pre-step 用 human 判定抢先归档。
+    await engine.setState('session-fake', { mode: 'recall-only' })
+    await ctx.callPreStep(session)
+    await settle(engine)
+    await engine.setState('session-fake', { mode: 'full-history' })
+    const stale = await engine.archiveForStep('session-fake', session, { turnBasis: 'dsh' }, { turn: 1 })
+    assert.equal(stale.status, 'archived', '滞后 turn 不得让全部轮都变 current：' + JSON.stringify(stale))
+    assert.deepEqual([stale.startSeq, stale.endSeq], [2, 3], '只压第 1 轮，最后一组仍是当前轮')
+    const nodes = await session.surface.nodes
+    assert.ok(nodes.includes(7) && nodes.includes(8), '第 2 轮必须保留：' + JSON.stringify(nodes))
+    assert.ok(nodes.includes(12) && nodes.includes(13), '第 3 轮必须保留：' + JSON.stringify(nodes))
+    assert.equal(engine.stateOf('session-fake').surface.lastArchiveEndSeq, 3)
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+/**
+ * AUD48-04-04：真实宿主的系统提示是 surface node 0，且插件摄入封闭集不含
+ * system/message（没有 v3 记录）；宿主还拒绝 user 回执覆盖 node 0。旧分组把它算进
+ * 第 1 轮 → missing-record 队头 break，按轮归档整体失效（真实 25 会话命中）。
+ * 修法：system/developer 不纳入轮组，作为边界留在活动面，档从它之后开始。
+ */
+test('按轮归档：首节点系统提示不阻塞归档，系统提示保留在活动面（AUD48-04-04）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-system-head-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  try {
+    const session = createFakeSession({ cwd: 'C:\\ws', contextWindow: 100000 })
+    const system = session.pushSystem('系统提示：你是 DSH 代理。')
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    session.pushUser('第一轮真人'.repeat(50))
+    session.pushAssistant('第一轮输出'.repeat(50))
+    session.append('step/end', { turn: 1, step: 1 })
+    session.append('turn/start', { turn: 2 })
+    session.append('step/start', { turn: 2, step: 1 })
+    session.pushUser('第二轮真人'.repeat(50))
+    session.pushAssistant('第二轮输出'.repeat(50))
+    session.append('step/end', { turn: 2, step: 1 })
+    // 先 recall-only 建库，避免 pre-step 用 human 判定抢先归档。
+    await engine.setState('session-fake', { mode: 'recall-only' })
+    await ctx.callPreStep(session)
+    await settle(engine)
+    await engine.setState('session-fake', { mode: 'full-history' })
+    const archived = await engine.archiveForStep('session-fake', session, { turnBasis: 'dsh' }, { turn: 2 })
+    assert.equal(archived.status, 'archived', '系统提示不得堵死首轮：' + JSON.stringify(archived))
+    assert.ok(archived.startSeq > system.seq, 'span 必须从系统提示之后开始：' + JSON.stringify(archived))
+    assert.equal(archived.receiptText.includes('回合数：1'), true, '回执按轮应写回合数：' + archived.receiptText)
+    assert.equal(archived.receiptText.includes('操作数：'), false)
+    const nodes = await session.surface.nodes
+    assert.ok(nodes.includes(system.seq), '系统提示必须仍在活动面：' + JSON.stringify(nodes))
+    assert.ok(nodes.includes(archived.receiptSeq), '回执应落面：' + JSON.stringify(nodes))
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+/**
+ * 回执边界：归档产生的回执是「上一段」的替代物，但它的事件 seq 落在下一轮开头
+ * （turn/start 已把它的 seq 归到下一轮）。旧分组把回执算进下一轮 → hasPlugin →
+ * 下一轮永远不能归档，归档只成功一次。修法：非回注插件节点不参与轮组。
+ */
+test('按轮归档：上一轮回执不得把下一轮当插件边界', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-receipt-boundary-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  try {
+    const session = createFakeSession({ cwd: 'C:\\ws', contextWindow: 100000 })
+    const system = session.pushSystem('系统提示')
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    session.pushUser('第一轮真人'.repeat(50))
+    session.pushAssistant('第一轮输出'.repeat(50))
+    session.append('step/end', { turn: 1, step: 1 })
+    session.append('turn/start', { turn: 2 })
+    session.append('step/start', { turn: 2, step: 1 })
+    session.pushUser('第二轮真人'.repeat(50))
+    session.pushAssistant('第二轮输出'.repeat(50))
+    session.append('step/end', { turn: 2, step: 1 })
+    await engine.setState('session-fake', { mode: 'recall-only' })
+    await ctx.callPreStep(session)
+    await settle(engine)
+    await engine.setState('session-fake', { mode: 'full-history' })
+    const first = await engine.archiveForStep('session-fake', session, { turnBasis: 'dsh' }, { turn: 2 })
+    assert.equal(first.status, 'archived', JSON.stringify(first))
+
+    // 第三轮：让第 2 轮成为已完成轮；回执现在位于第 2 轮节点之前。
+    session.append('turn/start', { turn: 3 })
+    session.append('step/start', { turn: 3, step: 1 })
+    session.pushUser('第三轮真人'.repeat(50))
+    session.pushAssistant('第三轮输出'.repeat(50))
+    session.append('step/end', { turn: 3, step: 1 })
+    await engine.setState('session-fake', { mode: 'recall-only' })
+    await ctx.callPreStep(session)
+    await settle(engine)
+    await engine.setState('session-fake', { mode: 'full-history' })
+    const second = await engine.archiveForStep('session-fake', session, { turnBasis: 'dsh' }, { turn: 3 })
+    assert.equal(second.status, 'archived', '上一轮回执不得挡住下一轮：' + JSON.stringify(second))
+    assert.ok(second.startSeq > first.endSeq, '第二段必须接在回执之后：' + JSON.stringify(second))
+    assert.equal((await engine.historyOf('session-fake')).total, 2)
+    const nodes = await session.surface.nodes
+    assert.ok(nodes.includes(system.seq), '系统提示必须仍在活动面：' + JSON.stringify(nodes))
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})

@@ -469,12 +469,20 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
         if (typeof input?.kind !== 'string' || typeof text !== 'string') {
           throw new V3ContractViolation('v3 store: importRecords 每条需要 kind 与 payload.text')
         }
+        // AUD48-08-03：导入必须保留 metaOnly / structure；否则导出再导入后
+        // 「仅元数据」记录会被当成空正文损坏，工具调用参数也会丢失。
+        const payload = { text, bytes: Buffer.byteLength(text, 'utf8') }
+        if (input.payload.metaOnly === true) payload.metaOnly = true
+        if (typeof input.payload.metaReason === 'string' && input.payload.metaReason.length > 0) payload.metaReason = input.payload.metaReason
+        if (input.payload.structure !== null && typeof input.payload.structure === 'object') {
+          payload.structure = structuredClone(input.payload.structure)
+        }
         return {
           id: 'v3r-' + randomUUID().replace(/-/g, '').slice(0, 16),
           kind: input.kind,
           sessionKey,
           createdAt: at + index,
-          payload: { text, bytes: Buffer.byteLength(text, 'utf8') },
+          payload,
           provenance: { sourceEventId: null, sourceForm: 'import', transactionId: 'import-' + randomUUID() },
         }
       })
