@@ -25,7 +25,7 @@
 - 新增/扩展回归：`v3-archive-prestep`（系统提示首节点、回执边界）、`v3-archive-not-worth`（空正文判负 + 状态可见 + now 重试）、`v3-ingest-redaction`（前缀键/PEM/全角/URL 编码）、`v3-export`（凭证清除 + metaOnly/structure 往返）。
 - 红绿对照：临时回退 `plugin/src` 后，上述用例全部失败（系统提示/回执边界/滞后 turn 3 红、空正文 1 红、脱敏 1 红、导出 2 红）；恢复后全部通过。
 - 全量：**101 套 / 475 用例 / 475 通过 / 0 失败 / 0 skip**（`npm test`，2026-10-29；日志 `.tmp/test-beta50.log`）。
-- **发布**：release 镜像自测 101 套全绿；tag / GitHub Release / asset digest 与安装记录在发布后补记。
+- **发布与安装**：release 镜像自测 101 套全绿；tag `v0.14.0-beta.50`（commit `5d0f13f`）、GitHub Release（Pre-release）asset 78 files / 243,865 B / sha256 `b04e72d43936e0e5aa534e193065f701c9dbe547a1a1924686f953c09cb62df9`（远端 digest 已核对）；profile 依赖切到 `记忆上下文/dist/dsh-memory-context-lab-0.14.0-beta.50.tgz` 并 `pnpm install`，安装副本 `src/` 63 文件与 release 逐字节一致（唯一差异是发布侧镜像标记行）；安装面 5/5 真跑通过。**未重启 DSH**。
 
 ## 0.14.0-beta.49（2026-10-29，测试版）
 
