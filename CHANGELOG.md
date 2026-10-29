@@ -20,7 +20,12 @@
 
 - 新增 `test/v3-archive-not-worth.test.mjs`（判负队头 → 预览与执行都越过它、第二段继续归档、判负 span 仍在面上）；`v3-step-cooling` 增 `minStartSeq` 选择器用例。
 - 红色对照：临时去掉 `minStartSeq` 过滤后，两条新用例均实测必红（not-worth 卡在 seq 3–12 / 6 条记录、sourceChars 6 < receiptChars 183），复原后转绿。
-- 全量 99 套 / 452 用例 / 448 通过 / 0 失败 / 4 安装面 skip（源码 beta.46 尚未安装到 profile，按设计 skip）。
+- 全量 99 套 / 452 用例 / 452 通过 / 0 失败 / 0 skip（安装 beta.46 后安装面 5 条全部真跑）。
+
+### 发布
+
+- tag `v0.14.0-beta.46`（commit `07b9aa1`）；GitHub Release（Pre-release）asset 78 files / 280,825 B / sha256 `15a30783070e124b490b3a7f0b1f7e071b5a1960f540e44cf88cf880ca6c073b`（远端 digest 已核对）。
+- profile 依赖切到 `记忆上下文/dist/dsh-memory-context-lab-0.14.0-beta.46.tgz` 并 `pnpm install`；安装副本 `src/` 63 文件与源码逐字节一致（唯一差异是发布侧镜像标记行）；`install.test` 5/5 真跑通过。**未重启 DSH**。
 
 ## 0.14.0-beta.45（2026-10-29，测试版）
 
