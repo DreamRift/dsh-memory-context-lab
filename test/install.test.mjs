@@ -237,7 +237,9 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
   assert.equal(ctx._projections.length, 1, '宿主提供 sessionProjections 时必须注册只读状态投影')
   assert.equal(ctx._projections[0].key, 'memoryContextLabStatus', '客户端 dock 读的就是这个 key')
-  assert.equal(ctx._projections[0].stateVersion, 1)
+  // beta.45 起投影视图多一个覆盖键（limit + gate），stateVersion 1→2 让宿主的旧检查点
+  // 一并丢弃重折；state 仍只有 {sessionId, tick}，重折没有成本。
+  assert.equal(ctx._projections[0].stateVersion, 2)
   assert.equal(typeof ctx._projections[0].wire?.view, 'function')
   assert.equal(typeof ctx._projections[0].wire?.viewSchema?.parse, 'function')
   // Both features ride `agent/pre-step`: the cooler delegates then cools, and
