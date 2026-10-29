@@ -107,3 +107,31 @@ test('H-05 全量可容纳时不产生省略行（不虚报截断）', async () 
   assert.equal(injectedLinesOf(out.text), 3)
   assert.equal(out.capExceeded, false)
 })
+/**
+ * 审计 E-A（beta.46 排查）：收缩路径把不可读命中的 ID 标到了别的正文上。
+ * hitLines 只收「可读」命中，result.pack 仍含不可读命中；旧实现 hitLineAt 用 result.pack[n]
+ * 取 ID，于是「B 的正文 + A 的 ID」——模型按行内 ID 回读会读到另一条（或读不到）。
+ */
+test('不可读命中不得把 ID 挪到别的正文上（收缩路径）', async () => {
+  const hits = [
+    { id: 'v3r-0000000000000001', score: 2, text: '' },
+    { id: 'v3r-0000000000000002', score: 1, text: '长'.repeat(5000) },
+  ]
+  const provider = {
+    async search() { return { display: hits, pack: hits, dropped: [], oovTerms: [] } },
+    async read(id) {
+      if (id === 'v3r-0000000000000001') throw new Error('ESTORE_CORRUPT 模拟不可读')
+      return { text: hits.find((h) => h.id === id).text }
+    },
+    async health() { return { healthy: true } },
+    capabilities() { return { name: 'test', tier: 'T1', live: true } },
+  }
+  const recall = createRecall({ provider, sessionKey: 's-unreadable-id' })
+  const out = await recall({ query: '长', turn: 1, limit: 2, previewChars: 3900 })
+  assert.equal(out.injected, true, JSON.stringify(out).slice(0, 200))
+  const lines = out.text.split('\n').filter((line) => line.startsWith('· '))
+  assert.equal(lines.length, 1)
+  assert.ok(lines[0].includes('v3r-0000000000000002'), '行内 ID 必须属于这条正文：' + lines[0].slice(0, 90))
+  assert.ok(!lines[0].includes('v3r-0000000000000001'), '不得标成不可读命中的 ID')
+  assert.ok(out.text.includes('读取失败：1 条'), '不可读仍要如实留痕')
+})

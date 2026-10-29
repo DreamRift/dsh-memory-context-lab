@@ -131,9 +131,12 @@ test('P4：随机截断 jsonl 后失败关闭（50 轮）', async () => {
   const rand = prng(999)
   try {
     const { port, store } = await createSessionStorePort(root, 'sess-a')
-    await port.transaction([record('v3r-0000000000000000', '正文一', 'tx-1'), record('v3r-0000000000000001', '正文二', 'tx-2')])
+    // 两笔事务 → 两行 commit；否则「损坏第 2 行」其实只损坏了唯一条 commit 的尾部。
+    await port.transaction([record('v3r-0000000000000000', '正文一', 'tx-1')])
+    await port.transaction([record('v3r-0000000000000001', '正文二', 'tx-2')])
     store.close()
-    // 两种损坏语义（M2 设计）：尾部半行=崩溃残留（open 对账修复）；中段行损坏=health 可见不伪成功
+    // 两种损坏语义（M2 设计）：尾部半行=崩溃残留（open 锁内自动截断修复）；
+    // 中段行损坏=health 可见不伪成功（绝不截断）。
     const file = path.join(root, 'sessions', 'sess-a', 'transactions.jsonl')
     const raw = await fs_readFile(file)
     if (rand() < 0.5) {

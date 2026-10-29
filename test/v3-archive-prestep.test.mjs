@@ -187,3 +187,57 @@ test('新会话 defaultEnabled=false：默认不摄入，/on 后才摄入', asyn
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+/**
+ * 0.14.0-beta.47：轮次判定可在设置页切换。
+ * 这条用例复现真实形状——一条真人指令 + 一次目标自动继续：真人判定下两者是同一个
+ * 当前回合（永远不压），DSH 轮次判定下第 1 轮已完成、可立即归档。
+ */
+test('按轮归档：切到 DSH 轮次判定后，目标自动继续前的上一轮可归档（真人判定仍不压）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-pre-turn-basis-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  try {
+    const session = createFakeSession({ cwd: 'C:\\ws', contextWindow: 100000 })
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    session.pushUser('真人指令'.repeat(50))
+    session.pushAssistant('第一轮输出'.repeat(50))
+    session.append('step/end', { turn: 1, step: 1 })
+    session.append('turn/start', { turn: 2 })
+    session.append('step/start', { turn: 2, step: 1 })
+    session.append('user/message', { source: { kind: 'goal' }, content: [{ type: 'text', text: '目标自动继续'.repeat(20) }] })
+    session.pushAssistant('第二轮输出'.repeat(50))
+    session.append('step/end', { turn: 2, step: 1 })
+    await ctx.callPreStep(session)
+    await settle(engine)
+
+    // 真人判定（默认）：唯一真人回合就是当前回合 → 没有候选。
+    const human = await engine.dryRunArchive('session-fake', session, { turnBasis: 'human' })
+    assert.equal(human.status, 'no-candidate', JSON.stringify(human))
+
+    // DSH 轮次判定：第 1 轮已完成；预览与执行必须给出同一个 span。
+    const planned = await engine.dryRunArchive('session-fake', session, { turnBasis: 'dsh' })
+    assert.equal(planned.status, 'planned', JSON.stringify(planned))
+    const archived = await engine.archiveForStep('session-fake', session, { turnBasis: 'dsh' })
+    assert.equal(archived.status, 'archived', JSON.stringify(archived))
+    assert.deepEqual([archived.startSeq, archived.endSeq], [planned.startSeq, planned.endSeq],
+      '预览与执行不得各说各话')
+    assert.equal((await engine.historyOf('session-fake')).total, 1)
+    assert.equal(engine.stateOf('session-fake').surface.lastArchiveEndSeq, 3,
+      '归档只覆盖第 1 轮（seq 2–3），当前第 2 轮不得被压')
+
+    const nodes = await session.surface.nodes
+    assert.ok(nodes.includes(7) && nodes.includes(8), '当前轮（目标自动继续）必须留在活动面：' + JSON.stringify(nodes))
+    assert.ok(!nodes.includes(2) && !nodes.includes(3), '第 1 轮已被回执替换：' + JSON.stringify(nodes))
+
+    // 当前轮再压一次仍是 no-candidate（不是静默重复归档）。
+    const again = await engine.archiveForStep('session-fake', session, { turnBasis: 'dsh' })
+    assert.equal(again.status, 'no-candidate', JSON.stringify(again))
+    assert.deepEqual(ctx.warnings, [], '归档不得告警失败')
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})

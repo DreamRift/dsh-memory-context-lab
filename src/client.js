@@ -84,6 +84,15 @@ window.__ModuleLoader__.load({
     const FIELDS = [
       { key: 'enabled', kind: 'boolean', label: 'enabledLabel', hint: 'enabledHint' },
       { key: 'fullHistory', kind: 'boolean', label: 'fullHistoryLabel', hint: 'fullHistoryHint' },
+      // 轮次判定（0.14.0-beta.47）：两个值用下拉框而不是开关——开关的「开/关」说不出
+      // 哪一边是默认，用户无法从界面判断切换后压得更快还是更慢。
+      {
+        key: 'turnBasis',
+        kind: 'string',
+        options: [{ value: 'human', label: 'turnBasisHuman' }, { value: 'dsh', label: 'turnBasisDsh' }],
+        label: 'turnBasisLabel',
+        hint: 'turnBasisHint',
+      },
       { key: 'planFirst', kind: 'boolean', label: 'planFirstLabel', hint: 'planFirstHint' },
       { key: 'autoRestore', kind: 'boolean', label: 'autoRestoreLabel', hint: 'autoRestoreHint' },
       { key: 'limit', kind: 'number', min: 1, max: 20, step: 1, label: 'limitLabel', hint: 'limitHint' },
@@ -94,7 +103,7 @@ window.__ModuleLoader__.load({
     ]
 
     /** 与宿主半 `SETTINGS_DEFAULTS` 同值：只用于「宿主还没答」时的占位显示，不参与写。 */
-    const DEFAULTS = { enabled: true, fullHistory: true, planFirst: false, autoRestore: true, limit: 10, coolingGate: 20, packMinScore: 0.5, previewChars: 160, queryMaxChars: 512 }
+    const DEFAULTS = { enabled: true, fullHistory: true, turnBasis: 'human', planFirst: false, autoRestore: true, limit: 10, coolingGate: 20, packMinScore: 0.5, previewChars: 160, queryMaxChars: 512 }
 
     /** 会话弹层可覆盖的数值项（全局默认在插件设置页；这里只写本对话）。 */
     /**
@@ -124,6 +133,11 @@ window.__ModuleLoader__.load({
       enabledHint: '新会话的默认。命中历史时把要点追加到本步上下文；本对话可在 composer 面板单独关闭。',
       fullHistoryLabel: '默认全历史模式',
       fullHistoryHint: '新会话默认把已完成历史归档成可恢复回执；关闭后改用压力闸门驱动的普通降温。',
+      turnBasisLabel: '按轮归档的轮次判定',
+      turnBasisHint: '真人消息：只有你发新消息才算下一轮（默认，压得慢）。DSH 轮次：按界面「N 轮」计数，目标自动继续的每一轮都算，压得更快；被压的原话仍可按 ID 恢复。',
+      turnBasisHuman: '真人消息（默认）',
+      turnBasisDsh: 'DSH 轮次',
+      invalidChoice: '请选择下拉框里的选项。',
       planFirstLabel: '计划先行默认',
       planFirstHint: '计划期间暂停归档与自动回注，计划工件受保护。',
       autoRestoreLabel: '停用/恢复时还原原文',
@@ -210,6 +224,11 @@ window.__ModuleLoader__.load({
       enabledHint: 'Default for new chats. This chat can override it in the composer panel; turning it off stops recall only.',
       fullHistoryLabel: 'Default full-history mode',
       fullHistoryHint: 'New chats archive completed history into restorable receipts; off switches to pressure-gated cooling.',
+      turnBasisLabel: 'Full-history turn basis',
+      turnBasisHint: 'Human messages: a new turn only starts with your message (default, archives slower). DSH turns: count like the "N turns" chip, so every goal auto-continuation counts; archived originals stay restorable by ID.',
+      turnBasisHuman: 'Human messages (default)',
+      turnBasisDsh: 'DSH turns',
+      invalidChoice: 'Pick one of the options in the list.',
       planFirstLabel: 'Default plan-first',
       planFirstHint: 'Pause archiving and auto recall while a plan is active; plan artifacts stay protected.',
       autoRestoreLabel: 'Restore originals on disable',
@@ -344,6 +363,11 @@ window.__ModuleLoader__.load({
         if (Object.hasOwn(draft, field.key)) return draft[field.key]
         const current = values[field.key]
         if (field.kind === 'boolean') return current === undefined ? DEFAULTS[field.key] === true : current === true
+        if (field.kind === 'string') {
+          const allowed = Array.isArray(field.options) ? field.options.map((option) => option.value) : []
+          if (allowed.includes(current)) return current
+          return allowed.includes(DEFAULTS[field.key]) ? DEFAULTS[field.key] : (allowed[0] ?? '')
+        }
         return String(current === undefined ? DEFAULTS[field.key] : current)
       }
 
@@ -370,6 +394,16 @@ window.__ModuleLoader__.load({
           const raw = draft[field.key]
           if (field.kind === 'boolean') {
             if (raw !== (values[field.key] === true)) ops.push({ op: 'set', path: [field.key], value: raw })
+            continue
+          }
+          if (field.kind === 'string') {
+            const value = String(raw)
+            // 只允许下拉框给出的值：手改 draft 或旧配置里的未知值一律拦在本地。
+            if (!Array.isArray(field.options) || !field.options.some((option) => option.value === value)) {
+              setOutcome({ kind: 'invalid', field: field.key })
+              return
+            }
+            if (value !== values[field.key]) ops.push({ op: 'set', path: [field.key], value })
             continue
           }
           const text = String(raw).trim()
@@ -407,19 +441,33 @@ window.__ModuleLoader__.load({
             disabled: !writable,
             onChange: (next) => setDraft((previous) => ({ ...previous, [field.key]: next === true })),
           })
-          : React.createElement('input', {
-            key: 'control',
-            id,
-            type: 'number',
-            min: field.min,
-            max: field.max,
-            step: field.step,
-            value: draftOf(field),
-            disabled: !writable,
-            style: INPUT_STYLE,
-            'aria-label': t(field.label),
-            onChange: (event) => setDraft((previous) => ({ ...previous, [field.key]: event.target.value })),
-          })
+          : field.kind === 'string'
+            ? React.createElement('select', {
+              key: 'control',
+              id,
+              value: draftOf(field),
+              disabled: !writable,
+              style: INPUT_STYLE,
+              'aria-label': t(field.label),
+              'data-mcl-select': field.key,
+              onChange: (event) => setDraft((previous) => ({ ...previous, [field.key]: event.target.value })),
+            }, (field.options ?? []).map((option) => React.createElement('option', {
+              key: option.value,
+              value: option.value,
+            }, t(option.label))))
+            : React.createElement('input', {
+              key: 'control',
+              id,
+              type: 'number',
+              min: field.min,
+              max: field.max,
+              step: field.step,
+              value: draftOf(field),
+              disabled: !writable,
+              style: INPUT_STYLE,
+              'aria-label': t(field.label),
+              onChange: (event) => setDraft((previous) => ({ ...previous, [field.key]: event.target.value })),
+            })
         const invalid = outcome !== null && outcome.kind === 'invalid' && outcome.field === field.key
         return React.createElement('div', { key: field.key, style: ROW_STYLE, 'data-mcl-field': field.key }, [
           // 数字输入用 label 关联（htmlFor 指得到 id）；开关的可访问名由 Switch 的 label 提供。
@@ -438,7 +486,7 @@ window.__ModuleLoader__.load({
               : null,
           ]),
           React.createElement('div', { key: 'hint', style: HINT_STYLE }, invalid
-            ? t('invalid', { min: String(field.min), max: String(field.max) })
+            ? t(field.kind === 'string' ? 'invalidChoice' : 'invalid', { min: String(field.min), max: String(field.max) })
             : t(field.hint)),
         ])
       })

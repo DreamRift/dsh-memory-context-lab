@@ -11,7 +11,7 @@
 import { assertPort } from '../../ports/index.mjs'
 import { v3Error, V3ContractViolation } from '../../contracts/index.mjs'
 import { restoreEligibilityOf } from '../../domain/archive/restore.mjs'
-import { openV3SessionStore } from './session-store.mjs'
+import { openV3SessionStore, repairSessionJournals } from './session-store.mjs'
 import { withCrossProcessWriteLock, withWriteLock } from './write-lock.mjs'
 import { buildLexicalIndex, isIndexStale, readLexicalIndex, writeLexicalIndex } from './lexical-index.mjs'
 
@@ -21,10 +21,27 @@ import { buildLexicalIndex, isIndexStale, readLexicalIndex, writeLexicalIndex } 
  * @param {string} sessionKey 会话隔离键
  */
 export async function createSessionStorePort(root, sessionKey) {
-  const store = await openV3SessionStore(root, sessionKey)
+  let store = await openV3SessionStore(root, sessionKey)
+  // G-A（0.14.0-beta.48）：崩溃留下的**尾部半行**在写锁内自动截断后重开；
+  // 中段损坏/完整行损坏/账实不符一概不动，仍按 damaged 失败关闭（读允许、写拒绝）。
+  try {
+    if (store.health().healthy !== true) {
+      const repaired = await repairSessionJournals(store.directory)
+      if (repaired.changed === true) {
+        store.close()
+        store = await openV3SessionStore(root, sessionKey)
+      }
+    }
+  } catch {
+    // 修复失败不改变失败关闭语义：保留 damaged 句柄，写入继续被拒绝（不静默放行）。
+  }
   const dir = store.directory
 
-  async function rebuildIndex() {
+  /**
+   * 构建索引（可选是否落盘）。H-1："锁外构建 + 锁内短写" 与锁内重建共用这一份，
+   * 避免两套遍历逻辑漂移。
+   */
+  async function buildIndex({ write = true } = {}) {
     // 跨句柄一致性：重建前先把别的句柄/进程写入的 forget 行并进来，
     // 否则已遗忘记录会被重新写进索引（隐私面回退，且 indexStale 不会再纠正）。
     await store.refreshForgotten?.()
@@ -64,8 +81,46 @@ export async function createSessionStorePort(root, sessionKey) {
       entries.push({ id, text: record.payload.text })
     }
     const index = buildLexicalIndex(entries, { sourceCount: committedIds.length, forgottenCount: forgotten.size })
-    await writeLexicalIndex(store, index)
+    if (write) await writeLexicalIndex(store, index)
     return index
+  }
+
+  /** 锁内全量重建（调用方必须已持锁）。 */
+  async function rebuildIndex() {
+    return buildIndex({ write: true })
+  }
+
+  /**
+   * H-1（0.14.0-beta.48）：索引重建默认在**锁外构建**，只在锁内做新鲜度复核 + 短写。
+   *
+   * 旧实现把「读全部记录 + 建索引 + 写 3 MB」整个塞进跨进程写锁：443 条约 307 ms，
+   * 线性外推到 5,431 条约 3.7 s，叠加另一进程持锁的最长 5 s 等待，ELOCKED 风险真实。
+   * 判据：构建前后取两次轻量基线（事务号/已提交数/遗忘戳），相同才在锁内复核后落盘；
+   * 任一字段变化（期间有提交/遗忘）或复核不符 → 退回锁内全量重建（正确性优先）。
+   * 记录提交后不可变，锁外读记录本身不会读到半条。
+   */
+  async function rebuildIndexSafely() {
+    let built = null
+    try {
+      await store.refreshForgotten?.()
+      const before = await store.freshness()
+      const index = await buildIndex({ write: false })
+      const after = await store.freshness()
+      built = { index, baseline: after, stable: JSON.stringify(before) === JSON.stringify(after) }
+    } catch {
+      built = null // 构建失败不掩盖：锁内重建会如实抛出
+    }
+    return withCrossProcessWriteLock(dir, async () => {
+      await store.syncFromLog()
+      if (built !== null && built.stable === true) {
+        const current = await store.freshness()
+        if (JSON.stringify(current) === JSON.stringify(built.baseline)) {
+          await writeLexicalIndex(store, built.index)
+          return built.index
+        }
+      }
+      return rebuildIndex()
+    })
   }
 
   // 来源事件 ID 缓存：进程内惰性构建，任何写操作后失效（H-01：断点必须能从库反推）
@@ -246,11 +301,31 @@ export async function createSessionStorePort(root, sessionKey) {
     },
 
     async rebuildIndex() {
-      return withCrossProcessWriteLock(dir, async () => { await store.syncFromLog(); return rebuildIndex() })
+      return rebuildIndexSafely()
+    },
+
+    /** 日志尾部半行修复（/memory-lab repair）：dryRun 只报告，不写任何字节。 */
+    async repairJournals(options = {}) {
+      return repairSessionJournals(dir, options)
+    },
+
+    /** 关闭底层句柄（composition.dispose 用；端口方法面之外，测试替身可缺席）。 */
+    close() {
+      store.close()
     },
 
     listVouchers() {
       return store.listVouchers()
+    },
+
+    /** D-C：隐私面清除标记（history 用；旧测试替身可缺席）。 */
+    redactedVoucherIds() {
+      return typeof store.redactedVoucherIds === 'function' ? store.redactedVoucherIds() : []
+    },
+
+    async markVoucherRedacted(voucherId, redacted) {
+      if (typeof store.markVoucherRedacted !== 'function') return { changed: false }
+      return store.markVoucherRedacted(voucherId, redacted)
     },
 
     // 会话目录只读暴露（usage 聚合落盘/观察面 stats 用；不承诺更多）

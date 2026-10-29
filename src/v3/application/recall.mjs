@@ -142,10 +142,12 @@ export function createRecall({ provider, metrics, sessionKey } = {}) {
       headerLines.push('词表外词（未参与打分）：' + boundedTerms(result.oovTerms).join('、'))
     }
     const hitLines = []
+    const hitPackIndex = [] // hitLines[n] 对应的 result.pack 下标（不可读命中被跳过，两者会错位）
     const sourceTexts = [] // 每条命中的原文（预算不足时据此缩短首部，见 compose）
     const hitTimes = [] // D-13 口径（2026-10-26 拍板「优先保最新的」）：截断丢最旧，不砍尾部
     let unreadableHits = 0
-    for (const hit of result.pack) {
+    for (let packIndex = 0; packIndex < result.pack.length; packIndex += 1) {
+      const hit = result.pack[packIndex]
       let record = null
       try {
         record = await provider.read(hit.id)
@@ -161,6 +163,10 @@ export function createRecall({ provider, metrics, sessionKey } = {}) {
       // 混用会让含代理对（emoji）的短文本被判为「超长」，于是全文保留还加一个省略号。
       const preview = [...recordText].length > previewChars ? sliceByChars(recordText, previewChars) + '…' : recordText
       hitLines.push('· ' + hit.id + '（相关度 ' + hit.score.toFixed(3) + '）首部：' + preview)
+      // 收缩路径必须按 hitLines 自己的映射取 pack 项：不可读命中被 continue 跳过后，
+      // hitLines[n] 与 result.pack[n] 不再同指——旧实现用 result.pack[n] 打 ID，
+      // 会把「可读正文」标成另一条（不可读）记录的 ID（审计 E-A 实测）。
+      hitPackIndex.push(packIndex)
       // 原文单独留一份：预算收敛时要按可用余量**缩短首部**，不得只靠「整条丢弃」。
       sourceTexts.push(recordText)
       hitTimes.push(Number.isFinite(record?.record?.createdAt) ? record.record.createdAt : 0)
@@ -187,7 +193,8 @@ export function createRecall({ provider, metrics, sessionKey } = {}) {
     const hitLineAt = (n, capChars) => {
       const text = sourceTexts[n] ?? ''
       const preview = [...text].length > capChars ? sliceByChars(text, capChars) + '…' : text
-      return '· ' + result.pack[n].id + '（相关度 ' + result.pack[n].score.toFixed(3) + '）首部：' + preview
+      const packHit = result.pack[hitPackIndex[n] ?? n]
+      return '· ' + packHit.id + '（相关度 ' + packHit.score.toFixed(3) + '）首部：' + preview
     }
     /**
      * 组装回注包。

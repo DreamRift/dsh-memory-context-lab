@@ -19,18 +19,21 @@
  *   - transactions.jsonl 解析失败（含尾部半行）→ 存储判 damaged：读允许、写拒绝，
  *     文件字节不动（disposition-integrity 保留判据：读路径不得改写日志）。
  */
-import { mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readdir, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 
 import { v3Error, V3ContractViolation } from '../../contracts/errors.mjs'
 import { assertValidRecord, validateRecord } from '../../contracts/records.mjs'
+import { withCrossProcessWriteLock } from './write-lock.mjs'
 
 const SCHEMA_VERSION = 1
 const MANIFEST = 'manifest.json'
 const TXN_LOG = 'transactions.jsonl'
 const VOUCHERS_LOG = 'vouchers.jsonl'
 const FORGOTTEN_LOG = 'forgotten.jsonl'
+// D-C：隐私面清除/还原的持久标记（history 同步读取，不能现场读宿主活动面）
+const REDACTIONS_LOG = 'redactions.jsonl'
 const RECORDS_DIR = 'records'
 const QUARANTINE_DIR = 'quarantine'
 
@@ -90,23 +93,139 @@ async function parseTxnLog(filePath, label = path.basename(filePath)) {
 }
 
 /**
+ * 日志文件尾部检查（G-A，0.14.0-beta.48）：只认「尾部无换行且 JSON 不可解析」的半行。
+ *
+ * 安全红线（用户 2026-10-29 拍板）：
+ * - 只动**尾部**，中段损坏与完整行解析失败一律判 damaged，绝不截断；
+ * - 半行 = 文件末尾（最后一个 \n 之后）非空、且 JSON.parse 失败；
+ *   完整行（即使没有结尾换行）可解析 → 视为已提交，不动；
+ * - 检查先验证前缀全部可解析，前缀有坏行同样不截断（可能是中段损坏的另一种表现）。
+ * @returns {Promise<object>} { state: 'absent'|'ok'|'tail-half-line'|'damaged', ... }
+ */
+export async function inspectJournalFile(filePath, label = path.basename(filePath)) {
+  let buffer
+  try {
+    buffer = await readFile(filePath)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { state: 'absent', file: label, path: filePath }
+    return { state: 'unreadable', file: label, path: filePath, reason: error?.code ?? String(error) }
+  }
+  const lastNewline = buffer.lastIndexOf('\n'.charCodeAt(0))
+  const endsWithNewline = lastNewline === buffer.length - 1
+  const tailStart = endsWithNewline ? buffer.length : lastNewline + 1
+  const tail = buffer.subarray(tailStart).toString('utf8')
+  const hasTail = !endsWithNewline && tail.trim().length > 0
+  // 前缀（尾部半行之前）必须整体可解析；否则不是「只坏尾部」，不能截断。
+  const prefix = buffer.subarray(0, tailStart).toString('utf8')
+  const prefixLines = prefix.split('\n')
+  for (let i = 0; i < prefixLines.length; i += 1) {
+    const raw = prefixLines[i]
+    if (raw.length === 0) continue
+    try {
+      JSON.parse(raw)
+    } catch {
+      return { state: 'damaged', file: label, path: filePath, line: i + 1, reason: label + ' 第 ' + (i + 1) + ' 行不可解析（中段/完整行损坏，不自动截断）' }
+    }
+  }
+  if (!hasTail) return { state: 'ok', file: label, path: filePath, bytes: buffer.length }
+  try {
+    JSON.parse(tail)
+    // 合法 JSON 但缺结尾换行：视为已提交的完整行（不猜、不改写）。
+    return { state: 'ok', file: label, path: filePath, bytes: buffer.length, unterminatedComplete: true }
+  } catch {
+    return {
+      state: 'tail-half-line',
+      file: label,
+      path: filePath,
+      keptBytes: tailStart,
+      removedBytes: buffer.length - tailStart,
+      tailPreview: tail.slice(0, 120),
+      reason: label + ' 尾部半行（无结尾换行且 JSON 不可解析）',
+    }
+  }
+}
+
+const REPAIR_LOG = 'repair-log.jsonl'
+
+/**
+ * 修复会话日志尾部（G-A）：锁内重读 → 逐文件只截尾部半行 → 先写审计再截断。
+ *
+ * 只处理 append-only 日志（transactions / vouchers / forgotten）的尾部半行：
+ * 半行是未完成的 append，截掉即回到最后一条完整事实；中段损坏与完整行损坏仍失败关闭。
+ * 审计行写进 sessions/<key>/repair-log.jsonl（先落审计，审计失败则不改动任何字节）。
+ *
+ * @param {string} dir 会话目录
+ * @param {{dryRun?: boolean, now?: () => number}} [options]
+ */
+export async function repairSessionJournals(dir, { dryRun = false, now = () => Date.now() } = {}) {
+  const specs = [
+    { file: TXN_LOG },
+    { file: VOUCHERS_LOG },
+    { file: FORGOTTEN_LOG },
+    { file: REDACTIONS_LOG },
+  ]
+  const inspectAll = async () => {
+    const rows = []
+    for (const spec of specs) {
+      rows.push(await inspectJournalFile(path.join(dir, spec.file), spec.file))
+    }
+    return rows
+  }
+  const before = await inspectAll()
+  const tails = before.filter((row) => row.state === 'tail-half-line')
+  if (dryRun) {
+    return { dryRun: true, files: before, repaired: [], changed: false }
+  }
+  if (tails.length === 0) {
+    return { dryRun: false, files: before, repaired: [], changed: false }
+  }
+  // 跨进程锁内重读后再截断：别的进程可能刚补完那条 append。
+  return withCrossProcessWriteLock(dir, async () => {
+    const inside = await inspectAll()
+    const repaired = []
+    for (const row of inside) {
+      if (row.state !== 'tail-half-line') continue
+      const audit = {
+        schemaVersion: 1,
+        at: now(),
+        file: row.file,
+        keptBytes: row.keptBytes,
+        removedBytes: row.removedBytes,
+        removedPreview: row.tailPreview,
+        reason: '尾部半行（无结尾换行且 JSON 不可解析）',
+      }
+      // 审计先落盘：写不进去就不改数据（不留「悄悄截断」的路径）。
+      await appendLine(path.join(dir, REPAIR_LOG), audit)
+      await truncate(row.path, row.keptBytes)
+      repaired.push(audit)
+    }
+    const after = await inspectAll()
+    return { dryRun: false, files: after, repaired, changed: repaired.length > 0 }
+  })
+}
+
+/**
  * 打开（或创建）会话存储，并执行崩溃对账。
  * @returns {object} store：submitTransaction / readRecord / health / close
  */
-export async function openV3SessionStore(root, sessionKey) {
+export async function openV3SessionStore(root, sessionKey, options = {}) {
   if (typeof root !== 'string' || root.length === 0) {
     throw new V3ContractViolation('v3 store: root 必须是非空字符串')
   }
   if (typeof sessionKey !== 'string' || sessionKey.trim().length === 0) {
     throw new V3ContractViolation('v3 store: sessionKey 必须是非空白字符串')
   }
+  // stat 可注入（G-B 守卫）：fileExists 只把 ENOENT 当「没有」，其余错误必须向上抛；
+  // 测试注入 EACCES 证明「读不到」不再被当成「不存在」而重建 manifest/txn 号。
+  const statOf = typeof options.stat === 'function' ? options.stat : stat
+  const fileExistsHere = (p) => fileExists(p, statOf)
   const dir = sessionDirOf(root, sessionKey)
   await mkdir(path.join(dir, RECORDS_DIR), { recursive: true })
   await mkdir(path.join(dir, QUARANTINE_DIR), { recursive: true })
 
   const manifestPath = path.join(dir, MANIFEST)
   let manifest
-  if (await fileExists(manifestPath)) {
+  if (await fileExistsHere(manifestPath)) {
     manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
     if (manifest.sessionKey !== sessionKey || manifest.schemaVersion !== SCHEMA_VERSION) {
       throw v3Error('ESTORE_SESSION_MISMATCH', 'manifest 与请求会话不符（跨会话不串数据的第一道闸）')
@@ -136,6 +255,14 @@ export async function openV3SessionStore(root, sessionKey) {
   const vouchersParsed = await parseTxnLog(vouchersPath, VOUCHERS_LOG)
   const forgottenPath = path.join(dir, FORGOTTEN_LOG)
   const forgottenParsed = await parseTxnLog(forgottenPath, FORGOTTEN_LOG)
+  const redactionsPath = path.join(dir, REDACTIONS_LOG)
+  const redactionsParsed = await parseTxnLog(redactionsPath, REDACTIONS_LOG)
+  const redactedVouchers = new Set()
+  for (const line of redactionsParsed.lines) {
+    if (typeof line.voucherId !== 'string') continue
+    if (line.action === 'redact') redactedVouchers.add(line.voucherId)
+    else if (line.action === 'unredact') redactedVouchers.delete(line.voucherId)
+  }
   const forgotten = new Set()
   for (const line of forgottenParsed.lines) {
     if (typeof line.id !== 'string') continue
@@ -306,7 +433,7 @@ export async function openV3SessionStore(root, sessionKey) {
       const ids = records.map((r) => r.id)
       // 已存在（已提交）的 ID → 冲突拒绝（重试须用新事务，不得覆盖）
       for (const id of ids) {
-        if (committedIds.has(id) || (await fileExists(path.join(dir, RECORDS_DIR, id + '.json')))) {
+        if (committedIds.has(id) || (await fileExistsHere(path.join(dir, RECORDS_DIR, id + '.json')))) {
           throw v3Error('ESTORE_TXN_CONFLICT', '记录已存在：' + id + '（重试须用新 ID/新事务，不覆盖）')
         }
       }
@@ -373,7 +500,7 @@ export async function openV3SessionStore(root, sessionKey) {
       } catch (error) {
         if (error?.code === 'ENOENT') {
           // 隔离区里有的话如实说明（崩溃残留不是「从未存在」）
-          if (await fileExists(path.join(dir, QUARANTINE_DIR, id + '.json'))) {
+          if (await fileExistsHere(path.join(dir, QUARANTINE_DIR, id + '.json'))) {
             throw v3Error('ESTORE_CORRUPT', '记录 ' + id + ' 是崩溃残留（已隔离），未提交，不可读')
           }
           throw v3Error('ESTORE_CORRUPT', '记录不存在：' + id)
@@ -503,6 +630,21 @@ export async function openV3SessionStore(root, sessionKey) {
       return [...committedIds]
     },
 
+    /**
+     * 轻量基线（H-1，0.14.0-beta.48）：索引「锁外构建 + 锁内短写」用它判新鲜度。
+     * 任一字段变化都说明构建窗口内有写者，结果不可直接落盘（退回锁内重建）。
+     * 事务号从磁盘重读（另一进程提交后本句柄的 manifest 副本会过期）。
+     */
+    async freshness() {
+      const manifestNow = await rereadManifestTxnNext()
+      return {
+        txnNext: manifestNow.txnNext,
+        committed: committedIds.size,
+        forgotten: forgotten.size,
+        forgottenStamp,
+      }
+    },
+
     /** 主动遗忘：幂等（重复遗忘同一 ID 不报错不重复记账）；未提交过的 ID 拒绝。 */
     async forget(id) {
       assertWritable()
@@ -543,6 +685,28 @@ export async function openV3SessionStore(root, sessionKey) {
         forgotten.delete(id)
       }
       return { forgottenCount: forgotten.size }
+    },
+
+    /** 隐私面已清除的回执 ID 集合（D-C，history 同步读取）。损坏 → 失败关闭。 */
+    redactedVoucherIds() {
+      if (redactionsParsed.damaged) {
+        throw v3Error('ESTORE_DAMAGED', 'redactions.jsonl 损坏（' + (redactionsParsed.reason ?? '未给出原因') + '）：无法判定哪些回执已清除')
+      }
+      return [...redactedVouchers]
+    },
+
+    /** 标记回执已清除/已还原（幂等；只追加，不物理删除）。 */
+    async markVoucherRedacted(voucherId, redacted) {
+      assertWritable()
+      if (typeof voucherId !== 'string' || voucherId.length === 0) {
+        throw new V3ContractViolation('v3 store: voucherId 必须是非空字符串')
+      }
+      const action = redacted === true ? 'redact' : 'unredact'
+      if ((action === 'redact') === redactedVouchers.has(voucherId)) return { changed: false, redacted: action === 'redact' }
+      await appendLine(redactionsPath, { action, voucherId, at: null })
+      if (action === 'redact') redactedVouchers.add(voucherId)
+      else redactedVouchers.delete(voucherId)
+      return { changed: true, redacted: action === 'redact' }
     },
 
     /** 列已遗忘 ID；账本损坏 → ESTORE_DAMAGED（与 listVouchers 同口径，不静默当空）。 */
@@ -587,13 +751,18 @@ async function appendLine(filePath, value) {
   await appendFile(filePath, JSON.stringify(value) + '\n', 'utf8')
 }
 
-async function fileExists(filePath) {
-  const { stat } = await import('node:fs/promises')
+/**
+ * G-B：只把 ENOENT 当「没有」；EACCES/EMFILE/ELOOP 等一律向上抛（失败关闭）。
+ * 旧实现吞掉所有 stat 错误并返回 false：manifest 瞬时读不到 → 以 txnNext=1 重建
+ * （事务号复用）；记录冲突检查读不到 → 覆盖同 ID 记录。v2 的 isAbsent 纪律在 v3 落地。
+ */
+async function fileExists(filePath, statOf = stat) {
   try {
-    await stat(filePath)
+    await statOf(filePath)
     return true
-  } catch {
-    return false
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
   }
 }
 
@@ -611,4 +780,3 @@ async function fileStampOf(filePath) {
     throw error
   }
 }
-

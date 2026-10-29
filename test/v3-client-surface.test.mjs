@@ -410,3 +410,21 @@ test('命名空间未被服务时页面说明「插件未加载」，不渲染�
   assert.equal(tree.type, 'p')
   assert.equal(tree.children, 'unavailable')
 })
+
+test('轮次判定字段是下拉框：切到 DSH 轮次提交字符串值，未改动不提交', async () => {
+  const entry = await loadClient()
+  const run = runApply(entry)
+  const rendered = run.bind(run.slots[1].component, { view: 'page', t: (key) => key })
+  const select = findElement(rendered.get(), (node) => node.type === 'select' && node.props['aria-label'] === 'turnBasisLabel')
+  assert.ok(select, '轮次判定必须渲染成下拉框（开关说不出哪边是默认）')
+  assert.equal(select.props.value, 'human', '默认必须是真人消息')
+  const options = (select.children ?? []).flat(2).filter((node) => node !== null && typeof node === 'object')
+  assert.deepEqual(options.map((node) => node.props.value), ['human', 'dsh'], '两个选项都要在')
+
+  select.props.onChange({ target: { value: 'dsh' } })
+  const save = findElement(rendered.get(), (node) => node.type === run.Button && node.props['data-mcl-save'] === true)
+  save.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(run.writes, [{ ops: [{ op: 'set', path: ['turnBasis'], value: 'dsh' }], revision: 3 }],
+    '只提交轮次判定的字符串值，其它字段不动')
+})

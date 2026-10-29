@@ -8,9 +8,13 @@
  * - 新 seq 必须大于 start/end；start/end 必须在当前 surface 中且顺序正确。
  *
  * 不模拟真实的 request/header/tool 结构；测试只关心 surface/seq/正文。
+ *
+ * 真实宿主的活动面**不含 tool/call**（调用记录只在 append-only 日志里，参数随
+ * assistant/message 的 content 块出现）。B-3（0.14.0-beta.48）起夹具同口径：
+ * pushToolCall 默认 log-only；需要旧形状的用例显式传 { onSurface: true }。
  */
 
-const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/call', 'tool/result'])
+const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
 
 export function createFakeSession({ cwd = 'C:\\workspace', contextWindow = 100000, id = 'session-fake' } = {}) {
   const log = []
@@ -73,8 +77,21 @@ export function createFakeSession({ cwd = 'C:\\workspace', contextWindow = 10000
     pushAssistant(text) {
       return append('assistant/message', { message: { role: 'assistant', content: [{ type: 'text', text }] }, source: { kind: 'assistant' } })
     },
-    pushToolCall(callId, name, args = {}) {
-      return append('tool/call', { message: { role: 'assistant', content: [{ type: 'tool-call', callId, name, arguments: JSON.stringify(args) }] }, callId, name, arguments: JSON.stringify(args) })
+    pushToolCall(callId, name, args = {}, { onSurface = false } = {}) {
+      // 真实形状：内容块在 assistant/message 里，tool/call 事件本身 log-only。
+      if (onSurface === true) SURFACE_TYPES.add('tool/call')
+      try {
+        return append('tool/call', { message: { role: 'assistant', content: [{ type: 'tool-call', callId, name, arguments: JSON.stringify(args) }] }, callId, name, arguments: JSON.stringify(args) })
+      } finally {
+        if (onSurface === true) SURFACE_TYPES.delete('tool/call')
+      }
+    },
+    /** 真实形状：assistant 消息同时带可见文本与工具调用块（B-1 的恢复面夹具）。 */
+    pushAssistantWithToolCall(text, callId, name, args = {}) {
+      const content = []
+      if (typeof text === 'string' && text.length > 0) content.push({ type: 'text', text })
+      content.push({ type: 'tool-call', callId, name, arguments: JSON.stringify(args) })
+      return append('assistant/message', { message: { role: 'assistant', content }, source: { kind: 'assistant' } })
     },
     pushToolResult(callId, text) {
       return append('tool/result', { message: { role: 'tool', content: [{ type: 'text', text }] }, callId, isError: false })

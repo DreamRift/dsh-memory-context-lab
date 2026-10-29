@@ -76,3 +76,60 @@ test('buildStepUnits：真实 tool/result 闭合后 hasUnfinished=false', () => 
   const [unit] = buildStepUnits(events)
   assert.equal(unit.hasUnfinished, false)
 })
+
+/**
+ * 0.14.0-beta.47：按轮归档的轮次判定可在「真人消息」与「DSH 轮次」之间切换。
+ * 真实故障形状（会话 9513ac70）：一条真人指令 + 10 次目标自动继续，界面显示
+ * 「14 轮 281 步」，但真人判定把 10 轮自动继续全部算进同一个当前回合 → 只压到 2 轮。
+ */
+test('按轮：DSH 轮次判定把目标自动继续的每一轮当一轮，真人判定只剩当前回合', () => {
+  const events = [
+    { seq: 0, type: 'turn/start', data: { turn: 1 } },
+    { seq: 1, type: 'step/start', data: { turn: 1, step: 1 } },
+    { seq: 2, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '真人指令' }] } },
+    { seq: 3, type: 'assistant/message', data: { message: { role: 'assistant', content: [{ type: 'text', text: '第一轮分析' }] } } },
+    { seq: 4, type: 'step/end', data: { turn: 1, step: 1 } },
+    { seq: 5, type: 'turn/start', data: { turn: 2 } },
+    { seq: 6, type: 'step/start', data: { turn: 2, step: 1 } },
+    { seq: 7, type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: '目标自动继续' }] } },
+    { seq: 8, type: 'assistant/message', data: { message: { role: 'assistant', content: [{ type: 'text', text: '第二轮分析' }] } } },
+    { seq: 9, type: 'step/end', data: { turn: 2, step: 1 } },
+  ]
+  const surfaceNodes = [2, 3, 7, 8]
+  const humanGroups = groupSurfaceOperations({ surfaceNodes, events })
+  assert.equal(humanGroups.length, 1, '真人判定：goal 继续不是新回合')
+  assert.equal(humanGroups[0].current, true)
+  assert.equal(selectArchiveSpan({ surfaceNodes, events, hasRecord: () => true, mode: 'full-history' }), null,
+    '真人判定下唯一回合就是当前回合，没有可归档内容')
+
+  const dshGroups = groupSurfaceOperations({ surfaceNodes, events, turnBasis: 'dsh' })
+  assert.deepEqual(dshGroups.map((group) => [group.turn, group.current]), [[1, false], [2, true]],
+    'DSH 判定：两轮，只有第 2 轮是当前轮')
+  const span = selectArchiveSpan({
+    surfaceNodes, events, hasRecord: () => true, mode: 'full-history', turnBasis: 'dsh', maxOperations: 2,
+  })
+  assert.ok(span, '第 1 轮已完成，必须可归档')
+  assert.deepEqual([span.startSeq, span.endSeq], [2, 3])
+  assert.deepEqual(span.recordSeqs, [2, 3])
+})
+
+test('按轮：DSH 当前轮刚开、活动面还没有它的节点时，上一轮仍判为已完成', () => {
+  const events = [
+    { seq: 0, type: 'turn/start', data: { turn: 1 } },
+    { seq: 1, type: 'step/start', data: { turn: 1, step: 1 } },
+    { seq: 2, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '真人指令' }] } },
+    { seq: 3, type: 'assistant/message', data: { message: { role: 'assistant', content: [{ type: 'text', text: '第一轮分析' }] } } },
+    { seq: 4, type: 'step/end', data: { turn: 1, step: 1 } },
+    { seq: 5, type: 'turn/start', data: { turn: 2 } },
+    { seq: 6, type: 'step/start', data: { turn: 2, step: 1 } },
+  ]
+  const surfaceNodes = [2, 3]
+  // 没有 payload.turn 时保守：最后一组算当前轮，先不压。
+  assert.equal(groupSurfaceOperations({ surfaceNodes, events, turnBasis: 'dsh' })[0].current, true)
+  // pre-step 明确告知「当前是第 2 轮」：第 1 轮已完成，可立即归档（不等第 2 轮产出节点）。
+  const groups = groupSurfaceOperations({ surfaceNodes, events, turnBasis: 'dsh', currentTurn: 2 })
+  assert.equal(groups[0].current, false)
+  const span = selectArchiveSpan({ surfaceNodes, events, hasRecord: () => true, mode: 'full-history', turnBasis: 'dsh', currentTurn: 2 })
+  assert.ok(span)
+  assert.deepEqual([span.startSeq, span.endSeq], [2, 3])
+})

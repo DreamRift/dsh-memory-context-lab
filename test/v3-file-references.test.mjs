@@ -84,17 +84,17 @@ test('engine：读文件工具调用产生引用；verify → stale；stale 排�
     await settle(engine)
 
     const working = await engine.workingSet('session-fake')
-    const toolRow = working.rows.find((row) => row.seq === 1)
-    assert.ok(toolRow, 'tool/call 应有记录 ID')
+    // B-3：真实宿主活动面不含 tool/call（log-only），工作集不应把它算进来。
+    assert.equal(working.rows.find((row) => row.seq === 1), undefined, 'tool/call 不在活动面')
 
     const status = await engine.fileStatus('session-fake')
     assert.equal(status.error, undefined)
-    assert.equal(status.refs.length, 1)
-    assert.equal(status.refs[0].recordId, toolRow.recordId)
+    assert.equal(status.refs.length, 1, 'log-only 调用也要产生文件引用（摄入不依赖活动面）')
+    const toolRecordId = status.refs[0].recordId
     assert.equal(status.refs[0].status, 'unverified')
 
     await writeFile(path.join(workspace, 'alpha.txt'), 'alpha-changed', 'utf8')
-    const verified = await engine.verifyFiles('session-fake', { recordId: toolRow.recordId })
+    const verified = await engine.verifyFiles('session-fake', { recordId: toolRecordId })
     assert.equal(verified.rows[0].status, 'stale')
 
     const recalled = await engine.recallForInjection('session-fake', 'alpha', { turn: 2 })

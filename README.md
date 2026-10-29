@@ -4,7 +4,7 @@
 
 插件只改模型可见的**投影**，不改写 DSH 的 append-only 会话日志与命令审计。原始历史始终留在会话日志里，回执可按凭证恢复。
 
-> 当前源码版本 0.14.0-beta.46（测试版）。
+> 当前源码版本 0.14.0-beta.48（测试版）。
 
 ## 功能
 
@@ -18,6 +18,14 @@
 - **T1 / T2 双后端**：默认本地 Node store + 词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10 且 Python 可用时，按会话启动独立 `MDCG_ROOT` 的隔离 MCP（T2），检索融合本地与隔离灵枢；T2 不可用时如实回 T1。
 - **图形入口**：composer 工具行 chip + 弹层控制本对话启用/回注/计划/模式/条数；全局参数在插件设置页。
 - **可观测**：`/memory-lab status | t2 | history | working-set | file-status` 只读查看摄入、索引、归档、T2 与回注观测。
+
+## 0.14.0-beta.48 更新（相比 beta.46）
+
+- **恢复不再丢工具调用参数**：摄入时把 assistant 消息里的 `tool-call` 块（脱敏后）一并存进记录结构；`restore` 会带回工具名与参数，按 ID 回读即可还原。索引、正文与净收益判据不变，16000 字窗口守卫仍是失败关闭。
+- **损坏库自动截断尾部半行**：`transactions` / `vouchers` / `forgotten` / `redactions` 日志末尾若是崩溃留下的半行（无结尾换行且 JSON 不可解析），打开时会在写锁内重读并截到最后一条完整行；中段损坏或账实不符绝不截断。也可用 `/memory-lab repair [status|apply]` 手动审计/修复，截断前先写 `repair-log.jsonl`。
+- **崩溃恢复与记录会计**：归档意图区分按轮/按步并沿用事务号；恢复结果按「已恢复 / 跳过 / 已遗忘」分桶；隐私面清除失败可见，撤销遗忘会恢复 pin 保护。
+- **按轮归档的轮次判定可切换**（beta.47）：设置页新增 `turnBasis`——`human`（默认，真人消息算一轮）或 `dsh`（按界面「N 轮」计数，目标自动继续也会开新轮）。两种判定的判负游标独立，切换不会误跳未评估的轮。
+- **稳定性**：索引重建移到写锁外并在锁内复核新鲜度；`fileExists` 只把 ENOENT 当「没有」；状态行的「按步归档闸门」与「下一次归档」使用同一次 dry-run 的事实。
 
 ## 0.14.0-beta.46 更新（相比 beta.45）
 
@@ -49,7 +57,7 @@
 
 ```text
 cd "$DSH_HOME/profiles/<profile>"
-pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.46.tgz"
+pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.48.tgz"
 ```
 
 或把 tgz 路径写进 profile 的 `package.json` 后执行 `pnpm install`。安装后**重启 DSH**，服务端半才会加载新版本；客户端半在页面刷新后重新装配。
@@ -92,6 +100,7 @@ npm pack
 |---|---|---|
 | `enabled` | `true` | 新会话默认回注；本对话可单独关闭 |
 | `fullHistory` | `true` | 新会话默认按轮归档；关闭后默认按步归档 |
+| `turnBasis` | `human` | 按轮归档的轮次判定：`human` 真人消息（默认）；`dsh` 按界面「N 轮」，目标自动继续也算 |
 | `planFirst` | `false` | 计划期间暂停归档与自动回注 |
 | `autoRestore` | `true` | 停用/手动恢复时是否还原回执 |
 | `limit` | `10` | 单次回注条数（1–20） |

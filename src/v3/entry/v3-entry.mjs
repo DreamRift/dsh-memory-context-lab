@@ -145,6 +145,37 @@ function textOfBlocks(content) {
 }
 
 /**
+ * assistant 消息里的工具调用块（B-1 A，0.14.0-beta.48）。
+ *
+ * 真实宿主把工具调用放在 assistant/message 的 content 块（type='tool-call'），
+ * 而 tool/call 事件本身不在活动面——旧实现只取 text 块，于是归档恢复只恢复了
+ * 工具输出、没有恢复「当时调用了什么、参数是什么」（27/27 凭证、81 次调用、
+ * 105,975 字参数不可恢复）。这里把调用块提取成 structure.toolCalls：
+ * - **不改 text**：索引、净收益判据、sourceChars 全部不受影响；
+ * - 参数与 tool/call 记录同一套脱敏口径（redactValue + parseJsonishArguments）；
+ * - 同 callId 只留一条（重复块不放大恢复正文）。
+ */
+function toolCallsOfBlocks(content) {
+  if (!Array.isArray(content)) return []
+  const out = []
+  const seen = new Set()
+  for (const block of content) {
+    if (block?.type !== 'tool-call') continue
+    const callId = typeof block.callId === 'string' ? block.callId : ''
+    if (callId.length > 0) {
+      if (seen.has(callId)) continue
+      seen.add(callId)
+    }
+    out.push({
+      name: typeof block.name === 'string' ? block.name : '',
+      callId,
+      arguments: redactValue(parseJsonishArguments(block.arguments ?? block.args ?? {})),
+    })
+  }
+  return out
+}
+
+/**
  * 从 DSH 事件提取正文与结构（2026-10-25 P1 修正：按宿主源码核验的真实形状）。
  * - user/message：data.content[].text / data.text（原有路径）；
  * - assistant/message：正文在 data.message.content（dsh-agent-loop createAssistantMessage）；
@@ -156,8 +187,15 @@ export function extractEventBody(raw) {
   const data = raw?.data ?? {}
   const type = raw?.type ?? ''
   if (type === 'assistant/message') {
-    const text = textOfBlocks(data.message?.content) || textOfBlocks(data.content) || (typeof data.text === 'string' ? data.text : '')
+    const content = data.message?.content ?? data.content
+    const text = textOfBlocks(content) || (typeof data.text === 'string' ? data.text : '')
     const body = text ? { text } : { text: '', metaOnly: true, reason: 'assistant 无可见文本块' }
+    // B-1 A：工具调用参数随记录结构落库（text 不变），restore 按 structure 渲染。
+    const toolCalls = toolCallsOfBlocks(content)
+    if (toolCalls.length > 0) {
+      body.structure = { toolCalls }
+      if (!text) body.reason = 'assistant 仅工具调用（无可见文本）'
+    }
     const usage = usageOf(data.usage)
     if (usage) body.usage = usage
     return body
@@ -433,9 +471,13 @@ export function attachV3Engine(ctx, options = {}) {
    */
   const MAX_NOT_WORTH_SKIPS = 16
 
-  /** 连续跳过判负 span（单步最多扫 MAX_NOT_WORTH_SKIPS 段）；返回最终结果与最新游标。 */
-  async function skipNotWorthSpans(entry, run) {
-    let cursor = Number.isInteger(entry.notWorthThroughSeq) ? entry.notWorthThroughSeq : -1
+  /**
+   * 连续跳过判负 span（单步最多扫 MAX_NOT_WORTH_SKIPS 段）；返回最终结果与最新游标。
+   * 游标按模式分开存：按步 span 与回合 span 的判负结论互不蕴含，共用一个游标会让
+   * 一次模式切换把「没评估过」的回合当成「判负过」跳过（静默不归档，安全但无效）。
+   */
+  async function skipNotWorthSpans(entry, run, cursorField = 'notWorthThroughSeq') {
+    let cursor = Number.isInteger(entry[cursorField]) ? entry[cursorField] : -1
     let result = null
     for (let round = 0; round < MAX_NOT_WORTH_SKIPS; round += 1) {
       result = await run(cursor)
@@ -451,6 +493,12 @@ export function attachV3Engine(ctx, options = {}) {
     const entry = runtimes.get(String(sessionId ?? ''))
     if (entry === undefined || entry.inflight !== null) return { status: 'busy-or-not-ready' }
     if (entry.archive === null) return { status: 'host-no-surface' }
+    // C-F：每个 pre-step 先尝试对账旧 intent（失败保留 intent，只告警不阻塞）。
+    try {
+      await recoverArchiveIntent(entry, sessionId)
+    } catch (error) {
+      ctx.logger?.warn?.('memory-context-lab-v3: 归档意图对账失败（保留 intent）：' + (error?.message ?? String(error)))
+    }
     let state = stateOf(sessionId)
     if (state.mode === 'recall-only' || state.planFirst === true) return { status: 'paused' }
     if (state.mode === 'cooling') {
@@ -467,6 +515,10 @@ export function attachV3Engine(ctx, options = {}) {
     const surfaceNodes = await host.surfaceNodes()
     const events = Array.isArray(session?.log) ? session.log : (typeof session?.events === 'function' ? session.events() : null)
     if (!Array.isArray(events) || surfaceNodes.length === 0) return { status: 'no-surface' }
+    // 轮次判定（0.14.0-beta.47）：默认按真人消息（历史行为），可切到 DSH 自己的轮次计数。
+    // 只影响按轮归档的「什么算一轮」；按步归档与回执/恢复语义完全不变。
+    const turnBasis = settings.turnBasis === 'dsh' ? 'dsh' : 'human'
+    const turnCursorField = turnBasis === 'dsh' ? 'notWorthThroughSeqTurnDsh' : 'notWorthThroughSeqTurn'
     // 两种模式的分工（beta.40）：
     // - full-history：回合级，只压已完成回合（当前回合永不归档）——长程多轮；
     // - cooling：步骤级，在当前回合内实时压掉不再需要的旧步骤——长步数少轮，
@@ -491,7 +543,10 @@ export function attachV3Engine(ctx, options = {}) {
         entry.notWorthThroughSeq = skipped.cursor
       }
     } else {
-      result = await entry.archive.archiveOnce({
+      // 回合级判负同样是**非安全边界**：不回执、不遮蔽、留在活动面，但也不能把队头
+      // 之后的已完成回合永久堵死（与按步 beta.46 同一判据，游标分开存）。
+      const planFloor = Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1
+      const turnArgs = {
         sessionId,
         events,
         surfaceNodes,
@@ -502,10 +557,22 @@ export function attachV3Engine(ctx, options = {}) {
         maxOperations: 1,
         // 按轮归档只压已完成回合（当前回合已排除）：读租约不再钉住上一轮（AUD-09）。
         pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: false }),
-        minStartSeq: Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1,
+        // 轮次判定与当前轮：DSH 轮次下，目标自动继续开的新轮就是「当前轮」，
+        // 上一轮因此成为已完成——这正是「14 轮只压 2 轮」的修复点。
+        turnBasis,
+        currentTurn: Number.isInteger(options?.turn) ? options.turn : null,
         summary: options?.compact === true,
         txn: 1,
-      })
+      }
+      const skipped = await skipNotWorthSpans(
+        entry,
+        (cursor) => entry.archive.archiveOnce({ ...turnArgs, minStartSeq: Math.max(planFloor, cursor) }),
+        turnCursorField,
+      )
+      result = skipped.result
+      if (skipped.cursor > (Number.isInteger(entry[turnCursorField]) ? entry[turnCursorField] : -1)) {
+        entry[turnCursorField] = skipped.cursor
+      }
     }
     if (result.status === 'archived') {
       // 两种模式都记 lastArchiveAt（供状态行与切模式确认）；lastArchiveEndSeq 只给
@@ -522,7 +589,7 @@ export function attachV3Engine(ctx, options = {}) {
     return result
   }
 
-  async function dryRunArchive(sessionId, session, settings = {}) {
+  async function dryRunArchive(sessionId, session, settings = {}, options = {}) {
     const entry = runtimes.get(String(sessionId ?? ''))
     if (entry === undefined) return { status: 'not-ready' }
     if (entry.archive === null) return { status: 'host-no-surface' }
@@ -536,7 +603,9 @@ export function attachV3Engine(ctx, options = {}) {
     if (state.mode === 'cooling') {
       // 预览必须与真正会执行的选择器**和闸门**一致，否则 status 会骗人。
       const gate = await coolingGateOf(entry, state, settings)
-      if (!gate.opened) return { status: 'cooling-closed', occupancy: gate.occupancy, gate: gate.gate }
+      // F-C：预览结果带上同一时刻的闸门事实，status 的「按步归档闸门」行与
+      // 「下一次归档」行因此同源（不再一行读 state.cooling、一行现场重算）。
+      if (!gate.opened) return { status: 'cooling-closed', occupancy: gate.occupancy, gate: gate.gate, opened: false }
       const stepArgs = {
         sessionId,
         events,
@@ -549,9 +618,14 @@ export function attachV3Engine(ctx, options = {}) {
       // 预览与执行同一游标：判负的队头 span 不参与「下一次归档」，否则 status 会显示一个永远执行不了的候选。
       const { result: planned } = await skipNotWorthSpans(entry, (minStartSeq) => entry.archive.planSteps({ ...stepArgs, minStartSeq }))
       // 预期与真实执行同一份判据：no-candidate 的 reason 由选择器给出，原样透出。
-      return { status: planned.status ?? 'planned', ...planned }
+      return { status: planned.status ?? 'planned', ...planned, gate: gate.gate, occupancy: gate.occupancy, opened: gate.opened }
     }
-    return await entry.archive.dryRun({
+    // 预览与执行同一游标（只读、不推进）：否则 status 会报一个永远压不了的判负回合。
+    // 轮次判定与游标也必须同源：切到 DSH 轮次后，按真人消息判负过的 span 不能拿来跳过。
+    const turnBasis = settings.turnBasis === 'dsh' ? 'dsh' : 'human'
+    const turnCursorField = turnBasis === 'dsh' ? 'notWorthThroughSeqTurnDsh' : 'notWorthThroughSeqTurn'
+    const planFloor = Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1
+    const turnArgs = {
       sessionId,
       events,
       surfaceNodes,
@@ -562,8 +636,15 @@ export function attachV3Engine(ctx, options = {}) {
       maxOperations: 1,
       // 与 archiveForStep 的按轮分支同口径（AUD-09）：租约只保护工作集，不挡已完成回合。
       pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: false }),
-      minStartSeq: Number.isInteger(state.planFloorSeq) ? state.planFloorSeq : -1,
-    })
+      turnBasis,
+      currentTurn: Number.isInteger(options?.turn) ? options.turn : null,
+    }
+    const { result: planned } = await skipNotWorthSpans(
+      entry,
+      (cursor) => entry.archive.dryRun({ ...turnArgs, minStartSeq: Math.max(planFloor, cursor) }),
+      turnCursorField,
+    )
+    return { status: planned.status ?? 'planned', ...planned }
   }
 
   /** 历史凭证（只读；供 /memory-lab history 与面板）。 */
@@ -581,6 +662,26 @@ export function attachV3Engine(ctx, options = {}) {
     if (entry.archive === null) return { error: 'host-no-surface' }
     if (index === null) return await entry.archive.restoreAll({ maxChars })
     return await entry.archive.restoreVoucher(index, { maxChars })
+  }
+
+  /**
+   * 日志尾部半行修复（G-A，0.14.0-beta.48）：dryRun 只报告，不写任何字节。
+   * apply 成功后关闭旧句柄并丢弃入口缓存——下一次 pre-step 会重新建库/重开，
+   * 让 writable 与内存视图都回到修复后的真实状态（不伪造「已可写」）。
+   */
+  async function repairStore(sessionId, { dryRun = false } = {}) {
+    const key = String(sessionId ?? '')
+    const entry = runtimes.get(key)
+    if (entry === undefined) return { error: 'not-ready' }
+    const store = entry.runtime.store
+    if (typeof store.repairJournals !== 'function') return { error: 'store-no-repair' }
+    const report = await store.repairJournals({ dryRun })
+    if (dryRun !== true && report?.changed === true) {
+      try { entry.runtime.close?.() } catch { /* 关闭失败不改变修复事实 */ }
+      runtimes.delete(key)
+      entryFailures.delete(key)
+    }
+    return report
   }
 
   /** 显式 pin：这些记录所在的 surface 节点作为归档硬边界（pin 记录本身不归档）。 */
@@ -637,12 +738,18 @@ export function attachV3Engine(ctx, options = {}) {
         }
       }
       const vouchers = entry.runtime.store.listVouchers()
+      const unredact = { attempted: 0, changed: 0, failed: [] }
       for (let index = 0; index < vouchers.length; index += 1) {
-        if ((vouchers[index].recordIds ?? []).some((id) => recordIds.includes(id))) {
-          await entry.archive.unredactVoucher(index).catch(() => {})
+        if (!(vouchers[index].recordIds ?? []).some((id) => recordIds.includes(id))) continue
+        unredact.attempted += 1
+        const row = await entry.archive.unredactVoucher(index).catch((error) => ({ changed: false, reason: 'internal-failure', error }))
+        if (row.changed === true) unredact.changed += 1
+        else if (row.reason !== 'voucher-not-found') {
+          unredact.failed.push({ index, reason: row.reason ?? 'unknown' })
+          ctx.logger?.warn?.('memory-context-lab-v3: 撤销遗忘后回执还原失败（#' + index + '：' + (row.reason ?? 'unknown') + '）')
         }
       }
-      return { ...result, undone: true }
+      return { ...result, undone: true, unredact }
     }
     const result = await entry.runtime.store.forget(recordIds)
     await refreshSearchable(entry)
@@ -658,16 +765,22 @@ export function attachV3Engine(ctx, options = {}) {
       }
     }
     const vouchers = entry.runtime.store.listVouchers()
+    // D-C：隐私面级联失败必须可见（旧实现 .catch(() => {}) 把 receipt-changed 吞掉，
+    // 观察面以为回执仍可恢复）。
+    const redact = { attempted: 0, changed: 0, failed: [] }
     for (let index = 0; index < vouchers.length; index += 1) {
-      if ((vouchers[index].recordIds ?? []).some((id) => recordIds.includes(id))) {
-        await entry.archive.redactVoucher(index).catch(() => {})
+      if (!(vouchers[index].recordIds ?? []).some((id) => recordIds.includes(id))) continue
+      redact.attempted += 1
+      const row = await entry.archive.redactVoucher(index).catch((error) => ({ changed: false, reason: 'internal-failure', error }))
+      if (row.changed === true) redact.changed += 1
+      else if (row.reason !== 'voucher-not-found') {
+        redact.failed.push({ index, reason: row.reason ?? 'unknown' })
+        ctx.logger?.warn?.('memory-context-lab-v3: 隐私面回执清除失败（#' + index + '：' + (row.reason ?? 'unknown') + '）——历史里该段已不可恢复')
       }
     }
-    // 已遗忘记录不再需要 pin；避免 state 里留下不可用 ID。
-    const state = stateOf(sessionId)
-    const pins = state.pins.filter((id) => !recordIds.includes(id))
-    if (pins.length !== state.pins.length) await setState(sessionId, { pins }).catch(() => {})
-    return { ...result, undone: false }
+    // D-D：遗忘不再删除 pin。pin 是用户意图，一次 forget 不该永久丢失它；
+    // 保留后 undo 自然恢复保护（旧实现删了 pins、undo 却不恢复）。
+    return { ...result, undone: false, redact }
   }
 
   /**
@@ -1121,6 +1234,39 @@ async function fileStatus(sessionId) {
   }
 
   /** 回填状态（只读；坏文件如实回 error，不拿 0 冒充）。 */
+  /**
+   * 归档意图对账（C-D / C-F，0.14.0-beta.48）：建库时与每个 pre-step 都尝试。
+   *
+   * 旧实现只在 ensureEntry 跑一次——voucher 失败后要等进程重启才自愈。pre-step 每次
+   * 先读一次 intent（文件不存在就返回，成本一次 readFile），有 intent 才读活动面。
+   * 恢复落 state 时按 intent.mode 分流：按步归档只写 lastArchiveAt，绝不写
+   * lastArchiveEndSeq（那会成为回合级选择的永久下限）。
+   */
+  async function recoverArchiveIntent(entry, sessionId) {
+    if (entry === null || entry === undefined || entry.archive === null) return { recovered: false }
+    if (typeof entry.runtime?.host?.surfaceNodes !== 'function') return { recovered: false }
+    const intent = await readArchiveIntent(v3Root, String(sessionId)).catch((error) => {
+      ctx.logger?.warn?.('memory-context-lab-v3: 归档意图不可读（本步跳过对账）：' + (error?.message ?? String(error)))
+      return null
+    })
+    if (intent === null || typeof intent !== 'object') return { recovered: false }
+    const nodes = await entry.runtime.host.surfaceNodes()
+    const recovered = await entry.archive.recoverIntent({
+      sessionId: String(sessionId),
+      surfaceNodes: nodes,
+      surfaceTextOf: (seq) => entry.runtime.host.surfaceTextAt(seq),
+    })
+    if (recovered.recovered === true) {
+      const current = stateOf(String(sessionId))
+      const at = Date.now()
+      const surface = recovered.mode === 'cooling'
+        ? { lastArchiveAt: at }
+        : { lastArchiveEndSeq: recovered.endSeq, lastArchiveAt: at }
+      await writeSessionState(v3Root, String(sessionId), patchSessionState(current, { surface }))
+    }
+    return recovered
+  }
+
   async function backfillStateOf(sessionId) {
     const key = String(sessionId ?? '')
     const entry = runtimes.get(key)
@@ -1220,6 +1366,11 @@ async function fileStatus(sessionId) {
         // 按步归档的「判负跳过」游标（0.14.0-beta.46）：只跳过净收益为负的 span，
         // 不是持久化位点——进程重建后归零，最多重扫一次判负队头。
         notWorthThroughSeq: -1,
+        // 按轮归档的同一游标（回合级 span 与按步 span 不共享：判负结论不可跨模式复用）。
+        notWorthThroughSeqTurn: -1,
+        // 按轮归档切到「DSH 轮次」判定时的独立游标（0.14.0-beta.47）：
+        // 真人回合的判负结论不能拿来跳过别的分组口径，否则切换后静默不归档。
+        notWorthThroughSeqTurnDsh: -1,
         searchable,
         archive,
         cwd: session?.header?.cwd ?? session?.cwd ?? null,
@@ -1228,18 +1379,9 @@ async function fileStatus(sessionId) {
       }
       runtimes.set(sessionId, entry)
       pendingEntries.delete(sessionId)
-      if (archive !== null && typeof runtime.host.surfaceNodes === 'function') {
+      if (archive !== null) {
         try {
-          const nodes = await runtime.host.surfaceNodes()
-          const recovered = await archive.recoverIntent({
-            sessionId,
-            surfaceNodes: nodes,
-            surfaceTextOf: (seq) => runtime.host.surfaceTextAt(seq),
-          })
-          if (recovered.recovered === true && Number.isInteger(recovered.endSeq)) {
-            const current = stateOf(sessionId)
-            await writeSessionState(v3Root, String(sessionId), patchSessionState(current, { surface: { lastArchiveEndSeq: recovered.endSeq, lastArchiveAt: Date.now() } }))
-          }
+          await recoverArchiveIntent(entry, sessionId)
         } catch (error) {
           ctx.logger?.warn?.('memory-context-lab-v3: 归档意图对账失败（保留 intent）：' + (error?.message ?? String(error)))
         }
@@ -1464,8 +1606,9 @@ async function fileStatus(sessionId) {
   /**
    * 同步状态（0.14.0-beta.15，composer 状态条的数据源）。
    *
-   * 客户端读不到宿主进程里的对象；投影的 wire.view 需要一个**同步、零 I/O、绝不抛错**的
-   * 读取器，否则每步都要等文件系统。本函数全部走内存表：
+   * 客户端读不到宿主进程里的对象；投影的 wire.view 需要一个**同步、绝不抛错**的读取器，
+   * 否则每步都要等文件系统。实测它并不零 I/O：controlOf/stateOf 各一次 statSync（F-B，
+   * 内容有 mtime:size 缓存）——这里如实描述，不再宣称「零 I/O」。其余走内存表：
    * - 已建库：lastSeq / records / ingesting / 本会话回注计数；
    * - 建库中：pending；
    * - 建库失败：failed + code（与 /memory-lab status 的失败关闭口径一致，不伪装成「尚未摄入」）；
@@ -1579,6 +1722,7 @@ async function fileStatus(sessionId) {
     dryRunArchive,
     historyOf,
     restoreHistory,
+    repairStore,
     pinRecords,
     forgetPreview,
     forgetRecords,

@@ -5,14 +5,15 @@
  *   不是可观察状态（D-05：该窗口曾被当场判 stale 并接管，双写者同时持锁）；
  * - **心跳校验 token**：心跳先读回比对 token，不符即停表标 lost——被接管者的
  *   心跳不得覆盖新持有者的凭证（D-06）；
- * - **stale 接管**：心跳超 TTL 或持有进程已死 → 把旧锁目录改名墓碑后重取；
+ * - **stale 接管**：心跳超 TTL → 把旧锁目录改名墓碑后重取（**不探测 pid**；
+ *   持有进程已死也同样要等满 TTL，G-C 文档漂移已按实现更正）；
  *   接管/加锁的瞬态 EPERM/EBUSY/ENOENT 按退避重试，deadline 内用尽抛 ELOCKED
  *   （不无界自旋，W-02）；
  * - **同进程串行 + 重入**：同目录 withWriteLock 排队成链；同调用栈嵌套直接执行
  *   （不死锁）；不同目录互不阻塞（W-01）。
  * 时间经注入（now 函数），测试用虚拟时钟确定性驱动。
  */
-import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
@@ -27,10 +28,6 @@ const DEFAULT_WAIT_MS = 5000
 const RETRY_BACKOFF_MS = 25
 /** 续约间隔：TTL 的三分之一（60s TTL → 20s 一次），足以在两次续约之间容忍一次抖动。 */
 const HEARTBEAT_INTERVAL_MS = Math.max(1000, Math.floor(DEFAULT_TTL_MS / 3))
-
-async function exists(p) {
-  try { await stat(p); return true } catch { return false }
-}
 
 function lockDirOf(dir) {
   return path.join(dir, LOCK_DIR)

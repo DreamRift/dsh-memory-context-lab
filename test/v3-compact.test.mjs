@@ -51,13 +51,22 @@ test('compact：摘要进回执；遗忘级联清除；undo 还原', async () =>
     assert.equal(voucher.summary, true)
 
     const target = result.recordIds[0]
-    await engine.forgetRecords('session-fake', [target])
+    // D-D：pin 是用户意图，forget 不得删除；undo 后自然仍在。
+    const pinsBefore = (await engine.pinRecords('session-fake', [target])).pins
+    assert.deepEqual(pinsBefore, [target])
+    const forgotten = await engine.forgetRecords('session-fake', [target])
+    assert.equal(forgotten.redact.changed, 1, '隐私面级联必须报告实际清除段数')
+    assert.deepEqual(engine.stateOf('session-fake').pins, pinsBefore, 'forget 不得删除 pin')
+    assert.equal((await engine.historyOf('session-fake')).rows[0].redacted, true, '历史里必须标出正文已清除')
     const nodes = await session.surface.nodes
     const redacted = await session.textOf(nodes[0])
     assert.match(redacted, /已遗忘记录/)
     assert.doesNotMatch(redacted, /第一问/)
 
-    await engine.forgetRecords('session-fake', [target], { undo: true })
+    const undone = await engine.forgetRecords('session-fake', [target], { undo: true })
+    assert.equal(undone.unredact.changed, 1)
+    assert.equal((await engine.historyOf('session-fake')).rows[0].redacted, false)
+    assert.deepEqual(engine.stateOf('session-fake').pins, pinsBefore, 'undo 后 pin 仍在')
     const restoredReceipt = await session.textOf((await session.surface.nodes)[0])
     assert.match(restoredReceipt, /摘要：/)
     const restored = await engine.restoreHistory('session-fake', { index: 0 })

@@ -52,6 +52,7 @@ import {
   createStatusProjectionDefinition,
 } from '../src/v3/adapters/host/status-projection.mjs'
 import { SESSION_OVERRIDE_KEYS } from '../src/v3/domain/session/session-control.mjs'
+import { createFakeSession } from './helpers/fake-session.mjs'
 
 const SRC = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(SRC, '..')
@@ -194,4 +195,51 @@ test('schema 仍严格：overrides 少键/多键都必须抛错（不是放宽�
 test('STATUS_PROJECTION_VERSION 已提升：旧检查点必须被宿主丢弃重折', () => {
   assert.equal(STATUS_PROJECTION_VERSION, 2,
     'view 形状变了（overrides 多一个键）；不升版本，旧检查点会带着一条键的 state 冷恢复')
+})
+/**
+ * 审计 F-A（beta.46 排查）：`status` 在「本会话尚未摄入」分支把**全局**回注计数
+ * 当成这个会话的计数显示（`engine.stats().injection` 是跨会话聚合）。
+ * 后果：新会话/未摄入会话能看到别的会话的回注次数与上次结局——观察面跨会话串味。
+ */
+test('未摄入会话的 status 不得显示其它会话的回注计数', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'mcl-status-scope-'))
+  const previousHome = process.env.DSH_HOME
+  const previousT2 = process.env.MEMORY_LAB_T2
+  process.env.DSH_HOME = home
+  process.env.MEMORY_LAB_T2 = '0'
+  try {
+    const module = await import(pathToFileURL(ENTRY).href + '?t=' + Date.now())
+    const hooks = []
+    const { ctx, commands } = makeCtx()
+    ctx.on = (name, handler, opts) => { hooks.push({ name, handler, opts }); return () => {} }
+    await module.apply(ctx, {})
+    const run = (session, line) => commands[0].handler({ agent: { session }, rawInput: line })
+    const busy = createFakeSession({ id: 's-scope-busy' })
+    assert.equal((await run(busy, 'on')).kind, 'success')
+    busy.pushUser('审计回注计数：驱动一次回注尝试')
+    const ingest = hooks.find((hook) => hook.name === 'agent/pre-step' && hook.opts?.prepend !== true)
+    const recallHook = hooks.find((hook) => hook.name === 'agent/pre-step' && hook.opts?.prepend === true)
+    assert.ok(ingest && recallHook, '摄入与回注两个 pre-step 钩子都必须注册')
+    await ingest.handler({ agent: { session: busy }, signal: undefined }, async () => ({ kind: 'enter' }))
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const status = await run(busy, 'status')
+      if (/已摄入 [1-9]/.test(status.text) && !/后台摄入进行中/.test(status.text)) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    // 一次回注尝试（命中与否都会让 attempted +1）。
+    await recallHook.handler({
+      agent: { session: busy }, signal: undefined, turn: 1,
+      messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '审计回注计数' }] }],
+    }, async () => ({ kind: 'enter', messages: [] }))
+    const fresh = createFakeSession({ id: 's-scope-fresh' })
+    const status = await run(fresh, 'status')
+    assert.match(status.text, /本会话尚未摄入/, status.text)
+    assert.match(status.text, /· 回注：尝试 0 次/, '未摄入会话必须显示自己的 0 次，而不是其它会话的计数：' + status.text)
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    if (previousT2 === undefined) delete process.env.MEMORY_LAB_T2
+    else process.env.MEMORY_LAB_T2 = previousT2
+    await rm(home, { recursive: true, force: true }).catch(() => {})
+  }
 })

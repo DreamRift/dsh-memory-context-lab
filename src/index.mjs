@@ -51,6 +51,18 @@ const MODE_ALIASES = Object.freeze({
   cooling: 'cooling', step: 'cooling', '按步归档': 'cooling', '按步': 'cooling',
   'recall-only': 'recall-only', '仅回注': 'recall-only',
 })
+/**
+ * 按轮归档的轮次判定（0.14.0-beta.47）：
+ * - human（默认）：真人 user/message 才算新回合；DSH 目标自动继续不产生新回合，
+ *   所以一条真人指令下的 10 次自动继续都属于同一个「当前回合」，永远压不到。
+ * - dsh：按界面上的「N 轮」计数（turn/start / step/start 的 data.turn）；目标自动
+ *   继续也会开新轮，上一轮因此成为已完成。回执/恢复/安全边界两种判定完全一致。
+ */
+const TURN_BASIS_LABELS = Object.freeze({ human: '真人消息（默认）', dsh: 'DSH 轮次' })
+function turnBasisLabel(value) {
+  return value === 'dsh' ? TURN_BASIS_LABELS.dsh : TURN_BASIS_LABELS.human
+}
+
 function modeLabel(mode) {
   return MODE_LABELS[mode] ?? String(mode)
 }
@@ -79,6 +91,7 @@ export const Config = Schema.object({
   previewChars: Schema.number().default(160).min(40).max(4000).step(10).description('每条命中在回注包里的首部字符数').volatile(),
   queryMaxChars: Schema.number().default(512).min(32).max(4000).step(16).description('查询词只取用户消息的前 N 个字符（整条长消息会把检索拖成“必须命中整句”）').volatile(),
   fullHistory: Schema.boolean().default(true).description('新会话默认全历史模式；本对话可在面板切换').volatile(),
+  turnBasis: Schema.string().default('human').description('按轮归档的轮次判定：human = 真人消息（默认）；dsh = 按 DSH 界面显示的轮数（目标自动继续每轮都算，压得更快）').volatile(),
   planFirst: Schema.boolean().default(false).description('计划先行默认值：计划期间暂停归档与自动回注').volatile(),
   coolingGate: Schema.number().default(20).min(0).max(95).step(1).description('按步归档闸门：上下文占用达到该百分比才压缩旧步骤（0 = 每步都判断）').volatile(),
   autoRestore: Schema.boolean().default(true).description('停用/手动恢复时是否把回执恢复为原文').volatile(),
@@ -92,6 +105,7 @@ export const SETTINGS_DEFAULTS = Object.freeze({
   previewChars: 160,
   queryMaxChars: 512,
   fullHistory: true,
+  turnBasis: 'human',
   planFirst: false,
   autoRestore: true,
   coolingGate: 20,
@@ -123,6 +137,8 @@ export function readSettings(config) {
     previewChars: pick('previewChars', SETTINGS_DEFAULTS.previewChars, (v) => Number.isInteger(v) && v >= 0),
     queryMaxChars: pick('queryMaxChars', SETTINGS_DEFAULTS.queryMaxChars, (v) => Number.isInteger(v) && v >= 1),
     fullHistory: pick('fullHistory', SETTINGS_DEFAULTS.fullHistory, (v) => typeof v === 'boolean'),
+    // 只认两个值：设置页给的是下拉框，但配置文件可以手改；未知值一律回落默认（失败关闭）。
+    turnBasis: pick('turnBasis', SETTINGS_DEFAULTS.turnBasis, (v) => v === 'human' || v === 'dsh'),
     planFirst: pick('planFirst', SETTINGS_DEFAULTS.planFirst, (v) => typeof v === 'boolean'),
     autoRestore: pick('autoRestore', SETTINGS_DEFAULTS.autoRestore, (v) => typeof v === 'boolean'),
     coolingGate: pick('coolingGate', SETTINGS_DEFAULTS.coolingGate, (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 95),
@@ -153,6 +169,7 @@ const USAGE = [
   '　　　/memory-lab compact —— 归档并带确定性摘要',
   '　　　/memory-lab dry-run —— 预览归档候选（不写）',
   '　　　/memory-lab history —— 列出恢复凭证',
+  '　　　/memory-lab repair [status|apply] —— 日志尾部半行修复（status 只报告）',
   '　　　/memory-lab working-set —— 当前回合的工作集',
   '　　　/memory-lab export|adopt <文件名>|adopt-from <父ID> —— 导出/导入/父记忆复制',
   '　　　/memory-lab file-status、verify <ID|all> —— 文件引用与核证',
@@ -162,7 +179,7 @@ const USAGE = [
   '　　　/memory-lab t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] —— T2 诊断/覆盖率/显式回填',
   '　　　/memory-lab config show —— 查全局默认（写入在插件设置页）',
   '　　　/memory-lab help —— 本清单',
-  '全局默认：设置 → 插件 → 记忆上下文（开关 / 条数 / 装包阈 / 首部长度 / 查询上限）',
+  '全局默认：设置 → 插件 → 记忆上下文（开关 / 轮次判定 / 条数 / 装包阈 / 首部长度 / 查询上限）',
 ].join('\n')
 
 /** 宿主 CommandResult（success）。 */
@@ -366,7 +383,9 @@ export async function apply(ctx, config) {
       if (typeof sessionId === 'string' && sessionId.length > 0 && control?.enabled !== false) {
         try {
           // 闸门可以按本对话覆盖（/memory-lab set gate N）：effective 已合并控制文件。
-          await engine.archiveForStep(sessionId, payload?.agent?.session, { ...settings, coolingGate: effective.gate })
+          // turn 只用于「DSH 轮次」判定：当前轮刚开、活动面还没有它的节点时，
+          // 也能把上一轮判为已完成（否则会晚一轮才压）。
+          await engine.archiveForStep(sessionId, payload?.agent?.session, { ...settings, coolingGate: effective.gate }, { turn: payload?.turn })
         } catch (error) {
           warn('archive-failed', 'memory-context-lab: 归档评估异常（本步跳过）：'
             + (error?.code ?? 'EINTERNAL') + ' ' + (error instanceof Error ? error.message : String(error)))
@@ -429,7 +448,7 @@ export async function apply(ctx, config) {
       definitionId: COMMAND_DEFINITION_ID,
       name: COMMAND_NAME,
       description: '记忆上下文：本对话开关 / 摄入与回注 / 检索与回读',
-      input: { hint: 'status | on|off | inject on|off | set limit <1–20> | unset limit | reset | mode <full-history|cooling|recall-only> | planfirst on|off|approve | now | compact | dry-run | history | working-set | export|adopt <文件名>|adopt-from <父ID> | file-status | verify <ID|all> | restore [序号|all] | pin|unpin <ID> | pins | forget preview|apply|undo|status <ID…> | t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] | config show | recall <词> | read <ID> | help' },
+      input: { hint: 'status | on|off | inject on|off | set limit <1–20> | unset limit | reset | mode <full-history|cooling|recall-only> | planfirst on|off|approve | now | compact | dry-run | history | repair [status|apply] | working-set | export|adopt <文件名>|adopt-from <父ID> | file-status | verify <ID|all> | restore [序号|all] | pin|unpin <ID> | pins | forget preview|apply|undo|status <ID…> | t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] | config show | recall <词> | read <ID> | help' },
       handler: async (invocation) => {
         const words = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean)
         const sub = (words[0] ?? 'help').toLowerCase()
@@ -519,6 +538,7 @@ export async function apply(ctx, config) {
                 try {
                   const result = await engine.restoreHistory(sessionId, { maxChars: 16000 })
                   if (result.total > 0) restoreLine = '\n恢复：' + result.restored + '/' + result.total + '；跳过 ' + result.skipped
+                    + (result.forgotten > 0 ? '；已遗忘 ' + result.forgotten : '')
                 } catch (error) {
                   restoreLine = '\n恢复失败（停用仍生效）：' + (error?.code ?? error?.message ?? String(error))
                 }
@@ -615,7 +635,34 @@ export async function apply(ctx, config) {
             if (history.error !== undefined) return fail('历史凭证不可读：' + (history.error?.code ?? history.error?.message ?? String(history.error)))
             if (!Array.isArray(history.rows) || history.rows.length === 0) return ok('暂无归档凭证。')
             return ok(history.rows.map((row) => '#' + row.index + ' · seq ' + (row.startSeq ?? '?') + '–' + (row.endSeq ?? '?')
-              + ' · ' + row.recordIds.length + ' 条 · 回执 ' + row.chars + ' 字').join('\n'))
+              + ' · ' + row.recordIds.length + ' 条 · 回执 ' + row.chars + ' 字' + (row.redacted === true ? ' · 正文已清除' : '')).join('\n'))
+          }
+          if (sub === 'repair') {
+            const mode = (words[1] ?? 'status').toLowerCase()
+            if (mode !== 'status' && mode !== 'apply') return fail('用法：/memory-lab repair [status|apply]（status 只报告，apply 锁内截断尾部半行）')
+            const result = await engine.repairStore(sessionId, { dryRun: mode !== 'apply' })
+            if (result.error === 'not-ready') return fail('本会话尚未建库/打开：先发出任意一条消息，再执行 repair。')
+            if (result.error !== undefined) return fail('修复不可用：' + result.error)
+            const rows = (result.files ?? []).map((row) => {
+              if (row.state === 'ok') return '· ' + row.file + '：正常（' + (row.bytes ?? '?') + ' 字节）'
+              if (row.state === 'absent') return '· ' + row.file + '：不存在'
+              if (row.state === 'tail-half-line') {
+                return '· ' + row.file + '：尾部半行（将截掉 ' + row.removedBytes + ' 字节；保留 ' + row.keptBytes + ' 字节）'
+              }
+              return '· ' + row.file + '：' + (row.state === 'damaged' ? '损坏（' + (row.reason ?? '') + '，不自动截断）' : '不可读（' + (row.reason ?? '') + '）')
+            })
+            if (mode === 'status') {
+              return ok('日志尾部检查（只读）：\n' + rows.join('\n')
+                + (result.changed === false && (result.files ?? []).every((row) => row.state !== 'tail-half-line')
+                  ? '\n没有可自动修复的尾部半行。' : '\n执行 /memory-lab repair apply 截断尾部半行（先写审计再改字节）。'))
+            }
+            const lines = rows.length > 0 ? rows : ['（无日志文件）']
+            if (result.changed === true) {
+              lines.push('已修复 ' + result.repaired.length + ' 个文件；审计写入 repair-log.jsonl。本会话库已关闭，下一步自动按修复后的状态重开。')
+            } else {
+              lines.push('没有可修复的尾部半行（中段损坏/完整行损坏不自动截断，仍失败关闭）。')
+            }
+            return ok('日志尾部修复：\n' + lines.join('\n'))
           }
           if (sub === 'working-set') {
             const result = await engine.workingSet(sessionId)
@@ -666,7 +713,8 @@ export async function apply(ctx, config) {
             if (raw === '' || raw === 'all') {
               const result = await engine.restoreHistory(sessionId, { maxChars: 16000 })
               if (result.error !== undefined) return fail('恢复不可用：' + (result.error?.code ?? result.error))
-              return ok('恢复：' + result.restored + '/' + result.total + '；跳过 ' + result.skipped)
+              return ok('恢复：' + result.restored + '/' + result.total + '；跳过 ' + result.skipped
+                + (result.forgotten > 0 ? '；已遗忘 ' + result.forgotten : ''))
             }
             const index = parseStrictInteger(raw)
             if (index === null) return fail('用法：/memory-lab restore [序号|all]（序号必须是十进制整数）')
@@ -704,7 +752,12 @@ export async function apply(ctx, config) {
             }
             const result = await engine.forgetRecords(sessionId, ids, { undo: op === 'undo' })
             if (result.error !== undefined) return fail('遗忘' + (op === 'undo' ? '撤销' : '') + '不可用：' + result.error)
-            return ok((op === 'undo' ? '已撤销遗忘 ' : '已遗忘 ') + ids.length + ' 条；当前遗忘 ' + result.forgottenCount + ' 条。')
+            const face = op === 'undo' ? result.unredact : result.redact
+            const faceLine = face === undefined || face.attempted === 0
+              ? ''
+              : '\n隐私面：' + face.changed + '/' + face.attempted + ' 段回执已' + (op === 'undo' ? '还原' : '清除')
+                + (face.failed.length > 0 ? '；' + face.failed.length + ' 段不可定位（#' + face.failed.map((row) => row.index + ':' + row.reason).join('、') + '）' : '')
+            return ok((op === 'undo' ? '已撤销遗忘 ' : '已遗忘 ') + ids.length + ' 条；当前遗忘 ' + result.forgottenCount + ' 条。' + faceLine)
           }
           if (sub === 'recall') {
             if (arg.length === 0) return fail('用法：/memory-lab recall <查询词>')
@@ -754,6 +807,7 @@ export async function apply(ctx, config) {
       + '；首部 ' + settings.previewChars
       + ' 字符；查询上限 ' + settings.queryMaxChars + ' 字符'
       + '；全历史默认 ' + (settings.fullHistory === false ? '关' : '开')
+      + '；轮次判定 ' + turnBasisLabel(settings.turnBasis)
       + '；计划先行默认 ' + (settings.planFirst === true ? '开' : '关')
       // 合并后的设置里字段名是 gate；直接读 coolingGate 会恒回落 20%，把会话覆盖显示错（AUD-04）。
       + '；按步闸门 ' + (Number.isFinite(settings.gate) ? settings.gate
@@ -766,6 +820,7 @@ export async function apply(ctx, config) {
     if (state === null || typeof state !== 'object') return '模式未知'
     const parts = [
       modeLabel(state.mode) + '（' + (state.mode ?? 'unknown') + '）',
+      ...(state.mode === 'full-history' ? ['轮次判定 ' + turnBasisLabel(settingsNow().turnBasis)] : []),
       '计划先行 ' + (state.planFirst === true ? '开' : '关'),
       '停用恢复 ' + (settingsNow().autoRestore === false ? '关' : '开'),
     ]
@@ -881,7 +936,9 @@ export async function apply(ctx, config) {
         '· 本对话：' + controlLine(control),
         '· 模式：' + stateLine(engine.stateOf(sessionId)),
         '· 生效回注设置：' + settingsLine(effective),
-        '· 回注：' + injectionLine(engine.stats?.().injection),
+        // 计数必须取**本会话**：engine.stats().injection 是跨会话聚合，未摄入的新会话
+        // 会把别的会话的「尝试 1 次 / 上次结局 injected」当成自己的观测（审计 F-A）。
+        '· 回注：' + injectionLine(engine.statusOf(sessionId)),
       ].join('\n')
     }
     const control = state.control ?? engine.controlOf(sessionId)
@@ -900,6 +957,24 @@ export async function apply(ctx, config) {
     const metaOnly = state.coverage?.records?.metaOnly
     const metaPart = Number.isInteger(metaOnly) ? '（其中仅元数据 ' + metaOnly + ' 条不进索引）' : ''
     const lifecycle = engine.stateOf(sessionId)
+    // F-C：先算一次「下一次归档」预览，闸门行与预览行共用同一组事实（同一时刻）。
+    let preview = null
+    let previewError = null
+    if (session !== null) {
+      try {
+        preview = await engine.dryRunArchive(sessionId, session, effectiveSettingsOf(sessionId))
+      } catch (error) {
+        previewError = error
+      }
+    }
+    const gateFacts = preview !== null && Number.isFinite(preview.occupancy) && Number.isFinite(preview.gate)
+      ? { occupancy: preview.occupancy, gate: preview.gate, opened: preview.status !== 'cooling-closed', stale: false }
+      : {
+        occupancy: typeof lifecycle.cooling?.lastOccupancy === 'number' ? lifecycle.cooling.lastOccupancy : null,
+        gate: effective.gate,
+        opened: lifecycle.cooling?.open === true,
+        stale: true,
+      }
     const lines = [
       '会话：' + sessionId,
       '· 摄入位点：lastSeq ' + state.lastSeq + (state.ingesting ? '（后台摄入进行中）' : ''),
@@ -907,6 +982,7 @@ export async function apply(ctx, config) {
         + ' · 可检索 ' + (searchableCount === null ? '未知（' + searchableReason + '）' : searchableCount + ' 条')
         + metaPart,
       '· 库健康：' + (state.health?.healthy === true ? '正常' : '异常（' + JSON.stringify(state.health) + '）'),
+      ...(state.health?.healthy === true ? [] : ['· 修复：/memory-lab repair status 检查日志尾部半行（apply 锁内截断，先写审计）']),
       '· 占用：' + (state.usageError
         ? '读取失败（' + state.usageError + '），这不是「没有样本」'
         : state.usage
@@ -914,8 +990,11 @@ export async function apply(ctx, config) {
           : '暂无样本'),
       '· 本对话：' + controlLine(control),
       '· 模式：' + stateLine(lifecycle),
-      ...(lifecycle.mode === 'cooling' ? ['· 按步归档闸门：' + effective.gate + '%（' + (lifecycle.cooling?.open === true ? '已开闸' : '未开闸')
-        + (typeof lifecycle.cooling?.lastOccupancy === 'number' ? '；上次占用 ' + Math.round(lifecycle.cooling.lastOccupancy * 100) + '%' : '；占用未知')
+      ...(lifecycle.mode === 'full-history' ? ['· 轮次判定：' + turnBasisLabel(settingsNow().turnBasis)
+        + '（设置页可切换；DSH 轮次把目标自动继续的每一轮也算一轮）'] : []),
+      ...(lifecycle.mode === 'cooling' ? ['· 按步归档闸门：' + gateFacts.gate + '%（' + (gateFacts.opened ? '已开闸' : '未开闸')
+        + (typeof gateFacts.occupancy === 'number' ? '；占用 ' + Math.round(gateFacts.occupancy * 100) + '%' : '；占用未知')
+        + (gateFacts.stale ? '；来自上一步记录' : '；与「下一次归档」同一时刻')
         + '；0% = 每步都判断）'] : []),
       '· 生效回注设置：' + settingsLine(effective),
       '· 回注：' + injectionLine(state.injection),
@@ -923,11 +1002,9 @@ export async function apply(ctx, config) {
     // 下一次归档预览（只读）：直接回答「为什么没在压缩」——
     // 归档只在**完成回合**上发生，当前回合永远留在面上。
     if (session !== null) {
-      try {
-        lines.push('· 下一次归档：' + archiveLine(await engine.dryRunArchive(sessionId, session, effectiveSettingsOf(sessionId))))
-      } catch (error) {
-        lines.push('· 下一次归档：预览失败（' + (error?.code ?? 'EINTERNAL') + '）')
-      }
+      lines.push('· 下一次归档：' + (previewError !== null
+        ? '预览失败（' + (previewError?.code ?? 'EINTERNAL') + '）'
+        : archiveLine(preview)))
     }
     return lines.join('\n')
   }
