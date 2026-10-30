@@ -35,8 +35,9 @@ export function validateEvent(candidate) {
   if (typeof candidate.sessionKey !== 'string' || candidate.sessionKey.trim().length === 0) {
     errors.push('sessionKey 必须是非空白字符串')
   }
-  if (!Number.isFinite(candidate.at) || candidate.at < 0) {
-    errors.push('at 必须是有限非负数（毫秒纪元）')
+  // B3-1：at 可选——宿主没给事件时间就如实缺失，不伪造；给了就必须是合法时间戳。
+  if (candidate.at !== undefined && (!Number.isFinite(candidate.at) || candidate.at < 0)) {
+    errors.push('at 若存在必须是有限非负数（毫秒纪元）')
   }
   const source = candidate.source
   if (source === null || typeof source !== 'object' || Array.isArray(source)) {

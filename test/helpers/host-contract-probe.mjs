@@ -12,6 +12,11 @@
  * - dsh-session 的 toolCallId 与 sourceEventSeqs 密集覆盖判据。
  * 它不能替代运行时测试，但能在宿主升级后第一时间指出契约漂移。
  *
+ * B3-28（AUD50-10-06）：检查清单必须覆盖插件实际消费的宿主字段（payload.turn /
+ * data.turn / session.log / surface.nodes / payload.messages）；数量由
+ * test/v3-host-probe.test.mjs 钉死。**升级 DSH 的人工核对项**：升级后先跑本探针，
+ * 再对照「插件 src 对宿主对象的字段读取」grep 一遍，未覆盖字段在此补检查。
+ *
  * 用法：
  *   node test/helpers/host-contract-probe.mjs --asar "<DSH>/resources/app.asar"
  *   DSH_ASAR=<...> npm run probe:host
@@ -83,6 +88,14 @@ try {
     ['dsh-agent-loop: surfaceOp append', () => /surfaceOp:\s*["']append["']/.test(source.loop)],
     ['dsh-session: toolCallId（真实 tool/result 配对键）', () => /toolCallId/.test(source.session)],
     ['dsh-session: sourceEventSeqs 密集覆盖', () => /assertSourceEventReferences|sourceEventSeqs/.test(source.session)],
+    // B3-28（AUD50-10-06）：插件消费的其余宿主契约字段（旧探针 6/6 假绿，这些字段改名发现不了）。
+    // 增删检查时同步 test/v3-host-probe.test.mjs 的 EXPECTED_CHECKS。以下正则已对 0.14.0-beta.50
+    // 宿主源码逐条核验命中。
+    ['dsh-agent-loop: pre-step payload.turn（position 展开进 waterfall）', () => /waterfall\(\s*["']agent\/pre-step["'][\s\S]{0,120}\.\.\.position/.test(source.loop)],
+    ['dsh-agent-loop: pre-step payload.messages', () => /waterfall\(\s*["']agent\/pre-step["'][\s\S]{0,80}messages:\s*claimed/.test(source.loop)],
+    ['dsh-agent-loop: turn/start data.turn', () => /lastTurn:\s*event\.data\.turn/.test(source.loop)],
+    ['dsh-session: session.log（事件日志数组）', () => /this\.log\s*=/.test(source.session)],
+    ['dsh-session: session.surface.nodes', () => /get surface\(\)\s*\{\s*return this\.surfaceManager/.test(source.session) && /get nodes\(\)/.test(source.session)],
   ]
   const failed = []
   for (const [label, check] of checks) {

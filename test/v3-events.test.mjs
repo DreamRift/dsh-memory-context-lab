@@ -41,7 +41,7 @@ test('每类非法形状各有独立 error', () => {
     [goodEvent({ id: '' }), /id 必须是非空字符串/],
     [goodEvent({ type: 'system' }), /type 必须是封闭集/],
     [goodEvent({ sessionKey: ' ' }), /sessionKey 必须是非空白字符串/],
-    [goodEvent({ at: -1 }), /at 必须是有限非负数/],
+    [goodEvent({ at: -1 }), /at.*必须是有限非负数/], // B3-1 后措辞为「at 若存在必须是…」（at 可选，只有存在时才校验）
     [goodEvent({ source: null }), /source 必须是对象/],
     [goodEvent({ source: { kind: 'dsh', extra: 1 } }), /source 只允许 kind/],
     [goodEvent({ source: { kind: '', form: null } }), /source.kind 必须是非空字符串/],

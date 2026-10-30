@@ -6,7 +6,6 @@
  *
  * ## 断言组（随机输入下的不变量）
  * - 随机记录（CJK/emoji/ASCII/空白混合）入库→索引→检索→回读：正文逐字节一致；
- * - 预算器/renderer：随机 sections 与预算下，非溢出卡恒不超预算、丢弃恒可见；
  * - applyMinScore：pack 恒为 display 子集、顺序稳定；
  * - 损坏注入：随机截断 jsonl 后 listRecords/health 失败关闭（损坏可见），不伪成功。
  *
@@ -21,7 +20,6 @@ import path from 'node:path'
 
 import { createSessionStorePort } from '../src/v3/adapters/storage/session-store-port.mjs'
 import { createT1Provider } from '../src/v3/adapters/retrieval/t1-provider.mjs'
-import { renderWorkingCard } from '../src/v3/projection/card-renderer.mjs'
 import { applyMinScore, rankResults } from '../src/v3/domain/retrieval/query.mjs'
 
 /** 种子 PRNG（mulberry32）：同一种子同一序列，失败可重放。 */
@@ -78,36 +76,6 @@ test('P1：随机记录入库→检索→回读，正文逐字节一致（200 �
     store.close()
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {})
-  }
-})
-
-test('P2：随机 sections/预算下，卡恒不超预算且丢弃可见（300 轮）', () => {
-  const rand = prng(424242)
-  const cats = ['anchor', 'guard', 'evidence', 'progress', 'claims', 'notes']
-  const prios = ['structural', 'protected', 'soft', 'soft']
-  for (let round = 0; round < 300; round += 1) {
-    const sectionCount = 1 + Math.floor(rand() * 5)
-    const sections = []
-    for (let i = 0; i < sectionCount; i += 1) {
-      const lines = []
-      const lineCount = 1 + Math.floor(rand() * 4)
-      for (let l = 0; l < lineCount; l += 1) lines.push(randomText(rand, 40))
-      sections.push({ category: cats[i % cats.length] + '-' + i, priority: prios[Math.floor(rand() * 4)], producer: rand() > 0.2, lines })
-    }
-    const budgetChars = Math.floor(rand() * 400)
-    const card = renderWorkingCard({ sections, budgetChars })
-    if (!card.structuralOverflow) {
-      assert.ok(card.usedChars <= budgetChars, '非溢出不超预算 round=' + round + ' used=' + card.usedChars + ' budget=' + budgetChars)
-    }
-    const includedSet = new Set(card.included)
-    for (const { category } of sections) {
-      if (includedSet.has(category)) continue
-      assert.ok(card.excluded.some((e) => e.category === category), '丢弃可见 round=' + round + ' cat=' + category)
-    }
-    const unit = [...card.text]
-    const last = card.text.charCodeAt(card.text.length - 1)
-    assert.ok(!(Number.isFinite(last) && last >= 0xd800 && last <= 0xdbff), '卡文本不得以半个代理对结尾')
-    void unit
   }
 })
 

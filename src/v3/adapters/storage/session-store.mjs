@@ -24,7 +24,7 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 
 import { v3Error, V3ContractViolation } from '../../contracts/errors.mjs'
-import { assertValidRecord, validateRecord } from '../../contracts/records.mjs'
+import { RECORD_KINDS, assertValidRecord, validateRecord } from '../../contracts/records.mjs'
 import { withCrossProcessWriteLock } from './write-lock.mjs'
 
 const SCHEMA_VERSION = 1
@@ -36,6 +36,14 @@ const FORGOTTEN_LOG = 'forgotten.jsonl'
 const REDACTIONS_LOG = 'redactions.jsonl'
 const RECORDS_DIR = 'records'
 const QUARANTINE_DIR = 'quarantine'
+// AUD50-03-03（B2-6）：records/ 里的合法记录名。其它名字（writeFileAtomic 崩溃留下
+// 的 .tmp、系统文件）不是记录：不参与对账计数，不进 idsOnDisk，打开期移入 quarantine。
+const RECORD_FILE = /^v3r-[0-9a-f]{16}\.json$/
+// AUD50-04-02（B2-8）：打开期检查点（可重建缓存）。与提交同锁追加：
+// baseline 行 = 全量扫描后的完整「事件→记录」映射（迁移旧库只付一次扫描），
+// checkpoint 行 = 每笔事务的增量。判据：行内最大 txn 等于事务日志 maxTxn 才可用，
+// 落后/缺失/损坏一律回退全量 provenance 扫描（不用旧检查点掩盖新记录）。
+const CHECKPOINT_LOG = 'checkpoint.jsonl'
 
 /** 原子写：同目录 randomUUID 临时名 + fsync + rename（G8：禁止 tmp-<pid>-<Date.now()>）。
  *
@@ -163,6 +171,8 @@ export async function repairSessionJournals(dir, { dryRun = false, now = () => D
     { file: VOUCHERS_LOG },
     { file: FORGOTTEN_LOG },
     { file: REDACTIONS_LOG },
+    // B2-8：检查点是纯缓存（可全量重建），尾部半行截断零风险；纳入 repair 面。
+    { file: CHECKPOINT_LOG },
   ]
   const inspectAll = async () => {
     const rows = []
@@ -218,110 +228,151 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
   // stat 可注入（G-B 守卫）：fileExists 只把 ENOENT 当「没有」，其余错误必须向上抛；
   // 测试注入 EACCES 证明「读不到」不再被当成「不存在」而重建 manifest/txn 号。
   const statOf = typeof options.stat === 'function' ? options.stat : stat
+  // readdir 可注入（B2-6 守卫）：目录读不了（EACCES 等）必须向上抛，不得当空目录。
+  const readdirOf = typeof options.readdir === 'function' ? options.readdir : readdir
   const fileExistsHere = (p) => fileExists(p, statOf)
   const dir = sessionDirOf(root, sessionKey)
   await mkdir(path.join(dir, RECORDS_DIR), { recursive: true })
   await mkdir(path.join(dir, QUARANTINE_DIR), { recursive: true })
 
   const manifestPath = path.join(dir, MANIFEST)
-  let manifest
-  if (await fileExistsHere(manifestPath)) {
-    manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-    if (manifest.sessionKey !== sessionKey || manifest.schemaVersion !== SCHEMA_VERSION) {
-      throw v3Error('ESTORE_SESSION_MISMATCH', 'manifest 与请求会话不符（跨会话不串数据的第一道闸）')
-    }
-  } else {
-    manifest = { schemaVersion: SCHEMA_VERSION, sessionKey, txnNext: 1 }
-    await writeFileAtomic(manifestPath, JSON.stringify(manifest) + '\n')
-  }
-
   const logPath = path.join(dir, TXN_LOG)
-  const parsedTxn = await parseTxnLog(logPath, TXN_LOG)
-  const lines = parsedTxn.lines
-  // 事务日志**缺失**但记录还在（H-21）：对账依据本身丢了，不能把「无法证明已提交」
-  // 当成「崩溃残留」——旧实现会把全部记录移进 quarantine，而 health 仍报 healthy，
-  // 等于静默全丢（实测 5 条记录 → records/ 清空、quarantine/ 5 条、healthy=true）。
-  // 这里判 damaged：读允许（记录字节完好）、写拒绝，交人工裁决；不销毁任何字节。
-  const recordsOnDisk = await readdir(path.join(dir, RECORDS_DIR))
-  // 同一根因的另一个分支：日志文件在、但内容被清空（0 字节 / 只剩空行），而记录与
-  // manifest.txnNext（>1，说明历史上确实提交过）都还在——这同样不是「崩溃残留」，
-  // 而是对账依据丢失。两种形态一起判 damaged，绝不销毁记录字节。
-  const commitLines = lines.filter((line) => line.action === 'commit').length
-  const logLostWithRecords = recordsOnDisk.length > 0
-    && commitLines === 0
-    && Number.isInteger(manifest.txnNext) && manifest.txnNext > 1
-  const reconciliationLost = (!parsedTxn.exists || logLostWithRecords) && recordsOnDisk.length > 0
   const vouchersPath = path.join(dir, VOUCHERS_LOG)
-  const vouchersParsed = await parseTxnLog(vouchersPath, VOUCHERS_LOG)
   const forgottenPath = path.join(dir, FORGOTTEN_LOG)
-  const forgottenParsed = await parseTxnLog(forgottenPath, FORGOTTEN_LOG)
   const redactionsPath = path.join(dir, REDACTIONS_LOG)
-  const redactionsParsed = await parseTxnLog(redactionsPath, REDACTIONS_LOG)
-  const redactedVouchers = new Set()
-  for (const line of redactionsParsed.lines) {
-    if (typeof line.voucherId !== 'string') continue
-    if (line.action === 'redact') redactedVouchers.add(line.voucherId)
-    else if (line.action === 'unredact') redactedVouchers.delete(line.voucherId)
-  }
-  const forgotten = new Set()
-  for (const line of forgottenParsed.lines) {
-    if (typeof line.id !== 'string') continue
-    if (line.action === 'forget') forgotten.add(line.id)
-    else if (line.action === 'revoke') forgotten.delete(line.id)
-  }
 
-  const committedIds = new Set()
-  let maxTxn = 0
-  for (const line of lines) {
-    if (line.action === 'commit' && Number.isInteger(line.txn)) {
-      maxTxn = Math.max(maxTxn, line.txn)
-      for (const id of line.recordIds ?? []) committedIds.add(id)
+  // AUD50-03-01（B2-4）：打开期对账整段进跨进程写锁。旧实现在锁外读日志、判 damaged、
+  // 隔离残留，与在飞提交竞态：第二句柄在写入者「payload 已写、commit 未落」的窗口打开，
+  // 把在飞 payload 当崩溃残留隔离 → 写入者随后提交 → 「有 commit 无 payload」账实不符
+  // → 之后每次打开都 damaged，永久拒写。现在锁被活写者持有时**等待（有上限）**，
+  // 等不到抛 ELOCKED 失败关闭，绝不立即判 damaged；锁内**重新读**日志与记录目录，
+  // 不用锁外旧快照做隔离/损坏判定；隔离动作也进锁。同进程重入（端口/repair 已持锁时
+  // 再 open）由 write-lock 的 AsyncLocalStorage 重入保证，不死锁。
+  // AUD50-03-03（B2-6）：records/ 只认合法记录名（RECORD_FILE）——崩溃 .tmp、系统文件
+  // 不参与对账计数（旧实现把一个 .tmp 算成 1 条记录 → 全新库被判「对账依据丢失」）；
+  // 非 .json 残留打开期移入 quarantine（字节保留），移动失败只忽略并在 health 报告。
+  const opened = await withCrossProcessWriteLock(dir, async () => {
+    let manifest
+    if (await fileExistsHere(manifestPath)) {
+      manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      if (manifest.sessionKey !== sessionKey || manifest.schemaVersion !== SCHEMA_VERSION) {
+        throw v3Error('ESTORE_SESSION_MISMATCH', 'manifest 与请求会话不符（跨会话不串数据的第一道闸）')
+      }
+    } else {
+      manifest = { schemaVersion: SCHEMA_VERSION, sessionKey, txnNext: 1 }
+      await writeFileAtomic(manifestPath, JSON.stringify(manifest) + '\n')
     }
-  }
-  // 有 payload 无 commit 行 → 崩溃残留，移入 quarantine（对账即隔离，不静默复用）。
-  // 反方向（H-55）：**有 commit 行、无 payload** 同样是账实不符，但旧实现完全没查——
-  // 对账只做「盘上多出来的」，不做「日志里有而盘上没有的」。后果：health 报 healthy=true、
-  // recordCount 把不存在的记录算进去（实测 3 条里删掉 1 条仍报 3），而 rebuildIndex 遍历
-  // listRecordIds 时读不到那条 → 抛 ESTORE_CORRUPT，整个索引重建面被一条缺失字节打挂；
-  // 写入却照常成功，缺口被固化。判据与 H-21 同口径：账实不符即 damaged（读允许、写拒绝），
-  // **不伪造、不删除任何字节**。
-  const idsOnDisk = new Set()
-  for (const name of recordsOnDisk) {
-    if (name.endsWith('.json')) idsOnDisk.add(name.slice(0, -5))
-  }
-  const missingPayload = [...committedIds].filter((id) => !idsOnDisk.has(id))
-  const ledgerMismatch = missingPayload.length > 0
-  // H-55：账实不符（commit 行在、payload 不在）与 H-21（对账依据丢失）同一处置：
-  // 判 damaged，读允许、写拒绝，交人工裁决。两者都**不销毁字节、不伪造记录**。
-  const ledgerMismatchReason = ledgerMismatch
-    ? TXN_LOG + ' 有 ' + missingPayload.length + ' 条 commit 但记录文件缺失（' + missingPayload.slice(0, 5).join('、') + (missingPayload.length > 5 ? ' 等' : '') + '）：账实不符，读允许、写拒绝，需人工确认'
-    : null
-  const damaged = parsedTxn.damaged || reconciliationLost || ledgerMismatch
-  const reason = ledgerMismatchReason
-    ?? (reconciliationLost
-      ? TXN_LOG + (parsedTxn.exists ? ' 无 commit 行' : ' 缺失') + '但记录仍在（' + recordsOnDisk.length + ' 条，manifest.txnNext=' + manifest.txnNext + '）：对账依据丢失，读允许、写拒绝，需人工确认'
-      : parsedTxn.reason)
-  const orphaned = []
-  if (!damaged && !ledgerMismatch) {
-    for (const name of recordsOnDisk) {
-      const id = name.endsWith('.json') ? name.slice(0, -5) : null
-      if (id !== null && !committedIds.has(id)) {
-        await rename(path.join(dir, RECORDS_DIR, name), path.join(dir, QUARANTINE_DIR, name))
-        orphaned.push(id)
+
+    const parsedTxn = await parseTxnLog(logPath, TXN_LOG)
+    const lines = parsedTxn.lines
+    // 事务日志**缺失**但记录还在（H-21）：对账依据本身丢了，不能把「无法证明已提交」
+    // 当成「崩溃残留」——旧实现会把全部记录移进 quarantine，而 health 仍报 healthy，
+    // 等于静默全丢（实测 5 条记录 → records/ 清空、quarantine/ 5 条、healthy=true）。
+    // 这里判 damaged：读允许（记录字节完好）、写拒绝，交人工裁决；不销毁任何字节。
+    const allDiskNames = await readdirOf(path.join(dir, RECORDS_DIR))
+    const recordsOnDisk = allDiskNames.filter((name) => RECORD_FILE.test(name))
+    const leftoverFiles = allDiskNames.filter((name) => !RECORD_FILE.test(name))
+    for (const name of leftoverFiles) {
+      await rename(path.join(dir, RECORDS_DIR, name), path.join(dir, QUARANTINE_DIR, name)).catch(() => {})
+    }
+    // 同一根因的另一个分支：日志文件在、但内容被清空（0 字节 / 只剩空行），而记录与
+    // manifest.txnNext（>1，说明历史上确实提交过）都还在——这同样不是「崩溃残留」，
+    // 而是对账依据丢失。两种形态一起判 damaged，绝不销毁记录字节。
+    const commitLines = lines.filter((line) => line.action === 'commit').length
+    const logLostWithRecords = recordsOnDisk.length > 0
+      && commitLines === 0
+      && Number.isInteger(manifest.txnNext) && manifest.txnNext > 1
+    const reconciliationLost = (!parsedTxn.exists || logLostWithRecords) && recordsOnDisk.length > 0
+    const vouchersParsed = await parseTxnLog(vouchersPath, VOUCHERS_LOG)
+    const forgottenParsed = await parseTxnLog(forgottenPath, FORGOTTEN_LOG)
+    const redactionsParsed = await parseTxnLog(redactionsPath, REDACTIONS_LOG)
+    const redactedVouchers = new Set()
+    for (const line of redactionsParsed.lines) {
+      if (typeof line.voucherId !== 'string') continue
+      if (line.action === 'redact') redactedVouchers.add(line.voucherId)
+      else if (line.action === 'unredact') redactedVouchers.delete(line.voucherId)
+    }
+    const forgotten = new Set()
+    for (const line of forgottenParsed.lines) {
+      if (typeof line.id !== 'string') continue
+      if (line.action === 'forget') forgotten.add(line.id)
+      else if (line.action === 'revoke') forgotten.delete(line.id)
+    }
+
+    const committedIds = new Set()
+    let maxTxn = 0
+    for (const line of lines) {
+      if (line.action === 'commit' && Number.isInteger(line.txn)) {
+        maxTxn = Math.max(maxTxn, line.txn)
+        for (const id of line.recordIds ?? []) committedIds.add(id)
       }
     }
-  }
-  // 事务号分配器自愈（H-56）：`txnNext` 必须是 **≥1 的整数**。
-  // 旧实现只比 `txnNext <= maxTxn`，于是 `1.5` / `"7"` / `undefined` 这类非法值
-  // 一路漏过打开期——open 成功、health 原样回显垃圾值（`txnNext: 1.5` / `"7"`），
-  // 而**每一次写入**都在 rereadManifestTxnNext 里抛 ESTORE_CORRUPT：
-  // 存储自称健康却永远写不进去，观察面也看不到根因。
-  // 自愈方向是确定的、可证明安全的：`maxTxn+1` 一定没被用过（maxTxn 取自事务日志）。
-  const txnNextValid = Number.isInteger(manifest.txnNext) && manifest.txnNext >= 1
-  if (!txnNextValid || manifest.txnNext <= maxTxn) {
-    manifest = { ...manifest, txnNext: maxTxn + 1 }
-    await writeFileAtomic(manifestPath, JSON.stringify(manifest) + '\n')
-  }
+    // 有 payload 无 commit 行 → 崩溃残留，移入 quarantine（对账即隔离，不静默复用）。
+    // 反方向（H-55）：**有 commit 行、无 payload** 同样是账实不符，但旧实现完全没查——
+    // 对账只做「盘上多出来的」，不做「日志里有而盘上没有的」。后果：health 报 healthy=true、
+    // recordCount 把不存在的记录算进去（实测 3 条里删掉 1 条仍报 3），而 rebuildIndex 遍历
+    // listRecordIds 时读不到那条 → 抛 ESTORE_CORRUPT，整个索引重建面被一条缺失字节打挂；
+    // 写入却照常成功，缺口被固化。判据与 H-21 同口径：账实不符即 damaged（读允许、写拒绝），
+    // **不伪造、不删除任何字节**。
+    const idsOnDisk = new Set(recordsOnDisk.map((name) => name.slice(0, -5)))
+    const missingPayload = [...committedIds].filter((id) => !idsOnDisk.has(id))
+    const ledgerMismatch = missingPayload.length > 0
+    // H-55：账实不符（commit 行在、payload 不在）与 H-21（对账依据丢失）同一处置：
+    // 判 damaged，读允许、写拒绝，交人工裁决。两者都**不销毁字节、不伪造记录**。
+    const ledgerMismatchReason = ledgerMismatch
+      ? TXN_LOG + ' 有 ' + missingPayload.length + ' 条 commit 但记录文件缺失（' + missingPayload.slice(0, 5).join('、') + (missingPayload.length > 5 ? ' 等' : '') + '）：账实不符，读允许、写拒绝，需人工确认'
+      : null
+    const damaged = parsedTxn.damaged || reconciliationLost || ledgerMismatch
+    const reason = ledgerMismatchReason
+      ?? (reconciliationLost
+        ? TXN_LOG + (parsedTxn.exists ? ' 无 commit 行' : ' 缺失') + '但记录仍在（' + recordsOnDisk.length + ' 条，manifest.txnNext=' + manifest.txnNext + '）：对账依据丢失，读允许、写拒绝，需人工确认'
+        : parsedTxn.reason)
+    const orphaned = []
+    if (!damaged && !ledgerMismatch) {
+      for (const name of recordsOnDisk) {
+        const id = name.slice(0, -5)
+        if (!committedIds.has(id)) {
+          await rename(path.join(dir, RECORDS_DIR, name), path.join(dir, QUARANTINE_DIR, name))
+          orphaned.push(id)
+        }
+      }
+    }
+    // 事务号分配器自愈（H-56）：`txnNext` 必须是 **≥1 的整数**。
+    // 旧实现只比 `txnNext <= maxTxn`，于是 `1.5` / `"7"` / `undefined` 这类非法值
+    // 一路漏过打开期——open 成功、health 原样回显垃圾值（`txnNext: 1.5` / `"7"`），
+    // 而**每一次写入**都在 rereadManifestTxnNext 里抛 ESTORE_CORRUPT：
+    // 存储自称健康却永远写不进去，观察面也看不到根因。
+    // 自愈方向是确定的、可证明安全的：`maxTxn+1` 一定没被用过（maxTxn 取自事务日志）。
+    const txnNextValid = Number.isInteger(manifest.txnNext) && manifest.txnNext >= 1
+    if (!txnNextValid || manifest.txnNext <= maxTxn) {
+      manifest = { ...manifest, txnNext: maxTxn + 1 }
+      await writeFileAtomic(manifestPath, JSON.stringify(manifest) + '\n')
+    }
+    // B3-5（AUD50-03-04）：commit 行丢失但 manifest 已推进（事务号已消耗）→ 如实报告
+    // commit-lost，不只当 orphan 静默隔离——号不复用的前提下，这段缺口「发生过提交」
+    // 但提交行不可考。已 damaged 的库由 damagedReason 说明（本字段只补健康库上的事实）。
+    const commitLost = !damaged && manifest.txnNext > maxTxn + 1
+      ? { gap: manifest.txnNext - maxTxn - 1, missingFrom: maxTxn + 1, missingTo: manifest.txnNext - 1, orphanedCount: orphaned.length }
+      : null
+    return { manifest, parsedTxn, leftoverFiles, orphaned, damaged, reason, committedIds, maxTxn, forgotten, redactedVouchers, vouchersParsed, forgottenParsed, redactionsParsed, commitLost }
+  }, options.lock)
+
+  let manifest = opened.manifest
+  const parsedTxn = opened.parsedTxn
+  const leftoverFiles = opened.leftoverFiles
+  const orphaned = opened.orphaned
+  const damaged = opened.damaged
+  const reason = opened.reason
+  const committedIds = opened.committedIds
+  // maxTxn 是 syncFromLog 闭包要推进的可变绑定（跨句柄提交后本句柄视图同步），
+  // 必须留在 store 作用域，不能关进打开期锁回调里。
+  let maxTxn = opened.maxTxn
+  const forgotten = opened.forgotten
+  const redactedVouchers = opened.redactedVouchers
+  const vouchersParsed = opened.vouchersParsed
+  const forgottenParsed = opened.forgottenParsed
+  const redactionsParsed = opened.redactionsParsed
+  const commitLost = opened.commitLost
 
   let closed = false
   let writable = !damaged
@@ -339,12 +390,18 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       ? reason
       : (vouchersDamaged ? vouchersParsed.reason : (forgottenDamaged ? forgottenReason : null)),
     txnNext: manifest.txnNext,
+    // B2-8：事务日志的最大提交号（检查点新鲜度比对基线）
+    maxTxn,
     recordCount: committedIds.size,
     orphanedAtOpen: orphaned,
+    // B2-6：打开期从 records/ 移入 quarantine 的非记录残留（.tmp 等），供诊断面报告
+    leftoversAtOpen: leftoverFiles,
     voucherCount: voucherLines.length,
     vouchersDamaged,
     forgottenCount: forgotten.size,
     forgottenDamaged,
+    // B3-5：打开期检出的 commit 行丢失缺口（null = 无缺口）；可见、可判读，不静默
+    commitLostAtOpen: commitLost,
   })
 
   /**
@@ -449,7 +506,7 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       // 步骤 3：commit 行（提交点——此行落盘前的一切都是可隔离残留）
       const commitLine = { action: 'commit', txn, recordIds: ids }
       if (commitAt !== null) commitLine.at = commitAt
-      await appendLine(logPath, commitLine)
+      await appendLine(logPath, commitLine, { sync: true })
       for (const id of ids) committedIds.add(id)
       // 步骤 4：推进事务号
       manifest = { ...manifest, txnNext: txn + 1 }
@@ -468,6 +525,22 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
         const text = input?.payload?.text
         if (typeof input?.kind !== 'string' || typeof text !== 'string') {
           throw new V3ContractViolation('v3 store: importRecords 每条需要 kind 与 payload.text')
+        }
+
+        // B3-20（AUD50-07-02）：导入按 validateRecord 同口径整包预检。旧实现收下
+        // 「空正文且非 metaOnly」「未知 kind」「structure 不可 JSON 序列化」的包，
+        // 导入成功、读取时才 ESTORE_CORRUPT（audit-import-empty 实测）——库被污染。
+        // 预检在 submitTransaction 之前逐条抛错，一条不过整包不落库。
+        if (!RECORD_KINDS.includes(input.kind)) {
+          throw new V3ContractViolation('v3 store: importRecords kind 必须是封闭集 ' + RECORD_KINDS.join('/') + ' 之一，得到：' + JSON.stringify(input.kind))
+        }
+        if (text === '' && input.payload.metaOnly !== true) {
+          throw new V3ContractViolation('v3 store: importRecords 空正文必须 metaOnly=true（第 ' + index + ' 条）')
+        }
+        if (input.payload.structure !== null && typeof input.payload.structure === 'object') {
+          try { JSON.parse(JSON.stringify(input.payload.structure)) } catch {
+            throw new V3ContractViolation('v3 store: importRecords structure 必须可 JSON 序列化（第 ' + index + ' 条）')
+          }
         }
         // AUD48-08-03：导入必须保留 metaOnly / structure；否则导出再导入后
         // 「仅元数据」记录会被当成空正文损坏，工具调用参数也会丢失。
@@ -511,7 +584,14 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
           if (await fileExistsHere(path.join(dir, QUARANTINE_DIR, id + '.json'))) {
             throw v3Error('ESTORE_CORRUPT', '记录 ' + id + ' 是崩溃残留（已隔离），未提交，不可读')
           }
-          throw v3Error('ESTORE_CORRUPT', '记录不存在：' + id)
+          // 账实不符先于 not-found：commit 行说已提交、记录文件却没有 = 账有实无（H-55），
+          // 是损坏不是「从未存在」——否则 B3-17 的改分类会把真实缺口洗成「ID 输错」。
+          if (committedIds.has(id)) {
+            throw v3Error('ESTORE_CORRUPT', '记录 ' + id + ' 账实不符：事务日志已提交但记录文件缺失（损坏，失败关闭）')
+          }
+          // B3-17（AUD50-06-06）：未知 ID ≠ 损坏——旧实现共用 ESTORE_CORRUPT，
+          // 用户输错 ID 被报「库损坏」。未提交/不存在走 ERECORD_NOT_FOUND。
+          throw v3Error('ERECORD_NOT_FOUND', '记录不存在：' + id + '（未提交或 ID 不存在；不是库损坏）')
         }
         throw error
       }
@@ -579,7 +659,7 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       if (!Number.isInteger(voucher.txn) || voucher.txn < 1) {
         throw new V3ContractViolation('v3 store: voucher.txn 必须是 ≥1 整数')
       }
-      await appendLine(vouchersPath, voucher)
+      await appendLine(vouchersPath, voucher, { sync: true })
       voucherLines.push(voucher)
       return { voucherCount: voucherLines.length }
     },
@@ -667,7 +747,7 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
         throw v3Error('ESTORE_TXN_CONFLICT', 'forget 目标不存在或未提交：' + id)
       }
       if (!forgotten.has(id)) {
-        await appendLine(forgottenPath, { action: 'forget', id, at: null })
+        await appendLine(forgottenPath, { action: 'forget', id, at: null }, { sync: true })
         forgotten.add(id)
       }
       return { forgottenCount: forgotten.size }
@@ -689,7 +769,7 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
         throw v3Error('ESTORE_TXN_CONFLICT', '撤销遗忘目标不存在或未提交：' + id)
       }
       if (forgotten.has(id)) {
-        await appendLine(forgottenPath, { action: 'revoke', id, at: null })
+        await appendLine(forgottenPath, { action: 'revoke', id, at: null }, { sync: true })
         forgotten.delete(id)
       }
       return { forgottenCount: forgotten.size }
@@ -711,7 +791,7 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       }
       const action = redacted === true ? 'redact' : 'unredact'
       if ((action === 'redact') === redactedVouchers.has(voucherId)) return { changed: false, redacted: action === 'redact' }
-      await appendLine(redactionsPath, { action, voucherId, at: null })
+      await appendLine(redactionsPath, { action, voucherId, at: null }, { sync: true })
       if (action === 'redact') redactedVouchers.add(voucherId)
       else redactedVouchers.delete(voucherId)
       return { changed: true, redacted: action === 'redact' }
@@ -747,6 +827,72 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       return { mergedRecords: merged, maxTxn }
     },
 
+    /**
+     * AUD50-04-02（B2-8）：读打开期检查点。可用判据 = 行内最大 txn === 事务日志
+     * 现读的 maxTxn；落后/缺失/损坏一律 { usable:false }——不用旧检查点掩盖新记录。
+     */
+    async readCheckpoint() {
+      const parsed = await parseTxnLog(path.join(dir, CHECKPOINT_LOG), CHECKPOINT_LOG)
+      if (!parsed.exists) return { usable: false, reason: 'absent', txn: 0, pairs: [] }
+      if (parsed.damaged) return { usable: false, reason: parsed.reason, txn: 0, pairs: [] }
+      let acc = new Map()
+      let maxCheckpointTxn = 0
+      for (const line of parsed.lines) {
+        if (!Number.isInteger(line?.txn) || line.txn < 1 || !Array.isArray(line.pairs)) continue
+        const valid = []
+        for (const pair of line.pairs) {
+          if (!Array.isArray(pair) || typeof pair[0] !== 'string' || typeof pair[1] !== 'string') continue
+          valid.push([pair[0], pair[1]])
+        }
+        if (line.action === 'baseline') {
+          // baseline 行必须至少带回一条有效映射：全非法的基线 = 写坏了的缓存。
+          // 信任它会把「空映射」当最新检查点（实测：entry 断点回 -1 → 全量重摄、记录翻倍）。
+          if (valid.length === 0) return { usable: false, reason: 'baseline 行无有效映射', txn: 0, pairs: [] }
+          acc = new Map(valid)
+        } else if (line.action === 'checkpoint') {
+          for (const pair of valid) acc.set(pair[0], pair[1])
+        } else continue
+        maxCheckpointTxn = Math.max(maxCheckpointTxn, line.txn)
+      }
+      const logParsed = await parseTxnLog(logPath, TXN_LOG)
+      if (logParsed.damaged) return { usable: false, reason: logParsed.reason, txn: 0, pairs: [] }
+      let logMaxTxn = 0
+      for (const line of logParsed.lines) {
+        if (line.action === 'commit' && Number.isInteger(line.txn)) logMaxTxn = Math.max(logMaxTxn, line.txn)
+      }
+      return {
+        usable: maxCheckpointTxn === logMaxTxn && maxCheckpointTxn >= 1,
+        reason: maxCheckpointTxn === logMaxTxn ? null : '检查点落后于事务日志（' + maxCheckpointTxn + ' < ' + logMaxTxn + '）',
+        txn: maxCheckpointTxn,
+        pairs: [...acc],
+      }
+    },
+
+    /** 追加增量检查点行（调用方必须在写锁内、紧跟提交之后调用；失败只损失缓存速度）。 */
+    async appendCheckpoint(txn, pairs) {
+      if (!Number.isInteger(txn) || txn < 1) {
+        throw new V3ContractViolation('v3 store: appendCheckpoint 的 txn 必须是 ≥1 整数')
+      }
+      if (!Array.isArray(pairs)) throw new V3ContractViolation('v3 store: appendCheckpoint 的 pairs 必须是数组')
+      // 账本自己损坏时拒绝追加：好行写在坏行后面永远不可读（与 appendVoucher 同口径）。
+      const existing = await parseTxnLog(path.join(dir, CHECKPOINT_LOG), CHECKPOINT_LOG)
+      if (existing.damaged) return { appended: false, reason: existing.reason }
+      await appendLine(path.join(dir, CHECKPOINT_LOG), { action: 'checkpoint', txn, pairs })
+      return { appended: true }
+    },
+
+    /** 追加全量基线行（迁移/回退路径用；重置累积映射）。 */
+    async appendCheckpointBaseline(txn, pairs) {
+      if (!Number.isInteger(txn) || txn < 1) {
+        throw new V3ContractViolation('v3 store: appendCheckpointBaseline 的 txn 必须是 ≥1 整数')
+      }
+      if (!Array.isArray(pairs)) throw new V3ContractViolation('v3 store: appendCheckpointBaseline 的 pairs 必须是数组')
+      const existing = await parseTxnLog(path.join(dir, CHECKPOINT_LOG), CHECKPOINT_LOG)
+      if (existing.damaged) return { appended: false, reason: existing.reason }
+      await appendLine(path.join(dir, CHECKPOINT_LOG), { action: 'baseline', txn, pairs })
+      return { appended: true }
+    },
+
     close() {
       closed = true
       writable = false
@@ -754,9 +900,24 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
   }
 }
 
-async function appendLine(filePath, value) {
-  const { appendFile } = await import('node:fs/promises')
-  await appendFile(filePath, JSON.stringify(value) + '\n', 'utf8')
+async function appendLine(filePath, value, { sync = false } = {}) {
+  const data = JSON.stringify(value) + '\n'
+  if (!sync) {
+    const { appendFile } = await import('node:fs/promises')
+    await appendFile(filePath, data, 'utf8')
+    return
+  }
+  // B3-5（AUD50-03-04）：提交点必须落盘——appendFile 只把数据送进页缓存，掉电后
+  // 整行可丢（commit 行丢失 = 已成功提交被静默变成「从未发生」）。打开期把
+  // 「manifest 已推进但日志无 commit」报告为 commit-lost（health.commitLostAtOpen）。
+  const { open } = await import('node:fs/promises')
+  const handle = await open(filePath, 'a')
+  try {
+    await handle.writeFile(data, 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
 }
 
 /**

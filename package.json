@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-context-lab",
-  "version": "0.14.0-beta.50",
+  "version": "0.14.0-beta.51",
   "private": true,
   "description": "按会话启用的上下文管理（v3 单引擎）：原始历史全部可存、命中按需回注、观察面只读",
   "type": "module",

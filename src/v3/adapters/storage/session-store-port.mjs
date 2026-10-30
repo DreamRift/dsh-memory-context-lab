@@ -155,6 +155,14 @@ export async function createSessionStorePort(root, sessionKey) {
       const txn = await withCrossProcessWriteLock(dir, async () => {
       await store.syncFromLog() // H-10-b：锁内增量视图同步，多句柄/多进程提交不漏
         const committed = await store.submitTransaction(records, { at })
+        // B2-8：检查点与提交同一把锁内追加（纯缓存：失败只损失下次打开的速度，
+        // 下次打开回退全量扫描并重建基线，绝不影响正确性）。
+        try {
+          const pairs = records
+            .filter((record) => typeof record?.provenance?.sourceEventId === 'string' && typeof record?.id === 'string')
+            .map((record) => [record.provenance.sourceEventId, record.id])
+          await store.appendCheckpoint(committed.txn, pairs)
+        } catch { /* 检查点追加失败不回滚提交 */ }
         return committed
       })
       sourceEventCache = null
@@ -178,9 +186,31 @@ export async function createSessionStorePort(root, sessionKey) {
       return store.readProvenance(id)
     },
 
+    /** B2-8：读打开期检查点（透传 store；可用性由 store 判定）。 */
+    async readCheckpoint() {
+      return store.readCheckpoint()
+    },
+
+    /**
+     * B2-8：全量扫描后落检查点基线（迁移旧库/回退后的重建路径）。
+     * 锁内核对 txn 仍是日志最新——不一致就不写（扫描结果已过期，下次打开重扫）。
+     */
+    async saveCheckpointBaseline(txn, pairs) {
+      if (!Number.isInteger(txn) || txn < 1) return { written: false, reason: 'no-txn' }
+      if (!(pairs instanceof Map) || pairs.size === 0) return { written: false, reason: 'empty' }
+      return withCrossProcessWriteLock(dir, async () => {
+        await store.syncFromLog()
+        if (store.health().maxTxn !== txn) return { written: false, reason: 'stale' }
+        await store.appendCheckpointBaseline(txn, [...pairs])
+        return { written: true }
+      })
+    },
+
     /** 追加归档凭证（surface 回执 ↔ recordIds 的 durable 映射）。 */
     async appendVoucher(voucher) {
-      return store.appendVoucher(voucher)
+      // B3-7（AUD50-03-06）：凭证追加与其它写原语共用同一把跨进程写锁——裸追加在
+      // 两进程并发时会产生半行/丢失，repair 也会误判。已持锁的调用方走 ALS 重入，不死锁。
+      return withCrossProcessWriteLock(dir, () => store.appendVoucher(voucher))
     },
 
     /**
@@ -238,9 +268,24 @@ export async function createSessionStorePort(root, sessionKey) {
       })
     },
 
-    /** 导入外部脱敏包（M5）：新 ID/新事务；导入后重建索引使检索可见。 */
+    /**
+     * 导入外部脱敏包（M5）：新 ID/新事务；导入后重建索引使检索可见。
+     * AUD50-03-02（B2-5）：导入必须与 transaction/forget/revokeForget 共用同一把
+     * 跨进程写锁——旧实现绕过锁，两个句柄并发 import 会拿到同一个事务号
+     * （实测 txnA=txnB=1，commit 行 [1,1]，唯一事务号 1，manifest.txnNext=2）。
+     * 锁内先 syncFromLog：事务号基于最新日志分配。索引重建留在锁外（避免长临界区）。
+     */
     async importRecords(records) {
-      const result = await store.importRecords(records)
+      const result = await withCrossProcessWriteLock(dir, async () => {
+        await store.syncFromLog() // 锁内增量视图同步：多句柄/多进程提交不漏
+        const imported = await store.importRecords(records)
+        try {
+          // B2-8：导入事务也记账（pairs 为空——导入记录没有宿主事件映射），
+          // 让检查点的 txn 跟上日志 maxTxn，否则一次导入后每次打开都回退全量扫描。
+          await store.appendCheckpoint(imported.txn, [])
+        } catch { /* 检查点失败不影响导入事实 */ }
+        return imported
+      })
       try {
         await rebuildIndex()
       } catch {
@@ -325,7 +370,8 @@ export async function createSessionStorePort(root, sessionKey) {
 
     async markVoucherRedacted(voucherId, redacted) {
       if (typeof store.markVoucherRedacted !== 'function') return { changed: false }
-      return store.markVoucherRedacted(voucherId, redacted)
+      // B3-7：隐私面清除标记同样进写锁（所有写原语一个锁的纪律）
+      return withCrossProcessWriteLock(dir, () => store.markVoucherRedacted(voucherId, redacted))
     },
 
     // 会话目录只读暴露（usage 聚合落盘/观察面 stats 用；不承诺更多）

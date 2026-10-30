@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path'
 import { sessionIsolationKey } from '../../domain/session/isolation-key.mjs'
 import { emptySessionState, normalizeSessionState } from '../../domain/session/mode.mjs'
 import { writeFileAtomic } from './session-store.mjs'
+import { sessionDirFresh } from './session-file-gate.mjs'
 
 const FILE = 'state.json'
 const cache = new Map() // path → { stamp, state }
@@ -44,6 +45,11 @@ export function sessionStatePath(v3Root, sessionId) {
 export function readSessionState(v3Root, sessionId, { defaultMode = 'recall-only' } = {}) {
   const path = sessionStatePath(v3Root, sessionId)
   const fallback = () => ({ ...emptySessionState(defaultMode), path, exists: false })
+  // B3-9：目录级新鲜闸门（与 control 同一把；同批次内共享一次目录 stat）
+  if (sessionDirFresh(dirname(path))) {
+    const cached = cache.get(path)
+    if (cached !== undefined) return cached.state
+  }
   let stamp
   try {
     const stat = statSync(path)
@@ -52,7 +58,8 @@ export function readSessionState(v3Root, sessionId, { defaultMode = 'recall-only
     if (error?.code !== 'ENOENT') {
       return { ...emptySessionState(defaultMode), error: 'ESTATE_UNREADABLE', path, exists: true }
     }
-    cache.delete(path)
+    // B3-9：ENOENT 哨兵缓存（stamp=null）；文件出现时目录 mtime 变化触发全路径
+    cache.set(path, { stamp: null, state: fallback() })
     return fallback()
   }
   const cached = cache.get(path)

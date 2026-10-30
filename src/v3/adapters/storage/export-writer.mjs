@@ -1,5 +1,5 @@
 /** 导出包落盘（adapters/storage）：路径与原子写只在这里出现。 */
-import { mkdir, readFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { writeFileAtomic } from './session-store.mjs'
@@ -12,6 +12,10 @@ export async function writeExportBundle(v3Root, sessionKey, bundle) {
   await mkdir(directory, { recursive: true })
   const file = path.join(directory, exportFilenameOf(sessionKey, bundle.exportedAt))
   await writeFileAtomic(file, JSON.stringify(bundle, null, 2) + '\n')
+  // B3-21（AUD50-07-03）：分享包默认不 world-readable；只收紧导出路径，不改
+  // writeFileAtomic 的全局行为。Windows 的 chmod 只作用于只读位（受限 no-op），
+  // 语义由 POSIX 断言守卫（v3-export 套件，win32 skip 并注明）。
+  await chmod(file, 0o600)
   return file
 }
 

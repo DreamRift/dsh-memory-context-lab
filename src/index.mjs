@@ -91,9 +91,12 @@ export const Config = Schema.object({
   previewChars: Schema.number().default(160).min(40).max(4000).step(10).description('每条命中在回注包里的首部字符数').volatile(),
   queryMaxChars: Schema.number().default(512).min(32).max(4000).step(16).description('查询词只取用户消息的前 N 个字符（整条长消息会把检索拖成“必须命中整句”）').volatile(),
   fullHistory: Schema.boolean().default(true).description('新会话默认全历史模式；本对话可在面板切换').volatile(),
-  turnBasis: Schema.string().default('human').description('按轮归档的轮次判定：human = 真人消息（默认）；dsh = 按 DSH 界面显示的轮数（目标自动继续每轮都算，压得更快）').volatile(),
+  // B3-19（AUD50-07-01）：改为枚举——设置页下拉框只有 human/dsh，手改配置文件的
+// 非法值（'DSH'、'dsh '、''）在宿主 schema 层就被拒绝，不再静默失效。
+turnBasis: Schema.union([Schema.const('human'), Schema.const('dsh')]).default('human').description('按轮归档的轮次判定：human = 真人消息（默认）；dsh = 按 DSH 界面显示的轮数（目标自动继续每轮都算，压得更快）').volatile(),
   planFirst: Schema.boolean().default(false).description('计划先行默认值：计划期间暂停归档与自动回注').volatile(),
   coolingGate: Schema.number().default(20).min(0).max(95).step(1).description('按步归档闸门：上下文占用达到该百分比才压缩旧步骤（0 = 每步都判断）').volatile(),
+  restoreMaxChars: Schema.number().default(16000).min(1000).max(200000).step(100).description('恢复正文上限（字符）：恢复体积（正文+工具调用参数）超过它的完成回合不会写恢复凭证；status「下一次归档」会给出体积与预算').volatile(),
   autoRestore: Schema.boolean().default(true).description('停用/手动恢复时是否把回执恢复为原文').volatile(),
 })
 
@@ -109,6 +112,7 @@ export const SETTINGS_DEFAULTS = Object.freeze({
   planFirst: false,
   autoRestore: true,
   coolingGate: 20,
+  restoreMaxChars: 16000,
 })
 
 const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
@@ -130,6 +134,12 @@ export function readSettings(config) {
     const value = liveValue(config?.[key])
     return valid(value) ? value : fallback
   }
+  // B3-19：turnBasis 非法回落必须可见——readSettings 带 turnBasisInvalid 标记，
+  // status 的轮次判定行显示「配置值非法，已按 human 运行」。键未写（undefined）
+  // 与其它字段一样静默取默认，不算非法；写了但不认（'DSH'、''、null）才标记。
+  const turnBasisRaw = liveValue(config?.turnBasis)
+  const turnBasisValid = turnBasisRaw === 'human' || turnBasisRaw === 'dsh'
+  const turnBasisInvalid = !turnBasisValid && turnBasisRaw !== undefined
   return {
     enabled: pick('enabled', SETTINGS_DEFAULTS.enabled, (v) => typeof v === 'boolean'),
     limit: pick('limit', SETTINGS_DEFAULTS.limit, (v) => Number.isInteger(v) && v >= 1),
@@ -138,11 +148,104 @@ export function readSettings(config) {
     queryMaxChars: pick('queryMaxChars', SETTINGS_DEFAULTS.queryMaxChars, (v) => Number.isInteger(v) && v >= 1),
     fullHistory: pick('fullHistory', SETTINGS_DEFAULTS.fullHistory, (v) => typeof v === 'boolean'),
     // 只认两个值：设置页给的是下拉框，但配置文件可以手改；未知值一律回落默认（失败关闭）。
-    turnBasis: pick('turnBasis', SETTINGS_DEFAULTS.turnBasis, (v) => v === 'human' || v === 'dsh'),
+    turnBasis: turnBasisValid ? turnBasisRaw : SETTINGS_DEFAULTS.turnBasis,
+    ...(turnBasisInvalid ? { turnBasisInvalid: true } : {}),
     planFirst: pick('planFirst', SETTINGS_DEFAULTS.planFirst, (v) => typeof v === 'boolean'),
     autoRestore: pick('autoRestore', SETTINGS_DEFAULTS.autoRestore, (v) => typeof v === 'boolean'),
     coolingGate: pick('coolingGate', SETTINGS_DEFAULTS.coolingGate, (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 95),
+    // AUD50-02-02（B1-2）：恢复预算。范围与设置页一致；非法值回落 16000（失败关闭）。
+    restoreMaxChars: pick('restoreMaxChars', SETTINGS_DEFAULTS.restoreMaxChars, (v) => Number.isInteger(v) && v >= 1000 && v <= 200000),
   }
+}
+
+/**
+ * 归档选择器拒绝原因 → 中文说明（0.14.0-beta.45，AUD-09 附带项）。
+ * 选择器只给机器码，这里只做展示；未知码原样印出，不吞掉新原因。
+ * B1-2（AUD50-02-02）：纯函数上移到模块作用域——命令面与测试共用同一份文案，
+ * 不再内嵌插件工厂闭包；恢复预算超限有专属展示。
+ */
+const ARCHIVE_REASON_LABELS = Object.freeze({
+  'recall-only': '仅回注模式不归档',
+  'no-completed-group': '只有当前回合（当前回合永不归档）',
+  'no-completed-step': '没有完整步骤',
+  'retention-window': '候选都在工作集保留范围内',
+  'turn-boundary': '下一组属于别的回合（不跨回合）',
+  'turn-anchor': '用户消息锚点不能进 span',
+  'plugin-boundary': '插件回执/恢复节点是整组硬边界',
+  'unfinished-tool': '有未完成的工具调用',
+  pinned: '被 pin 保护',
+  'missing-record': '有活动面节点没有记录',
+  'not-dense': '活动面不连续',
+  'empty-records': '整段没有可恢复记录',
+  'restore-budget-exceeded': '恢复体积超预算',
+  'no-candidate': '没有候选',
+})
+
+/** 把拒绝原因压成一行可读文本：原因 + 计数 + 前几个 seq + 保留量。 */
+function archiveReasonText(result) {
+  const reason = typeof result.reason === 'string' ? result.reason : ''
+  const parts = []
+  if (reason.length > 0) parts.push(ARCHIVE_REASON_LABELS[reason] ?? reason)
+  if (Number.isInteger(result.count) && result.count > 0) parts.push(result.count + ' 条')
+  if (Array.isArray(result.seqs) && result.seqs.length > 0) {
+    const shown = result.seqs.slice(0, 5).map((seq) => String(seq)).join('/')
+    parts.push('seq ' + shown + (result.seqs.length > 5 ? '…' : ''))
+  }
+  if (Number.isInteger(result.seq)) parts.push('seq ' + result.seq)
+  if (Number.isInteger(result.retained)) parts.push('保留 ' + result.retained + ' 组')
+  return parts.join('；')
+}
+
+/** 归档命令结果：不把 no-op 说成已归档，也不把失败说成候选为空。 */
+export function archiveLine(result) {
+  if (result === null || typeof result !== 'object') return '归档：无结果'
+  if (result.status === 'archived') {
+    return '已归档 seq ' + result.startSeq + '–' + result.endSeq + '（' + result.recordIds.length + ' 条，回执 seq ' + result.receiptSeq + '）'
+  }
+  if (result.status === 'planned') return '候选：seq ' + result.startSeq + '–' + result.endSeq + '（' + result.recordIds.length + ' 条；dry-run 未写入）'
+  if (result.status === 'not-worth') return '不归档：回执 ' + result.receiptChars + ' 字 ≥ 原文 ' + result.sourceChars + ' 字（净收益为负）'
+  if (result.status === 'no-candidate') {
+    // B1-2：超预算要给出体积与预算本身，用户才知道调多大能归档（不藏配置名）。
+    if (result.reason === 'restore-budget-exceeded') {
+      return '暂无可归档的完成操作（恢复体积超预算：恢复需 ' + result.chars + ' 字 > 预算 ' + result.maxChars
+        + ' 字；调高设置页「恢复正文上限」后可重新归档）。'
+    }
+    const reason = archiveReasonText(result)
+    return '暂无可归档的完成操作' + (reason.length > 0 ? '（' + reason + '）' : '') + '。'
+  }
+  if (result.status === 'paused') return '当前模式暂停归档（recall-only 或 plan-first）。'
+  if (result.status === 'cooling-closed') {
+    const gate = Number.isFinite(result.gate) ? result.gate : 20
+    return '按步归档未开闸：' + (Number.isFinite(result.occupancy)
+      ? '占用 ' + Math.round(result.occupancy * 100) + '% < 闸门 ' + gate + '%'
+      : '占用不可判定') + '；本步不归档。'
+  }
+  if (result.status === 'busy-or-not-ready') return '建库/摄入进行中，稍后再试。'
+  if (result.status === 'not-ready') return '本会话尚未摄入或建库未完成。'
+  if (result.status === 'host-no-surface' || result.status === 'no-surface') return '宿主未提供活动面，归档不可用。'
+  if (result.status === 'failed') return '归档失败（' + (result.phase ?? 'unknown') + '）：' + (result.error?.code ?? result.error?.message ?? String(result.error))
+  return '归档：' + result.status
+}
+
+/** 恢复失败的命令面文案（B1-2）：restore-too-large 必须给出实际体积与预算。
+ *  B3-13（AUD50-06-02）：先判 result.error（与 all 分支一致），再按 reason 分类——
+ *  旧实现 { error:'not-ready' } 没有 reason 字段，被掩成「未恢复凭证 #N：unknown」。 */
+export function restoreFailureLine(result, index) {
+  if (result !== null && typeof result === 'object' && result.error !== undefined) {
+    const code = result.error?.code ?? result.error
+    if (code === 'not-ready') return '恢复不可用：记忆库未就绪（本对话还没建库或未启用），稍后再试'
+    if (code === 'host-no-surface') return '恢复不可用：宿主未提供活动面（无法恢复）'
+    return '恢复不可用：' + String(code)
+  }
+  if (result !== null && typeof result === 'object' && result.reason === 'voucher-not-found') {
+    return '未恢复凭证 #' + index + '：凭证不存在（用 /memory-lab history 查看现有序号）'
+  }
+  if (result !== null && typeof result === 'object' && result.reason === 'restore-too-large'
+    && Number.isInteger(result.chars) && Number.isInteger(result.maxChars)) {
+    return '未恢复凭证 #' + index + '：恢复正文 ' + result.chars + ' 字超预算 ' + result.maxChars
+      + ' 字（restore-too-large；可在设置页调高「恢复正文上限」，或按记录 ID 回读会话日志原文）'
+  }
+  return '未恢复凭证 #' + index + '：' + (result?.reason ?? 'unknown')
 }
 
 /** 命令名（宿主校验 /^[a-z][a-z0-9_-]*$/u）。 */
@@ -175,6 +278,7 @@ const USAGE = [
   '　　　/memory-lab file-status、verify <ID|all> —— 文件引用与核证',
   '　　　/memory-lab restore [序号|all] —— 恢复回执为原文',
   '　　　/memory-lab pin|unpin <记录ID>、pins —— 保护/取消保护记录',
+  '　　　/memory-lab set gate <0–95> / unset gate —— 按步归档闸门（会话覆盖）',
   '　　　/memory-lab forget preview|apply|undo|status <记录ID…> —— 遗忘/撤销',
   '　　　/memory-lab t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] —— T2 诊断/覆盖率/显式回填',
   '　　　/memory-lab config show —— 查全局默认（写入在插件设置页）',
@@ -200,6 +304,27 @@ function createWarnLimiter(intervalMs) {
 }
 
 /** 检索命中行：display 是 `{id, score}` 对象数组，不是字符串数组。 */
+/**
+ * 设置摘要（命令面也能看到当前生效值，不必去设置页猜）。
+ * B2-9（AUD50-06-01）：消费 mergeSessionSettings 的合并结果——全局键（turnBasis/
+ * fullHistory/planFirst/autoRestore）必须来自合并结果本身，否则 status 的生效设置行
+ * 与模式行、config show 各自回落默认、自相矛盾。导出供守卫测试与命令面共用。
+ */
+export function settingsLine(settings) {
+  return (settings.enabled ? '开启' : '已关闭')
+    + '；条数 ' + settings.limit
+    + '；装包阈 ' + settings.packMinScore
+    + '；首部 ' + settings.previewChars
+    + ' 字符；查询上限 ' + settings.queryMaxChars + ' 字符'
+    + '；全历史默认 ' + (settings.fullHistory === false ? '关' : '开')
+    + '；轮次判定 ' + turnBasisLabel(settings.turnBasis)
+    + '；计划先行默认 ' + (settings.planFirst === true ? '开' : '关')
+    // 合并后的设置里字段名是 gate；直接读 coolingGate 会恒回落 20%，把会话覆盖显示错（AUD-04）。
+    + '；按步闸门 ' + (Number.isFinite(settings.gate) ? settings.gate
+      : (Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20)) + '%'
+    + '；停用恢复 ' + (settings.autoRestore === false ? '关' : '开')
+}
+
 function formatHit(hit) {
   const id = typeof hit?.id === 'string' ? hit.id : String(hit?.id ?? '?')
   const score = typeof hit?.score === 'number' && Number.isFinite(hit.score) ? hit.score.toFixed(3) : '-'
@@ -448,7 +573,7 @@ export async function apply(ctx, config) {
       definitionId: COMMAND_DEFINITION_ID,
       name: COMMAND_NAME,
       description: '记忆上下文：本对话开关 / 摄入与回注 / 检索与回读',
-      input: { hint: 'status | on|off | inject on|off | set limit <1–20> | unset limit | reset | mode <full-history|cooling|recall-only> | planfirst on|off|approve | now | compact | dry-run | history | repair [status|apply] | working-set | export|adopt <文件名>|adopt-from <父ID> | file-status | verify <ID|all> | restore [序号|all] | pin|unpin <ID> | pins | forget preview|apply|undo|status <ID…> | t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] | config show | recall <词> | read <ID> | help' },
+      input: { hint: 'status | on|off | inject on|off | set limit <1–20> | unset limit | set gate <0–95> | unset gate | reset | mode <full-history|cooling|recall-only> | planfirst on|off|approve | now | compact | dry-run | history | repair [status|apply] | working-set | export|adopt <文件名>|adopt-from <父ID> | file-status | verify <ID|all> | restore [序号|all] | pin|unpin <ID> | pins | forget preview|apply|undo|status <ID…> | t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] | config show | recall <词> | read <ID> | help' },
       handler: async (invocation) => {
         const words = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean)
         const sub = (words[0] ?? 'help').toLowerCase()
@@ -536,7 +661,7 @@ export async function apply(ctx, config) {
               let restoreLine = ''
               if (settingsNow().autoRestore !== false) {
                 try {
-                  const result = await engine.restoreHistory(sessionId, { maxChars: 16000 })
+                  const result = await engine.restoreHistory(sessionId, { maxChars: settingsNow().restoreMaxChars })
                   if (result.total > 0) restoreLine = '\n恢复：' + result.restored + '/' + result.total + '；跳过 ' + result.skipped
                     + (result.forgotten > 0 ? '；已遗忘 ' + result.forgotten : '')
                 } catch (error) {
@@ -637,7 +762,9 @@ export async function apply(ctx, config) {
             if (history.error !== undefined) return fail('历史凭证不可读：' + (history.error?.code ?? history.error?.message ?? String(history.error)))
             if (!Array.isArray(history.rows) || history.rows.length === 0) return ok('暂无归档凭证。')
             return ok(history.rows.map((row) => '#' + row.index + ' · seq ' + (row.startSeq ?? '?') + '–' + (row.endSeq ?? '?')
-              + ' · ' + row.recordIds.length + ' 条 · 回执 ' + row.chars + ' 字' + (row.redacted === true ? ' · 正文已清除' : '')).join('\n'))
+              + ' · ' + row.recordIds.length + ' 条 · 回执 ' + row.chars + ' 字'
+              + (Number.isInteger(row.restoreChars) ? ' · 恢复 ' + row.restoreChars + ' 字' : '')
+              + (row.redacted === true ? ' · 正文已清除' : '')).join('\n'))
           }
           if (sub === 'repair') {
             const mode = (words[1] ?? 'status').toLowerCase()
@@ -707,30 +834,43 @@ export async function apply(ctx, config) {
             const result = target === 'all'
               ? await engine.verifyFiles(sessionId, { all: true })
               : await engine.verifyFiles(sessionId, { id: words[1], recordId: words[1] })
-            if (result.error !== undefined) return fail('核证不可用：' + result.error)
+            if (result.error !== undefined) {
+              // B3-14（AUD50-06-03）：零引用/引用 ID 不匹配是**空态**不是故障——
+              // 与 file-status 的空态口径一致，不再显示「核证不可用」。
+              if (result.error === 'no-matching-reference') return ok('暂无文件引用，或引用 ID 与任何记录不匹配。')
+              return fail('核证不可用：' + result.error)
+            }
             return ok(result.rows.map((row) => row.id + '：' + row.status + (row.reason ? '（' + row.reason + '）' : '')).join('\n'))
           }
           if (sub === 'restore') {
             const raw = (words[1] ?? '').toLowerCase()
             if (raw === '' || raw === 'all') {
-              const result = await engine.restoreHistory(sessionId, { maxChars: 16000 })
+              const result = await engine.restoreHistory(sessionId, { maxChars: settingsNow().restoreMaxChars })
               if (result.error !== undefined) return fail('恢复不可用：' + (result.error?.code ?? result.error))
               return ok('恢复：' + result.restored + '/' + result.total + '；跳过 ' + result.skipped
                 + (result.forgotten > 0 ? '；已遗忘 ' + result.forgotten : ''))
             }
             const index = parseStrictInteger(raw)
             if (index === null) return fail('用法：/memory-lab restore [序号|all]（序号必须是十进制整数）')
-            const result = await engine.restoreHistory(sessionId, { index, maxChars: 16000 })
+            const result = await engine.restoreHistory(sessionId, { index, maxChars: settingsNow().restoreMaxChars })
             return result.restored
               ? ok('已恢复凭证 #' + index + '（' + result.chars + ' 字）')
-              : fail('未恢复凭证 #' + index + '：' + (result.reason ?? 'unknown'))
+              : fail(restoreFailureLine(result, index))
           }
           if (sub === 'pin' || sub === 'unpin') {
             const ids = words.slice(1)
             if (ids.length === 0) return fail('用法：/memory-lab ' + sub + ' <记录ID…>')
             const result = await engine.pinRecords(sessionId, ids, { remove: sub === 'unpin' })
             if (result.error !== undefined) return fail('pin 不可用：' + result.error)
-            return ok((sub === 'pin' ? '已 pin ' : '已取消 pin ') + ids.length + ' 条；当前 pin ' + result.pins.length + ' 条。')
+            if (sub === 'unpin') {
+              // B3-16（AUD50-06-05）：按**实际删除数**回报——unpin 不存在的 ID 不能
+              // 再说「已取消 1 条」；无匹配给提示（幂等语义显式化）。
+              const removed = Number.isInteger(result.removed) ? result.removed : ids.length
+              if (removed === 0) return ok('没有匹配的 pin 记录；当前 pin ' + result.pins.length + ' 条。')
+              return ok('已取消 pin ' + removed + ' 条' + (removed < ids.length ? '（请求 ' + ids.length + ' 条）' : '')
+                + '；当前 pin ' + result.pins.length + ' 条。')
+            }
+            return ok('已 pin ' + ids.length + ' 条；当前 pin ' + result.pins.length + ' 条。')
           }
           if (sub === 'pins') {
             const state = engine.stateOf(sessionId)
@@ -801,28 +941,15 @@ export async function apply(ctx, config) {
     })
   }
 
-  /** 设置摘要（命令面也能看到当前生效值，不必去设置页猜）。 */
-  function settingsLine(settings) {
-    return (settings.enabled ? '开启' : '已关闭')
-      + '；条数 ' + settings.limit
-      + '；装包阈 ' + settings.packMinScore
-      + '；首部 ' + settings.previewChars
-      + ' 字符；查询上限 ' + settings.queryMaxChars + ' 字符'
-      + '；全历史默认 ' + (settings.fullHistory === false ? '关' : '开')
-      + '；轮次判定 ' + turnBasisLabel(settings.turnBasis)
-      + '；计划先行默认 ' + (settings.planFirst === true ? '开' : '关')
-      // 合并后的设置里字段名是 gate；直接读 coolingGate 会恒回落 20%，把会话覆盖显示错（AUD-04）。
-      + '；按步闸门 ' + (Number.isFinite(settings.gate) ? settings.gate
-        : (Number.isFinite(settings.coolingGate) ? settings.coolingGate : 20)) + '%'
-      + '；停用恢复 ' + (settings.autoRestore === false ? '关' : '开')
-  }
-
   /** 会话模式/引擎状态摘要。 */
   function stateLine(state) {
     if (state === null || typeof state !== 'object') return '模式未知'
     const parts = [
       modeLabel(state.mode) + '（' + (state.mode ?? 'unknown') + '）',
-      ...(state.mode === 'full-history' ? ['轮次判定 ' + turnBasisLabel(settingsNow().turnBasis)] : []),
+      ...(state.mode === 'full-history'
+        ? ['轮次判定 ' + turnBasisLabel(settingsNow().turnBasis)
+          + (settingsNow().turnBasisInvalid === true ? '（配置值非法，已按 human 运行）' : '')]
+        : []),
       '计划先行 ' + (state.planFirst === true ? '开' : '关'),
       '停用恢复 ' + (settingsNow().autoRestore === false ? '关' : '开'),
     ]
@@ -839,66 +966,6 @@ export async function apply(ctx, config) {
     return parts.join('；')
   }
 
-  /**
-   * 归档选择器拒绝原因 → 中文说明（0.14.0-beta.45，AUD-09 附带项）。
-   * 选择器只给机器码，这里只做展示；未知码原样印出，不吞掉新原因。
-   */
-  const ARCHIVE_REASON_LABELS = Object.freeze({
-    'recall-only': '仅回注模式不归档',
-    'no-completed-group': '只有当前回合（当前回合永不归档）',
-    'no-completed-step': '没有完整步骤',
-    'retention-window': '候选都在工作集保留范围内',
-    'turn-boundary': '下一组属于别的回合（不跨回合）',
-    'turn-anchor': '用户消息锚点不能进 span',
-    'plugin-boundary': '插件回执/恢复节点是整组硬边界',
-    'unfinished-tool': '有未完成的工具调用',
-    pinned: '被 pin 保护',
-    'missing-record': '有活动面节点没有记录',
-    'not-dense': '活动面不连续',
-    'empty-records': '整段没有可恢复记录',
-    'no-candidate': '没有候选',
-  })
-
-  /** 把拒绝原因压成一行可读文本：原因 + 计数 + 前几个 seq + 保留量。 */
-  function archiveReasonText(result) {
-    const reason = typeof result.reason === 'string' ? result.reason : ''
-    const parts = []
-    if (reason.length > 0) parts.push(ARCHIVE_REASON_LABELS[reason] ?? reason)
-    if (Number.isInteger(result.count) && result.count > 0) parts.push(result.count + ' 条')
-    if (Array.isArray(result.seqs) && result.seqs.length > 0) {
-      const shown = result.seqs.slice(0, 5).map((seq) => String(seq)).join('/')
-      parts.push('seq ' + shown + (result.seqs.length > 5 ? '…' : ''))
-    }
-    if (Number.isInteger(result.seq)) parts.push('seq ' + result.seq)
-    if (Number.isInteger(result.retained)) parts.push('保留 ' + result.retained + ' 组')
-    return parts.join('；')
-  }
-
-  /** 归档命令结果：不把 no-op 说成已归档，也不把失败说成候选为空。 */
-  function archiveLine(result) {
-    if (result === null || typeof result !== 'object') return '归档：无结果'
-    if (result.status === 'archived') {
-      return '已归档 seq ' + result.startSeq + '–' + result.endSeq + '（' + result.recordIds.length + ' 条，回执 seq ' + result.receiptSeq + '）'
-    }
-    if (result.status === 'planned') return '候选：seq ' + result.startSeq + '–' + result.endSeq + '（' + result.recordIds.length + ' 条；dry-run 未写入）'
-    if (result.status === 'not-worth') return '不归档：回执 ' + result.receiptChars + ' 字 ≥ 原文 ' + result.sourceChars + ' 字（净收益为负）'
-    if (result.status === 'no-candidate') {
-      const reason = archiveReasonText(result)
-      return '暂无可归档的完成操作' + (reason.length > 0 ? '（' + reason + '）' : '') + '。'
-    }
-    if (result.status === 'paused') return '当前模式暂停归档（recall-only 或 plan-first）。'
-    if (result.status === 'cooling-closed') {
-      const gate = Number.isFinite(result.gate) ? result.gate : 20
-      return '按步归档未开闸：' + (Number.isFinite(result.occupancy)
-        ? '占用 ' + Math.round(result.occupancy * 100) + '% < 闸门 ' + gate + '%'
-        : '占用不可判定') + '；本步不归档。'
-    }
-    if (result.status === 'busy-or-not-ready') return '建库/摄入进行中，稍后再试。'
-    if (result.status === 'not-ready') return '本会话尚未摄入或建库未完成。'
-    if (result.status === 'host-no-surface' || result.status === 'no-surface') return '宿主未提供活动面，归档不可用。'
-    if (result.status === 'failed') return '归档失败（' + (result.phase ?? 'unknown') + '）：' + (result.error?.code ?? result.error?.message ?? String(result.error))
-    return '归档：' + result.status
-  }
 
   /** 会话控制摘要（本对话开关 + 覆盖项）。 */
   function controlLine(control) {
@@ -983,6 +1050,10 @@ export async function apply(ctx, config) {
       '· 覆盖：已摄入 ' + (ingestedCount === null ? '未知' : ingestedCount)
         + ' · 可检索 ' + (searchableCount === null ? '未知（' + searchableReason + '）' : searchableCount + ' 条')
         + metaPart,
+      // AUD50-02-03（B2-1）：坏事件不再静默——拒绝计数在 status 可见（不重放，详见日志）。
+      ...(Number.isInteger(state.rejectedEvents) && state.rejectedEvents > 0
+        ? ['· 摄入拒绝：' + state.rejectedEvents + ' 条事件无法入库（已跳过不重放；详见日志）']
+        : []),
       '· 库健康：' + (state.health?.healthy === true ? '正常' : '异常（' + JSON.stringify(state.health) + '）'),
       ...(state.health?.healthy === true ? [] : ['· 修复：/memory-lab repair status 检查日志尾部半行（apply 锁内截断，先写审计）']),
       '· 占用：' + (state.usageError

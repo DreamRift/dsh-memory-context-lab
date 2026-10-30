@@ -71,12 +71,32 @@ async function installedMatchesSource() {
     ])
     const versionOf = (text) => JSON.parse(text)?.version
     if (versionOf(installedManifest) !== versionOf(sourceManifest)) return false
-    const [installed, source] = await Promise.all([
-      readFile(installedEntry, 'utf8'),
-      readFile(SOURCE_ENTRY, 'utf8'),
+    // B3-27（AUD50-10-05）：旧判据只比 src/index.mjs 单文件——安装副本「同版本
+    // 但其它 src 文件被热修」时判据仍为真，安装面断言拿旧副本跑新断言。现在对整棵
+    // src/ 逐文件哈希比对（换行归一同上），覆盖同号不同树。
+    const digestTree = async (baseDir) => {
+      const out = new Map()
+      const walk = async (dir) => {
+        for (const entry of await readdir(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name)
+          if (entry.isDirectory()) { await walk(full); continue }
+          if (!/\.(mjs|js|cjs)$/.test(entry.name)) continue
+          const body = await readFile(full, 'utf8')
+          out.set(path.relative(baseDir, full).replaceAll('\\', '/'), body.split(String.fromCharCode(13)).join(''))
+        }
+      }
+      await walk(baseDir)
+      return out
+    }
+    const [installedTree, sourceTree] = await Promise.all([
+      digestTree(path.dirname(installedEntry)),
+      digestTree(path.join(SOURCE_ENTRY, '..')),
     ])
-    const normalize = (text) => text.split(String.fromCharCode(13)).join('')
-    return normalize(installed) === normalize(source)
+    if (installedTree.size !== sourceTree.size) return false
+    for (const [rel, body] of sourceTree) {
+      if (installedTree.get(rel) !== body) return false
+    }
+    return true
   } catch {
     return false
   }
@@ -336,4 +356,3 @@ test('the installed host half registers a command that records its input', async
   assert.equal(typeof command.description, 'string')
   assert.ok(command.description.trim().length > 0, '宿主强制 description 非空')
 })
-

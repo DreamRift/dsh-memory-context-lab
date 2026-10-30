@@ -11,12 +11,82 @@
 import { V3ContractViolation } from '../../contracts/errors.mjs'
 import { callIdOf, isHumanUserEvent, isPluginSurfaceEvent, isRecallPackEvent, isStructuralSurfaceEvent } from './event-shape.mjs'
 
-function eventAtOf(events) {
-  const map = new Map()
-  for (const event of events) {
-    if (Number.isInteger(event?.seq)) map.set(event.seq, event)
+// —— B3-8（AUD50-04-03）增量投影缓存 ——
+// 选择器每个 pre-step 都被调用，旧实现每次全量扫 events 建全量 Map（bySeq + dsh 的
+// turnAt），35k 事件的会话每步固定 ~2.5ms 且随历史线性。会话日志是 **append-only**：
+// 按「数组身份 + 长度」做增量缓存——长度没变直接复用；变长只合并新增段；变短
+// （测试替身重排/复用数组）全量重建。失效条件就这两条；「已有元素不被改写」与宿主
+// append-only 契约一致——改写内容但不换数组身份的用法不在适用面，调用方应传新数组。
+const bySeqCache = new WeakMap()
+const turnCache = new WeakMap()
+const cacheStats = { builds: 0, merges: 0, mergedEvents: 0, hits: 0 }
+
+/** 测试/诊断用：缓存命中画像（生产不调用；守卫测试用它做「不随历史线性变慢」的结构断言）。 */
+export function _candidatesCacheStats() {
+  return { ...cacheStats }
+}
+
+/** 测试用：清零缓存画像计数（不改缓存内容）。 */
+export function _resetCandidatesCacheStats() {
+  cacheStats.builds = 0
+  cacheStats.merges = 0
+  cacheStats.mergedEvents = 0
+  cacheStats.hits = 0
+}
+
+function cachedBySeq(events) {
+  let entry = bySeqCache.get(events)
+  if (entry === undefined || events.length < entry.upto) {
+    entry = { upto: 0, bySeq: new Map() }
+    bySeqCache.set(events, entry)
+    cacheStats.builds += 1
+  } else {
+    cacheStats.hits += 1
   }
-  return map
+  if (events.length > entry.upto) {
+    for (let i = entry.upto; i < events.length; i += 1) {
+      const event = events[i]
+      if (Number.isInteger(event?.seq)) entry.bySeq.set(event.seq, event)
+    }
+    cacheStats.mergedEvents += events.length - entry.upto
+    cacheStats.merges += 1
+    entry.upto = events.length
+  }
+  return entry.bySeq
+}
+
+/** dsh 分组的轮次投影：seq → 最近一次 turn/start|step/start 的 turn（回执节点除外）。 */
+function cachedTurnProjection(events) {
+  let entry = turnCache.get(events)
+  if (entry === undefined || events.length < entry.upto) {
+    entry = { upto: 0, turnAt: new Map(), lastTurn: null }
+    turnCache.set(events, entry)
+    cacheStats.builds += 1
+  } else {
+    cacheStats.hits += 1
+  }
+  if (events.length > entry.upto) {
+    for (let i = entry.upto; i < events.length; i += 1) mergeTurnEvent(entry, events[i])
+    cacheStats.mergedEvents += events.length - entry.upto
+    cacheStats.merges += 1
+    entry.upto = events.length
+  }
+  return entry
+}
+
+function mergeTurnEvent(entry, event) {
+  if (!Number.isInteger(event?.seq)) return
+  // 非回注的插件节点（归档回执/恢复）是表面分隔，不是轮次成员：给它打 turn 会让
+  // 回执在下一轮被当成「插件边界」，把那一轮整组挡住（真实形状：回执替换了上一段后
+  // 落在下一轮第一个节点之前，turn/start 已把它的 seq 归到下一轮）。它在选择循环里
+  // 走 turn === undefined 的 finish/跳过分支，轮组从回执之后重新开始。
+  if (isPluginSurfaceEvent(event) && !isRecallPackEvent(event)) return
+  // turn/start 与 step/start 都带 turn；step/start 覆盖「turn 内每一步」，更细。
+  if (event.type === 'turn/start' || event.type === 'step/start') {
+    if (Number.isInteger(event?.data?.turn)) entry.lastTurn = event.data.turn
+  }
+  // 第一轮开始之前的节点没有轮次归属：不猜、不归档（留在活动面上）。
+  if (entry.lastTurn !== null) entry.turnAt.set(event.seq, entry.lastTurn)
 }
 
 /**
@@ -46,7 +116,7 @@ export function groupSurfaceOperations({ surfaceNodes, events, turnBasis = 'huma
   if (!Array.isArray(surfaceNodes) || !Array.isArray(events)) {
     throw new V3ContractViolation('v3 archive/candidates: surfaceNodes/events 必须是数组')
   }
-  const bySeq = eventAtOf(events)
+  const bySeq = cachedBySeq(events)
   return turnBasis === 'dsh'
     ? groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn })
     : groupByHumanTurn({ surfaceNodes, bySeq })
@@ -54,22 +124,8 @@ export function groupSurfaceOperations({ surfaceNodes, events, turnBasis = 'huma
 
 /** DSH 轮次判定：真人消息只是普通节点，轮次边界由宿主自己的 turn 计数给出。 */
 function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
-  const turnAt = new Map()
-  let lastTurn = null
-  for (const event of events) {
-    if (!Number.isInteger(event?.seq)) continue
-    // 非回注的插件节点（归档回执/恢复）是表面分隔，不是轮次成员：给它打 turn 会让
-    // 回执在下一轮被当成「插件边界」，把那一轮整组挡住（真实形状：回执替换了上一段后
-    // 落在下一轮第一个节点之前，turn/start 已把它的 seq 归到下一轮）。让它在下面走
-    // turn === undefined 的 finish/跳过分支，轮组从回执之后重新开始。
-    if (isPluginSurfaceEvent(event) && !isRecallPackEvent(event)) continue
-    // turn/start 与 step/start 都带 turn；step/start 覆盖「turn 内每一步」，更细。
-    if (event.type === 'turn/start' || event.type === 'step/start') {
-      if (Number.isInteger(event?.data?.turn)) lastTurn = event.data.turn
-    }
-    // 第一轮开始之前的节点没有轮次归属：不猜、不归档（留在活动面上）。
-    if (lastTurn !== null) turnAt.set(event.seq, lastTurn)
-  }
+  // B3-8：轮次投影走增量缓存（append-only 日志，只合并新增段）
+  const { turnAt, lastTurn } = cachedTurnProjection(events)
   // 旧宿主/旧夹具没有 turn 计数：退回真人判定（= 切换前的行为），不猜轮次。
   if (lastTurn === null) return groupByHumanTurn({ surfaceNodes, bySeq })
   const groups = []
@@ -107,19 +163,21 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
   }
   finish(current)
   if (groups.length === 0) return groups
-  // 当前轮 = 宿主说正在跑的那一轮；没有 payload.turn 时退回「最后一组」。
-  //
-  // 只有 payload.turn 与日志最大轮**同步**（lastTurn）或刚开下一轮（lastTurn + 1）才可信。
-  // 旧实现只挡住「超前」，没挡「滞后」：目标自动继续 / 子代理 / 旧宿主若把 turn 传成 1
-  // （日志已经到 3），"group.turn >= 1" 会把**所有已完成轮**都标成当前轮，按轮归档
-  // 从此对整段历史 no-candidate——这就是 beta.47 真机上「切到 dsh 后反而不归档」的形状。
-  // 滞后与超前都不可信：退回「最后一组是当前轮」，宁可晚压一轮，也不能把活动内容压掉。
-  const canTrustTurn = Number.isInteger(currentTurn) && Number.isInteger(lastTurn)
-    && currentTurn >= lastTurn && currentTurn <= lastTurn + 1
-  if (canTrustTurn) {
-    for (const group of groups) group.current = group.turn >= currentTurn
-  } else {
+  // 当前轮判定（B3-12，AUD50-05-02）：turn/start 已写入日志时**日志是权威**——
+  // 当前轮 = max(日志 lastTurn, payload.turn)。
+  // - 同步（payload = lastTurn）：与旧口径一致；
+  // - payload 滞后（新轮首步宿主还没交新轮号，beta.49 之后的已知晚一步）：max 取日志
+  //   lastTurn → 新轮首步即归档上一轮（本条修复的目标）；
+  // - payload 超前一轮（当前轮刚开、turn/start 还没落日志）：currentTurn = lastTurn + 1
+  //   → 日志里没有任何当前轮节点，已完成轮立即可归档（beta.47 行为保留）；
+  // - payload 超前两轮以上（宿主计数与日志脱节）：不可信，保守回退「最后一组 = 当前轮」
+  //   （滞后不得误压的守卫，beta.49：payload 传成 1 而日志在 3 时绝不能把已完成轮全标当前轮）；
+  // - 没有 payload.turn（now/status 无参调用）：保守按「最后一组 = 当前轮」（beta.47 口径）。
+  if (!Number.isInteger(currentTurn) || (Number.isInteger(currentTurn) && currentTurn > lastTurn + 1)) {
     groups[groups.length - 1].current = true
+  } else {
+    const effectiveTurn = Math.max(currentTurn, lastTurn)
+    for (const group of groups) group.current = group.turn >= effectiveTurn
   }
   return groups
 }
@@ -160,6 +218,31 @@ function groupByHumanTurn({ surfaceNodes, bySeq }) {
   finish(current)
   if (groups.length > 0) groups[groups.length - 1].current = true
   return groups
+}
+
+/**
+ * B3-11（AUD50-05-01）：回执吸收——把紧邻 span 起点之前的**连续回执节点**吸收进本次
+ * replace。新回执落位后旧回执随之消失，活动面恒只留最新一张（一进一出，不逐轮累积）。
+ * 吸收的回执进 sourceEventSeqs（被遮蔽），不进 recordSeqs（它没有 v3 记录）；
+ * 回注包不吸收（一次性注入，不是回执链成员）；被 pin 的回执不吸收（用户意图优先）。
+ * 恢复语义不变：被吸收回执的凭证仍按 voucher recordIds 记账，恢复时按「回执正文
+ * 逐字节比对」如实记 skipped（锚点已被吸收，不猜）。
+ * @returns {{ absorbed: number[], startIdx: number }} 吸收的 seq（升序）与新起点下标
+ */
+export function absorbPrecedingReceipts({ surfaceNodes, startIdx, events, pinnedSeqs = new Set() } = {}) {
+  const bySeq = cachedBySeq(events)
+  const absorbed = []
+  let idx = startIdx
+  while (idx > 0) {
+    const prevSeq = surfaceNodes[idx - 1]
+    if (pinnedSeqs.has(prevSeq)) break
+    const prevEvent = bySeq.get(prevSeq)
+    if (prevEvent === undefined) break
+    if (!isPluginSurfaceEvent(prevEvent) || isRecallPackEvent(prevEvent)) break
+    absorbed.unshift(prevSeq)
+    idx -= 1
+  }
+  return { absorbed, startIdx: idx }
 }
 
 /**
@@ -226,16 +309,22 @@ export function selectArchiveSpan({ surfaceNodes, events, hasRecord, mode, retai
   }
   if (selected.length === 0) return reject(stop ?? { reason: 'no-candidate' })
   selected.sort((a, b) => a - b)
-  const startSeq = selected[0]
+  let startSeq = selected[0]
   const endSeq = selected[selected.length - 1]
   // 必须连续地在当前 surface 中（宿主 range replace 的硬前提）。
-  const startIdx = surfaceNodes.indexOf(startSeq)
+  const foundIdx = surfaceNodes.indexOf(startSeq)
   const endIdx = surfaceNodes.indexOf(endSeq)
-  if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  if (foundIdx === -1 || endIdx === -1 || foundIdx > endIdx) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  // B3-11：吸收紧邻起点的连续回执（一进一出）；吸收后起点前移，span 仍是连续区间。
+  const { absorbed, startIdx } = absorbPrecedingReceipts({ surfaceNodes, startIdx: foundIdx, events, pinnedSeqs })
   const shadowed = surfaceNodes.slice(startIdx, endIdx + 1)
-  if (shadowed.length !== selected.length || shadowed.some((seq, index) => seq !== selected[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
-  // recordSeqs 只收有记录的节点：回注包被遮蔽了也还不了（它本来就没入库）。
-  const recordSeqs = shadowed.filter((seq) => !transient.has(seq))
+  const expected = [...absorbed, ...selected]
+  if (shadowed.length !== expected.length || shadowed.some((seq, index) => seq !== expected[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  if (absorbed.length > 0) startSeq = absorbed[0]
+  // recordSeqs 只收有记录的节点：回注包被遮蔽了也还不了（它本来就没入库）；
+  // 吸收的回执同样没有记录（它是旧 span 的替代节点，凭证按 recordIds 记账）。
+  const absorbedSet = new Set(absorbed)
+  const recordSeqs = shadowed.filter((seq) => !transient.has(seq) && !absorbedSet.has(seq))
   if (recordSeqs.length === 0) return reject('empty-records', { seqs: shadowed, count: shadowed.length })
   return {
     startSeq,

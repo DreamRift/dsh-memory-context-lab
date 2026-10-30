@@ -9,6 +9,8 @@ import path from 'node:path'
 
 import { attachV3Engine } from '../src/v3/entry/v3-entry.mjs'
 import { createFakeSession } from './helpers/fake-session.mjs'
+import { openV3SessionStore } from '../src/v3/adapters/storage/session-store.mjs'
+import { V3ContractViolation } from '../src/v3/contracts/errors.mjs'
 
 function fakeCtx() {
   const handlers = new Map()
@@ -90,6 +92,33 @@ test('adoptFrom：同一引擎父会话 → 空子会话（原生 fork 记忆复
   } finally {
     await engine._waitForIdle().catch(() => {})
     engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+test('importRecords：脏记录整包预检拒绝，库不被污染（B3-20 / AUD50-07-02）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-import-validate-'))
+  const store = await openV3SessionStore(root, 'sess-validate')
+  try {
+    const good = { kind: 'message-user', payload: { text: '正常正文' } }
+    const circular = { self: null }
+    circular.self = circular
+    const cases = [
+      [{ kind: 'message-user', payload: { text: '', metaOnly: false } }, '空正文非 metaOnly'],
+      [{ kind: 'operation-unknown', payload: { text: 'x' } }, '未知 kind'],
+      [{ kind: 'message-user', payload: { text: 'x', structure: { big: 1n } } }, 'structure 含 BigInt'],
+      [{ kind: 'message-user', payload: { text: 'x', structure: circular } }, 'structure 循环引用'],
+    ]
+    for (const [bad, label] of cases) {
+      await assert.rejects(() => store.importRecords([good, bad]), (error) => error instanceof V3ContractViolation,
+        label + ' 必须整包拒绝')
+      assert.deepEqual(await store.listRecordIds(), [], label + ' 拒绝后不得留下半包（good 也不能落库）')
+    }
+    // 同包去掉脏行后照常导入：拒绝的是数据不是能力
+    const ok = await store.importRecords([good])
+    assert.equal(ok.recordIds.length, 1)
+  } finally {
+    store.close?.()
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })

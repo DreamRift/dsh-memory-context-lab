@@ -4,7 +4,7 @@
 
 插件只改模型可见的**投影**，不改写 DSH 的 append-only 会话日志与命令审计。原始历史始终留在会话日志里，回执可按凭证恢复。
 
-> 当前源码版本 0.14.0-beta.50（测试版）。
+> 当前源码版本 0.14.0-beta.51（测试版）。
 
 ## 功能
 
@@ -18,6 +18,17 @@
 - **T1 / T2 双后端**：默认本地 Node store + 词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10 且 Python 可用时，按会话启动独立 `MDCG_ROOT` 的隔离 MCP（T2），检索融合本地与隔离灵枢；T2 不可用时如实回 T1。
 - **图形入口**：composer 工具行 chip + 弹层控制本对话启用/回注/计划/模式/条数；全局参数在插件设置页。
 - **可观测**：`/memory-lab status | t2 | history | working-set | file-status` 只读查看摄入、索引、归档、T2 与回注观测。
+
+## 0.14.0-beta.51 更新（相比 beta.50）
+
+一次性收完「审计 beta.50 后续」的全部 40 项确认缺陷（2 P1 + 10 P2 + 28 P3），要点：
+
+- **脱敏更严**：JSON 引号键凭据（`"api_key": "…"`）不再绕过脱敏；`;/,` 分隔符后的凭据续脱敏；author/authMode 等非凭据字段不再过度脱敏；**导出重建时正文再过一次脱敏**（双保险）。
+- **恢复正文上限可调**：新增设置项 `restoreMaxChars`（1000–200000，默认 16000）——单次恢复/单组归档的正文体积预算；超限失败关闭、**不做隐式截断**，并如实提示体积与调法。
+- **存储更稳**：打开期对账、导入、凭证追加全量并入跨进程写锁；新增打开期检查点，大会话打开不再全量读记录；会话 runtime 空闲淘汰。
+- **归档更顺**：归档时吸收紧邻上一张回执（活动面不再每轮多一张）；当前轮判定以日志为权威；`status` 的生效设置与 `config show` 同源。
+- **命令面更诚实**：restore/verify/unpin 的错误码、空态与实际数量口径修正；`turnBasis` 非法值回落可见；help 补 `set gate`。
+- **分享面**：导入整包预检；分享包默认 0600；导出只携带可解释的归档事实。
 
 ## 0.14.0-beta.50 更新（相比 beta.48）
 
@@ -65,7 +76,7 @@
 
 ```text
 cd "$DSH_HOME/profiles/<profile>"
-pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.50.tgz"
+pnpm add "file:/path/to/dsh-memory-context-lab-0.14.0-beta.51.tgz"
 ```
 
 或把 tgz 路径写进 profile 的 `package.json` 后执行 `pnpm install`。安装后**重启 DSH**，服务端半才会加载新版本；客户端半在页面刷新后重新装配。
@@ -116,6 +127,7 @@ npm pack
 | `previewChars` | `160` | 每条命中首部字符数（40–4000） |
 | `queryMaxChars` | `512` | 查询词只取用户消息前 N 个字符 |
 | `coolingGate` | `20` | 按步归档的上下文占用闸门（0–95） |
+| `restoreMaxChars` | `16000` | 恢复正文上限（1000–200000）；超限失败关闭、不隐式截断 |
 
 ## 工作原理
 

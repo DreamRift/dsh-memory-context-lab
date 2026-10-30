@@ -20,6 +20,7 @@ import {
   patchSessionState,
 } from '../src/v3/domain/session/mode.mjs'
 import { readSessionState, sessionStatePath, writeSessionState } from '../src/v3/adapters/storage/session-state.mjs'
+import { writeFileAtomic } from '../src/v3/adapters/storage/session-store.mjs'
 
 test('模式：新会话默认 full-history，关 fullHistory 回 cooling；旧会话迁移 recall-only', () => {
   assert.deepEqual([...SESSION_MODES], ['full-history', 'cooling', 'recall-only'])
@@ -97,7 +98,9 @@ test('state 存储：默认/原子写/损坏可见/路径键与 control 同算�
     assert.equal(read.planFirst, true)
 
     const file = sessionStatePath(root, 's-state')
-    await writeFile(file, '{not json', 'utf8')
+    // B3-9 目录闸门：损坏注入走真实写入方式（temp+rename，推进目录 mtime）；
+    // 生产代码对 state.json 没有任何原地写路径。
+    await writeFileAtomic(file, '{not json')
     const broken = readSessionState(root, 's-state', { defaultMode: 'recall-only' })
     assert.equal(broken.error, 'ESTATE_CORRUPT')
     assert.equal(broken.mode, 'recall-only')

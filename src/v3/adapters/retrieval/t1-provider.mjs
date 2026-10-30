@@ -239,6 +239,17 @@ export function createT1Provider({ port, store, metrics } = {}) {
     capabilities() {
       return { name: T1_BACKEND_NAME, tier: 'T1', live: true }
     },
+
+    /**
+     * AUD50-04-01（B2-7）：runtime 淘汰时释放索引解析缓存。
+     * cachedIndex 是十几–二十几 MB 的对象图（22.6MB 索引 parse 后堆 +78MB），
+     * 不清掉的话「淘汰」只是关了 store，内存照样常驻。索引是可重建派生物，
+     * 下次 freshIndex 照常从盘上重读。
+     */
+    close() {
+      cachedIndex = null
+      cachedStamp = null
+    },
   }
 
   return assertPort('MemoryProvider', impl)

@@ -33,7 +33,8 @@ test('H-22 回填口径（拍板：保最新）：超预算丢最旧，最新行
       id: 'v3r-' + String(when).padStart(16, '0'),
       sessionKey: 'session-h22-1',
       kind: 'message-user',
-      payload: { text: id + '：' + '正文'.repeat(60), bytes: Buffer.byteLength(id + '：' + '正文'.repeat(60), 'utf8'), metaOnly: false, metaReason: null },
+      // 正文 1400 字 × previewChars 1300：每条首部 ~1330 字符，3 条超 4000 硬顶、2 条装得下——「丢最旧」必须真实发生，断言才不空转（B3-27）。
+      payload: { text: id + '：' + '正文'.repeat(700), bytes: Buffer.byteLength(id + '：' + '正文'.repeat(700), 'utf8'), metaOnly: false, metaReason: null },
       provenance: { sourceEventId: 'ev-' + id, sourceForm: 'tool/result', transactionId: 'tx-' + id },
       createdAt: when,
     })
@@ -44,7 +45,11 @@ test('H-22 回填口径（拍板：保最新）：超预算丢最旧，最新行
     const result = await rt.recall({ query: '正文', turn: 1, limit: 3, previewChars: 1300 })
     const pack = String(result.text ?? '')
     assert.ok(pack.includes('c-new：'), '最新的 C 必须在包内（拍板：保最新）')
-    // 省略行必须可见，且省的是最旧集合（C 不被省）
+    // B3-27（AUD50-10-05）：标题承诺「丢最旧」必须有真断言——最旧 ID 不在包内，
+    // 省略行如实计数（不是静默丢）。旧断言只钉「C 在包内」，A 根本没被验证丢弃。
+    assert.ok(!pack.includes('a-old：'), '最旧的 A 必须被丢（保最新口径），不得原样进包')
+    assert.equal(result.omittedHits, 1, '省略计数如实：丢 1 条')
+    assert.ok(pack.includes('1 条已省略'), '省略必须可见（按 ID 回读）：' + pack.split('\n').slice(-2).join(' / '))
     await rt.dispose?.()
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {})

@@ -301,6 +301,9 @@ test('表单字段与宿主半 Config 同域：键、类型、上下界、步长
       max: node.meta?.max,
       step: node.meta?.step,
       volatile: node.meta?.volatile,
+      consts: node.type === 'union'
+        ? (node.list ?? []).map((r) => refs[r] ?? r).map((c) => c.value)
+        : undefined,
     }
   })
   assert.deepEqual(module.FIELDS.map((field) => field.key).sort(), schemaFields.map((field) => field.name).sort(),
@@ -308,7 +311,13 @@ test('表单字段与宿主半 Config 同域：键、类型、上下界、步长
 
   for (const field of module.FIELDS) {
     const schema = schemaFields.find((row) => row.name === field.key)
-    assert.equal(schema.type, field.kind, field.key + ' 的类型必须与 schema 一致')
+    if (schema.type === 'union') {
+      // 枚举字段（B3-19）：schema 是 union(const)，客户端以 kind 'string' + options 渲染下拉框
+      assert.equal(field.kind, 'string', field.key + ' 枚举字段客户端须以 string 下拉框渲染')
+      assert.deepEqual(field.options?.map((o) => o.value), schema.consts, field.key + ' 的下拉选项必须与 schema 枚举逐值一致')
+    } else {
+          assert.equal(schema.type, field.kind, field.key + ' 的类型必须与 schema 一致')
+    }
     assert.equal(schema.volatile, true, field.key + ' 必须 volatile，否则宿主 describe() 不投影它')
     assert.equal(module.DEFAULTS[field.key], schema.default, field.key + ' 的默认值必须与 schema 一致')
     if (field.kind === 'number') {

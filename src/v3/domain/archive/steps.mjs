@@ -23,6 +23,7 @@
  * 不用概率模型（确定性优先，与 P9 单源口径一致）。
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
+import { absorbPrecedingReceipts } from './candidates.mjs'
 import { callIdOf, isHumanUserEvent, isPluginSurfaceEvent, isRecallPackEvent } from './event-shape.mjs'
 
 /** 把会话事件切成步骤单元；只有 start…end 成对的步骤标 complete。 */
@@ -137,16 +138,21 @@ export function selectStepSpan({ surfaceNodes, events, hasRecord, retainSteps = 
   }
   if (selected.length === 0) return reject(stop ?? { reason: 'no-candidate' })
   const wanted = selected.flatMap((unit) => unit.surfaceSeqs)
-  const startSeq = wanted[0]
+  let startSeq = wanted[0]
   const endSeq = wanted[wanted.length - 1]
-  const startIdx = surfaceNodes.indexOf(startSeq)
+  const foundIdx = surfaceNodes.indexOf(startSeq)
   const endIdx = surfaceNodes.indexOf(endSeq)
-  if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  if (foundIdx === -1 || endIdx === -1 || foundIdx > endIdx) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  // B3-11：吸收紧邻起点的连续回执（一进一出）——按步归档的上一张回执不逐次累积。
+  const { absorbed, startIdx } = absorbPrecedingReceipts({ surfaceNodes, startIdx: foundIdx, events, pinnedSeqs })
   const shadowed = surfaceNodes.slice(startIdx, endIdx + 1)
   // 必须密集覆盖且顺序一致：宿主 range replace 的硬前提，也保证不会吞掉锚点。
-  if (shadowed.length !== wanted.length || shadowed.some((seq, index) => seq !== wanted[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  const expected = [...absorbed, ...wanted]
+  if (shadowed.length !== expected.length || shadowed.some((seq, index) => seq !== expected[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  if (absorbed.length > 0) startSeq = absorbed[0]
   const transient = new Set(selected.flatMap((unit) => unit.transient))
-  const recordSeqs = shadowed.filter((seq) => !transient.has(seq))
+  const absorbedSet = new Set(absorbed)
+  const recordSeqs = shadowed.filter((seq) => !transient.has(seq) && !absorbedSet.has(seq))
   if (recordSeqs.length === 0) return reject({ reason: 'empty-records', seqs: shadowed, count: shadowed.length })
   return { startSeq, endSeq, sourceEventSeqs: shadowed, recordSeqs, operations: selected.length, steps: selected.length }
 }

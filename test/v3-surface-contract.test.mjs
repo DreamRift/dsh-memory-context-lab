@@ -465,7 +465,7 @@ test('设置面：入口导出 Config，字段全部 volatile（宿主设置页�
   const dict = root.dict ?? {}
   const refs = json.refs ?? {}
   const fields = Object.keys(dict)
-  assert.deepEqual(fields.sort(), ['autoRestore', 'coolingGate', 'enabled', 'fullHistory', 'limit', 'packMinScore', 'planFirst', 'previewChars', 'queryMaxChars', 'turnBasis'])
+  assert.deepEqual(fields.sort(), ['autoRestore', 'coolingGate', 'enabled', 'fullHistory', 'limit', 'packMinScore', 'planFirst', 'previewChars', 'queryMaxChars', 'restoreMaxChars', 'turnBasis'])
   // volatileForm 只渲染 meta.volatile 的字段；少一个就少一个控件
   for (const [name, ref] of Object.entries(dict)) {
     const node = refs[ref] ?? ref

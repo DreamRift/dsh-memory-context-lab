@@ -135,6 +135,11 @@ export function mergeSessionSettings(globalSettings, control) {
     && (control === null || control === undefined || control.enabled !== false)
     && (control === null || control === undefined || control.recall !== false)
   return {
+    // AUD50-06-01（B2-9）：全局键全部透传。旧实现只回 6 个键，turnBasis / fullHistory /
+    // planFirst / autoRestore 从合并结果里拿不到，消费方（settingsLine 生效设置行）只好
+    // 各自回落默认——同一份 status 出现「轮次判定 DSH 轮次」与「轮次判定 真人消息（默认）」
+    // 并存的自相矛盾。先铺全局、再覆写覆盖项与派生值。
+    ...globalSettings,
     enabled,
     limit: overrides.limit ?? globalSettings.limit,
     gate: overrides.gate ?? (Number.isFinite(globalSettings.coolingGate) ? globalSettings.coolingGate : 20),

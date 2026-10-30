@@ -1,7 +1,7 @@
 /**
  * 双槽规划器（domain/context，M4）——Q3-A/B（注入即替换、稳态双槽）的纯决策层。
- * 归属说明：槽位规划是决策不是渲染（application 只依赖 domain/ports 的架构口径），
- * 渲染留在 projection/card-renderer。
+ * 归属说明：槽位规划是决策不是渲染（application 只依赖 domain/ports 的架构口径）；
+ * 卡片渲染从未接线，死模块已随 B3-26（AUD50-10-04）删除。
  *
  * 不变量（beta.8 拍板口径）：
  * - 稳态活动面恒为 [全量基准卡][最新增量卡] 两个卡节点；

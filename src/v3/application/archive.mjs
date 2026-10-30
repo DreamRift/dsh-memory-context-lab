@@ -83,7 +83,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
     return { ok: true, rows }
   }
 
-  async function plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = false }) {
+  async function plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = false, restoreMaxChars = null }) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
     // 拒绝原因（AUD-09 附带项）：选择器只回 null，原因经 onReject 带出，供 status 直读。
@@ -103,35 +103,47 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       onReject: (row) => { rejection = rejection ?? row },
     })
     if (span === null) return noCandidate(rejection)
-    return await makePlan(span, { summary, seqToRecordId, unitLabel: mode === 'cooling' ? '步骤数' : '回合数' })
+    return await makePlan(span, { summary, seqToRecordId, unitLabel: mode === 'cooling' ? '步骤数' : '回合数', restoreMaxChars })
   }
 
   /**
    * span → 回执计划（回合级与步骤级共用）。
    * 净收益门槛在这里只有一处：回执本身也是上下文税，小段（回执比原文长）归档会让占用变大。
    */
-  async function makePlan(span, { summary = false, seqToRecordId, unitLabel = '操作数' } = {}) {
+  async function makePlan(span, { summary = false, seqToRecordId, unitLabel = '操作数', restoreMaxChars = null } = {}) {
     const recordIds = span.recordSeqs.map((seq) => seqToRecordId.get(seq))
     if (recordIds.some((id) => typeof id !== 'string' || id.length === 0)) return null
     const loaded = await recordsOf(recordIds)
     if (!loaded.ok) return { status: 'failed', reason: 'record-read-failed', error: loaded.error, span, recordIds }
     const summaryText = summary === true ? summarizeRecords(loaded.rows) : ''
-    const receiptText = renderArchiveReceipt({ startSeq: span.startSeq, endSeq: span.endSeq, recordIds, operations: span.operations, unitLabel, summary: summaryText })
+    // B3-11：回执正文打印**记录 seq 范围**（recordSeqs 首尾）——吸收旧回执后 span.startSeq
+    // 是被吸收回执的 seq（数值上可能大于 endSeq），不是已归档记录的范围。
+    const receiptStart = span.recordSeqs.length > 0 ? span.recordSeqs[0] : span.startSeq
+    const receiptEnd = span.recordSeqs.length > 0 ? span.recordSeqs[span.recordSeqs.length - 1] : span.endSeq
+    const receiptText = renderArchiveReceipt({ startSeq: receiptStart, endSeq: receiptEnd, recordIds, operations: span.operations, unitLabel, summary: summaryText })
     const sourceChars = loaded.rows.reduce((sum, row) => sum + textOfRecord(row).length, 0)
+    // AUD50-02-02（B1-2）：净收益为正 ≠ 恢复得回来。恢复体积按 restoreTextOfRecord
+    // （正文 + toolCalls 参数文本）在**写凭证前**对照生效预算；超限回合不写凭证、
+    // 不改活动面，返回 no-candidate/restore-budget-exceeded——拒绝可重试（调高预算后
+    // 同一轮会重新归档），不进 not-worth 游标，也不做隐式截断（截断是产品决策）。
+    const restoreChars = loaded.rows.reduce((sum, row) => sum + restoreTextOfRecord(row).length, 0)
+    if (Number.isInteger(restoreMaxChars) && restoreMaxChars >= 1 && restoreChars > restoreMaxChars) {
+      return { status: 'no-candidate', reason: 'restore-budget-exceeded', chars: restoreChars, maxChars: restoreMaxChars, span, recordIds }
+    }
     // AUD48-04-01：sourceChars === 0（空正文/纯 metaOnly 回合）时旧条件被短路，160 字回执
     // 替换 0 字正文 → 活动面净增。回执本身也是上下文税，0 源必须判负；结构（toolCalls）
     // 的可恢复性不改变「可见正文为 0」这一事实，不能拿它给负收益开绿灯。
     if (receiptText.length >= sourceChars) {
       return { status: 'not-worth', span, recordIds, receiptText, sourceChars, receiptChars: receiptText.length }
     }
-    return { ...span, recordIds, receiptText, summaryText }
+    return { ...span, recordIds, receiptText, summaryText, restoreChars }
   }
 
   /**
    * 步骤级计划（普通降温 / 实时压缩）：在当前回合内压已完成步骤。
    * 与回合级共用回执与净收益口径，只是候选选择换成 steps.mjs。
    */
-  async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false } = {}) {
+  async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false, restoreMaxChars = null } = {}) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
     let rejection = null
@@ -146,7 +158,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       onReject: (row) => { rejection = rejection ?? row },
     })
     if (span === null) return noCandidate(rejection)
-    return await makePlan(span, { summary, seqToRecordId, unitLabel: '步骤数' })
+    return await makePlan(span, { summary, seqToRecordId, unitLabel: '步骤数', restoreMaxChars })
   }
 
   /** 只预览，不触碰 surface/store。 */
@@ -157,8 +169,8 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
   }
 
   /** 执行一次归档；失败绝不推进 state。 */
-  async function archiveOnce({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = false, txn = 1 }) {
-    const planned = await plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations, lastArchiveEndSeq, maxOperations, pinnedSeqs, minStartSeq, turnBasis, currentTurn, summary })
+  async function archiveOnce({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = false, restoreMaxChars = null, txn = 1 }) {
+    const planned = await plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations, lastArchiveEndSeq, maxOperations, pinnedSeqs, minStartSeq, turnBasis, currentTurn, summary, restoreMaxChars })
     return await commitPlanned({ sessionId, planned, txn, mode: mode === 'cooling' ? 'cooling' : 'full-history' })
   }
 
@@ -167,8 +179,8 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
    * 与回合级共用宿主 range replace、voucher 与失败语义；不推进 lastArchiveEndSeq
    * （那是回合级位点，步骤级用磁盘上的真实节点判幂等，重复压缩不会重复计费）。
    */
-  async function archiveStepOnce({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false, txn = 1 } = {}) {
-    const planned = await planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps, maxSteps, pinnedSeqs, minStartSeq, summary })
+  async function archiveStepOnce({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false, restoreMaxChars = null, txn = 1 } = {}) {
+    const planned = await planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps, maxSteps, pinnedSeqs, minStartSeq, summary, restoreMaxChars })
     return await commitPlanned({ sessionId, planned, txn, mode: 'cooling' })
   }
 
@@ -190,6 +202,8 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       sourceEventSeqs: [...planned.sourceEventSeqs],
       recordIds: [...planned.recordIds],
       receiptText: planned.receiptText,
+      // AUD50-02-02：恢复体积随 intent 落盘，崩溃对账补凭证时体积估计不丢。
+      restoreChars: Number.isInteger(planned.restoreChars) ? planned.restoreChars : null,
       createdAt: clock.now(),
     }
     if (journal?.write !== undefined) await journal.write(intent)
@@ -225,6 +239,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
         targetEventId: receiptSeq,
         receiptText: planned.receiptText,
         summaryText: planned.summaryText ?? '',
+        restoreChars: Number.isInteger(planned.restoreChars) ? planned.restoreChars : null,
         txn: Number.isInteger(txn) && txn >= 1 ? txn : 1,
       })
     } catch (error) {
@@ -277,6 +292,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
           endSeq: intent.endSeq,
           targetEventId: receiptSeq,
           receiptText: intent.receiptText,
+          restoreChars: Number.isInteger(intent.restoreChars) ? intent.restoreChars : null,
           // C-E：用 intent 里的事务号（旧版 intent 没有 txn → 1，与旧行为一致）。
           txn: Number.isInteger(intent.txn) && intent.txn >= 1 ? intent.txn : 1,
         })
@@ -365,7 +381,9 @@ async function replaceVoucherReceipt(index, expected, next) {
     const loaded = await recordsOf(voucher.recordIds)
     if (!loaded.ok) {
       // D-B：已遗忘与「读失败」必须分开记账（旧实现只表现为 record-read-failed）。
-      const reason = loaded.error?.code === 'EFORGOTTEN' ? 'record-forgotten' : 'record-read-failed'
+      const reason = loaded.error?.code === 'EFORGOTTEN' ? 'record-forgotten'
+        : loaded.error?.code === 'ERECORD_NOT_FOUND' ? 'record-not-found'
+        : 'record-read-failed'
       return { restored: false, reason, error: loaded.error }
     }
     const text = loaded.rows.map(restoreTextOfRecord).filter((part) => part.length > 0).join('\n\n')
@@ -422,6 +440,8 @@ async function replaceVoucherReceipt(index, expected, next) {
         endSeq: voucher.endSeq ?? null,
         recordIds: Array.isArray(voucher.recordIds) ? [...voucher.recordIds] : [],
         chars: typeof voucher.receiptText === 'string' ? voucher.receiptText.length : 0,
+        // AUD50-02-02：归档时记录的恢复体积（旧凭证没有 → null，不猜）。
+        restoreChars: Number.isInteger(voucher.restoreChars) ? voucher.restoreChars : null,
         summary: typeof voucher.summaryText === 'string' && voucher.summaryText.length > 0,
         // D-C：隐私面已清除的回执在历史里必须看得出来（否则观察面以为它仍可恢复）。
         redacted: redactedIds === null ? null : redactedIds.has(voucher.voucherId),

@@ -1,4 +1,3 @@
-<!-- release mirror: 与 plugin/src/v3/README.md 同文；仅此标记用于区分镜像与源文档。 -->
 # v3 源码目录（0.14.0 线）
 
 按《开发计划-v3》§2 建立的模块化单体，**0.14.0-beta.10 起是插件的唯一引擎**：
@@ -40,7 +39,7 @@ v3 只使用 `<DSH_HOME>/.memory-context-lab/v3/`；clean 只处理 v3 自有目
 - `contracts/errors.mjs`：错误信封 kind/code/message/text 的单一真源。
 - `ports/index.mjs`：HostSurface / SessionStore / MemoryProvider / Clock / Random / Metrics 的方法面定义。
 - `contracts/outcomes.mjs`：投影结果合同（applied/partial/failed；「失败伪装已完成」「瞒报失败」在结构层非法）。
-- `test/v3-property.test.mjs`：property/fuzz 层（种子确定可重放：P1 逐字节回读×200 / P2 预算上界×300 / P3 pack⊆display×200 / P4 损坏双语义×50）。
+- `test/v3-property.test.mjs`：property/fuzz 层（种子确定可重放：P1 逐字节回读×200 / P3 pack⊆display×200 / P4 损坏双语义×50）。
 - `adapters/retrieval/backend-negotiation.mjs`：记忆后端协商（探测注入；D3 失败关闭回 T1；决策记录随 provider 返回——报实际生效不是期望）。
 - `entry/v3-entry.mjs`：引擎挂载（attachV3Engine：pre-step 增量摄入、批量事务、断点续传、阈值/装包参数透传、失败只告警、dispose 注销）；回注取数（`recallForInjection`，判别式 status + 按会话计数）由入口钩子调用，**追加消息在入口完成**。
 - `composition/composition.mjs`：composition root（唯一看全层的装配点；`handleDshEvent` / `handleDshEventBatch` 归一化与 own-source 裁决；Date.now/randomUUID 只出现在这里）。
@@ -48,8 +47,7 @@ v3 只使用 `<DSH_HOME>/.memory-context-lab/v3/`；clean 只处理 v3 自有目
 - `application/surface-executor.mjs`：投影执行（R4：replace 被拒→降级 append+cardReplaceFallbacks+一步恢复；宿主确认必须带 seq；新卡未落面不推进状态）。
 - `adapters/retrieval/t1-provider.mjs`：T1 检索提供者（BM25；查询词元去重；覆盖门槛按不同词元并设上限；索引按文件戳缓存、损坏即重建、`allowRebuild:false` 供热路径；read 顶层 text 恒非空；capabilities 报实际生效后端）。
 - `application/recall.mjs`：recall 用例（纯壳不注入；首部切片按码点；P3 同回合一次；OOV 去重有界；超硬顶拒绝注入；单条命中读取失败不废整包；回读句柄是真实命令 `/memory-lab read`）。
-- `projection/card-renderer.mjs`：工作卡渲染（allocateBudget 接入；页脚保留量先扣再用；严格上界含页脚；丢弃可见）。
-- `domain/context/slot-planner.mjs`：双槽规划（Q3-A/B：注入即替换/稳态双槽/占位回执；gateRecallInjection P3 回注闸；决策归 domain，渲染在 projection）。
+- `domain/context/slot-planner.mjs`：双槽规划（Q3-A/B：注入即替换/稳态双槽/占位回执；gateRecallInjection P3 回注闸；决策归 domain）。
 - `application/session-lifecycle.mjs`：enable/disable/restore/forget 用例（Q-01 三结局回执；G3 unknown 守卫；N-11 会计；forget 幂等+隐私面）。
 - `application/process-turn.mjs`：processTurn 用例（顺序固化：归一化→裁决→持久化→投影→计量；`processTurn.many` 让一批事件共用一笔事务，失败整批 failed 且回合号回滚；装配期端口校验 + random 探针）。
 - `adapters/storage/session-store-port.mjs`：SessionStore 端口装配（assertPort + 锁内事务 + 遗忘不入索引 + 恢复资格 N-11b）。
@@ -58,7 +56,6 @@ v3 只使用 `<DSH_HOME>/.memory-context-lab/v3/`；clean 只处理 v3 自有目
 - `adapters/storage/write-lock.mjs`：跨进程写锁（两阶段创建 / token 心投校验 / stale 墓碑接管 / deadline 内 ELOCKED；withWriteLock 同进程串行+重入，队列排空自清理）。
 - `adapters/storage/session-store.mjs`：M2 会话存储（原子写 randomUUID 临时名 + **fsync**；事务协议 payload→commit 行→txnNext；崩溃对账：残留隔离/号不复用/推进对账/尾损坏判 damaged 读允许写拒绝且字节不动；账本各自损坏时**按账本**拒绝追加；记录读写校验会话归属；遗忘集合读前按文件戳刷新；close 后 ESTORE_CLOSED）。
 - `domain/retrieval/query.mjs`：查询规范化（CJK 单字+相邻双字、ASCII 小写）/ 双面 min_score 门槛 / 确定性排序。
-- `domain/context/budget.mjs`：投影预算器（structural 无条件保留 + 超预算如实标注；protected 次优；soft 丢最旧保最新；无生产类目可见摘除；非法预算 fail-fast）。
 - `domain/archive/restore.mjs`：恢复资格（逐字节重建）/ 停用动作（Q-01 正交 + G3 unknown fail-closed）/ 会计结算（N-11 三桶恒等）。
 - `domain/session/turn.mjs`：回合判定（真实用户=非插件来源的 user 事件；turn 0 禁止注入；oncePerTurnGate 同回合同类只放行一次）。
 - `contracts/events.mjs`：归一化事件合同（四类型封闭集；保留宿主原始 event id/source）。

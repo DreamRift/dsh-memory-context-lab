@@ -3,11 +3,12 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { buildExportBundle } from '../src/v3/domain/export/bundle.mjs'
+import { writeExportBundle } from '../src/v3/adapters/storage/export-writer.mjs'
 import { openV3SessionStore } from '../src/v3/adapters/storage/session-store.mjs'
 import { attachV3Engine } from '../src/v3/entry/v3-entry.mjs'
 import { createFakeSession } from './helpers/fake-session.mjs'
@@ -140,3 +141,54 @@ test('importRecords：导入保留 metaOnly / structure（AUD48-08-03）', async
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+test('buildExportBundle：state 只留归档事实白名单，不带本机运行态（B3-22 / AUD50-07-04）', () => {
+  const bundle = buildExportBundle({
+    sessionKey: 's',
+    records: [],
+    state: {
+      schemaVersion: 1,
+      mode: 'full-history',
+      modeSource: 'default',
+      planFirst: false,
+      autoRestore: true,
+      pins: ['v3r-0123456789abcdef'],
+      readLease: ['v3r-0123456789abcdef'],
+      provider: { tier: 'T2', reason: '隔离 MCP' },
+      path: 'C:/Users/somebody/.dsh/.memory-context-lab/v3/sessions/x/state.json',
+      exists: true,
+      surface: { lastArchiveEndSeq: 42, lastArchiveAt: 1700000000000 },
+      cooling: { open: true, lastOccupancy: 0.9, lastRunAt: 1, lastReason: 'r' },
+      planFloorSeq: 7,
+      updatedAt: 1700000000000,
+    },
+  })
+  assert.deepEqual(bundle.state, { surface: { lastArchiveEndSeq: 42, lastArchiveAt: 1700000000000 } })
+  const text = JSON.stringify(bundle)
+  for (const banned of ['path', 'pins', 'readLease', 'provider', 'exists', 'cooling', 'mode', 'planFloorSeq']) {
+    assert.equal(text.includes('"' + banned + '"'), false, '分享包不得携带本机运行态键：' + banned)
+  }
+})
+
+test('buildExportBundle：state null / 无 surface 时最小化为空事实（B3-22）', () => {
+  assert.equal(buildExportBundle({ sessionKey: 's', records: [] }).state, null)
+  assert.deepEqual(buildExportBundle({ sessionKey: 's', records: [], state: { mode: 'cooling' } }).state,
+    { surface: { lastArchiveEndSeq: null, lastArchiveAt: null } })
+})
+
+test('writeExportBundle：导出文件权限 0600（B3-21 / AUD50-07-03；POSIX）',
+  { skip: process.platform === 'win32' ? 'Windows 的 chmod 只作用于只读位，mode 断言无意义（任务书注明 win32 skip）' : false },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'mcl-export-perm-'))
+    try {
+      const bundle = buildExportBundle({ sessionKey: 'perm-sess', records: [] })
+      const file = await writeExportBundle(root, 'perm-sess', bundle)
+      const st = await stat(file)
+      assert.equal(st.mode & 0o777, 0o600, '导出包默认不 world-readable')
+      // 内容不受收紧影响
+      const parsed = JSON.parse(await readFile(file, 'utf8'))
+      assert.equal(parsed.schemaVersion, 1)
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => {})
+    }
+  })

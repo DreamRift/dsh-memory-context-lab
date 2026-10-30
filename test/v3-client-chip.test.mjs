@@ -23,6 +23,7 @@ import { createStatusProjectionDefinition, STATUS_PROJECTION_KEY, STATUS_PROJECT
 import { attachV3Engine } from '../src/v3/entry/v3-entry.mjs'
 import { SESSION_OVERRIDE_BOUNDS, mergeSessionSettings, normalizeSessionControl, patchSessionControl } from '../src/v3/domain/session/session-control.mjs'
 import { readSessionControl, sessionControlPath, writeSessionControl } from '../src/v3/adapters/storage/session-control.mjs'
+import { writeFileAtomic } from '../src/v3/adapters/storage/session-store.mjs'
 
 const SRC = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(SRC, '..')
@@ -800,7 +801,8 @@ test('会话控制文件：默认全开 / 原子写 / 损坏可见 / 哈希键',
     assert.equal(read.recall, false)
     assert.equal(read.overrides.limit, 5)
 
-    await writeFile(sessionControlPath(root, 's-control'), '{not json', 'utf8')
+    // B3-9 目录闸门：损坏注入走真实写入方式（temp+rename，推进目录 mtime）；生产代码对 control.json 没有原地写路径
+    await writeFileAtomic(sessionControlPath(root, 's-control'), '{not json')
     const broken = readSessionControl(root, 's-control')
     assert.equal(broken.error, 'ECONTROL_CORRUPT', '损坏必须可见，不能静默说成用户关掉了')
     assert.equal(broken.enabled, true, '默认全开的调用方按默认继续')
@@ -924,4 +926,27 @@ test('命令面：on/off、inject、set limit、reset、status 都写本对话�
     else process.env.DSH_HOME = previous
     await rm(home, { recursive: true, force: true }).catch(() => {})
   }
+})
+
+test('B3-18：stateError 与按步归档事实在弹层可见（cooling 不推进 lastArchiveEndSeq）', async () => {
+  const entry = await loadClient()
+  const run = runApply(entry)
+  const pop = openPanel(run, {}, { ...READY_STATUS, mode: 'cooling', surface: { lastArchiveEndSeq: -1, lastArchiveAt: 1700000000000 }, stateError: 'ESTATE_CORRUPT' })
+  const panel = run.bind(pop.type, pop.props)
+  assert.ok(findElement(panel.get(), (n) => typeof n.children === 'string' && n.children.startsWith('statusStateError')),
+    '状态文件异常必须可见（不能静默显示默认值）')
+  assert.ok(findElement(panel.get(), (n) => typeof n.children === 'string' && n.children.startsWith('statusArchivedAt')),
+    '按步归档事实必须可见（lastArchiveAt 两种模式都推进）')
+  // 干净状态（无异常、无按步归档）不多两行噪音
+  const run2 = runApply(entry)
+  const pop2 = openPanel(run2, {}, { ...READY_STATUS, mode: 'cooling', surface: { lastArchiveEndSeq: -1, lastArchiveAt: 0 }, stateError: null })
+  const panel2 = run2.bind(pop2.type, pop2.props)
+  assert.equal(findElement(panel2.get(), (n) => typeof n.children === 'string' && (n.children === 'statusStateError' || n.children === 'statusArchivedAt')), undefined,
+    '干净状态不多两行噪音')
+  // 中英字典各补一键
+  const dict = run.dictionaries[0].dict
+  assert.match(dict.zh.statusStateError, /状态文件异常/)
+  assert.match(dict.en.statusStateError, /State file error/i)
+  assert.match(dict.zh.statusArchivedAt, /已按步归档/)
+  assert.match(dict.en.statusArchivedAt, /Archived per step/i)
 })

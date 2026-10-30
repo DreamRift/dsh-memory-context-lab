@@ -17,6 +17,7 @@ export const ERROR_CODES = Object.freeze([
   'EINTERNAL',
   'ESTORE_SESSION_MISMATCH',
   'ESTORE_CORRUPT',
+  'ERECORD_NOT_FOUND',
   'ESTORE_DAMAGED',
   'ESTORE_TXN_CONFLICT',
   'ESTORE_CLOSED',
@@ -30,6 +31,8 @@ const CODE_KIND = new Map([
   ['EINTERNAL', 'internal'],
   ['ESTORE_SESSION_MISMATCH', 'conflict'],
   ['ESTORE_CORRUPT', 'corrupt'],
+  // B3-17（AUD50-06-06）：ID 不存在不是库损坏——用户输错 ID 不再被报「损坏」
+  ['ERECORD_NOT_FOUND', 'invalid'],
   ['ESTORE_DAMAGED', 'corrupt'],
   ['ESTORE_TXN_CONFLICT', 'conflict'],
   ['ESTORE_CLOSED', 'unavailable'],

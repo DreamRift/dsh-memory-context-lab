@@ -258,7 +258,9 @@ export function createT2IsolatedProvider({ t1, client, sessionKey, metrics, root
     }
     // 隐私/隔离错误不得被镜像绕过：已遗忘、跨会话、损坏一律原样抛出。
     if (localError?.code === 'EFORGOTTEN' || localError?.code === 'ESTORE_SESSION_MISMATCH') throw localError
-    if (localError?.code !== 'ESTORE_CORRUPT' || !String(localError.message).includes('记录不存在')) {
+    const notFoundLocally = localError?.code === 'ERECORD_NOT_FOUND'
+      || (localError?.code === 'ESTORE_CORRUPT' && String(localError.message).includes('记录不存在'))
+    if (!notFoundLocally) {
       throw localError
     }
     const result = await client.callTool('cg', { op: 'read', node_id: recordId }, { timeoutMs: 10000 })

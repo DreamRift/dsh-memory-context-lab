@@ -66,15 +66,20 @@ export function normalizeDshEvent(raw, sessionKey) {
   // 宿主事件的时间字段是 `time`（dsh-session `append()`：{type, seq, time, data}），
   // 不是 `at`。旧实现只读 `at`，于是每条归一化事件的 at 恒为 0——记录本身用
   // clock.now() 另存 createdAt 才没暴露，但「事件时间」这个事实在入口就丢了。
-  // `at` 保留为兼容旧夹具/旧格式，两者都缺失才回落 0。
-  const at = Number.isFinite(raw.at) ? raw.at : (Number.isFinite(raw.time) ? raw.time : 0)
-  return validateShape({
+  // `at` 保留为兼容旧夹具/旧格式（at 优先于 time）。B3-1：时间只在合法时保留，
+  // 非法/缺失一律缺失并在返回值记 atReason——不再回落 0 伪造「1970 年发生」。
+  const rawAt = Number.isFinite(raw.at) ? raw.at : raw.time
+  const at = typeof rawAt === 'number' && Number.isFinite(rawAt) && rawAt >= 0 ? rawAt : undefined
+  const atReason = at !== undefined ? undefined : (raw.at !== undefined || raw.time !== undefined ? 'invalid' : 'missing')
+  const checked = validateShape({
     id: dshEventIdOfSeq(raw.seq),
     type,
     sessionKey,
-    at,
+    ...(at !== undefined ? { at } : {}),
     source: { kind: typeof source.kind === 'string' && source.kind.length > 0 ? source.kind : 'dsh', form: typeof source.form === 'string' ? source.form : null },
   })
+  if (!checked.ok) return checked
+  return atReason === undefined ? { ok: true, event: checked.event } : { ok: true, event: checked.event, atReason }
 }
 
 function validateShape(candidate) {
@@ -160,8 +165,12 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
           end = targetEventId
           sources = [targetEventId]
         }
-        if (!Number.isInteger(start) || start < 0 || !Number.isInteger(end) || end < start) {
-          throw new V3ContractViolation('v3 dsh-host: replace 的 startSeq/endSeq 必须是 start≤end 的非负整数')
+        if (!Number.isInteger(start) || start < 0 || !Number.isInteger(end) || end < 0) {
+          // B3-11：不按数值判 start≤end——真实宿主（dsh-session lib/index.js:365-369，
+          // 2026-10-30 核验）只按**活动面顺序**（nodes.indexOf 的 startIdx≤endIdx，下方已查）
+          // 判 replace 区间；回执节点的 seq 恒大于其后面的正文节点（回执是后追加的），
+          // 吸收回执（B3-11）的区间 replace 必然数值倒序。数值约束是旧实现自加的。
+          throw new V3ContractViolation('v3 dsh-host: replace 的 startSeq/endSeq 必须是非负整数')
         }
         if (!Array.isArray(sources) || sources.length === 0
           || sources.some((seq) => !Number.isInteger(seq) || seq < 0)

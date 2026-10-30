@@ -2,6 +2,37 @@
 
 > 0.14.0-beta.7 ~ beta.10 未在本文件单独收录（当时以进展卡与转正方案为准）；beta.11 起恢复逐版记录。
 
+## 0.14.0-beta.51（2026-10-30，测试版）
+
+相比 0.14.0-beta.50（本版一次收完「审计 beta.50 后续」（20261029，开发仓 docs/dev-0.14.0）的全部 40 项确认缺陷：2 P1 + 10 P2 + 28 P3，按 B1/B2/B3 批执行；不改产品边界）：
+
+### 修复（B1 批，两个 P1）
+
+- **AUD50-02-01（B1-1）：JSON 引号键凭据绕过脱敏**。`redactText` 补引号键形态（键名允许引号、分隔符两侧空白）；脱敏实现上移到 `domain/security/redact.mjs` 供摄入与导出共用；导出重建时对正文**再过一次脱敏**（与 07-01 修复同一道双保险）。
+- **AUD50-02-02（B1-2）：恢复预算 16k 与自动回执体积冲突**（实测单凭证 20 万+ 字符，restore 永久失败）。按产品拍板落地：恢复预算改为设置项 **`restoreMaxChars`「恢复正文上限」**（1000–200000，默认 16000；非法值回落默认，失败关闭）；**不做隐式截断**；归档/恢复因超预算失败时给出实际体积、预算值与调法（不藏配置名）。
+
+### 修复（B2 批，P2 数据完整性 / 隐私 / 性能）
+
+- **摄入 02-03/04/05**：单个缺 `arguments` 的 tool/call 不再永久卡死本会话摄入（拒绝计数在 status 可见，不重放）；assistant 工具调用块兼容真实宿主的 `{type,id,name,arguments}` 形状；脱敏值的 `;/,;` 分隔边界按上下文区分，分隔符后的凭据续脱敏。
+- **存储 03-01/02/03**：打开期对账整段进跨进程写锁（不再与在飞提交竞态锁死会话）；`importRecords` 与事务/遗忘共用同一把锁与事务号分配（不再并发同号）；`records/` 只认合法记录名，崩溃 tmp 启动即清。
+- **性能 04-01/02**：会话 runtime 空闲淘汰（store + T1 解析索引不再每会话常驻，淘汰时释放缓存）；新增**打开期检查点**（事件→记录映射，与提交同锁追加、失败只损下次打开速度），进程内打开不再 O(记录数) 全量读。
+- **状态 06-01**：`status` 生效设置行消费合并后的完整全局值（不再丢 turnBasis/fullHistory/planFirst/autoRestore 四键，与 `config show` 同源）。
+- **导出 07-01**：导出重建时 user/assistant/tool 正文一律再过 `redactText`；清除账本读不到仍失败关闭。
+
+### 修复（B3 批，P3 批量小修）
+
+- **摄入/脱敏**：事件时间只在未来得合法时保留（02-06）；`redactValue` 截断可见（02-07）；非凭据键名白名单，author/authMode 等不再过度脱敏（02-08）；归一化失败的尾部事件不再堵住 lastSeq 推进（02-09）。
+- **存储**：事务 commit 行丢失如实报告（03-04）；写锁读错误只把 ENOENT 当「没有」（03-05）；voucher/redactions 追加并入写锁（03-06）。
+- **归档/索引**：归档选择**吸收紧邻上一张回执**（一进一出，不再每轮 +1 常驻，05-01）；当前轮判定以日志为权威，不再固定晚一个 step（05-02）；dsh start/end 不按数值比较（宿主为字符串序号）；归档选择改增量投影缓存（04-03）；statusOf 的 I/O 事实如实标注（04-04）；indexStamp 弃 mtimeMs 粒度（04-05）。
+- **命令/UI**：`restore` 先判 `result.error`（06-02）；`verify all` 空态口径对齐 file-status（06-03）；USAGE/hint 补 `set gate`（06-04）；`unpin` 回报实际移除数（06-05）；not-found 与库损坏错误码分离（06-06）；composer 弹层消费 `stateError`（06-07）；`turnBasis` 改枚举校验，非法值回落可见（06-08）。
+- **隐私/导入**：导入按 `validateRecord` 整包预检（07-02）；分享包默认 0600 收紧（07-03）；导出 state 白名单，只留可解释归档事实（07-04）。
+- **发布/测试（10-01..06）**：删除死模块 `card-renderer.mjs`/`budget.mjs`；安装面版本门改**整树哈希**比对；host 契约探针扩到 11 项字段并钉进测试；新增 release↔plugin 文档差异白名单守卫（`release-doc-guard`）；npm 分发现状、公开面流程与「未重启」口径按事实改正。
+
+### 验证
+
+- 新增回归 29 个测试文件（脱敏 5 条、命令面契约、导入预检、打开检查点、回执吸收、写锁并发/凭证锁、runtime 淘汰、恢复预算、turnBasis 枚举、安装面守卫、宿主探针、release 文档守卫等）；删除随死模块退场的 3 个旧测试。
+- 全量 `npm run test:all`：**127 套 / 571 用例 / 566 通过 / 0 失败 / 5 skip**（skip = 安装面 5 条，源码树未安装时按设计跳过，安装后真跑见「发布与安装」）（2026-10-30，日志 `plugin/.tmp/test-beta51.log`）。
+
 ## 0.14.0-beta.50（2026-10-29，测试版）
 
 相比 0.14.0-beta.49（本版修审计 beta.49 的 3 个 P1 + 归档选择器 2 个 P2/P3，均为已确认缺陷）：
@@ -25,7 +56,7 @@
 - 新增/扩展回归：`v3-archive-prestep`（系统提示首节点、回执边界）、`v3-archive-not-worth`（空正文判负 + 状态可见 + now 重试）、`v3-ingest-redaction`（前缀键/PEM/全角/URL 编码）、`v3-export`（凭证清除 + metaOnly/structure 往返）。
 - 红绿对照：临时回退 `plugin/src` 后，上述用例全部失败（系统提示/回执边界/滞后 turn 3 红、空正文 1 红、脱敏 1 红、导出 2 红）；恢复后全部通过。
 - 全量：**101 套 / 475 用例 / 475 通过 / 0 失败 / 0 skip**（`npm test`，2026-10-29；日志 `.tmp/test-beta50.log`）。
-- **发布与安装**：release 镜像自测 101 套全绿；tag `v0.14.0-beta.50`（commit `5d0f13f`）、GitHub Release（Pre-release）asset 78 files / 243,865 B / sha256 `b04e72d43936e0e5aa534e193065f701c9dbe547a1a1924686f953c09cb62df9`（远端 digest 已核对）；profile 依赖切到 `记忆上下文/dist/dsh-memory-context-lab-0.14.0-beta.50.tgz` 并 `pnpm install`，安装副本 `src/` 63 文件与 release 逐字节一致（唯一差异是发布侧镜像标记行）；安装面 5/5 真跑通过。**未重启 DSH**。
+- **发布与安装**：release 镜像自测 101 套全绿（安装后安装面 5 条真跑）；tag `v0.14.0-beta.50`（commit `5d0f13f`）、GitHub Release（Pre-release）asset 78 files / 243,865 B / sha256 `b04e72d4…2df9`；profile 已装 beta.50，安装副本 `src/` 63 文件与 release 逐字节一致（唯一差异是发布侧镜像标记行）。DSH 已于 2026-10-29 21:34:43 重启并运行 beta.50（安装 21:22:12；发布时记的「未重启」随即过时，AUD50-10-01 复核作废）。
 
 ## 0.14.0-beta.49（2026-10-29，测试版）
 
@@ -36,7 +67,6 @@
 - **P1 `currentTurn` 滞后导致整段历史变「当前轮」**：`groupByDshTurn` 原先只拒绝「超前于日志最大轮一步以上」的 `payload.turn`，没有拒绝**滞后**。当真机把 turn 交成 1 而日志已到第 3 轮时，`group.turn >= 1` 会把第 1/2 轮也标成 current，选择器返回 `no-candidate / no-completed-group`，按轮归档从此对整段历史失效（切回 human 后因新真人消息重新出现完成轮，才恢复）。
 - **修法**：只有 `currentTurn === lastTurn` 或 `currentTurn === lastTurn + 1` 才信任；滞后/超前都退回「最后一组是当前轮」，宁可晚压一轮，也不能把活动内容压掉。
 - **验证**：新增 `v3-archive-prestep` 用例「currentTurn 滞后于日志最大轮时，仍按最后一组为当前轮归档」；修前实测返回 `no-candidate / no-completed-group`，修后归档第 1 轮（seq 2–3），第 2/3 轮保留。
-
 ## 0.14.0-beta.48（2026-10-29，测试版）
 
 相比 0.14.0-beta.47：
@@ -209,7 +239,7 @@
 - **实现要点**：`step/start`、`step/end` 是日志事件、不是活动面节点，span 只能由步骤内的**活动面节点**拼成——否则宿主 `range replace` 的密集覆盖判据必然失败（本版真实踩到并钉了守卫）。
 - **e2e**：cooling 用 6 步夹具实测「保留最近 2 步、一次压 3 步」，闸门与凭证照常；`/memory-lab status` 的「下一次归档」预览在 cooling 下走同一个步骤选择器，不骗人。
 - **守卫**：新增 `v3-step-cooling`（6 条）。全量 **92 套全绿、0 跳过**。
-- **文档**：实时降温判定设计-beta.40（开发期文档，不随发布包分发；灵枢 role 分层/时间衰减/可回读/主动遗忘四条对照，及为何不引入概率模型）。
+- **文档**：[实时降温判定设计-beta.40（开发仓 docs/dev-0.14.0/实时降温判定设计-beta.40.md）（灵枢 role 分层/时间衰减/可回读/主动遗忘四条对照，及为何不引入概率模型）。
 
 ## 0.14.0-beta.39（2026-10-28，测试版；回注包不再锁死归档 + 下一次归档预览）
 
@@ -397,3 +427,55 @@
 ## 0.14.0-beta.19（2026-10-27，测试版；H-103 根因修复：composer chip 弹层不再被 SlotErrorBoundary 摘除）
 
 - **真机错误原文**（DevTools Console）：`slot entry crashed in 'conversation.input.left': Error: cannot get property "remote.commands" without inject`，调用栈落在 `MemoryPopover (client.js:630)`。不是注册被 dispose、不是 fiber 卸载、也不是 `@deepseek-ai/dsh-api-remotes` 图依赖。
+- **根因**：客户端动态门面按插件**服务声明**（`client.js` 的 `inject` 数组）判权。beta.17 的弹层在 render 里读 `ctx.remote.commands.execute`，但 `inject` 只声明了 `slots` / `locale`；`ctx.get('remote')` 返回的是受保护代理，读取 `.commands` 时在代理 `get` 陷阱抛错。错误冒到 render，宿主 `SlotErrorBoundary` 记一条 `slot entry crashed`，对 list 槽位执行 `reportEntryError(..., { abdicate: true })`，条目被标成 inactive 并从读数里摘掉——所以 chip「出现一下又消失」，而设置页的 `plugins.bundle.config` 条目仍是 active。
+- **修复**：
+  - `src/client.js` 的 `inject` 补 `remote` / `remote.commands`（与宿主官方 `CommandUiRuntime` 同形声明）；`package.json` 的 `dsh.client.inject` **不**加 `@deepseek-ai/dsh-api-remotes`（图依赖不是本缺陷的解法，beta.18 的移除方向保留）。
+  - `remoteOf(ctx)` 把「解析 remote + 触碰 `.commands.execute`」整体放进 try；未声明/未就绪/代理拒绝时回 `null`，弹层控件禁用并显示「命令通道不可用」，不再抛进 render。
+- **守卫**：`test/v3-client-chip.test.mjs` 17 条；新增「受保护 remote 代理拒绝 commands 时不崩（H-103 回归）」，用 Proxy 复现宿主门面抛错；旧的 `assert.equal(module.inject.includes('remote.commands'), false)` 方向翻转为必须声明。全量 **75 套全绿、0 跳过**。
+- **验证**：全量 75 套通过、`check-docs` 0 错误；安装 beta.19 到 desktop profile（`src/` 逐字节一致，`install.test` 5 条 0 跳过）。**重启 DSH 由用户执行**；重启后应看到 chip 常驻，点开向上弹层含两个开关 + 条数输入。
+
+## 0.14.0-beta.18（2026-10-27，测试版；composer chip 真机不可见 → 移除可疑客户端图依赖，移交）
+
+- **现象**：beta.16/17 的 composer chip 在真机（desktop profile）里没有出现在输入框工具行；beta.15 的 dock 状态条在装 beta.16 后消失。设置页是否仍在、浏览器控制台是否有报错尚未取证（H-103，未解决）。
+- **本版唯一源码改动**：从 `dsh.client.inject` 移除 `@deepseek-ai/dsh-api-remotes`。`remote` 改为只在调用期 `ctx.get('remote')` 解析（无 remote 时控件禁用），不再让本包的客户端模块图依赖 api-remotes；移除理由是它是 beta.17 相对 beta.16 新增的唯一图依赖，且 `arriveDependency` 失败会跳过消费者 bundle。**是否恢复 chip 未验证**。
+- **保留**：本对话控制（启用/自动回注/条数）、全局设置页五项、会话 `control.json`、命令面、投影 `control`、15+ 条守卫全部不变。
+- **验证**：全量 75 套全绿、0 跳过；`check-docs` 0 错误；安装 beta.18（`src/` 逐字节一致，`install.test` 5 条 0 跳过）。
+- **未做 / 待接**：重启 DSH 后肉眼确认 chip；浏览器 console / `__DSH_BOOT__` 图取证；H-103 的根因定位。交接提示词见最终回复。
+
+## 0.14.0-beta.17（2026-10-27，测试版；composer 只留本对话控制，底层参数回设置页）
+
+- **返工原因**：beta.16 把五项全局设置搬进 composer 弹层。用户反馈：全局/底层参数应在插件设置页，composer 只保留「本对话是否启用、功能开关、少量数值」，让每个对话能按情况调整。
+- **本对话控制（弹层）**：本对话启用、自动回注、每次回注条数（留空 = 跟随全局）。只改本对话，不重复全局参数。
+- **全局设置页（不变）**：`enabled`（默认回注开关）、`limit`、`packMinScore`、`previewChars`、`queryMaxChars`。所有底层参数只在设置页；命令能改的会话项都有全局对应（`enabled` / `limit`）或本身就是每对话独立开关（启用）。
+- **会话控制存储**：每会话 `sessions/<key>/control.json`（与冷库同目录、`writeFileAtomic` 原子写、控制文件损坏可见）；`controlOf` 同步读、`setControl` 校验失败关闭；摄入钩子按总开关短路，回注按「全局 enabled + 会话 enabled + 会话 recall」合并，`limit` 按会话覆盖。
+- **命令**：`/memory-lab on|off`、`inject on|off`、`set limit <1–20>`、`unset limit`、`reset`、`status`；不提供装包阈/首部/查询上限的会话命令。
+- **守卫**：`test/v3-client-chip.test.mjs` 14 条（槽位/命令/开关/条数/无 remote/投影 control/控制文件/摄入门/命令面）；全量 **75 套全绿、0 跳过**。
+- **安装**：npm pack + desktop profile 安装 beta.17；**未重启 DSH**。
+
+## 0.14.0-beta.16（2026-10-27，测试版；composer 恢复 chip + 弹层）
+
+- **返工原因**：beta.15 按方案 B 做成 composer 上方的一行常驻状态条，用户明确反馈「不是之前那样的界面」。既有界面是 v1/v2 的 **composer 工具行 chip + 向上弹层**（源码在 beta.10 前，槽位 `conversation.input.left`）。
+- **形态**：恢复 chip（id `memory-context-lab`、order 20，与权限选择器同形），点开向上弹层；chip 在 hero 与 composer 两种变体都渲染（旧 `conversation.composer.dock` 在 hero 变体不渲染，新对话点不到）。
+- **内容映射到 v3**：弹层显示本会话摄入/回注状态 + 五项回注设置（开关、条数、装包阈、首部、查询上限）。设置写入走现有 `configForms`（与设置页同一文档、同一 revision 并发保护），不新增命令、不直连 remote；`configForms` 缺席时 chip 仍显示，弹层只读。
+- **不伪造旧功能**：v3 没有 v2 的降温/归档/清理/计划先行，弹层**不提供这些按钮**；数据仍来自 `memoryContextLabStatus` 投影（state 只存 `{sessionId,tick}`，计数在 `wire.view` 读同步 `statusOf`）。
+- **守卫**：`test/v3-client-chip.test.mjs`（11 条）覆盖槽位/id/order、投影文案、弹层五项、开关写 enabled、数字合法/越界、无 configForms、只读部署，以及宿主投影/statusOf 会计。全量 **75 套全绿、0 跳过**。
+- **安装**：npm pack + desktop profile 安装 beta.16（详见 AGENTS 口径）；**未重启 DSH**。
+
+## 0.14.0-beta.15（2026-10-27，测试版；composer 常驻只读状态条 = 方案 B）
+
+- **新增 composer 只读状态条**：`conversation.input.dock` 注册 `id=memory-context-lab-recall`（不撞 queue/todo/goal/claude-code-mods），一行显示「已摄入 N 条 · 回注 M 次（上次 injected）」；建库中 / 尚未摄入 / 建库失败 / 状态未知各有可判读文案。组件无 onClick、无 mutate、无命令调用，不接管 `conversation.composer`。
+- **数据通路 = 宿主会话投影**（`app.asar` 源码核验，2026-10-27）：宿主半用 `ctx.inject(['sessionProjections'], …)` 注册 `memoryContextLabStatus`（stateVersion 1）；客户端用槽位标准属性 `useProjection` 读同一 key。宿主 `SessionControlController` 订阅 `sessionProjections.onChanged` 并原样广播，baseline 用 `snapshot(session)` 带出所有 wire key——推送式、不轮询、不写会话事件。
+- **state 与 view 的分工**：state 只存 `{ sessionId, tick }`（会被 `session-projection-cache` 持久化，不能藏引擎计数）；`wire.view` 读引擎新增的**同步** `statusOf(sessionId)`（O(1) 内存读：records / lastSeq / ingesting / 每会话回注计数）。宿主 `imageLimits` 投影是同一形态的先例。
+- **会计与失败可见**：引擎 `records` 在建库后台任务里由 `health().recordCount` 初始化、按真正 applied 的批增量累加（own-source / rejected 不计）；health 读不到时是 `null`（未知），不回 0；`statusOf` 对未知会话如实 `absent`，且不创建回注计数桶。
+- **客户端依赖拆分**：configForms 从硬依赖改为 `ctx.inject` 可选——设置服务缺席时状态条仍渲染；`package.json` 的 `dsh.client.inject` 补 `@deepseek-ai/dsh-client-ui-conversation`（先例：`dsh-client-ui-goal` 同样声明并占用同一槽位）。
+- **新增守卫 `test/v3-client-dock.test.mjs`（10 条）**：manifest 依赖成对、slots.inject ↔ id/order、缺数据渲染未知、只读静态扫描、投影 key/stateVersion/state 形状（多余字段拒绝）、view 抛错转 failed、入口可选注入、真实摄入后的 `statusOf` 会计、计数不可读回 null。每类各做一次「改回去必红」。全量 **75 套全绿、0 跳过**。
+- **安装（2026-10-27）**：`npm pack` 生成 `dsh-memory-context-lab-0.14.0-beta.15.tgz`（48 文件 / 172.4 kB）并装进 desktop profile；安装副本 `src/` 38 个文件与源码逐字节一致，`install.test` 5 条全部执行、0 跳过。**未重启 DSH**（重启前运行实例仍是 beta.13 的宿主半，状态条不会出现）。
+
+## 0.14.0-beta.14（2026-10-27，测试版；设置极值缺陷修复批）
+
+- 三条「参数在 Schema 与设置页里都合法、下游用例另有隐含前提」的缺陷：H-97 装包阈 0 让回注 100% 失败（`RECALL_RESULT_MIN_SCORE` 成对派生）、H-98 热路径从后门重建索引（`allowRebuild=false` 一律不重建 + 首次摄入补建）、H-99 `previewChars` 取上界时回注退化成纯壳（两段式收敛）。守卫 `test/v3-settings-extremes.test.mjs`。详见 bug-hunt 第十二部分。
+
+## 0.14.0-beta.13（2026-10-27，测试版；设置界面真正恢复——客户端半重建）
+
+- **修复：beta.12 补了 `Config` 仍然没有设置界面。** 宿主源码核验（`app.asar` 内 `dsh-settings/lib/index.js` + `dsh-client-ui-plugin-manager/lib/client.js`）给出真相：`describe()` 只把入口 `Config` 投影成 `settings.describe` 的**数据行**（`ns/revision/schema/value/base/user`），**页面由 ui-plugin-manager 按槽位注册渲染**——`plugins.item`（官方插件）/ `plugins.bundle.config`（键 = 包名）/ `plugins.row.config`（键 = `<包名>#<行 id>`）。没有注册就没有界面，与 Config 是否存在无关。
+- **修复：beta.11 的 P0-A 处置方向被推翻。** 那次真机故障是「`dsh.client` 声明在、`src/client.js` 不在 → 构造期抛 `ClientPackageCompositionError`」，正确修复是**补齐文件**，而不是删掉声明——删声明等于永久放弃设置界面。beta.11 起 `v3-surface-contract` 里「两者必须同时缺席」的断言方向已翻转。

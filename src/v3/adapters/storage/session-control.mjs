@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path'
 import { sessionIsolationKey } from '../../domain/session/isolation-key.mjs'
 import { emptySessionControl, normalizeSessionControl } from '../../domain/session/session-control.mjs'
 import { writeFileAtomic } from './session-store.mjs'
+import { sessionDirFresh } from './session-file-gate.mjs'
 
 const FILE = 'control.json'
 const cache = new Map() // path → { stamp, control }
@@ -46,6 +47,12 @@ export function sessionControlPath(v3Root, sessionId) {
 export function readSessionControl(v3Root, sessionId, { defaultEnabled = true } = {}) {
   const path = sessionControlPath(v3Root, sessionId)
   const fallback = () => ({ ...emptySessionControl(), enabled: defaultEnabled !== false, path })
+  // B3-9（AUD50-04-04）：目录级新鲜闸门——目录 mtime 没变（本仓库写入都走 temp+rename）
+  // 时直接用进程内缓存，0 次文件 stat；变了才走下面的逐文件戳校验。
+  if (sessionDirFresh(dirname(path))) {
+    const cached = cache.get(path)
+    if (cached !== undefined) return cached.control
+  }
   let stamp
   try {
     const stat = statSync(path)
@@ -54,7 +61,9 @@ export function readSessionControl(v3Root, sessionId, { defaultEnabled = true } 
     if (error?.code !== 'ENOENT') {
       return { ...fallback(), error: 'ECONTROL_UNREADABLE' }
     }
-    cache.delete(path)
+    // B3-9：ENOENT 也进缓存（stamp=null 哨兵）——「文件不存在」是稳定状态，闸门命中时
+    // 直接返回，不再每 tick 付一次 ENOENT stat；文件之后出现时目录 mtime 变化必然触发全路径。
+    cache.set(path, { stamp: null, control: fallback() })
     return fallback()
   }
   const cached = cache.get(path)

@@ -8,6 +8,7 @@
  * - 读写经 writeFileAtomic / JSON；索引文件损坏 → ESTORE_CORRUPT，
  *   调用方走 rebuildLexicalIndex 从记录重建（派生物不许挡权威数据）。
  */
+import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -91,15 +92,30 @@ export async function writeLexicalIndex(store, index) {
 
 /** 读取索引；缺失返回 null（可重建），损坏抛 ESTORE_CORRUPT（不静默重建掩盖）。 */
 /**
- * 索引文件戳（mtimeMs + size）：检索侧缓存解析结果的唯一判据。
+ * 索引文件戳（mtimeNs + size + 头 64 字节摘要）：检索侧缓存解析结果的唯一判据。
  * 索引是派生文件，写入走原子 rename——戳变化即「有别的写入者换了内容」。
+ * B3-10（AUD50-04-05）：旧 mtimeMs 是 1ms 粒度，「同毫秒同大小替换内容」时替换不可见
+ * （低置信假设；实测 Windows 内核计时粒度 ~1-15ms，连 bigint stat 的 mtimeNs 都救不了
+ * 快速连写）。修法：mtimeNs + **头 64 字节内容摘要**——索引 JSON 首部含计数字段，
+ * 同大小替换几乎必然改变头部；摘要把「同大小替换可见」变成确定性，成本一次 64 字节读
+ * （对比 22MB 解析可忽略）。剩余碰撞面 = 头 64 字节也相同 + 同戳，如实为边界。
  * @returns {Promise<string>} 不存在返回 'absent'（与「读失败」区分）
  */
 export async function indexStampOf(store) {
-  const { stat } = await import('node:fs/promises')
+  const { open, stat } = await import('node:fs/promises')
+  const filePath = path.join(store.directory, INDEX_FILE)
   try {
-    const info = await stat(path.join(store.directory, INDEX_FILE))
-    return info.mtimeMs + ':' + info.size
+    const info = await stat(filePath, { bigint: true })
+    const handle = await open(filePath, 'r')
+    let head = ''
+    try {
+      const buffer = Buffer.alloc(64)
+      const read = await handle.read(buffer, 0, 64, 0)
+      head = buffer.subarray(0, read.bytesRead).toString('latin1')
+    } finally {
+      await handle.close()
+    }
+    return info.mtimeNs.toString() + ':' + info.size.toString() + ':' + createHash('sha1').update(head).digest('hex').slice(0, 8)
   } catch (error) {
     if (error?.code === 'ENOENT') return 'absent'
     throw error

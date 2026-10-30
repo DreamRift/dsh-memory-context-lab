@@ -97,6 +97,9 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
           sourceEventId: normalized.id,
           sourceForm: normalized.source.form,
           transactionId: batchTxnHandle,
+          // B3-1 事件时间：宿主给了合法时间才带 eventAt。createdAt 是**摄入时间**
+          // （clock.now()），两者语义不同且不互相覆盖；缺失 eventAt 的记录如实缺失。
+          ...(normalized.at !== undefined ? { eventAt: normalized.at } : {}),
         },
       }
       const decision = sealDecision({

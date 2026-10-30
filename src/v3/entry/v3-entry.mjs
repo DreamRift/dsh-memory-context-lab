@@ -30,6 +30,7 @@ import { readBackfillState, writeBackfillState } from '../adapters/storage/t2-ba
 import { mirrorRootOf, scanMirrorableRecords, scanMirroredNodes } from '../adapters/storage/mirror-inventory.mjs'
 import { parseBackfillLimit, planBackfill, runBackfill } from '../application/t2-backfill.mjs'
 import { clearArchiveIntent, readArchiveIntent, writeArchiveIntent } from '../adapters/storage/archive-intent.mjs'
+import { parseJsonishArguments, redactText, redactValue } from '../domain/security/redact.mjs'
 import {
   captureFileReference,
   isStaleFileReference,
@@ -39,84 +40,6 @@ import {
 } from '../adapters/storage/file-references.mjs'
 
 const MEMORY_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/call', 'tool/result'])
-
-/** 敏感字段脱敏（P1 摄入合同 4.1.3：凭据/令牌不静默入库）。 */
-const SENSITIVE_KEY = /token|secret|pass(word|wd)?|credential|api[-_]?key|auth|cookie|session[-_]?id|bearer|密钥|密码|令牌|凭据|凭证/i
-
-/**
- * 真实宿主的 tool/call 参数是 **JSON 字符串**（dsh-agent-loop appendToolCall：
- * `arguments: block.arguments`，content 块里是序列化后的字符串）。只对 object 递归的
- * 脱敏会整体漏掉这种形态（H-06：apiKey/password 明文入库）。这里先尝试解析成对象再脱敏；
- * 不是 JSON 的普通字符串原样返回（不猜、不改写用户文本）。
- */
-function parseJsonishArguments(value) {
-  if (typeof value !== 'string') return value
-  const trimmed = value.trim()
-  if (trimmed.length < 2 || (trimmed[0] !== '{' && trimmed[0] !== '[')) return value
-  try {
-    const parsed = JSON.parse(trimmed)
-    return parsed !== null && typeof parsed === 'object' ? parsed : value
-  } catch {
-    return value
-  }
-}
-
-/**
- * 值里出现凭据形态的**文本**也要脱敏（H-27）：只按 key 名匹配会漏掉
- * `{headers: 'Authorization: Bearer sk-…'}`、`{url: '…?token=sk-…'}`、
- * `{args: ['--password=hunter2']}` 这类「凭据写在普通字段的值里」的形态。
- * 只改匹配到的凭据片段，不整段吞掉用户正文（保持可读性与对账价值）。
- */
-const SENSITIVE_VALUE_PATTERNS = Object.freeze([
-  // PEM 私钥（RSA/EC/OPENSSH/PKCS8 等）：整段替换，避免 base64 段被当成普通文本。
-  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED]'],
-  // Authorization: Bearer xxx / Basic xxx
-  [/\b(authorization\s*[:=]\s*)(bearer|basic|token)?\s*([A-Za-z0-9._~+/=-]{8,})/gi, '$1[REDACTED]'],
-  // key=value / key: value / key：value / key%3Dvalue 形态的常见凭据名。
-  // AUD48-02-04：旧式的 \b 边界在 AWS_SECRET_ACCESS_KEY / MY_API_KEY 这类**前缀/后缀键**
-  // 上不成立（_ 是词字符），全角冒号与 URL 编码分隔符也不认；键名允许由 . _ - 连接，
-  // 保留键名本身、只替换值（可读性与对账价值不丢）。
-  [/\b([A-Za-z0-9_.-]*(?:api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)[A-Za-z0-9_.-]*)(\s*[:=：]\s*|%3[dDaA])(["']?)([^\s"',&;]{4,})\3/gi, '$1$2$3[REDACTED]$3'],
-  // sk- 开头的常见密钥前缀（OpenAI/Anthropic 等）
-  [/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]'],
-  // AWS access key ID（AKIA/ASIA/AIDA/AROA/... + 16 位大写字母数字）
-  [/\b(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[0-9A-Z]{16}\b/g, '[REDACTED]'],
-  // GitHub token（ghp_/gho_/ghu_/ghs_/ghr_ 与细粒度 github_pat_）
-  [/\bgh[pousr]_[A-Za-z0-9]{36,}\b/g, '[REDACTED]'],
-  [/\bgithub_pat_[A-Za-z0-9_]{22,}\b/g, '[REDACTED]'],
-  // Slack token
-  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED]'],
-  // Google API key
-  [/\bAIza[0-9A-Za-z_-]{35}\b/g, '[REDACTED]'],
-  // Stripe secret/restricted key
-  [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}\b/g, '[REDACTED]'],
-  // JWT（三段式；只匹配足够长的段，避免误伤普通点号文本）
-  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[REDACTED]'],
-  // CLI 形态 --password=xxx
-  [/(--?(?:password|passwd|token|secret|api[-_]?key)\s*[= ]\s*)([^\s"']{4,})/gi, '$1[REDACTED]'],
-])
-
-function redactText(text) {
-  if (typeof text !== 'string' || text.length === 0) return text
-  let out = text
-  for (const [pattern, replacement] of SENSITIVE_VALUE_PATTERNS) out = out.replace(pattern, replacement)
-  return out
-}
-
-function redactValue(value, depth = 0) {
-  // 深度超限**不是**「放行原值」（H-27）：旧实现 depth > 6 直接 return value，
-  // 于是第 7 层以下的凭据完全不脱敏——脱敏函数的失败模式必须是「更严」而不是「更松」。
-  if (depth > 6) return '[REDACTED:depth]'
-  if (value === null) return value
-  if (typeof value === 'string') return redactText(value)
-  if (typeof value !== 'object') return value
-  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redactValue(v, depth + 1))
-  const out = {}
-  for (const [k, v] of Object.entries(value).slice(0, 50)) {
-    out[k] = SENSITIVE_KEY.test(k) ? '[REDACTED]' : redactValue(v, depth + 1)
-  }
-  return out
-}
 
 /** 宿主 usage（dsh-llm：inputTokens/outputTokens/totalTokens/cacheReadTokens/reasoningTokens）。全字段缺省/非数字返回 null（不可观测不猜）。 */
 function usageOf(u) {
@@ -166,7 +89,11 @@ function toolCallsOfBlocks(content) {
   const seen = new Set()
   for (const block of content) {
     if (block?.type !== 'tool-call') continue
-    const callId = typeof block.callId === 'string' ? block.callId : ''
+    // AUD50-02-04（B2-2）：真实宿主的调用块是 {type,id,name,arguments}（dsh-agent-loop），
+    // 没有 callId 字段——id 才是调用标识。callId 与 id 同时存在时优先 callId；空串按缺失。
+    const callId = typeof block.callId === 'string' && block.callId.length > 0
+      ? block.callId
+      : (typeof block.id === 'string' && block.id.length > 0 ? block.id : '')
     if (callId.length > 0) {
       if (seen.has(callId)) continue
       seen.add(callId)
@@ -228,8 +155,17 @@ export function extractEventBody(raw) {
     try {
       // 字符串形态（非法 JSON，解析不了）也要过一遍值脱敏（H-27）：
       // parseJsonishArguments 对非 JSON 原样返回，旧实现于是把整串明文写进记录。
-      argsText = typeof structure.arguments === 'string' ? redactText(structure.arguments) : JSON.stringify(structure.arguments)
+      // AUD50-02-01：序列化文本（含 redactValue 之后的对象再序列化）统一再过一次
+      // redactText，兜住「非敏感键的字符串值里内嵌 JSON 引号键」的形态。
+      // AUD50-02-03（B2-1）：arguments 缺失时 JSON.stringify 返回 undefined（不是字符串），
+      // 旧实现直接对它取 .length 当场抛错，整批摄入卡死。空参数按 '' 处理，记录仍可 metaOnly。
+      argsText = redactText(
+        typeof structure.arguments === 'string'
+          ? structure.arguments
+          : (structure.arguments === undefined ? '' : (JSON.stringify(structure.arguments) ?? '')),
+      ) ?? ''
     } catch { argsText = '[不可序列化参数]' }
+    if (typeof argsText !== 'string') argsText = '[不可序列化参数]'
     if (argsText.length > 400) argsText = [...argsText].slice(0, 400).join('') + '…'
     return { text: '工具调用 ' + structure.name + '(' + structure.callId + ')：' + argsText, structure }
   }
@@ -289,6 +225,65 @@ export function attachV3Engine(ctx, options = {}) {
     ctx.logger?.warn?.('memory-context-lab-v3: 建库失败（' + (error?.code ?? 'EINTERNAL') + '）：'
       + (error instanceof Error ? error.message : String(error)) + '（同会话每分钟最多一条）')
   }
+
+  // AUD50-04-01（B2-7）：runtime 淘汰（空闲 TTL + 存量上限）。
+  // 22.57MB 索引 parse 后堆 +78MB，而 runtimes 只在引擎整体 dispose 清空——依次打开
+  // 10 个大会话即数百 MB 常驻。淘汰 = 关 store + 清 provider 索引缓存 + 清定时器；
+  // 数据都在盘上（断点从记录反推 H-01、索引可全量重建），下次打开照常恢复。
+  // 可配置走 attachV3Engine options（不进设置页：这是资源治理，不是产品行为开关）。
+  const runtimeLimits = {
+    maxLiveSessions: Number.isInteger(options.maxLiveSessions) && options.maxLiveSessions >= 1 ? options.maxLiveSessions : 8,
+    idleTtlMs: Number.isFinite(options.idleTtlMs) && options.idleTtlMs > 0 ? options.idleTtlMs : 10 * 60 * 1000,
+  }
+  // 上限淘汰的宽限期：刚被使用的 runtime（几秒内的活动步骤/命令）不淘汰——
+  // 淘汰正在被引用的 runtime 会让在飞操作拿到 ESTORECLOSED（任务书风险条款）。
+  const EVICT_GRACE_MS = 5000
+  const evictedSessions = []
+
+  function closeRuntime(key, reason) {
+    const entry = runtimes.get(key)
+    if (entry === undefined) return
+    const timer = rebuildTimers.get(entry)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      rebuildTimers.delete(entry)
+    }
+    try { entry.runtime.close?.() } catch { /* 关闭失败不改变淘汰事实 */ }
+    runtimes.delete(key)
+    evictedSessions.push({ sessionId: key, reason, at: Date.now() })
+    if (evictedSessions.length > 50) evictedSessions.shift()
+    ctx.logger?.info?.('memory-context-lab-v3: runtime 已淘汰（' + key + '，' + reason + '）；下次打开按需重建')
+  }
+
+  /** 淘汰扫描：空闲超 TTL 的先走；仍超上限时按最久未用补足（宽限期内与在飞不碰）。 */
+  function evictIdleRuntimes(now = Date.now()) {
+    if (disposed.value) return
+    const busy = (key, entry) => entry.inflight !== null || backfillJobs.has(key) || pendingEntries.has(key)
+    const victims = new Set()
+    for (const [key, entry] of runtimes) {
+      if (busy(key, entry)) continue
+      if (now - (entry.lastUsedAt ?? 0) >= runtimeLimits.idleTtlMs) victims.add(key)
+    }
+    let overflow = runtimes.size - victims.size - runtimeLimits.maxLiveSessions
+    if (overflow > 0) {
+      const candidates = [...runtimes.entries()]
+        .filter(([key, entry]) => !victims.has(key) && !busy(key, entry)
+          && now - (entry.lastUsedAt ?? 0) >= EVICT_GRACE_MS)
+        .sort((a, b) => (a[1].lastUsedAt ?? 0) - (b[1].lastUsedAt ?? 0))
+      for (const [key] of candidates) {
+        if (overflow <= 0) break
+        victims.add(key)
+        overflow -= 1
+      }
+    }
+    for (const key of victims) closeRuntime(key, '空闲淘汰/存量上限')
+  }
+
+  const evictTimer = setInterval(
+    () => evictIdleRuntimes(),
+    Math.min(60000, Math.max(1000, Math.floor(runtimeLimits.idleTtlMs / 4))),
+  )
+  evictTimer.unref?.()
   /**
    * 回注观测（beta.10）：每种结局都计数。
    * 「回注 0 次却没人发现」正是旧实现只 dispatch 一条 warn 的直接后果——
@@ -477,6 +472,18 @@ export function attachV3Engine(ctx, options = {}) {
   const MAX_NOT_WORTH_SKIPS = 16
 
   /**
+   * 恢复预算（AUD50-02-02，B1-2）：Config.restoreMaxChars 的引擎侧回落值（配置缺失/
+   * 非法时用；合法范围由 index.mjs readSettings 校验后传入）。与 index.mjs 的
+   * SETTINGS_DEFAULTS.restoreMaxChars 同值：两边各自失败关闭，宁可拒绝归档也不写
+   * 「永远恢复不回来」的凭证。
+   */
+  const RESTORE_BUDGET_DEFAULT = 16000
+  function restoreBudgetOf(settings) {
+    const value = settings?.restoreMaxChars
+    return Number.isInteger(value) && value >= 1 ? value : RESTORE_BUDGET_DEFAULT
+  }
+
+  /**
    * 连续跳过判负 span（单步最多扫 MAX_NOT_WORTH_SKIPS 段）；返回最终结果与最新游标。
    * 游标按模式分开存：按步 span 与回合 span 的判负结论互不蕴含，共用一个游标会让
    * 一次模式切换把「没评估过」的回合当成「判负过」跳过（静默不归档，安全但无效）。
@@ -561,6 +568,7 @@ export function attachV3Engine(ctx, options = {}) {
         maxSteps: 3,
         // 按步归档在**当前回合内**压缩：刚读过的记录必须留在工作集里（租约生效）。
         pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
+        restoreMaxChars: restoreBudgetOf(settings),
         summary: options?.compact === true,
         txn: 1,
       }
@@ -596,6 +604,7 @@ export function attachV3Engine(ctx, options = {}) {
         // 上一轮因此成为已完成——这正是「14 轮只压 2 轮」的修复点。
         turnBasis,
         currentTurn: Number.isInteger(options?.turn) ? options.turn : null,
+        restoreMaxChars: restoreBudgetOf(settings),
         summary: options?.compact === true,
         txn: 1,
       }
@@ -652,6 +661,7 @@ export function attachV3Engine(ctx, options = {}) {
         retainSteps: Number.isInteger(settings.retainOperations) ? settings.retainOperations : 4,
         maxSteps: 3,
         pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: true }),
+        restoreMaxChars: restoreBudgetOf(settings),
       }
       // 预览与执行同一游标：判负的队头 span 不参与「下一次归档」，否则 status 会显示一个永远执行不了的候选。
       const priorNotWorth = entry.lastNotWorth?.['notWorthThroughSeq'] ?? null
@@ -682,6 +692,7 @@ export function attachV3Engine(ctx, options = {}) {
       pinnedSeqs: pinnedSeqsOf(entry, state, { includeLease: false }),
       turnBasis,
       currentTurn: Number.isInteger(options?.turn) ? options.turn : null,
+      restoreMaxChars: restoreBudgetOf(settings),
     }
     const priorNotWorth = entry.lastNotWorth?.[turnCursorField] ?? null
     const { result: planned } = await skipNotWorthSpans(
@@ -702,7 +713,7 @@ export function attachV3Engine(ctx, options = {}) {
   }
 
   /** 恢复一个/全部凭证（M2）。 */
-  async function restoreHistory(sessionId, { index = null, maxChars = 16000 } = {}) {
+  async function restoreHistory(sessionId, { index = null, maxChars = RESTORE_BUDGET_DEFAULT } = {}) {
     const entry = runtimes.get(String(sessionId ?? ''))
     if (entry === undefined) return { error: 'not-ready' }
     if (entry.archive === null) return { error: 'host-no-surface' }
@@ -737,14 +748,16 @@ export function attachV3Engine(ctx, options = {}) {
     if (entry === undefined) return { error: 'not-ready' }
     const state = stateOf(sessionId)
     const pins = new Set(state.pins)
+    let removed = 0
     for (const id of recordIds) {
-      if (remove) { pins.delete(id); continue }
+      if (remove) { if (pins.delete(id)) removed += 1; continue }
       const record = await entry.runtime.store.readRecord(id) // 不存在/已遗忘 → 失败关闭
       if (record?.id !== id) throw new V3ContractViolation('v3 entry: pin 目标不是本会话记录')
       pins.add(id)
     }
     const next = await setState(sessionId, { pins: [...pins] })
-    return { pins: next.pins }
+    // B3-16：removed = 实际删除数（unpin 回报口径），unchanged = 请求中无匹配的条数
+    return { pins: next.pins, removed, unchanged: recordIds.length - removed }
   }
 
   /** 遗忘预览：只读检查与已遗忘状态，不写账本。 */
@@ -1147,20 +1160,51 @@ async function fileStatus(sessionId) {
     let batch = []
     let batchFirstSeq = null
     let ingested = 0
+    // B3-4（AUD50-02-09）：非记忆/坏 seq 事件不在断点账上——队尾残留时每次 pre-step
+    // 都重扫同一段。非记忆事件（合法 seq）在**本轮全部记忆事件处理完后**推进断点
+    // （不写记录）；坏 seq 无法推进（不伪造 lastSeq），warn 一次并在内存记「已见」。
+    let lastSkippedSeq = null
+    const batchState = { failedUpTo: -1 }
+    let failedUpTo = -1
     for (const raw of log) {
       if (disposed.value) return
-      if (!MEMORY_EVENT_TYPES.has(raw?.type)) continue
+      if (!Number.isSafeInteger(raw?.seq) || raw.seq < 0) {
+        // 只有记忆类型事件才值得告警（非记忆坏 seq 本来就不进管线）；warn 一次，不逐步刷屏
+        if (raw !== null && typeof raw === 'object' && MEMORY_EVENT_TYPES.has(raw?.type)) {
+          const key = String(raw.seq)
+          if (!entry.badSeqs.has(key)) {
+            entry.badSeqs.add(key)
+            metricsNote('v3.ingest.badSeq')
+            ctx.logger?.warn?.('memory-context-lab-v3: 记忆事件 seq 非法（不推进断点、不入库）：' + key + '（type=' + String(raw.type) + '）')
+          }
+        }
+        continue
+      }
+      if (!MEMORY_EVENT_TYPES.has(raw.type)) {
+        lastSkippedSeq = lastSkippedSeq === null ? raw.seq : Math.max(lastSkippedSeq, raw.seq)
+        continue
+      }
       if (Number.isInteger(entry.lastSeq) && raw.seq <= entry.lastSeq) continue
       batch.push(raw)
       batchFirstSeq = batchFirstSeq ?? raw.seq
       if (batch.length >= INGEST_BATCH) {
-        ingested += await ingestBatch(entry, batch, batchFirstSeq)
+        ingested += await ingestBatch(entry, batch, batchFirstSeq, batchState)
+        failedUpTo = Math.max(failedUpTo, batchState.failedUpTo)
+        batchState.failedUpTo = -1
         batch = []
         batchFirstSeq = null
       }
     }
     if (batch.length > 0 && !disposed.value) {
-      ingested += await ingestBatch(entry, batch, batchFirstSeq)
+      ingested += await ingestBatch(entry, batch, batchFirstSeq, batchState)
+      failedUpTo = Math.max(failedUpTo, batchState.failedUpTo)
+    }
+    // B3-4：非记忆事件推进断点——仅当本轮没有失败的存储事务（事务级失败的记忆事件
+    // 还没入库，推进断点会把它们永久跳过；下轮摄入成功后自然吸收）。
+    if (!disposed.value && lastSkippedSeq !== null && failedUpTo === -1
+      && (!Number.isInteger(entry.lastSeq) || lastSkippedSeq > entry.lastSeq)) {
+      entry.lastSeq = lastSkippedSeq
+      metricsNote('v3.ingest.nonMemorySkipped')
     }
     // 只有回填（大批量）才在这里重建索引；每步 1-3 条的小增量留 stale，
     // 检索时懒重建——否则每步全量重建二十几 MB 索引会卡住宿主事件循环（首字慢）。
@@ -1198,11 +1242,36 @@ async function fileStatus(sessionId) {
    * 无记录 → -1（首事件 seq=0 不漏）；读失败 → 抛出，由调度层告警后保持 -1（不静默当作没有）。
    */
   async function resumeCheckpointOf(runtime) {
+    // AUD50-04-02（B2-8）：优先读检查点（checkpoint.jsonl 与提交同锁追加的事件→记录
+    // 映射），一次文件读恢复 lastSeq / seqToRecordId；缺失/损坏/落后于事务日志时
+    // 回退全量 provenance 扫描（失败关闭，不用旧检查点掩盖新记录），并在扫描后把
+    // 基线写回——迁移旧库只付一次全量扫描的钱。
+    if (typeof runtime.store.readCheckpoint === 'function') {
+      try {
+        const checkpoint = await runtime.store.readCheckpoint()
+        if (checkpoint?.usable === true) {
+          let last = -1
+          const seqToRecordId = new Map()
+          for (const [sourceEventId, recordId] of checkpoint.pairs) {
+            const seq = seqOfDshEventId(sourceEventId)
+            if (seq === null) continue
+            if (seq > last) last = seq
+            seqToRecordId.set(seq, recordId)
+          }
+          return { lastSeq: last, seqToRecordId, checkpoint: 'hit' }
+        }
+      } catch (error) {
+        ctx.logger?.warn?.('memory-context-lab-v3: 检查点读取失败（回退全量扫描）：' + (error?.message ?? String(error)))
+      }
+    }
     let last = -1
     const seqToRecordId = new Map()
     // 归档需要「宿主 seq → v3 记录 ID」；sourceEventIds 只给来源 ID，不能直接当记录 ID。
     // listRecordIds + readProvenance 是现有端口的最小组合，只在建库后台任务里跑一次。
     if (typeof runtime.store.listRecordIds === 'function' && typeof runtime.store.readProvenance === 'function') {
+      // 检查点基线口径是「宿主事件 ID → 记录 ID」（与提交侧增量行同键）；
+      // seqToRecordId（seq 数字键）只是入口运行期视图，两者不能混用。
+      const eventToRecordId = new Map()
       for (const recordId of await runtime.store.listRecordIds()) {
         const provenance = await runtime.store.readProvenance(recordId)
         const sourceEventId = provenance?.sourceEventId
@@ -1210,8 +1279,21 @@ async function fileStatus(sessionId) {
         if (seq === null) continue
         if (seq > last) last = seq
         seqToRecordId.set(seq, recordId)
+        eventToRecordId.set(sourceEventId, recordId)
       }
-      return { lastSeq: last, seqToRecordId }
+      // B2-8：迁移/回退扫完即写检查点基线（best-effort；扫描结果已过期时端口内部拒绝）。
+      if (eventToRecordId.size > 0 && typeof runtime.store.saveCheckpointBaseline === 'function' && typeof runtime.store.health === 'function') {
+        try {
+          const health = await runtime.store.health()
+          await runtime.store.saveCheckpointBaseline(health.maxTxn, eventToRecordId)
+        } catch (error) {
+          ctx.logger?.warn?.('memory-context-lab-v3: 检查点基线写入失败（下次打开再扫一次）：' + (error?.message ?? String(error)))
+        }
+      }
+      if (seqToRecordId.size > 0) {
+        ctx.logger?.warn?.('memory-context-lab-v3: 检查点不可用，回退全量扫描（' + seqToRecordId.size + ' 条）')
+      }
+      return { lastSeq: last, seqToRecordId, checkpoint: 'fallback' }
     }
     for (const sourceEventId of await runtime.store.sourceEventIds()) {
       const seq = seqOfDshEventId(sourceEventId)
@@ -1418,6 +1500,14 @@ async function fileStatus(sessionId) {
         runtime,
         lastSeq: checkpoint.lastSeq,
         records,
+        // AUD50-02-03（B2-1）：摄入拒绝计数（正文提取失败 + store 校验拒绝）。
+        // 只增不清（进程生命周期内累计）；重放同批因断点已推进不会重复计数。
+        rejectedEvents: 0,
+        // B3-4：已告警过的坏 seq（内存去重，warn 一次不逐步刷屏）；不持久化——重启后
+        // 最多再 warn 一次，断点语义不受影响。
+        badSeqs: new Set(),
+        // AUD50-04-01（B2-7）：最近使用时刻（淘汰判据）；所有取用路径都要 touch。
+        lastUsedAt: Date.now(),
         inflight: null,
         seqToRecordId: checkpoint.seqToRecordId,
         // 按步归档的「判负跳过」游标（0.14.0-beta.46）：只跳过净收益为负的 span，
@@ -1436,6 +1526,7 @@ async function fileStatus(sessionId) {
       }
       runtimes.set(sessionId, entry)
       pendingEntries.delete(sessionId)
+      evictIdleRuntimes() // B2-7：新 runtime 入表后执行一次存量上限扫描
       if (archive !== null) {
         try {
           await recoverArchiveIntent(entry, sessionId)
@@ -1505,7 +1596,10 @@ async function fileStatus(sessionId) {
   /** 观察面/检索面等待建库完成（这些是命令路径，不在首字热路径上）。 */
   async function entryOf(sessionId) {
     const ready = runtimes.get(String(sessionId ?? ''))
-    if (ready !== undefined) return ready
+    if (ready !== undefined) {
+      ready.lastUsedAt = Date.now() // B2-7：命令/回注路径取用即视为活跃
+      return ready
+    }
     const pending = pendingEntries.get(String(sessionId ?? ''))
     if (pending === undefined) return null
     try { return await pending } catch { return null }
@@ -1514,52 +1608,82 @@ async function fileStatus(sessionId) {
   const bodyOf = (raw) => extractEventBody(raw)
   function metricsNote(name) { entryMetrics.set(name, (entryMetrics.get(name) ?? 0) + 1) }
 
-  async function ingestBatch(entry, batch, firstSeq) {
+  async function ingestBatch(entry, batch, firstSeq, batchState = { failedUpTo: -1 }) {
     let applied = 0
+    let rejected = 0
     let refsChanged = false
+    // AUD50-02-03（B2-1）：正文提取逐事件 try/catch——坏事件（如缺 arguments 的 tool/call）
+    // 记 rejected、断点推进到它自身、后续事件继续入库。旧实现 batch.map 在大 try 里
+    // 一坏全批崩，断点永远停在同一处，摄入从此卡死（探针 AFTER_BAD.lastSeq=-1 不再前进）。
+    const bodies = new Array(batch.length)
+    const usable = []
+    for (let index = 0; index < batch.length; index += 1) {
+      const raw = batch[index]
+      try {
+        bodies[index] = bodyOf(raw)
+        usable.push(index)
+      } catch (error) {
+        rejected += 1
+        entry.rejectedEvents += 1
+        metricsNote('v3.ingest.rejected')
+        // 断点推进保证幂等：重放同一批时该事件被 seq<=lastSeq 跳过，不重复计数/告警
+        entry.lastSeq = raw.seq
+        ctx.logger?.warn?.('memory-context-lab-v3: 事件正文提取失败已跳过 seq=' + raw.seq + '：' + (error?.message ?? String(error)))
+      }
+    }
     try {
       // 一批一笔事务（beta.11）：逐事件事务在回填时是 10+ 次 fs/条 + 每笔同步全量事务日志，
       // 实测 1500 条约 45 秒、5000 条约 8 分钟；这段时间 inflight 恒非空，回注被 busy 挡住。
-      const bodies = batch.map((raw) => bodyOf(raw))
-      const results = await entry.runtime.handleDshEventBatch(batch.map((raw, index) => ({
-        event: raw,
+      // 事务里只进正文提取成功的事件；store 层校验拒绝的事件单独标 rejected、不进事务
+      // （processTurn.many 的既定语义），同批好事件照常提交。
+      const results = usable.length > 0 ? await entry.runtime.handleDshEventBatch(usable.map((index) => ({
+        event: batch[index],
         text: bodies[index].text,
         meta: { metaOnly: bodies[index].metaOnly === true, metaReason: bodies[index].reason ?? '', structure: bodies[index].structure ?? undefined },
-      })))
-      for (let index = 0; index < batch.length; index += 1) {
+      }))) : []
+      for (let position = 0; position < usable.length; position += 1) {
         // dispose 落在批内：store 已 close，本批取消，断点停在上一批（下一批失败关闭并告警）
         if (disposed.value) break
+        const index = usable[position]
         const raw = batch[index]
         const body = bodies[index]
-        const result = results[index] ?? { status: 'not-memory-event' }
-        if (body.metaOnly === true) metricsNote('v3.ingest.metadataOnly')
-        if (body.usage !== undefined) await appendUsage(entry, raw, body.usage)
-        // own-source 也推进断点：否则尾部注入事件每次重启都被重扫（断点语义不完整）
-        if (result.status === 'applied' || result.status === 'rejected' || result.status === 'own-source') entry.lastSeq = raw.seq
-        if (result.status === 'applied') {
-          applied += 1
-          // 只有真正提交的记录才计入「已摄入」；own-source / rejected / not-memory-event 不计。
-          // records 为 null 表示建库时计数不可读，保持未知而不是从 0 重来。
-          if (Number.isInteger(entry.records)) entry.records += 1
-          if (typeof result.recordId === 'string' && result.recordId.length > 0) entry.seqToRecordId.set(raw.seq, result.recordId)
-          if (raw?.type === 'tool/call' && typeof result.recordId === 'string' && entry.cwd !== null && entry.fileRefsError === null) {
-            try {
-              const ref = await captureFileReference({ event: raw, recordId: result.recordId, cwd: entry.cwd })
-              if (ref !== null) {
-                const index = entry.fileRefs.findIndex((item) => item.id === ref.id)
-                if (index >= 0) entry.fileRefs[index] = ref
-                else entry.fileRefs.push(ref)
-                if (entry.fileRefs.length > 500) entry.fileRefs = entry.fileRefs.slice(-500)
-                refsChanged = true
+        const result = results[position] ?? { status: 'not-memory-event' }
+        try {
+          if (body.metaOnly === true) metricsNote('v3.ingest.metadataOnly')
+          if (body.usage !== undefined) await appendUsage(entry, raw, body.usage)
+          // own-source 也推进断点：否则尾部注入事件每次重启都被重扫（断点语义不完整）
+          if (result.status === 'applied' || result.status === 'rejected' || result.status === 'own-source') entry.lastSeq = raw.seq
+          if (result.status === 'applied') {
+            applied += 1
+            // 只有真正提交的记录才计入「已摄入」；own-source / rejected / not-memory-event 不计。
+            // records 为 null 表示建库时计数不可读，保持未知而不是从 0 重来。
+            if (Number.isInteger(entry.records)) entry.records += 1
+            if (typeof result.recordId === 'string' && result.recordId.length > 0) entry.seqToRecordId.set(raw.seq, result.recordId)
+            if (raw?.type === 'tool/call' && typeof result.recordId === 'string' && entry.cwd !== null && entry.fileRefsError === null) {
+              try {
+                const ref = await captureFileReference({ event: raw, recordId: result.recordId, cwd: entry.cwd })
+                if (ref !== null) {
+                  const refIndex = entry.fileRefs.findIndex((item) => item.id === ref.id)
+                  if (refIndex >= 0) entry.fileRefs[refIndex] = ref
+                  else entry.fileRefs.push(ref)
+                  if (entry.fileRefs.length > 500) entry.fileRefs = entry.fileRefs.slice(-500)
+                  refsChanged = true
+                }
+              } catch (error) {
+                ctx.logger?.warn?.('memory-context-lab-v3: 文件引用采集失败（不影响摄入）：' + (error?.message ?? String(error)))
               }
-            } catch (error) {
-              ctx.logger?.warn?.('memory-context-lab-v3: 文件引用采集失败（不影响摄入）：' + (error?.message ?? String(error)))
             }
           }
-        }
-        if (result.status === 'own-source') metricsNote('v3.ingest.ownSourceSkipped')
-        if (result.status === 'rejected') {
-          ctx.logger?.warn?.('memory-context-lab-v3: 事件被拒绝 seq=' + raw.seq + '：' + (result.errors ?? []).join('；'))
+          if (result.status === 'own-source') metricsNote('v3.ingest.ownSourceSkipped')
+          if (result.status === 'rejected') {
+            rejected += 1
+            entry.rejectedEvents += 1
+            metricsNote('v3.ingest.rejected')
+            ctx.logger?.warn?.('memory-context-lab-v3: 事件被拒绝 seq=' + raw.seq + '：' + (result.errors ?? []).join('；'))
+          }
+        } catch (error) {
+          // 单事件后处理失败不拖垮整批：记录该提交的已提交，断点语义保持
+          ctx.logger?.warn?.('memory-context-lab-v3: 事件后处理失败 seq=' + raw.seq + '：' + (error?.message ?? String(error)))
         }
       }
       if (refsChanged) {
@@ -1569,9 +1693,12 @@ async function fileStatus(sessionId) {
           ctx.logger?.warn?.('memory-context-lab-v3: file-references 写入失败（核证面暂不可用）：' + (error?.message ?? String(error)))
         }
       }
-      ctx.logger?.info?.('memory-context-lab-v3: 摄入批完成（起 seq=' + firstSeq + '，' + applied + '/' + batch.length + ' 条）')
+      ctx.logger?.info?.('memory-context-lab-v3: 摄入批完成（起 seq=' + firstSeq + '，' + applied + '/' + batch.length + ' 条'
+        + (rejected > 0 ? '，拒绝 ' + rejected + ' 条' : '') + '）')
     } catch (error) {
-      // 影子模式不干扰宿主：摄入失败只告警，断点停在已完成处，下一步续传
+      // 存储事务级失败（全有或全无）：断点停在已完成处，下一步续传（影子模式不干扰宿主）。
+      // B3-4：失败批的 seq 上界回报给 ingestAll——本轮不得把非记忆事件推进到它之后。
+      batchState.failedUpTo = Math.max(batchState.failedUpTo, batch[batch.length - 1]?.seq ?? -1)
       ctx.logger?.warn?.('memory-context-lab-v3: 影子摄入失败（seq 起 ' + firstSeq + '）：' + (error?.message ?? String(error)))
     }
     // 返回真正落库的条数：own-source / not-memory-event 不算「摄入」
@@ -1605,6 +1732,7 @@ async function fileStatus(sessionId) {
       }
       // 2026-10-25 事故修正：摄入**后台异步**执行（历史大会话回填实测 10 分钟），
       // 钩子立即返回 decision，绝不阻塞首字；单飞行防重入，新事件由下一次 pre-step 续传。
+      entry.lastUsedAt = Date.now() // B2-7：活动会话不淘汰
       startIngest(entry, session)
     } catch (error) {
       ctx.logger?.warn?.('memory-context-lab-v3: 影子调度失败：' + (error?.message ?? String(error)))
@@ -1654,6 +1782,7 @@ async function fileStatus(sessionId) {
       injection: injectionSnapshot(sessionId),
       control,
       records: Number.isInteger(entry.records) ? entry.records : null,
+      rejectedEvents: entry.rejectedEvents,
       searchable,
       coverage,
       coverageError,
@@ -1664,8 +1793,9 @@ async function fileStatus(sessionId) {
    * 同步状态（0.14.0-beta.15，composer 状态条的数据源）。
    *
    * 客户端读不到宿主进程里的对象；投影的 wire.view 需要一个**同步、绝不抛错**的读取器，
-   * 否则每步都要等文件系统。实测它并不零 I/O：controlOf/stateOf 各一次 statSync（F-B，
-   * 内容有 mtime:size 缓存）——这里如实描述，不再宣称「零 I/O」。其余走内存表：
+   * 否则每步都要等文件系统。I/O 事实（B3-9 目录闸门后）：一次 view 的 control+state
+   * 共享 **1 次目录 stat**（同同步批次），缓存命中时 0 次文件 I/O；内容仍有 mtime:size
+   * 逐文件戳校验兜底。其余走内存表：
    * - 已建库：lastSeq / records / ingesting / 本会话回注计数；
    * - 建库中：pending；
    * - 建库失败：failed + code（与 /memory-lab status 的失败关闭口径一致，不伪装成「尚未摄入」）；
@@ -1720,6 +1850,7 @@ async function fileStatus(sessionId) {
     }
     const entry = runtimes.get(key)
     if (entry !== undefined) {
+      entry.lastUsedAt = Date.now() // B2-7：投影每事件都读，活动会话不淘汰
       return {
         state: 'ready',
         ingested: Number.isInteger(entry.records) ? entry.records : null,
@@ -1832,8 +1963,17 @@ async function fileStatus(sessionId) {
     },
     search: searchReadOnly,
     read: readReadOnly,
+    /** B2-7 测试钩子：手动驱动一次淘汰扫描（now 可注入未来时刻测 TTL）。 */
+    _evictNow: evictIdleRuntimes,
+    /** B2-7 测试钩子：把会话的 lastUsedAt 拨到指定时刻（构造「最久未用」排序）。 */
+    _touchRuntime(sessionId, at) {
+      const entry = runtimes.get(String(sessionId ?? ''))
+      if (entry !== undefined) entry.lastUsedAt = at
+    },
+    _runtimeLimits: runtimeLimits,
     dispose() {
       disposed.value = true
+      clearInterval(evictTimer)
       // 在飞回填：置中断位（批间生效），不再等待；已写入的节点在磁盘上仍然幂等。
       for (const job of backfillJobs.values()) job.controller.aborted = true
       backfillJobs.clear()

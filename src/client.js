@@ -97,13 +97,14 @@ window.__ModuleLoader__.load({
       { key: 'autoRestore', kind: 'boolean', label: 'autoRestoreLabel', hint: 'autoRestoreHint' },
       { key: 'limit', kind: 'number', min: 1, max: 20, step: 1, label: 'limitLabel', hint: 'limitHint' },
       { key: 'coolingGate', kind: 'number', min: 0, max: 95, step: 1, label: 'coolingGateLabel', hint: 'coolingGateHint' },
+      { key: 'restoreMaxChars', kind: 'number', min: 1000, max: 200000, step: 100, label: 'restoreMaxCharsLabel', hint: 'restoreMaxCharsHint' },
       { key: 'packMinScore', kind: 'number', min: 0, max: 50, step: 0.1, label: 'packMinScoreLabel', hint: 'packMinScoreHint' },
       { key: 'previewChars', kind: 'number', min: 40, max: 4000, step: 10, label: 'previewCharsLabel', hint: 'previewCharsHint' },
       { key: 'queryMaxChars', kind: 'number', min: 32, max: 4000, step: 16, label: 'queryMaxCharsLabel', hint: 'queryMaxCharsHint' },
     ]
 
     /** 与宿主半 `SETTINGS_DEFAULTS` 同值：只用于「宿主还没答」时的占位显示，不参与写。 */
-    const DEFAULTS = { enabled: true, fullHistory: true, turnBasis: 'human', planFirst: false, autoRestore: true, limit: 10, coolingGate: 20, packMinScore: 0.5, previewChars: 160, queryMaxChars: 512 }
+    const DEFAULTS = { enabled: true, fullHistory: true, turnBasis: 'human', planFirst: false, autoRestore: true, limit: 10, coolingGate: 20, restoreMaxChars: 16000, packMinScore: 0.5, previewChars: 160, queryMaxChars: 512 }
 
     /** 会话弹层可覆盖的数值项（全局默认在插件设置页；这里只写本对话）。 */
     /**
@@ -145,6 +146,8 @@ window.__ModuleLoader__.load({
       limitLabel: '默认单次回注条数',
       coolingGateLabel: '按步归档闸门（占用 %）',
       coolingGateHint: '上下文占用达到该百分比才压缩旧步骤；0 = 每步都判断（最省 token、最费前缀缓存）。',
+      restoreMaxCharsLabel: '恢复正文上限（字符）',
+      restoreMaxCharsHint: '恢复体积（正文+工具调用参数）超过它的完成回合不会写恢复凭证；1000–200000。',
       gateLabel: '按步归档闸门',
       gateHint: '本对话的闸门百分比（跟随全局 = 留空）；0 = 每步都判断。',
       limitHint: '新会话默认；本对话可在 composer 面板覆盖（1–20）。',
@@ -184,6 +187,8 @@ window.__ModuleLoader__.load({
       statusMode: '模式：{mode}',
       statusPlanFirst: '计划先行：开',
       statusArchived: '已归档到 seq {seq}',
+statusArchivedAt: '已按步归档（{time}）',
+statusStateError: '状态文件异常：{code}（值已按默认回落）',
       modeFullHistory: '按轮归档',
       modeCooling: '按步归档',
       modeRecallOnly: '仅回注',
@@ -236,6 +241,8 @@ window.__ModuleLoader__.load({
       limitLabel: 'Default matches per recall',
       coolingGateLabel: 'Per-step archive gate (occupancy %)',
       coolingGateHint: 'Compress old steps only after context occupancy reaches this percent; 0 = judge every step (cheapest tokens, most prefix churn).',
+      restoreMaxCharsLabel: 'Restore text budget (chars)',
+      restoreMaxCharsHint: 'Completed turns whose restore size (text + tool-call args) exceeds it get no voucher; 1000–200000.',
       gateLabel: 'Per-step archive gate',
       gateHint: 'Gate percent for this chat (blank = follow global); 0 = judge every step.',
       limitHint: 'Default for new chats; this chat can override it in the composer panel (1–20).',
@@ -275,6 +282,8 @@ window.__ModuleLoader__.load({
       statusMode: 'Mode: {mode}',
       statusPlanFirst: 'Plan-first: on',
       statusArchived: 'Archived through seq {seq}',
+statusArchivedAt: 'Archived per step ({time})',
+statusStateError: 'State file error: {code} (defaults in effect)',
       modeFullHistory: 'archive per turn',
       modeCooling: 'archive per step',
       modeRecallOnly: 'recall only',
@@ -675,6 +684,14 @@ window.__ModuleLoader__.load({
       if (status.planFirst === true) prefix.push(t('statusPlanFirst'))
       if (Number.isInteger(status.surface?.lastArchiveEndSeq) && status.surface.lastArchiveEndSeq >= 0) {
         prefix.push(t('statusArchived', { seq: status.surface.lastArchiveEndSeq }))
+      } else if (typeof status.surface?.lastArchiveAt === 'number' && status.surface.lastArchiveAt > 0) {
+        // B3-18（AUD50-06-07）：cooling（按步归档）不推进 lastArchiveEndSeq——只认它会让
+        // 整个按步模式在弹层里「没有归档事实」。lastArchiveAt 两种模式都推进。
+        prefix.push(t('statusArchivedAt', { time: new Date(status.surface.lastArchiveAt).toLocaleString() }))
+      }
+      if (typeof status.stateError === 'string' && status.stateError.length > 0) {
+        // B3-18：状态文件异常（state.json 损坏/不可读）必须可见，不能静默显示默认值
+        prefix.push(t('statusStateError', { code: status.stateError }))
       }
       const withPrefix = (lines) => [...prefix, ...lines]
       const injected = Number.isInteger(status.injected) && status.injected >= 0 ? status.injected : 0

@@ -135,6 +135,10 @@ export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsS
         results[index] = { status: 'not-memory-event', errors: normalizedEvent.errors }
         continue
       }
+      if (normalizedEvent.atReason !== undefined) {
+        // B3-1：事件时间非法/缺失如实计数（时间不伪造进记录，原因可观测）
+        metrics.counter(normalizedEvent.atReason === 'invalid' ? 'v3.ingest.eventAtInvalid' : 'v3.ingest.eventAtMissing', 1)
+      }
       normalized.push({ index, event: normalizedEvent.event, text: item.text, meta: item.meta })
     }
     if (normalized.length === 0) return results

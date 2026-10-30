@@ -21,7 +21,9 @@
  *
  * - `state` 只存 `{ sessionId, tick }`。`tick` 是本会话最近一个事件的 seq；每个事件都换
  *   状态引用，驱动 view 重算（这是「读模型水位」，不是引擎计数）。
- * - `wire.view` 读引擎的**同步** `statusOf(sessionId)`（O(1) 内存读，零 I/O）。视图不落盘，
+ * - `wire.view` 读引擎的**同步** `statusOf(sessionId)`。I/O 事实（B3-9 目录闸门）：
+ *   每 tick 至多 1 次目录 stat（同批次 control/state 共享），文件缓存命中时零文件 I/O。
+ *   视图不落盘，
  *   冷恢复时由当前进程重新算一遍。
  *
  * 这不是自创形态：宿主自己的 `imageLimits` 投影就是 `state: null` + `wire.view: () =>

@@ -13,7 +13,7 @@
  *   （不死锁）；不同目录互不阻塞（W-01）。
  * 时间经注入（now 函数），测试用虚拟时钟确定性驱动。
  */
-import { mkdir, readFile, rename, rm } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
@@ -33,19 +33,40 @@ function lockDirOf(dir) {
   return path.join(dir, LOCK_DIR)
 }
 
+/**
+ * 读锁凭证。B3-6（AUD50-03-05）：只把 ENOENT 当「没有」（与 fileExists 的 G-B 口径
+ * 一致）——旧实现 catch-all 返回 null，owner.json 是目录（EISDIR）或读不到（EACCES）
+ * 时被当 stale **直接接管**，等于双写者同时进临界区。其它读错误/凭证损坏一律失败关闭。
+ */
 async function readOwner(lockDir, now) {
+  let raw
   try {
-    const raw = JSON.parse(await readFile(path.join(lockDir, OWNER_FILE), 'utf8'))
-    if (typeof raw.token !== 'string' || !Number.isFinite(raw.heartbeatAt)) return null
-    return raw
-  } catch {
-    return null
+    raw = await readFile(path.join(lockDir, OWNER_FILE), 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    throw v3Error('ELOCKED', 'owner.json 读取失败（失败关闭，不当作 stale 接管）：' + (error?.code ?? 'EINTERNAL') + ' ' + (error?.message ?? String(error)))
   }
+  let owner
+  try {
+    owner = JSON.parse(raw)
+  } catch (error) {
+    throw v3Error('ELOCKED', 'owner.json 损坏（两阶段创建后不该发生；接管被拒绝，失败关闭）：' + (error?.message ?? String(error)))
+  }
+  if (owner === null || typeof owner !== 'object' || typeof owner.token !== 'string' || !Number.isFinite(owner.heartbeatAt)) {
+    throw v3Error('ELOCKED', 'owner.json 形状非法（接管被拒绝，失败关闭）')
+  }
+  return owner
 }
 
-function isStale(owner, now, ttlMs) {
-  if (owner === null) return true
-  return now() - owner.heartbeatAt > ttlMs
+/** B3-6：owner 缺失不立即 stale——按锁目录 mtime 计龄，超过 TTL 才接管。 */
+async function lockDirStaleWithoutOwner(lockDir, now, ttlMs) {
+  try {
+    const info = await stat(lockDir)
+    return now() - info.mtimeMs > ttlMs
+  } catch (error) {
+    if (error?.code === 'ENOENT') return true // 锁目录没了：下一轮 rename 直接成功
+    throw error
+  }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -87,9 +108,12 @@ export async function acquireWriteLock(dir, options = {}) {
       if (!isTransient(error)) throw error
     }
 
-    // 锁目录已存在：读凭证判 stale
+    // 锁目录已存在：读凭证判 stale（owner 缺失按锁目录 mtime 计龄，B3-6）
     const current = await readOwner(lockDir, now)
-    if (!isStale(current, now, ttlMs)) {
+    const stale = current === null
+      ? await lockDirStaleWithoutOwner(lockDir, now, ttlMs)
+      : now() - current.heartbeatAt > ttlMs
+    if (!stale) {
       if (now() >= deadline) {
         throw v3Error('ELOCKED', '写锁被活持有者持有（token ' + String(current?.token).slice(0, 8) + '…，心跳 ' + (now() - (current?.heartbeatAt ?? 0)) + 'ms 前）')
       }
@@ -173,9 +197,15 @@ export async function withWriteLock(dir, body) {
  * 进程内队列（同进程串行 + 重入）→ 跨进程文件锁（acquireWriteLock）→ body → release。
  * 两 DSH 进程同写一会话目录时事务号与凭证不再相撞；锁等待 5s 内未取得抛 ELOCKED 失败关闭。
  */
-export async function withCrossProcessWriteLock(dir, body) {
+export async function withCrossProcessWriteLock(dir, body, options = {}) {
+  // B2-4（AUD50-03-01）锁重入：同一异步上下文已持同目录锁时（端口/repair 持锁期间
+  // 再 open）跳过二次取文件锁——acquireWriteLock 不重入，嵌套会与自己互等 5s 后
+  // ELOCKED（实测最小复现）。进程内串行/重入语义由 withWriteLock 的 ALS 保证。
+  const held = reentry.getStore()
+  const reentrant = held !== undefined && held.has(dir)
   return withWriteLock(dir, async () => {
-    const lock = await acquireWriteLock(dir)
+    if (reentrant) return body()
+    const lock = await acquireWriteLock(dir, options)
     // 事务期间必须**续约**：TTL 默认 60s，而一次回填批或索引重建可能更久。
     // 旧实现从不调用 heartbeat，`owner.heartbeatAt` 恒等于 acquiredAt——超过 TTL 的
     // 事务会被另一进程判定 stale 并接管，两个写者同时进临界区（且旧持有者不会停）。

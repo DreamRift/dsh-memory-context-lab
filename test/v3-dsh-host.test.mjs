@@ -125,7 +125,13 @@ test('归一化：四类映射；system/head 拒绝；非法入参拒绝', () =>
   const legacyAt = normalizeDshEvent({ seq: 11, type: 'user/message', at: 42, data: { source: { kind: 'user' } } }, 'sess-a')
   assert.equal(legacyAt.event.at, 42, 'at 保留为兼容旧夹具/旧格式')
   const noTime = normalizeDshEvent({ seq: 12, type: 'user/message', data: { source: { kind: 'user' } } }, 'sess-a')
-  assert.equal(noTime.event.at, 0, '两者都缺失才回落 0（不猜）')
+  assert.equal(noTime.ok, true)
+  assert.equal(noTime.event.at, undefined, 'B3-1：时间缺失如实缺失，不回落 0 伪造')
+  assert.equal(noTime.atReason, 'missing')
+  const badTime = normalizeDshEvent({ seq: 13, type: 'user/message', time: 'not-a-number', data: { source: { kind: 'user' } } }, 'sess-a')
+  assert.equal(badTime.ok, true)
+  assert.equal(badTime.event.at, undefined, 'B3-1：非法时间丢弃，不伪造')
+  assert.equal(badTime.atReason, 'invalid')
 })
 
 test('组合：真实形状下 surface-executor R4 全链路成立', async () => {

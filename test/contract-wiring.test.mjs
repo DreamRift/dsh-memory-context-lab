@@ -41,7 +41,9 @@ const EXPORT_WHITELIST = new Map(Object.entries({
   apply: '宿主插件入口（DSH 经插件协议调用 apply，src 内零消费是协议必然）',
   Config: '宿主设置页入口（dsh-settings 读 fiber.runtime.Config 生成表单，消费方在宿主侧；src 内零消费是协议必然）；v3-surface-contract 锁「五个 volatile 字段 + ~standard 默认值」',
   evaluatePressureGate: '定案·白名单：闸门判定纯函数（v3-pressure-gate 套件锁 G1-G4 判据）；触发动作属①②④缓议项（2026-10-25 用户拍板），接线后摘除',
-  isReadLeaseActive: '定案·白名单：租约判据助手（v3-context-budget 套件锁失败关闭口径）；allocateBudget 内联消费 leaseUntil 字段，读路径接线（recall 后记 lastReadAt）后摘除',
+  _candidatesCacheStats: '测试钩子（B3-8）：v3-candidates-cache 套件锁「选择器不随历史长度线性变慢」的计数器，src 内零消费是设计',
+  _resetCandidatesCacheStats: '测试钩子（B3-8）：v3-candidates-cache 套件复位计数用，src 内零消费是设计',
+  _sessionDirGateStats: '测试钩子（B3-9）：v3-status-file-gate 套件锁「每 tick stat 次数上限」的计数器，src 内零消费是设计',
   // —— 测试钩子（*ForTest），生产不消费是设计而非缺口 ——  // —— P0-4 待逐个三选一（接线/删除/白名单定案），见进展卡-beta.9 ——  // —— v3 M0 骨架（dev-0.14.0/进展卡-M0）：M3 composition root 接线后逐项摘除 ——
   assertPort: 'v3 M0：装配期端口校验，消费者是 M3 的 index.mjs composition root（尚未入驻）；v3 套件锁「缺方法必点名」',
   isV3Error: 'v3 M0：错误信封判别，M3 边界转换消费；v3-session-isolation 套件锁信封形状',
@@ -56,7 +58,6 @@ const EXPORT_WHITELIST = new Map(Object.entries({
   createProcessTurn: 'v3 M3：processTurn 用例工厂，composition root 在 M5 宿主接线时消费；v3-process-turn 套件锁全链路五态',
   createSessionStorePort: 'v3 M3：SessionStore 端口装配，composition root 在 M5 消费；套件锁端口面与真实适配器组合',
   createSessionLifecycle: 'v3 M3：生命周期用例工厂（enable/disable/restore/forget），composition root 在 M5 消费；v3-session-lifecycle 套件锁 Q-01/G3/N-11',
-  renderWorkingCard: 'v3 M4：卡片渲染器，消费者是 M4/M5 投影执行路径（尚未入驻）；v3-card-renderer 套件锁严格上界含页脚',
   planSlots: 'v3 M4：双槽规划，消费者是 M5 surface 执行层（尚未入驻）；v3-slot-planner 套件锁稳态双槽',
   createT1Provider: 'v3 M4：T1 提供者工厂，backend-negotiation 与 composition 消费；v3-t1-recall 套件锁 BM25/OOV/双面门槛/自动重建',
   negotiateMemoryBackend: 'v3 M5：记忆后端协商（D3 fail-closed），消费者是 composition root 切换处（T2 实测登记后接入）；v3-backend-negotiation 套件锁各回落分支',
@@ -149,6 +150,7 @@ const ORPHAN_ALLOWLIST = new Map(Object.entries({
   bjob: 'protection job-id 正则残渣',
   id: 'protection job-id 正则残渣',
   gi: '正则 flags 残渣',
+  o600: '八进制字面量 0o600 被剥码器切出的词法残渣（B3-21 导出权限 0o600）',
   ID: '模板散文「记录 ID」',
   seq$: '模板散文 seq 前缀',
   // —— 字符串比较/枚举值在插值散文里的残渣 ——
