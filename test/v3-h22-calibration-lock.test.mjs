@@ -1,21 +1,33 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { evaluatePressureGate } from '../src/v3/domain/session/pressure-gate.mjs'
 
 // H-22 口径锁：参数表文档与闸门判据互锁，防止「文档说一套、行为另一套」的静默漂移。
-// 单一真源：docs/dev-0.14.0/检索复验基线与provisional参数-20261026.md 的定稿表。
+// 真源：工作区 docs/dev-0.14.0/检索复验基线与provisional参数-20261026.md 的定稿表；
+// 该文档不随源码分发，干净克隆 / CI 读不到 → 仓库内保留冻结夹具（本测试的判据基准），
+// 工作区文档存在时同时比对两者，漂移即红（缺文件不再让整库套件必红）。
 const here = path.dirname(fileURLToPath(import.meta.url))
-const doc = await readFile(path.join(here, '../../docs/dev-0.14.0/检索复验基线与provisional参数-20261026.md'), 'utf8')
+const FIXTURE = path.join(here, 'fixtures/h22-calibration.md')
+const WORKSPACE_DOC = path.join(here, '../../docs/dev-0.14.0/检索复验基线与provisional参数-20261026.md')
+const doc = await readFile(FIXTURE, 'utf8')
+const workspaceDoc = existsSync(WORKSPACE_DOC) ? await readFile(WORKSPACE_DOC, 'utf8') : null
 
 test('H-22 口径锁：参数表文档含四项定稿且数值可解析', () => {
   assert.ok(doc.includes('20 万 token（百万窗口 × 20%）'), '入门阈值定稿行')
   assert.ok(doc.includes('max(5%, 3σ₃₀)'), '滞回死区定稿行')
   assert.ok(doc.includes('闸门失效保护 25 万（25%）'), '紧急线定稿行')
   assert.ok(doc.includes('贴线率/超调率不劣于实测（12% / 4.4%）'), '转正验收指标行')
+})
+
+test('H-22 口径锁：工作区文档若存在，四项定稿与冻结夹具一致（漂移即红）', { skip: workspaceDoc === null ? '工作区文档不在本检出（干净克隆 / CI）' : false }, () => {
+  for (const line of ['20 万 token（百万窗口 × 20%）', 'max(5%, 3σ₃₀)', '闸门失效保护 25 万（25%）', '贴线率/超调率不劣于实测（12% / 4.4%）']) {
+    assert.ok(workspaceDoc.includes(line), '工作区文档与冻结夹具漂移：' + line)
+  }
 })
 
 test('H-22 口径锁：闸门判据行为与定稿值一致（0.2 开 / 0.25 兜底语义）', () => {
