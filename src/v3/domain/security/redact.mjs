@@ -110,6 +110,21 @@ export const SENSITIVE_VALUE_PATTERNS = Object.freeze([
       + (value.charCodeAt(0) === 34 ? '"[REDACTED]"' : value.charCodeAt(0) === 39 ? "'[REDACTED]'" : '[REDACTED]')
     },
   ],
+  // 中文键名（密码/密钥/令牌/凭据/凭证）：SENSITIVE_KEY 认这些键，对象面 redactValue
+  // 已按 isSensitiveKey 脱敏；但上面两条文本规则的键名只允许 ASCII 标识符，于是
+  // tool/result 正文里的「密码：…」原样入库——两面不一致。中文键单独成条，
+  // 不改写 ASCII 规则的边界；值一律替换（不做「普通词」豁免——中文键后跟的值
+  // 按凭据处理，宁可误伤不可漏）。引号键形态先跑，避免被裸键规则拆开。
+  [
+    /(["'])(密码|密钥|令牌|凭据|凭证)\1(\s*[:=：]\s*|%3[dDaA])("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',&;}\]]{1,})/g,
+    (_match, quote, key, separator, value) => quote + key + quote + separator
+      + (value.charCodeAt(0) === 34 ? '"[REDACTED]"' : value.charCodeAt(0) === 39 ? "'[REDACTED]'" : '[REDACTED]'),
+  ],
+  [
+    /(密码|密钥|令牌|凭据|凭证)(\s*[:=：]\s*|%3[dDaA])("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]{1,})/g,
+    (_match, key, separator, value) => key + separator
+      + (value.charCodeAt(0) === 34 ? '"[REDACTED]"' : value.charCodeAt(0) === 39 ? "'[REDACTED]'" : '[REDACTED]'),
+  ],
   // sk- 开头的常见密钥前缀（OpenAI/Anthropic 等）
   [/\bsk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]'],
   // AWS access key ID（AKIA/ASIA/AIDA/AROA/... + 16 位大写字母数字）
