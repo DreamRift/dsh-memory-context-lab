@@ -69,9 +69,13 @@ test('B3-9 ENOENT 哨兵：默认值稳定、文件后来出现也能读到', as
     }
     const after = _sessionDirGateStats()
     assert.equal(after.stats - before.stats, 5, '哨兵路径每 tick 仍只 1 次目录 stat')
-    await writeFile(sessionControlPath(root, 's3'), JSON.stringify({ enabled: false }), 'utf8')
+    // 生产写路径是 temp+rename（writeSessionControl）；这里用同一路径，避免在
+    // Windows 上依赖「新建文件会立即推进目录 mtime」——NTFS 的目录时间戳更新是
+    // 惰性的，直接 writeFile 会让本用例偶发读到缓存的默认值（实测 4/10 红）。
+    // 原地改写/外部创建不推进 mtime 属已声明边界（见下一条用例）。
+    await writeSessionControl(root, 's3', { enabled: false })
     await Promise.resolve()
-    assert.equal(readSessionControl(root, 's3').enabled, false, '文件出现后读到新值')
+    assert.equal(readSessionControl(root, 's3').enabled, false, '文件出现后读到新值（生产写路径）')
   })
 })
 
