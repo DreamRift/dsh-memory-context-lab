@@ -115,32 +115,30 @@ composer 工具行左侧的「记忆上下文」chip（宿主 `conversation.inpu
 
 ## 安装
 
-**从 npm 安装（推荐）**
-
-```powershell
-dsh plugin --profile desktop add dsh-memory-context-lab
-```
-
-**从 GitHub Release 安装**：下载 `dsh-memory-context-lab-0.15.2.tgz`，再
+1. 在 [Releases](https://github.com/DreamRift/dsh-memory-context-lab/releases) 页面下载 `dsh-memory-context-lab-0.15.2.tgz`。
+2. 装进 desktop profile：
 
 ```powershell
 dsh plugin --profile desktop add "<下载路径>\dsh-memory-context-lab-0.15.2.tgz"
 ```
 
-两种方式装完都要重启 DSH。升级、回滚、磁盘占用与卸载见 [INSTALL.md](./INSTALL.md)。
+3. 重启 DSH。
 
-安装包约 165 MB：其中携带了完整的 Windows x64 Bash 载荷（约 411 MB 解压后），所以第一次装会比普通插件慢，属正常。**npm 上的包与 Release 里的 tgz 是同一份产物**（同版本同内容），只是分发渠道不同。
+安装包约 165 MB：其中携带了完整的 Windows x64 Bash 载荷（约 411 MB 解压后），所以第一次装会比普通插件慢，属正常。升级、回滚、磁盘占用与卸载见 [INSTALL.md](./INSTALL.md)。
+
+> **暂不提供 npm 分发**：本包携带 411 MB 的 Bash 载荷，打包后单文件约 165 MB，超出 npm registry 对单次发布请求的实际承受范围，多次尝试均以 PUT 失败告终。因此 0.15.2 只通过 GitHub Release 分发。
 
 ## 致谢：dsh-ops
 
 本插件包内捆绑了一份**针对记忆上下文定制适配的 [dsh-ops](https://github.com/T-Auto/dsh-ops)**（上游作者 [T-Auto](https://github.com/T-Auto)，MIT 许可）。
 
 - **为什么捆绑**：记忆上下文的核心目标是省 token，而工具调用的输入输出本身就是上下文增长的大头。dsh-ops 的 `ops_*` 系列工具用更紧凑的返回、带行号的结构化输出和更明确的错误反馈来压低这部分开销，和归档/回注是同一个目标的两条路径——所以把它作为第二组件一起分发，而不是让用户再单独装一遍、再对一遍配置。
-- **做了哪些适配**：砍掉与记忆上下文冲突或纯增开销的部分——关掉动态工具发现（`discovery.enabled: false`）与动态工具加载（`dynamicTools: false`），保证会话中途工具 schema 不变，不会反复作废前缀缓存；默认用 `ops_*` 替换官方 `read`/`glob`/`grep`（可关），`pwsh` 保留不动；文件核证白名单加进 `ops_inspect_local_file`，替换后仍进 `file-references` 账本。所有定制版 ops 的功能（文件工具、PTC、面板、TUI、设置页）都保留。
+- **做了哪些适配**：关掉上游的动态工具发现入口（`discovery.enabled: false`；代码里 `consumer/gates.ts` 与 `consumer/mount.ts` 对这条是**硬关**，不跟随设置开关），避免 ops 在会话中途通过发现机制新增工具、把工具清单搅动一遍；默认用 `ops_*` 替换官方 `read`/`glob`/`grep`（可在组件页关），`pwsh` 默认保留；文件核证白名单加进 `ops_inspect_local_file`，替换后仍进 `file-references` 账本。常驻工具面在版本加载时固定下来，`dynamicTools` 是「发现入口」开关（默认 `true`，本包 patch 里设为 `false`），与「会话中途增删工具」不是同一件事。所有定制版 ops 的功能（文件工具、PTC、面板、TUI、设置页）都保留。
 - **怎么用**：装好本插件就已经包含 ops 组件，不需要另外安装。侧边栏「插件」→ `dsh-memory-context-lab` →「包含的组件」里有 `dsh-ops` 一行，点进去是它自己的完整设置页；不想用就在那一行关掉，记忆上下文本身不受影响。
 - **边界**：ops 的源码、文档与发布归上游项目所有，本仓库只放构建产物 `vendor/dsh-ops`（不进 git，随 tgz 分发）。上游的 issue、PR、版本节奏请走 [T-Auto/dsh-ops](https://github.com/T-Auto/dsh-ops)。
 
 ## 发布资产
 
-- 0.15.2 的 tgz 在 `dist/dsh-memory-context-lab-0.15.2.tgz`，同时作为 **GitHub Release asset** 与 **npm 包** 分发。
+- 0.15.2 的 tgz 在 `dist/dsh-memory-context-lab-0.15.2.tgz`，作为 **GitHub Release asset** 上传。
 - 单文件约 165 MB，超过 GitHub 仓库单文件 100 MB 限制，`dist/` 不进 git。
+- 卸载：在插件管理器移除 `dsh-memory-context-lab`；会话数据在 `$DSH_HOME/.memory-context-lab/v3/`，按需删除。

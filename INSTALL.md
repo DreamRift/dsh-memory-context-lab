@@ -1,6 +1,6 @@
 # 安装与升级
 
-本文件是 0.15.2 的安装说明。两种分发渠道内容完全一致：**npm 包** `dsh-memory-context-lab` 与 **GitHub Release** 里的 `dsh-memory-context-lab-0.15.2.tgz`。
+本文件是 0.15.2 的安装说明。发布资产在 GitHub Release 页面。
 
 ## 环境要求
 
@@ -8,50 +8,37 @@
 |---|---|
 | DSH Desktop | 0.2.1-rc.5（宿主契约按该版本源码核验） |
 | Node.js | ≥ 22.19 |
-| pnpm | ≥ 12.8（tgz 内的 `file:` 依赖解析依赖该修复） |
+| pnpm | ≥ 12.8（插件 tgz 内的 `file:` 依赖解析依赖该修复） |
 | 平台 | Windows x64（随包 Bash 载荷与 worker 仅覆盖该平台） |
-
-## 从 npm 安装（推荐）
-
-```powershell
-dsh plugin --profile desktop add dsh-memory-context-lab
-```
-
-如果 `dsh` 不在 PATH，使用 DSH 安装目录下的：
-
-```powershell
-& "<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add dsh-memory-context-lab
-```
-
-装完重启 DSH。
 
 ## 从 GitHub Release 安装
 
 1. 在 [Releases](https://github.com/DreamRift/dsh-memory-context-lab/releases) 页面下载 `dsh-memory-context-lab-0.15.2.tgz`。
-2. 装进 desktop profile：
+2. 在 PowerShell 中把 tgz 装进 desktop profile：
 
 ```powershell
 dsh plugin --profile desktop add "<下载路径>\dsh-memory-context-lab-0.15.2.tgz"
 ```
 
+如果 `dsh` 不在 PATH，使用 DSH 安装目录下的：
+
+```powershell
+& "<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "<下载路径>\dsh-memory-context-lab-0.15.2.tgz"
+```
+
 3. 重启 DSH。
+4. 侧边栏「插件」→ `dsh-memory-context-lab` →「包含的组件」，应看到两行：
+   `memory-context-lab` 与 `dsh-ops`。点 `dsh-ops` 进入它的完整设置页。
 
-## 安装后确认
+## 为什么不在 npm 上
 
-侧边栏「插件」→ `dsh-memory-context-lab` →「包含的组件」，应看到两行：
-`memory-context-lab` 与 `dsh-ops`。点 `dsh-ops` 进入它的完整设置页。
+本包携带完整的 Windows x64 Bash 载荷（解压约 411 MB），打包后单文件约 165 MB。npm registry 对单次发布请求的实际承受范围撑不住这个体积——实测多次尝试均以 `PUT ... FETCH_ERROR` 或请求长时间挂起告终，registry 自身连通正常（`/-/ping` 返回 200），也可以确定不是带宽问题（同一份文件走 GitHub 上传通道成功）。
 
-`dsh-ops` 是随包捆绑的定制组件，**不需要单独安装**；它的上游是 [T-Auto/dsh-ops](https://github.com/T-Auto/dsh-ops)。
+因此 0.15.2 只通过 GitHub Release 分发。若后续把 Bash 载荷拆成独立的可选下载项，npm 分发会重新评估。
 
 ## 升级与回滚
 
-升级到同一条线的新版本时，重复上面的 `add` 命令并重启；npm 渠道下直接指定版本号即可：
-
-```powershell
-dsh plugin --profile desktop add dsh-memory-context-lab@0.15.2
-```
-
-回滚到 0.15.0（该版本不含 dsh-ops 组件）：
+升级到同一条线的新版本时，重复上面的 `add` 命令并重启。回滚到 0.15.0（该版本不含 dsh-ops 组件）：
 
 ```powershell
 dsh plugin --profile desktop add "<下载路径>\dsh-memory-context-lab-0.15.0.tgz"
