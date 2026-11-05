@@ -133,3 +133,32 @@ test('按轮：DSH 当前轮刚开、活动面还没有它的节点时，上一�
   assert.ok(span)
   assert.deepEqual([span.startSeq, span.endSeq], [2, 3])
 })
+
+// C5（2026-11-04 审计：`planfirst approve` 的冻结边界「没有验证手段」）。
+// 生产接线：v3-entry 把 `Math.max(state.planFloorSeq, cursor)` 作为 `minStartSeq` 传给
+// archiveOnce → plan → selectArchiveSpan。冻结语义是**闭区间排除**：startSeq <= floor
+// 的组必须永远留在活动面（含 floor 本身）。这里直接锁选择器判据，变异 `>` 为 `>=` 必红。
+test('C5 计划冻结边界：startSeq <= planFloorSeq 的组永不被选中', () => {
+  const events = [
+    { seq: 0, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'turn1' }] } },
+    { seq: 1, type: 'step/start', data: { turn: 1, step: 1 } },
+    { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'a1' }] } } },
+    { seq: 3, type: 'step/end', data: { turn: 1, step: 1 } },
+    { seq: 4, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'turn2' }] } },
+    { seq: 5, type: 'step/start', data: { turn: 2, step: 1 } },
+    { seq: 6, type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'a2' }] } } },
+    { seq: 7, type: 'step/end', data: { turn: 2, step: 1 } },
+    { seq: 8, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'current' }] } },
+  ]
+  const surfaceNodes = [0, 2, 4, 6, 8]
+  const base = { surfaceNodes, events, hasRecord: () => true, mode: 'full-history', retainOperations: 5, maxOperations: 1, pinnedSeqs: new Set(), turnBasis: 'human' }
+  const free = selectArchiveSpan({ ...base, lastArchiveEndSeq: -1, minStartSeq: -1 })
+  assert.equal(free.startSeq, 0, '无冻结时从最早完成组开始')
+
+  // floor = 4（第二个回合的用户消息 seq）：turn1（startSeq 0）被冻结，turn2（startSeq 4）也被冻结
+  assert.equal(selectArchiveSpan({ ...base, lastArchiveEndSeq: -1, minStartSeq: 4 }), null,
+    'startSeq 等于 floor 的组必须保留（闭区间排除）')
+  // floor = 3：turn1（0）冻结，turn2（4）可选
+  const afterFloor = selectArchiveSpan({ ...base, lastArchiveEndSeq: -1, minStartSeq: 3 })
+  assert.equal(afterFloor.startSeq, 4)
+})

@@ -1,0 +1,201 @@
+{
+  "name": "r06-red-cross-step",
+  "kind": "red",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：assistant 在 step1 声明 c1,c2；c2 的 call/result 落在 step2。按步闭包必须跨步可见，step1 不得先归档。",
+  "mode": "step",
+  "surfaceNodes": [
+    1,
+    2,
+    3,
+    5,
+    6,
+    7,
+    9,
+    12
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 1
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "tool-call",
+              "id": "c1",
+              "name": "read",
+              "arguments": "{}"
+            },
+            {
+              "type": "tool-call",
+              "id": "c2",
+              "name": "grep",
+              "arguments": "{}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "tool/call",
+      "data": {
+        "callId": "c1",
+        "name": "read",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "tool/result",
+      "data": {
+        "callId": "c1",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c1",
+          "source": {
+            "kind": "tool",
+            "callId": "c1"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 1
+      }
+    },
+    {
+      "seq": 5,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 2
+      }
+    },
+    {
+      "seq": 6,
+      "type": "tool/call",
+      "data": {
+        "callId": "c2",
+        "name": "grep",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 7,
+      "type": "tool/result",
+      "data": {
+        "callId": "c2",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c2",
+          "source": {
+            "kind": "tool",
+            "callId": "c2"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 2
+      }
+    },
+    {
+      "seq": 9,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 3
+      }
+    },
+    {
+      "seq": 10,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "a3"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 3
+      }
+    },
+    {
+      "seq": 12,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 4
+      }
+    },
+    {
+      "seq": 13,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "a4"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 14,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 4
+      }
+    }
+  ],
+  "select": {
+    "retainSteps": 3,
+    "maxSteps": 3
+  },
+  "expect": {
+    "selection": null,
+    "why": "c2 结果在 step2：step1 的 assistant 消息不得先归档（跨步闭包）"
+  }
+}

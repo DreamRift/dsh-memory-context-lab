@@ -246,7 +246,14 @@ test('recallForInjection：入参是对象且必须带 turn（旧实现传字符
 
     const stats = engine.stats().injection
     assert.equal(stats.attempted, 2)
-    assert.equal(stats.injected, 1)
+    // R04（0.15.0）：装包成功 ≠ 注入成功。计数要等**宿主事件确认**（这里没有宿主落库，
+    // 所以 injected 仍是 0，handedOff 才是 1）——旧实现交给宿主就 injected++，把「没说谎
+    // 的 pending」显示成了「已呈现」。
+    assert.equal(stats.injected, 0, '未见宿主事件确认前不得计「已注入」')
+    // 直接调 engine（没有经过 pre-step 钩子）时消息并没有交给宿主，因此 handedOff 也必须是 0：
+    // 「已交给宿主」只能由钩子在真的追加 decision.messages 之后登记。
+    assert.equal(stats.handedOff, 0, '未经钩子交给宿主时不得计 handedOff')
+    assert.equal(outcome.confirmed, false, 'recallForInjection 只交付候选包，不是「已确认呈现」')
     assert.equal(stats.failed, 1, '失败必须计数——「回注 0 次没人发现」就是只 warn 的后果')
   } finally {
     engine.dispose()
@@ -333,7 +340,16 @@ test('回注不被本步摄入饿死：两个真实钩子串联后仍能注入�
     const injected = decision.messages.filter((message) => message.source?.kind === PLUGIN_SOURCE_KIND)
     assert.equal(injected.length, 1, '本步必须注入一条回注包（旧实现：busy，0 条）')
     const status = await stub.registered[0].handler({ agent: { session }, rawInput: 'status' })
-    assert.match(status.text, /注入 1/, 'status 必须如实显示注入次数：' + status.text)
+    assert.match(status.text, /上次结局：pending-confirm/, 'status 必须如实显示「已交给宿主、待确认」：' + status.text)
+    assert.match(status.text, /注入 0/, '未见宿主事件前不得显示已注入：' + status.text)
+    // 宿主在 append 之后同步发 session/event：正向证据一到即确认（不必等 step/end）。
+    for (const message of injected) {
+      const event = { seq: events.length, type: 'user/message', data: { id: message.id, role: 'user', content: message.content, source: message.source } }
+      events.push(event)
+      for (const listener of stub.listeners.filter((row) => row.event === 'session/event')) listener.handler(session, event)
+    }
+    const confirmed = await stub.registered[0].handler({ agent: { session }, rawInput: 'status' })
+    assert.match(confirmed.text, /注入 1/, '宿主事件确认后 status 必须如实显示注入次数：' + confirmed.text)
   })
 })
 
@@ -465,7 +481,10 @@ test('设置面：入口导出 Config，字段全部 volatile（宿主设置页�
   const dict = root.dict ?? {}
   const refs = json.refs ?? {}
   const fields = Object.keys(dict)
-  assert.deepEqual(fields.sort(), ['autoRestore', 'coolingGate', 'enabled', 'fullHistory', 'limit', 'packMinScore', 'planFirst', 'previewChars', 'queryMaxChars', 'restoreMaxChars', 'turnBasis'])
+  // G7 接线（2026-11-01）：设置面新增 G5 调度候选的 5 个字段（默认关闭）。
+  // 这是**守卫升级**不是放宽：字段集仍是逐键穷举，任何多/少一个字段都会红；
+  // 5 个字段的取值范围由 contracts/archive-schedule-policy.mjs 的 BOUNDS 派生（单一真源）。
+  assert.deepEqual(fields.sort(), ['autoRestore', 'coolingBatchSize', 'coolingGate', 'enabled', 'fullHistory', 'limit', 'offlineDiagnostics', 'packMinScore', 'planFirst', 'previewChars', 'queryMaxChars', 'scheduleBacklogCoalesceUnits', 'scheduleMaxRequestGap', 'scheduleMinGrowthMessages', 'scheduleMinRequestGap', 'schedulePolicy', 'turnBasis'])
   // volatileForm 只渲染 meta.volatile 的字段；少一个就少一个控件
   for (const [name, ref] of Object.entries(dict)) {
     const node = refs[ref] ?? ref
@@ -509,7 +528,11 @@ test('设置生效：enabled=false 不注入；查询词按 queryMaxChars 截断
         turn: 1, queryMaxChars: 4, limit: 3, packMinScore: 0.2, previewChars: 50,
       })
       const sent = calls.at(-1)
-      assert.equal(sent.query, '一二三四', '查询词按码点截断到 queryMaxChars')
+      // P5：长查询不再只裁前缀——首尾各留一部分（唯一错误码/路径常在尾部）。
+      assert.equal([...sent.query].length, 4, '查询词按码点截断到 queryMaxChars')
+      assert.ok(sent.query.startsWith('一'), '保留首部：' + sent.query)
+      assert.ok(sent.query.endsWith('十'), '保留尾部：' + sent.query)
+      assert.ok(sent.query.includes('…'), '缩减必须可解释（省略号）：' + sent.query)
       assert.equal(sent.limit, 3)
       assert.equal(sent.packMinScore, 0.2)
       assert.equal(sent.previewChars, 50)

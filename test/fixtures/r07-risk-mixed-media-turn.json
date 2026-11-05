@@ -1,0 +1,77 @@
+{
+  "name": "r07-risk-mixed-media-turn",
+  "kind": "risk",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：assistant 含 text+image，文本有记录即被当作可归档；未检查媒体恢复能力（R07 风险登记）。",
+  "mode": "turn",
+  "turnBasis": "human",
+  "surfaceNodes": [
+    0,
+    1,
+    2
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u0"
+          }
+        ]
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "see image"
+            },
+            {
+              "type": "image",
+              "source": {
+                "kind": "file",
+                "path": "shot.png"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u2"
+          }
+        ]
+      }
+    }
+  ],
+  "select": {
+    "maxOperations": 1
+  },
+  "expect": {
+    "selection": "non-null",
+    "seqs": [
+      0,
+      1
+    ],
+    "why": "登记当前行为：只按 hasRecord 判定，未检查 restoreCapability；R07 风险对照单列，不构成 R06 结论"
+  }
+}

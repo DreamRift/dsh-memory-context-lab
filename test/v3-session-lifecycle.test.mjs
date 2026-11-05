@@ -106,7 +106,11 @@ test('disable restore：逐字节匹配 restored；不匹配 skipped(已变化)�
     assert.equal(result.settled.restored, 2)
     assert.equal(result.settled.skipped, 1)
     assert.equal(result.settled.balanced, true)
-    assert.ok(result.receiptFirstLine.startsWith('已恢复 2/3 段'))
+    // P2-06 语义更新：这条路径只做资格裁决、不执行真实恢复 → 首行必须是「可恢复 N/M」，
+    // 不得印「已恢复」。旧断言（已恢复 2/3）正是缺陷行为本身。
+    assert.equal(result.wired, false, 'M5 未接线必须显式可见：' + JSON.stringify(result.wired))
+    assert.equal(result.eligibleNotRestored, 2, '资格通过但未恢复的行数要如实带出')
+    assert.ok(result.receiptFirstLine.startsWith('可恢复 2/3 段'), '首行不得谎报已恢复：' + result.receiptFirstLine)
     const mismatched = result.rowResults[1]
     assert.equal(mismatched.outcome, 'skipped')
     assert.match(mismatched.reason, /已变化/)
@@ -116,7 +120,10 @@ test('disable restore：逐字节匹配 restored；不匹配 skipped(已变化)�
 test('回执首行三结局一一对应（纯函数）', () => {
   assert.match(disableReceiptFirstLine({ action: 'skip-by-setting', restored: 0, total: 3, skippedByGuard: 0 }), /^按设置未恢复/)
   assert.match(disableReceiptFirstLine({ action: 'skip-by-guard', restored: 0, total: 3, skippedByGuard: 3 }), /^守卫拒绝/)
+  // wired=true（接线后）仍是「已恢复」口径；wired=false 走诚实口径。
   assert.ok(disableReceiptFirstLine({ action: 'restore', restored: 2, total: 3, skippedByGuard: 0 }).startsWith('已恢复 2/3'))
+  assert.ok(disableReceiptFirstLine({ action: 'restore', restored: 2, total: 3, skippedByGuard: 0, wired: false }).startsWith('可恢复 2/3 段（本次未执行恢复'))
+  assert.ok(!disableReceiptFirstLine({ action: 'restore', restored: 2, total: 3, skippedByGuard: 0, wired: false }).startsWith('已恢复'))
 })
 
 test('restoreOne：命中取回正文；未命中如实 reason；下标越界不炸', async () => {

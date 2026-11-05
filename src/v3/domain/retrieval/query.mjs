@@ -7,6 +7,9 @@
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
 
+/** 分词契约版本：chunk 索引/窗口换算必须带同一版本（迁移时按版本拒绝混用）。 */
+export const TOKENIZER_VERSION = 'cjk-uni-bi-v1'
+
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
 
 /**

@@ -6,8 +6,18 @@
  * 闸门，两套规则迟早漂移。依赖方向：domain 内部模块，entry/application 均可引。
  */
 
+/**
+ * 中文凭据键核心词（P1-01 单一真源）：对象面 \`isSensitiveKey\` 与文本面键名共用这一份词表。
+ * 两套词表迟早漂移——0.15.1 的缺口正是「对象面认中文、文本面只认 ASCII」。
+ * \`口令/私钥\` 只进文本面与对象面判据（不是新工具、不改合同）。
+ */
+const SECRET_KEY_CJK = ['密码', '密钥', '令牌', '凭据', '凭证', '口令', '私钥']
+
 /** 敏感字段脱敏（P1 摄入合同 4.1.3：凭据/令牌不静默入库）。 */
-export const SENSITIVE_KEY = /token|secret|pass(word|wd)?|credential|api[-_]?key|auth|cookie|session[-_]?id|bearer|密钥|密码|令牌|凭据|凭证/i
+export const SENSITIVE_KEY = new RegExp(
+  'token|secret|pass(word|wd)?|credential|api[-_]?key|auth|cookie|session[-_]?id|bearer|' + SECRET_KEY_CJK.join('|'),
+  'i',
+)
 
 /**
  * B3-3（AUD50-02-08）：明确不是凭据的键名白名单——旧规则里的裸 `auth` 把
@@ -70,6 +80,70 @@ export function parseJsonishArguments(value) {
  * `{args: ['--password=hunter2']}` 这类「凭据写在普通字段的值里」的形态。
  * 只改匹配到的凭据片段，不整段吞掉用户正文（保持可读性与对账价值）。
  */
+/** 文本规则里「凭据键核心词」的唯一真源（裸键 / 引号键 / URL 查询串三处共用）。 */
+const SECRET_KEY_WORDS = 'api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token|cookie|session[-_]?id'
+/** 键名允许由 . _ - 连接（DB_PASSWORD / MY_API_KEY / db.password 这类前缀/后缀键）。 */
+const SECRET_KEY_ASCII_BODY = '[A-Za-z0-9_.-]*(?:' + SECRET_KEY_WORDS + ')[A-Za-z0-9_.-]*'
+/**
+ * P1-01：中文键形态。核心词与对象面同源（SECRET_KEY_CJK），前缀允许至多 8 个「ASCII/CJK」
+ * 字符（数据库密码 / 登录口令 / API密钥），但**不允许中文字后缀**——后缀会把
+ * \`密码学：…\`、\`密钥长度：256\` 这类技术名词当成凭据键，误伤散文（宁可少误伤，
+ * 后缀键的真实凭据会在文本里另有 ASCII 形态或对象面兜底）。
+ */
+const SECRET_KEY_CJK_BODY = '[A-Za-z0-9_.\\-\\u4e00-\\u9fff]{0,8}?(?:' + SECRET_KEY_CJK.join('|') + ')'
+const SECRET_KEY_BODY = '(?:' + SECRET_KEY_ASCII_BODY + '|' + SECRET_KEY_CJK_BODY + ')'
+/**
+ * 键名起点边界（P1-01）：ASCII 词边界 \`\b\` 对 CJK 字符不成立（JS 的 \\w 只有 ASCII，
+ * \`密码\` 前不会出现 \`\b\`），旧写法导致中文键整条规则失效。改用「前一个字符不是
+ * ASCII 词字符」的零宽后视——语义与 \`\b\` 等价，且对 CJK 起首的键成立。
+ */
+const KEY_BOUNDARY = String.raw`(?<![A-Za-z0-9_])`
+/** key: value / key=value / 全角冒号 / URL 编码分隔符（单独一段：三个规则共用同一份分隔符）。 */
+const SECRET_KEY_SEP = String.raw`(\s*[:=：]\s*|%3[dDaA])`
+
+/** 裸键形态（含 URL 查询串分支，分支判据见下方回调）。 */
+const KEY_VALUE_RE = new RegExp(
+  String.raw`([?&](` + SECRET_KEY_BODY + String.raw`)(?:=|%3[dDaA]))([^&#\s]{4,})` + String.raw`|` + KEY_BOUNDARY + '(' + SECRET_KEY_BODY + ')' + SECRET_KEY_SEP + String.raw`("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]{4,})`,
+  'gi',
+)
+
+/** JSON 引号键形态（键可被 " 或 ' 包裹）。 */
+const QUOTED_KEY_VALUE_RE = new RegExp(
+  String.raw`(["'])(` + SECRET_KEY_BODY + String.raw`)\1` + SECRET_KEY_SEP + String.raw`("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',&;}\]]{4,})`,
+  'gi',
+)
+
+/** token 类键：值是明确普通词时保留（`token: oauth` / `the token: appears`），B3-3 的收敛不回退。 */
+const TOKENISH_KEY = /token|令牌/i
+/** 中文凭据键（P1-01）：命中即无条件替换值，与 SECRET_KEY_CJK 同源。 */
+const CJK_KEY = new RegExp(SECRET_KEY_CJK.join('|'))
+
+/**
+ * 文本路径的值判据（AUD51-07-01）：旧实现让**所有**键都过 `credentialShapedValue`，
+ * 于是纯字母口令（`DB_PASSWORD=swordfish`）被当成「不像凭据」放行。
+ * - token/令牌 键：仍按形态判（否则 `token: oauth` 被误伤）；
+ * - 其余凭据键（password/secret/api_key/credential/cookie/session_id…）：无条件替换。
+ * 对象路径与文本路径共用这一处判据（两套规则迟早漂移）。
+ */
+function textValueIsSecret(key, rawValue) {
+  if (typeof rawValue !== 'string') return true
+  // P1-01（用户裁定：中文键后一律替换）：中文字键不做「值像凭据」的形态放宽——
+  // 中文标签后跟的短口令（\`令牌：abc\`）同样是凭据，形态判据只服务 ASCII 的 token 键。
+  if (CJK_KEY.test(key)) return true
+  const value = bareOfQuoted(rawValue)
+  if (value.length === 0) return false
+  if (TOKENISH_KEY.test(key)) return credentialShapedValue(rawValue)
+  return true
+}
+
+/** 替换值并保留引号外壳（JSON 仍可解析，对账价值不丢）。 */
+function redactedValueOf(rawValue) {
+  if (typeof rawValue !== 'string' || rawValue.length === 0) return '[REDACTED]'
+  if (rawValue.charCodeAt(0) === 34) return '"[REDACTED]"'
+  if (rawValue.charCodeAt(0) === 39) return "'[REDACTED]'"
+  return '[REDACTED]'
+}
+
 export const SENSITIVE_VALUE_PATTERNS = Object.freeze([
   // PEM 私钥（RSA/EC/OPENSSH/PKCS8 等）：整段替换，避免 base64 段被当成普通文本。
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED]'],
@@ -86,14 +160,13 @@ export const SENSITIVE_VALUE_PATTERNS = Object.freeze([
   // - 引号值：引号内整段替换（含分隔符），支持 \" 转义。
   // 单条正则两分支：URL 分支先消费 [?&]key= 形态，普通分支不再重复命中同一处。
   [
-    /([?&]([A-Za-z0-9_.-]*(?:api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)[A-Za-z0-9_.-]*)(?:=|%3[dDaA]))([^&#\s]{4,})|\b([A-Za-z0-9_.-]*(?:api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)[A-Za-z0-9_.-]*)(\s*[:=：]\s*|%3[dDaA])("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]{4,})/gi,
+    KEY_VALUE_RE,
     (_match, urlPrefix, _urlKey, urlValue, plainKey, plainSeparator, plainValue) => {
+      // URL 查询串分支恒替换（值边界到 &/#/空白，下一个参数不被误吞）。
       if (urlPrefix !== undefined) return urlPrefix + '[REDACTED]'
-      // B3-3：普通词形态（the token: appears）不替换；形态判据失败时原样返回整段匹配。
-      if (plainValue !== undefined && !credentialShapedValue(plainValue)) return _match
-      if (typeof plainValue !== 'string') return plainKey + plainSeparator + '[REDACTED]'
-      return plainKey + plainSeparator
-        + (plainValue.charCodeAt(0) === 34 ? '"[REDACTED]"' : plainValue.charCodeAt(0) === 39 ? "'[REDACTED]'" : '[REDACTED]')
+      // 键名判据（AUD51-07-01）：token 类看形态，其余凭据键无条件替换。
+      if (!textValueIsSecret(plainKey, plainValue)) return _match
+      return plainKey + plainSeparator + redactedValueOf(plainValue)
     },
   ],
   // AUD50-02-01（B1-1）：JSON 引号键形态——键可被 " 或 ' 包裹（JSON.stringify 的标准输出），
@@ -102,12 +175,11 @@ export const SENSITIVE_VALUE_PATTERNS = Object.freeze([
   // 键名核心词与上一条裸键规则一致：不含 auth——author/authMode 的对象路径误伤由
   // AUD50-02-08（B3-3）统一收紧，文本路径不在此扩大误伤面。
   [
-    /(["'])([A-Za-z0-9_.-]*(?:api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|passwd|credential|token)[A-Za-z0-9_.-]*)\1(\s*[:=：]\s*|%3[dDaA])("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',&;}\]]{4,})/gi,
+    QUOTED_KEY_VALUE_RE,
     (_match, keyQuote, key, separator, value) => {
-      // B3-3：JSON 引号键同口径——值是明确普通词（authMode:'oauth' 之外的 token:'oauth' 等）不替换
-      if (!credentialShapedValue(value)) return _match
-      return keyQuote + key + keyQuote + separator
-      + (value.charCodeAt(0) === 34 ? '"[REDACTED]"' : value.charCodeAt(0) === 39 ? "'[REDACTED]'" : '[REDACTED]')
+      // 与裸键同一判据：token 类看形态，其余凭据键无条件替换。
+      if (!textValueIsSecret(key, value)) return _match
+      return keyQuote + key + keyQuote + separator + redactedValueOf(value)
     },
   ],
   // sk- 开头的常见密钥前缀（OpenAI/Anthropic 等）
@@ -155,11 +227,11 @@ export function redactValue(value, depth = 0) {
   const out = {}
   // B3-3：键判定走 isSensitiveKey（author/authMode 白名单）；token/令牌类键的值是
   // 明确普通词时保留（oauth 等），password/secret 等仍无条件脱敏（宁可误伤不可漏）。
-  const TOKENISH_KEY = /token|令牌/i
+  // AUD51-07-01：文本路径与对象路径共用 textValueIsSecret 这一处判据。
   for (const [k, v] of entries.slice(0, 50)) {
     if (!isSensitiveKey(k)) {
       out[k] = redactValue(v, depth + 1)
-    } else if (TOKENISH_KEY.test(k) && typeof v === 'string' && !credentialShapedValue(v)) {
+    } else if (!textValueIsSecret(k, v)) {
       out[k] = redactValue(v, depth + 1)
     } else {
       out[k] = '[REDACTED]'

@@ -1,10 +1,297 @@
+## 0.15.2（2026-11-05）
+
+> 本版是相对上一个正式版本 **v0.13.1** 的发布版本。0.14.0-beta.1 … beta.51、0.15.0、0.15.1 全部是开发期过渡号，
+> 下面「本版内容」只讲 0.15.2 自己改了什么；**跨版本的大项变化**（v3 单引擎、历史检索回注、双归档模式、
+> 回执摘要、捆绑 dsh-ops 等）写在同一 tag 的 GitHub Release 说明里，不在这里重复。
+
+0.15.1 的源码线收口后，真机走查发现**按步归档在真实会话里一次都压不动**：把模式切到「按步归档」后，`/memory-lab status` 的「下一次归档」恒为「活动面不连续（not-dense）」。本轮只修这一处根因，**不改产品方向、不改默认值、无新增配置项、无数据迁移**。
+
+### 根因
+
+真实宿主在**上一步 `step/end` 之后、下一步 `step/start` 之前**产出预步骤回执；而 `buildStepUnits` 只收「打开的步骤内」的事件，两步之间的回执**不属于任何步骤单元**。选择器因此完全看不见它：既不让单元 `hasPlugin`，也不会把它吸收进 span，于是每段 span 的密集判据（`shadowed.length !== wanted.length`）必然失败。回执由 pre-step 产出，位置**恒**在两步之间，所以「压完一批就永久停摆」是稳定结局而非偶发。离线夹具把回执都写在步骤**内部**，因此一直全绿。
+
+### 修法
+
+- `domain/archive/steps.mjs` 新增 `attachInterStepNodes`：切完单元、进 `traceBatch` **之前**做一次只读归位，把两步之间的活动面节点归到**前一个单元**。
+- **回注包透明**：并进 `surfaceSeqs` 一起遮蔽，但**不进** `recordSeqs`（与回注包既有口径一致）。
+- **硬边界**：回执/恢复、真人消息、其余无记录节点是硬边界——前一个单元到此收尾，边界留在活动面，后面的步另起一段。硬边界同时作用于阶段 2（窗口内切 run）与阶段 3（批尾闭包向后扩展），两处都就地 `closeRun` 并如实报 `boundary`。
+
+### 不改
+
+步骤**内部**的回执仍是整步边界（原判据一字未动，有用例对照）；回执不吸收（F1 / AUD51-05-02 不变）；净收益、pin、未完成工具对、H=200 判据全部不变。
+
+### 守卫与自证
+
+- 新增 `test/v3-step-inter-receipt.test.mjs`（5 例）：两步之间的回执是硬边界且不产生 not-dense、回执之后自成后续段（不停摆）、两步之间的回注包透明、段内回执判据不变（对照）、以及**端到端**——真实时序下 `archiveForStep` 真的落到活动面且回执仍在面上。
+- **变异自证**：注释掉归位调用 → **4 例红**（含端到端）；恢复后 5/5 绿，文件 md5 回到原值。
+- **真机日志复跑**：把上一会话的 `session.v4.jsonl.zstd`（14,614 事件 / 240 节点）按真实 surface fold 重放给选择器——修前 `not-dense`（`seqs [101,138]` 形状），修后正常成段。
+
+### 验证
+
+- `plugin` 源码线 `node scripts/test-all.mjs`：**239/239 套件通过**（exit 0，2026-11-05，win32-x64 / Node v26.12.1）；步骤相关 7 个套件 79/79 绿。
+- `release` 镜像自测：**239/239 套件通过**（exit 0，镜像内装面按设计 skip）。
+- `node scripts/check-docs.mjs` errors = 0。
+- **产物**：`dist/dsh-memory-context-lab-0.15.2.tgz`（同时复制到 `release/dist/`），10,248 条目；精确字节数与 sha256 记在 `release/RELEASE.md`——CHANGELOG 本身在包内，写死自身摘要会自指失效。
+
+### 未做
+
+**未安装到 desktop profile、未重启 DSH**（需用户另行授权）——真机上要等重装并通过 pre-step 触发后，才会看到按步归档恢复。**未推送、未打 tag、未建 Release**（等用户单独授权）。
+
+## 0.15.1（2026-11-04，定制 dsh-ops 随包分发；未推送）
+
+用户拍板恢复「定制版 dsh-ops 作为记忆上下文 bundle 的第二组件」，并把完整 Windows x64 Bash 载荷一起打包，默认开启 Bash。版本升到 0.15.1；源码线与 release 镜像同步。
+
+### 组件与打包
+
+- `cordis.patch.yml` 恢复两条组件行：`memory-context-lab` 与 `dsh-ops`；插件页「包含的组件」显示两行，点 `dsh-ops` 进入它自己的完整设置页（键 `dsh-memory-context-lab#dsh-ops`；dsh-ops 客户端同时注册 `dsh-ops#dsh-ops`，两种承载形态都能打开）。
+- dsh-ops 以 **vendored 依赖**随包分发：`package.json` 的 `dsh-ops: file:./vendor/dsh-ops`；**不进入 `dsh.profile.bundles`**，不会多出一张独立插件卡片。DSH 的 bundle 运行时解析会递归收集该依赖，Loader 仍能用裸名 `dsh-ops` 加载。
+- 随包携带完整 Windows x64 Bash 载荷 `vendor/bash-win32-x64`（`@dsh-ops/bash-win32-x64@0.2.1`，PortableGit + GNU bash 5.3.15，解压约 411 MB）；`package.json` 以 `optionalDependencies` 的 `file:` 依赖安装，dsh-ops 从自己的包根向上解析到它。
+- 重新构建并随 dsh-ops 包携带 `runtime/win32-x64/bash-ipc`（`opsipc.dll` / `opsnt.dll` / `provenance.json`）：没有这份兼容回执时，受限模式（read-only / workspace-write）会拒绝 `ops_bash`；这是 0.15.1 默认 Bash 可用的必要条件。
+- 默认值：`bash: true`、`hidePwsh: false`、`hideOfficialTools: true`、`dynamicTools: false`、`discovery.enabled: false`；四个预设默认开启，panel/tui 默认关闭。所有定制版 ops 功能（文件工具、PTC、面板、TUI、设置页）保留。
+- `README` 与 `docs/设置与组件.md` 更新为两组件形态；旧「不随插件启动 dsh-ops」的说明退役。
+
+### 兼容修补
+
+- 记忆上下文文件核证白名单加入 `ops_inspect_local_file`：默认替换官方 `read` 后，ops 的读文件调用仍进 `file-references` 账本。
+- `v3-tool-surface-default` 从「只能一个组件行」改成「双组件 + 完整载荷」守卫：钉死两条 patch 行、dsh-ops 默认值、`file:` 依赖、Bash 载荷、dsh-ops 不声明 `dsh.bundle`、客户端双键、三工具清单不变。
+
+### 验证
+
+- `plugin` 与 `release` 各跑 `node scripts/test-all.mjs`：**203/203 套件通过**（exit 0）；`node scripts/check-docs.mjs` errors = 0。
+- 临时 profile 用 pnpm 12.14 安装新 tgz：`node_modules/dsh-memory-context-lab/node_modules/dsh-ops` 与 `@dsh-ops/bash-win32-x64` 均存在；`createRequire` 能解析两者；`bundledShell` 返回载荷内 `bin/bash.exe`，直接运行报告 **GNU bash 5.3.15**。
+- `dsh --profile <temp> --dump-config` 显示两条组件行（`memory-context-lab`、`dsh-ops`）及默认配置；`confinedBash` 能从随包载荷复制出带 IPC 回执的受管 bash。
+- **产物**：`dist/dsh-memory-context-lab-0.15.1.tgz`（同时复制到 `release/dist/`，作为 GitHub Release asset） = **10,247 条目 / 165,530,447 B / sha256 `06D84177…B749`**；内层定制 dsh-ops tgz = **663 文件 / 4,753,367 B / sha256 `05D7E3AE…FFA00`**。
+- **边界（如实登记）**：dsh-ops 的 `Config` 不是宿主原生 Schemastery schema，`--dump-config-schema` 对 dsh-ops 报 `unsupported`；组件行页由 dsh-ops 自己的 `plugins.row.config` 渲染，不依赖该 schema，但宿主配置 schema 工具不覆盖它。
+- **未做**：desktop profile 安装与 DSH 重启需用户另行授权；GitHub 推送/tag/Release 未做。真实宿主工具面与受限模式 `ops_bash` 执行走查结果以安装轮为准。
+
+
+### 0.15.1 修复轮：契约与默认值变更（2026-11-05，40 项确证缺陷收口）
+
+按 `docs/dev-0.15.1/记忆上下文-0.15.1-独立排查报告.md` 的严重度顺序逐条根因修复。逐条根因、守卫与「改回去必红」的变异读数见 `docs/dev-0.15.1/修复处置台账.md`。**以下是会改变外部可观察行为的部分**（其余为内部健壮性修复）。
+
+- **默认值变更（用户裁定 §1★9）**：`turnBasis` 默认从 `human` 改为 `dsh`。长程「一条真人指令 + N 次目标自动继续」的会话在 `human` 判定下只有 1 个回合，按轮归档**从结构上永远压不到**（真机 6 个 full-history 会话 records 213–1931、`lastArchiveAt=null`）。改默认后这些会话的已完成轮次会开始被归档。想保持旧行为的用户可在设置页切回 `human`。
+- **`disableSession` 文案（P2-06）**：未接线路径不再印「已恢复 N/M 段」，改为「可恢复 N/M 段（本次未执行恢复；原文仍在冷库，`/memory-lab restore` 可还原）」。生产路径当前无调用方，这条改动只为将来接线时不带假账。
+- **摘录预算语义（P2-10）**：`SEARCH_EXCERPT_MAX_CHARS` 的语义明确为**每窗口**预算（注释记录历史误读），新增 `SEARCH_EXCERPT_MAX_TOTAL_CHARS`（160×2+3 = 323）作为唯一真实上界。**不收紧实现**——收紧会让「两个远处事实都可见」这条被 G1/P5 保护的产品行为消失。
+- **读游标绑定 detail（P2-09）**：游标版本材料改为 `<detail>|<objectVersion>`。换 detail 的旧游标会得到 `read-cursor-object-changed`（失败关闭），不再静默沿用；读信封新增 `detail` 回显。
+- **回注纯壳判据（P2-08）**：`previewChars=0` 现在**不注入**（判据从「条数为 0」改为「有效正文总量为 0」），`notPresented` 带回 `bodyChars` 与原因。
+- **回执批量顶层字段（P2-19）**：多段批的 `receiptText` 现在包含**全部段**、与 `receiptChars` 同源（旧实现只取首段、字符数却是各段之和）。
+- **purge 与恢复资格（P2-07）**：`archive.history()` 行新增 `purged`；`redacted` 改为「有 redactions 标记 **或** 该凭证任一记录已被 purge」——purge 事实优先于标记。`restoreVoucher` 命中 purge 账本即回 `record-purged`。
+- **回注尾行（P2-18）**：尾行改为指向可分页的 `memory_context_read`（此前只给命令面、不分页）。
+- **工具面参数越界（P2-12）**：搜索 `limit` / 回读 `length` / 引用 `refs_limit` 越界由「静默夹取」改为**失败关闭**。
+- **写锁损坏 owner（P1-05）**：`owner.json` 解析失败不再直接抛错，改按「锁目录 mtime + TTL」判定——未过 TTL 仍失败关闭，过 TTL 接管并记 `repair-log`。这**部分推翻** 0.14.0-beta.54 的 B3-6「owner.json 损坏一律失败关闭」。
+- **新账本与字段**：`orphan-receipts.jsonl`（P1-07，补账失败时的孤儿回执，与 `vouchers.jsonl` 分账）；`redactions.jsonl` 新增 `seq` 字段（P1-08，老行无 seq 时按唯一性兜底，否则失败关闭）；按步归档新增诊断字段 `skippedHeads/headSkipped`（P1-09，只在真的跳过时出现）。
+- **追加门与读门分离（P3-07）**：`appendCheckpoint` / `appendCheckpointBaseline` 的追加前检查从「整本解析」改为「尾部 64 KiB 窗口」（新模块 `adapters/storage/append-tail.mjs`）。**读门未改**：`readCheckpoint` 仍整本解析、首个坏行即 `usable:false`。2 万行账本实测 12.08 ms → 1.10 ms/次。
+- **死分支（P3-08）**：`readSettings` 不再产生 `turnBasisInvalid` 标记，status 也不再印「配置值非法，已按 human 运行」——宿主 schema 早已在加载期拒绝非法值，那条提示不可达，且其「回落值」与 0.15.1 的新默认不一致。客户端 `diagnosticLines` 保持**未接线 + 如实标注**：诊断包四个事实今天都没有生产方，生产面上一行诊断都不出（有用例钉死）。
+
+**验证**：`plugin` 源码树 `node scripts/test-all.mjs` **238/238 套件通过**（exit 0，2026-11-05，win32-x64 / Node v26.12.1）。**未做**：`release/` 镜像同步、打包、安装、重启 DSH——等用户授权。
+
+### 0.15.1 修复轮补丁：按步归档「两步之间的回执」死锁（2026-11-05，真机走查发现）
+
+真机把 `mode` 切到按步归档后**一次都压不动**：`/memory-lab status` 的「下一次归档」恒为「活动面不连续（not-dense）」。
+
+- **根因**：真实宿主的 pre-step 在上一轮 `step/end` **之后**、下一步 `step/start` **之前**追加回执，而 `buildStepUnits` 只收「打开的步骤内」的事件——**落在两步之间的回执不属于任何步骤单元**。选择器因此完全看不见它：既不让单元 `hasPlugin`，也不会被吸收进 span，于是每段 span 的密集判据（`shadowed.length !== wanted.length`）必然失败。回执是 pre-step 产出的，位置**恒**在两步之间，所以「压完一批就永久停摆」不是偶发，而是按步归档在真实会话里的稳定结局。夹具里回执都写在步骤**内部**，因此离线一直是绿的。
+- **修法**（`domain/archive/steps.mjs` 新增 `attachInterStepNodes`，在切完单元、进 `traceBatch` 之前只读归位）：把两步之间的活动面节点归到**前一个单元**——回注包**透明**（并进 `surfaceSeqs` 一起遮蔽，但不进 `recordSeqs`，与回注包既有口径一致）；回执/恢复、真人消息、其余无记录节点是**硬边界**（前一个单元到此收尾，边界留在活动面，后面的步另起一段）。硬边界同时作用于阶段 2（窗口内切 run）与阶段 3（批尾闭包向后扩展），两处都就地 `closeRun` 并如实报 `boundary`。
+- **不改**：步骤**内部**的回执仍是整步边界（原判据一字未动，有用例对照）；回执不吸收（F1 / AUD51-05-02 不变）；净收益、pin、未完成工具对、H=200 判据全部不变。
+- **守卫**：新增 `test/v3-step-inter-receipt.test.mjs`（5 例）——两步之间的回执是硬边界且不产生 not-dense、回执之后自成后续段（不停摆）、两步之间的回注包透明、段内回执判据不变（对照）、以及**端到端**：真实时序下 `archiveForStep` 真的落到活动面且回执仍在面上。
+- **变异自证**：注释掉归位调用 → **4 例红**（含端到端）；恢复后 5/5 绿，文件 md5 回到原值。
+- **真机日志复跑**：把上一会话的 `session.v4.jsonl.zstd`（14,614 事件 / 240 节点）按真实 surface fold 重放给选择器——修前 `not-dense`（`seqs [101,138]` 形状），修后正常成段。
+- **验证**：`node scripts/test-all.mjs` **239/239 套件通过**（exit 0，`.tmp/full-r29.log`）；步骤相关 7 个套件 79/79 绿。**未做**：`release/` 镜像同步、打包、安装、重启 DSH——真机上要等重装并通过 pre-step 触发后才会看到按步归档恢复。
+
+## 未发布：0.15.0 独立审计修复轮（2026-11-04）
+
+按 `记忆上下文-0.15.0-独立审计报告` 逐项修复。**这一轮不改产品方向、不升版本号、不推送、不重新安装**；
+下面的「验证」是本机源码树的离线结果，真实宿主行为仍未验收。
+
+### 门禁可复现（H2 / F1–F3）
+
+- `release/README.md` 重写为公开面（去掉 7 条包外开发链接），`release/CHANGELOG.md` 两处链接改为纯文本；
+- `v3-i2-shadow` 合同文档路径改为相对 `plugin/` 推导，文档缺失时 skip（不再依赖已移除的 worktree 布局）；
+- T2 超时定时器不再 `unref()`：等超时的调用方自己保证事件循环存活，`node --test` 22.x 下 5 个取消/超时用例不再被 cancelled；
+- `scripts/test-all.mjs` 改**递归收集**（只排除 `p0/fixtures/` 测试数据），把 5 个 P0 反例以契约门形式并入
+  （`test/p0/run-red-baseline.mjs`），去掉 `--test-force-exit`，skip 单独计数。
+
+### 工具面与诊断（H1 / H3 / H7 / M7）
+
+- **ops 不再跟随插件启动**：`cordis.patch.yml` 只保留 `memory-context-lab` 一行；删除
+  `src/v3/adapters/dsh-ops/**`、composition `dshOps` 诊断项、客户端文案与测试；
+- shadow 端口守卫改**读方法白名单 + set/defineProperty/deleteProperty/setPrototypeOf 陷阱 + 嵌套递归包装**，
+  `set`/`persist`/`add`/`store`/`merge` 与直接赋值/删除一律拒绝；
+- 诊断去掉 `MEMORY_CONTEXT_DIAGNOSTICS` 环境变量后门；诊断函数带运行时开关（关闭即抛 `EDIAGNOSTICS_DISABLED`），
+  `calls` 改为只读 getter，外部赋值无法伪造「零调用」；
+- 工具注册单条失败后可补齐：保留已成功项、只为缺失名字重试（有界退避），不再「一次失败永久缺位」。
+
+### 隐私与隔离（H4 / H5 / M5 / M6 / M9）
+
+- **遗忘语义显式化**：`forget apply` 仍是逻辑遗忘（冷库正文保留、undo 可用），命令面不再宣称「正文已清除」；
+  新增 `forget purge` 物理删除正文与派生物（摘要转述、repair-log 残留、文件引用），undo 明确拒绝；
+- 回执清除的持久标记失败不再被吞：只有「活动面替换 + redactions 标记」都成功才计清除；
+- `adopt-from` 默认拒绝，父会话需显式 `adopt-allow on`；可判读的原生 fork 关系不一致即拒绝；
+- 导入包增加体积（64 MiB）/条数（5000）/单条字符（1 MiB）上限；
+- repair-log 不再写尾部半行原文（只留长度 + sha256 前 16）；文件引用不再落绝对路径（改 `workspaceId`），
+  工作区外引用只留文件名，遗忘/清除时级联删除。
+
+### 并发与存储（H6 / M1–M4 / M10 / C2）
+
+- 凭证 ID 唯一性由存储层在跨进程锁内强制（`ESTORE_DUPLICATE_VOUCHER`），`recoverIntent` 不再锁外判重；
+- `usage.jsonl` 追加进跨进程锁、按 seq 去重、加保留上限（1 MiB / 4096 行）；
+- 写锁：staging 创建入 try（不再留孤儿 `.tmp`）、owner 读取对瞬态 EPERM/EBUSY 有界重试（C2 偶发失败根因方向）、
+  rename 后复核 token（fencing）、取得尝试上限（防时钟回拨无界自旋）、释放失败返回 `error` 而非吞掉；
+- 状态/控制读取每 tick 校验文件戳（去掉「目录 mtime 未变就 0 stat」的失败开放短路）；
+- 版本补键在展开之后赋值（`schemaVersion: undefined` 不再落成无版本文件）；落盘写归一化结果。
+
+### 技术债与测试强度（T3–T8 / C5 / C6）
+
+- `textOfBlocks` 统一为 `domain/text/blocks.mjs` 单一实现（事件面 `\n`、预览面 `''` 显式声明）；
+- `log-prefix` 自检改为真的写临时源文件并跑同一扫描器；
+- `check-docs` 不再整目录豁免 `release/`（只豁免 `release/docs/` 镜像子树），`release/README.md` 照常审计；
+- 发布包 `files` 去掉 `scripts/`（tgz 不再带 11 个开发脚本）；
+- 新增：C4-9 写原语拒绝 `policyState`（C6）、计划冻结边界选择器用例（C5）、H1 工具面静态守卫、
+  H4 purge、H5 同意门、H6 凭证去重、M3 文件戳新鲜度、M7 工具补齐等套件。
+
+### 验证
+
+- `node scripts/test-all.mjs`：**全部 203 套件通过（exit 0，Node v22.22.2，win32-x64）**；
+  P0 契约门（R01/R03 GREEN + R02/R04/R08 冻结口径一致）在门禁内执行；
+- `node scripts/check-docs.mjs`：**errors = 0**（288 个自有文档；release 公开面 `README.md`/`CHANGELOG.md` 照常审计，
+  其余镜像子树按「第二副本」豁免；`dsh-ops/` 为独立子项目）；
+- **安装（2026-11-04 15:15）**：`npm pack` 重建 `dist/dsh-memory-context-lab-0.15.0.tgz`（115 条目 / 561,043 B /
+  sha256 `7bb5309f…cfb`，不含 `test/`、`scripts/`）；desktop profile `pnpm install` 完成，安装副本 0.15.0、
+  `src/index.mjs` 哈希 `400bf0e1…`。**DSH 未重启**（仍是旧进程），重启后新代码才生效。
+- **profile 清理（2026-11-04 15:19）**：`pnpm remove dsh-ops` 移除退役组件的 profile 依赖
+  （`package.json`/`pnpm-lock.yaml` 无残留、`node_modules/dsh-ops` 已删除、删除 2 个包）；
+  `dsh.profile.bundles` 本就不含它。孤儿运行时数据 `~/.dsh/dsh-ops`（便携 Git，412 MB）经确认后删除；
+  源码目录 `dsh-ops/` 保留（独立子项目）。
+- **未做**：DSH 重启、真实会话走查、推送/tag/Release。真实宿主行为仍按审计结论记为未验证。
+
+## 0.15.0（2026-11-01，集成分支；按步攒批 + 回执摘要 + 缓存观测/检索修复）
+
+本版把开发流程 P0–P8 中可离线验收的切片并入集成分支，并回答两条产品要求：**按步归档恢复“攒够 N 步再提交一批”**、**归档回执带总结且不破坏原历史**。P7 首次呈现按默认关闭交付；P0 的真实宿主/出站观测与 P9 真实模型对照仍未完成（见开发流程 §8.1 末）。
+
+### 新增
+
+- **按步攒批（`coolingBatchSize`）**：全局设置，1–200，默认 10。候选（工作集之外已完成的步骤）不足阈值时等待；达标后取最旧一批，按 pin / 未完成工具对 / 缺记录 / 插件回执等硬边界切成多个安全段，**逐段** intent+voucher 提交；单段失败即停并如实回报已提交/失败/未提交，已提交段不回滚，失败段保留 intent 供下次对账。显式 `now`/`compact` 绕闸门与阈值，但**不绕**保护闭包、完整性、正净收益与 H=200 上限。
+- **回执摘要**：归档回执默认带确定性摘要（不调用模型、不引入新事实）。摘要预算 = `min(400, 原文 − 基础回执 − 余量)`，预算 < 40 时整条省略；**摘要不会导致归档失败**（小步骤仍可归档）。原事件仍 append-only 保留，`restore` 逐张恢复完整原文。
+- **固定三工具**：`memory_context_search` / `memory_context_read` / `memory_context_compact`，版本加载时一次性注册、schema 固定；`submit` 只把提案排到下一安全边界（accepted ≠ committed），边界重验证失败即 stale。
+- **缓存观测**：`plugin-surface` 影子观测（投影指纹/相位/代际/跨进程消息链种子），严格不参与归档决策（导入级 + 符号级守卫）。
+
+### 组件与设置面（2026-11-04，用户拍板）
+
+- **设置面只保留组件行页**：删除 `plugins.bundle.config` 注册，bundle 详情页不再出现「外面一层」设置块；
+  同一张表单只挂在 `plugins.row.config`（键 `dsh-memory-context-lab#memory-context-lab`）。字段表见
+  `docs/设置与组件.md`，17 个 `Config` 字段与客户端 `FIELDS` 仍由 `v3-client-surface` 交叉钉住。
+- ~~**定制版 dsh-ops 成为第二组件**~~ **已于 2026-11-04 取消**：用户拍板「ops 跟随插件启动不再需要」。
+  `cordis.patch.yml` 恢复只声明 `memory-context-lab` 一行；I3 shadow adapter、composition `dshOps`
+  诊断项、客户端文案与对应测试一并删除。默认工具面回到「不隐藏、不替换官方工具」——与 P2 工具面
+  合同一致，也消除了「默认替换官方工具但从未验收」的中间态。dsh-ops 源码仍是独立子项目，
+  需要时自行安装，不再由本插件启动或改变模型可见工具集合。
+- **旧组件形态（历史）**：0.15.0 曾把 dsh-ops 以普通依赖装进 profile（不进 `dsh.profile.bundles`），
+  并注册组件行设置页与运行时状态卡。该形态随「ops 跟随插件启动」取消一并退役：现行安装面只有本插件
+  tgz，patch 只有一条组件行，`enableMode: with-memory-context` 的跟随 gate 不再是待接线项。
+- **验证**：源码树 `node scripts/test-all.mjs` **全部 199 套件通过**（2026-11-04，win32-x64，Node v26.12.1）。
+  dsh-ops 侧 `npm run build` + `npm run build:ptc`（Rust 1.88，win32-x64 worker）通过；完整 `npm run verify`
+  未跑（worker 套件与上游 CI 门不在本轮范围）。
+
+### 修复
+
+- **检索命中窗口**：稀有标识符加权，自然问句下尾部错误码/路径不再被正文常用词挤掉；`truncated` 如实反映中段缺口；chunk 索引截断时回退现扫；`boundQuery` 不再切碎尾实体。
+- **T2 合同**：显式 deadline 被尊重（文档化 60s 硬顶）；`k` 参数与 `state` 四态资格保留；外部名次分不穿本地装包门。0.9.17 仍为 candidate，默认名单仍是 0.9.10。
+- **摘要完整性**：读取/导出路径重算 sources 指纹并与落盘值对账，篡改 `sources` 会让摘要不可见、不可导出（隐私失败关闭）。
+- **资源释放**：`runtime.close` 等 provider 关闭落定后再关 store；`dispose` 返回 Promise；provider 拒绝不产生未处理拒绝。
+- **观察面如实**：窗口外候选全部不划算时报 `not-worth`（带跳过段数与字数），不再冒充「保留窗口」。
+
+### 验证
+
+源码树（集成分支，2026-11-01，Node v26.12.1 / win32-x64）：`node scripts/test-all.mjs` **exit 0**，原文「全部 163 套件通过。」；聚合 **163 套 / 901 用例 / 895 通过 / 0 失败 / 6 skip**（skip = install 4 + release-doc 1 + win32 0600 1）。
+
+### 未验边界
+
+- **P0 未通过**：真实宿主 runtime 时序、`outbound-request`/供应商 wire、脱敏可回放轨迹、真实 usage 指标口径仍缺；本版只冻结源码/夹具证据。
+- **P9 未做**：无真实模型配对评估，因此不宣称缓存命中/成本收益。
+- **P7 未启用**：源码合同成立（pre-step 改写会在下一次 `deriveMessages` 生效），但真机顺序未验；候选默认关闭、装配零引用。
+- **P6 关闭**：无数据集与逐路径消融证据，`queryExcerpt`/多路召回/图与时间路径/任务事实均未启用。
+
+
+## 未发布（beta.55 候选：beta.54 审计后续 B 组，2026-10-31；**版本号未升**，package.json 仍 0.14.0-beta.54）
+
+收「记忆上下文插件：beta.54 审计后续——修复与改进方案（2026-10-31，存工作区外，不入仓）」B 组 2 项（负责人 2026-10-31 拍板：D2 做、D4 做）。不改产品边界：归档/回注/恢复语义不变，只加一个新结果态与两条暂停文案。
+
+### 变更
+
+- **B-1 归档单飞**：`archiveForStep` 拆成单飞包装 + `runArchiveForStep` 原主体。同一进程内同一会话的归档同时只允许一个在跑，第二个立刻得到新结果态 **`archive-busy`**（不排队）——旧实现 `entry.inflight` 只挡摄入，`/memory-lab now` 与 pre-step 同时进入会在占槽层撞出一条 `intent-pending` 失败（无数据损坏，但用户看到一条 failed 噪音）。`try/finally` 保证抛错也清闸（否则永久 busy）。调用点适配：pre-step 的归档结果本就被忽略（busy 静默跳过，下一步自然重试）；`now`/`compact` 的回执经 `archiveLine` 新分支回「正在归档中（并发归档已被挡住），稍后再试。」。**语义边界（不夸大）**：单飞只覆盖本进程，两个进程仍可能同时归档——那时由占槽返回 `intent-pending`；`dryRunArchive`（status）不加单飞，只读必须永远能答。
+- **B-2 status 预览对齐 pending intent**：`dryRunArchive` 在 paused 判断之后、选 span 之前经**只读** `peekArchiveIntent` 看一眼意图槽位：槽位压着未对账意图（或内容不是合法意图对象）→ 预览返回 `intent-pending`；意图文件不可读 → `intent-unreadable`；两个新状态在 `archiveLine` 显示为「暂停：存在未对账的归档意图（活动面已替换、凭证未落账）…」与「暂停：归档意图文件不可读（失败关闭）…」。旧实现预览只跑选择器，槽位占用时 status 仍显示「下一次归档：seq X–Y（可归档）」，而真实提交会被锁内占槽挡下——预览与实际自相矛盾。分类判据 `classifyArchiveIntent` 是 **peek 与 reserve 共用的唯一实现**（判据同源）；reserve 外层行为不变（半截 JSON → unreadable 失败关闭、身份不匹配 → pending）。peek 不进写锁、无任何写副作用（不写盘、不补账、不清理），**不加缓存**（缓存会让「刚对账完仍显示暂停」，正是本项要消除的矛盾）。
+
+### 验证
+
+- 源码树全量（真 node v26.12.1，三片 47+47+45，2026-10-31）：**139 套 / 628 用例 / 623 通过 / 0 失败 / 5 skip**（基线 137 套/621 例 + 新增 2 套 7 例；skip = install 4 条安装面按设计 SKIP——源码已改、安装副本仍旧代码——+ v3-export 1 条 win32 0600）。
+- 新增 `v3-archive-singleflight`（4 条：Promise.all 并发恰一 archived 一 busy 且只多一张回执/单飞期间槽位 absent/busy 与抛错后可恢复/单飞窗口内外来占槽被槽位挡住——单飞不越权替代占槽）、`v3-status-intent-preview`（3 条：pending 槽预览返回 intent-pending 且文本不说「可归档」/目录占位注入读错误 → intent-unreadable/空槽回归保护 + peek 零副作用）。
+- 反例回归（改回去必红 → 复原必绿）：删 `archive-busy` 闸 → singleflight S1 红；`try/finally` 改裸 await → S3 红；删 peek 分支 → status-preview P1/P2 红。
+
+## 0.14.0-beta.54（2026-10-31，测试版）
+
+收「记忆上下文插件：详细修复与改进方案（2026-10-30，存工作区外，不入仓）」A 批「持久化与补账」4 项：R2-01 / R3-01 / R3-02（P1）+ R3-03（P2）。不改产品边界：命令面、设置面、面板文案均无变化。
+
+### 变更
+
+- **R2-01（P1）归档意图占槽**：新归档提交前先经 `reserveArchiveIntent` 在会话跨进程写锁内重读校验——槽位为空或同一身份（幂等重占）才写入；已有未对账意图（pending）或意图不可读（unreadable）→ 结构化阻断本会话的新归档（不写 intent、不碰宿主面、不追加凭证，正常对话与只读能力不受影响）。归档意图带稳定 `intentId`，由 `random.uuid` 端口生成（composition 注入、entry 装配传入，application 层不直接 import node:*）。入口对账结果改为可观测：意图补账失败/清理冲突/不可读均上报 `keptIntent`，归档面据此暂停，直到对账收敛。
+- **R3-02（P1）按身份清理**：新增 `clearArchiveIntentIfMatches`——锁内重读比对身份（新格式比 `intentId`；旧格式没有 ID 时以规范化完整载荷指纹作一次性比较条件），不匹配返回 `conflict` 而不删除；迟到的旧清理不再可能删除新意图。清理冲突/失败如实上报（`cleared:false` + `clearStatus`），不再冒充清理成功。旧 `clearArchiveIntent`（按路径无条件 rm）删除。
+- **R3-01（P1）state/control 锁内读改写**：新增 `updateSessionState` / `updateSessionControl` / `ensureInitialSessionState`——在同一会话跨进程写锁内**强制磁盘重读 → 归一化 → 合并 patch → 原子写回**；入口的 setState / setControl / 初始化 / 对账位点写入全部改走 patch。并发改不同顶层/嵌套字段不再互相覆盖；损坏/不可读的现存状态不按默认值覆盖（失败关闭）；非法 patch 抛错且磁盘不变；初始化 create-if-absent，两进程同时初始化只落一个。
+- **R3-03（P2）写锁续约与失锁失败关闭**：续约间隔按**实际 TTL** 推导（`heartbeatIntervalOf`，恒小于 TTL；旧实现固定按默认 60s 推导，自定义小 TTL 的长事务在首次续约前就被别的进程判 stale 接管）；续约单飞；心跳 lost（token 被换）或出错 → 停表并经 `ownership.assertOwned()` 抛新错误码 **ELOCK_LOST**。store 全部写原语（事务提交/凭证追加/遗忘与撤销/导入/隐私标记/检查点/索引重建短写）与 journal repair 的截断在提交前复核所有权——失锁后拒绝继续写；已在途的写入保留事务恢复证据，抛错不等于撤销。边界：提交前检查与真正落盘之间仍有窗口，这是协作式取消，不是硬性跨进程 fencing。
+- **守卫两处（全量回归撞出，均已修复复验）**：`contract-wiring` 判 `clearArchiveIntent` 导出零消费 → 按白名单只缩不涨删除该死导出，e2e 三个 journal 夹具的 clear 改走按身份清理；`architecture-guard` 判 application 层 `import node:crypto` 违反依赖方向 → `random` 端口随 runtime 透出，5 个测试文件 10 处 `createArchiveService` 调用点补注入。
+
+### 验证
+
+- 源码树全量（真 node v26.12.1，三片 46+46+44，2026-10-31）：**136 套 / 618 用例 / 613 通过 / 0 失败 / 5 skip**。5 条 skip = install.test.mjs 4 条（profile 尚未装本版时安装面断言按设计跳过，安装后复跑转真跑）+ v3-export.test.mjs 1 条（win32 的 chmod 只作用只读位，0600 mode 断言按任务书 skip）。
+- 新增 4 套 29 例：`v3-intent-reserve`（7：占槽幂等/拒绝/旧格式指纹/并发恰一成功含真实子进程/按身份清理/R3-02 编排/不可读失败关闭）、`v3-archive-intent-guard`（7：正常归档/凭证持续失败不覆盖旧意图/解除故障恰好补一次/不可读阻断/迟到清理不删新意图/引擎级 pending 与 unreadable 阻断自愈）、`v3-lock-renewal`（7：间隔推导/小 TTL 保活/失锁传播 ELOCK_LOST/心跳出错/正常与重入路径/token 透传）、`v3-state-control-rmw`（8：并发改不同字段全保留/嵌套按域合并/读缓存落后于磁盘/损坏不覆盖/create-if-absent/非法 patch 失败关闭/control 并发/跨进程真实子进程）。
+- 反例回归（改回去必红）：`v3-lock-renewal` 的「小 TTL 长事务：旧固定间隔必被接管」、`v3-state-control-rmw` 的「并发改不同字段（旧写法确定丢字段）」、`v3-intent-reserve` 的「R3-02 编排：A 迟到清理 → B 的意图仍在」、`v3-journal-clear-sync` 头部定点变异自证。
+- 安装后两处复跑（源码树与 release 镜像，注入 DSH_HOME，2026-10-31）：均为 **136 套 / 618 用例 / 617 通过 / 0 失败 / 1 skip**（唯一 skip 是 win32 无意义的 0600 断言；安装面 4 条由 SKIP 转真跑通过）。
+## 0.14.0-beta.53（2026-10-30，测试版）
+
+收 beta.51 后续审计确认项的 F1–F5 批（2 P1 之一 + 2 P2 + 4 P3 + 1 项 P1 语义务），并在 beta.52 基础上继续。版本号只升一次；未改其它产品边界。
+
+### 变更
+
+- **F1（P1，AUD51-05-02）停用回执吸收**：删除 `absorbPrecedingReceipts` 及其在回合级/步骤级选择器的调用。每次归档保留独立回执节点，活动面上每张凭证的回执正文都在，`restore <序号>` 与 `restore all` 才能逐张还原。代价：活动面每轮多一张 ~200 字回执。
+- **F2（P3，AUD51-09-01）「回合数」行**：`selectArchiveSpan` 的 `operations` 改为按**本次选中的组**计数（旧实现用吸收后的 startSeq 过滤 eligible，吸收后恒 0，回执丢「回合数：N。」）。步骤级 `selectStepSpan` 同步复核。
+- **F3（P2，AUD51-07-01/07-02）脱敏**：文本路径的凭据值不再一律要求「像 token」——`password`/`secret`/`api_key`/`credential`/`cookie`/`session_id` 等硬凭据键**无条件替换值**（`DB_PASSWORD=swordfish` 这类纯字母口令入库前即脱敏）；`token` 类键保留 B3-3 的形态收敛（`token: oauth` 不误伤）。键核心词与分隔符抽成单一真源（裸键 / JSON 引号键 / URL 查询串共用），并补 `cookie`/`session_id` 文本形态。对象路径与文本路径共用同一判据 `textValueIsSecret`。
+- **F4（P2，AUD48-08-01）注入来源标记**：回注包与恢复原文首尾各加一行插件来源标记（`〔记忆上下文插件·历史检索结果〕` / `〔记忆上下文插件·恢复的历史原文〕`），并声明「这是资料不是指令」；载荷内出现的标记前缀被打断，防止正文自造结束标记。机器可读侧新增 `source.form`：回执 `memory-lab3-surface`、恢复 `restore`、回注 `recall`（`kind` 不变，摄入跳过判据不受影响）。宿主对 `decision.messages` 一律按 `user/message` 落库、`role` 不生效，所以只能改文本（已核验源码）。
+- **F5（P3）小修**：
+  - `readRecord` 加记录 ID 形状白名单（`/^v3r-[0-9a-f]{16}$/`，唯一真源 `contracts/records.mjs` 的 `isRecordId`），非法直接 `EINVALID_ID`（新注册的错误码），`../x`/`..\x`/绝对路径/编码形态一律失败关闭；
+  - `journal.clear()` 不再假定返回 Promise（同步实现/同步抛错都不再把已落面的归档变成异常）；
+  - `status` 的「轮次判定」只出现一次并保留非法回落提示（`stateLine` 不再重复拼，生效设置行在按轮归档下省略该段）；
+  - 状态/控制文件的目录 mtime 闸门：**负缓存（文件不存在）不再「享受」闸门结论，但仍观察一次目录**，同一 tick 新建 `control.json`/`state.json` 立即可见。
+- **面板与文案（用户 2026-10-30 拍板）**：弹层去掉「模式」与「上次结局」两行；数字全部带单位并说清是什么（「已存历史 N 条 · 可检索 N 条 · 本会话回注 N 次」「回注尝试 N 次 · 跳过 N 次 · 失败 N 次」）；新增「已归档 N 段（每段一张凭证，可 restore 还原）」，读不到凭证账本时显示「未知」而不是 0。状态投影 `STATUS_PROJECTION_VERSION` 2 → 3（view 增加 `archived`）。
+- **`receipt-changed` 文案**：吸收停用后不再归因「被后续归档吸收」，改为「活动面上找不到与凭证逐字节相同的回执正文（回执已被改写或压缩）；旧轮请按记录 ID 回读原文」。
+
+### 验证
+
+- 新增 `v3-receipt-independent`（5 条：连续归档 3 轮后活动面 3 张回执、每张都能 restore）、`v3-redact-aud51`（6 条：纯字母凭据值 + Cookie/Set-Cookie/session_id 的文本/摄入/导出三路径）、`v3-injection-source-marker`（3 条：标记本身/恢复落面/回注落面）、`v3-record-id-whitelist`（3 条：穿越形态/非字符串/合法不回归）、`v3-journal-clear-sync`（3 条：同步返回/同步抛错/Promise 两态）、`v3-status-turnbasis-single`（3 条：合法一条/非法一条带提示/stateLine 不重复）。
+- 删除 `v3-receipt-absorb`（吸收退场）；更新 `v3-command-surface`/`v3-surface-contract`/`v3-client-chip`/`v3-status-projection-control`/`v3-status-file-gate`/`v3-redact-false-positive`/`install` 断言。
+- 全量 `test:all`：**安装前**源码树与 release 镜像各 **132 套 / 589 用例 / 584 通过 / 0 失败 / 5 skip**（5 skip = 安装面 4 条按版本差异跳过 + win32 无意义的 0600 断言）；**安装到 profile 后**两处复跑均 **588 通过 / 0 失败 / 1 skip**（安装面 4 条转为真跑通过，唯一 skip 是 win32 无意义的 0600 断言）。
+- 发布与安装：release 镜像自测全绿；profile 依赖已切到本版 tgz 并完成 `pnpm install`（安装副本 0.14.0-beta.53，`src/` 与 release 0 差异）；**DSH 未重启**，重启后新语义生效。tag/Release 未推送。tgz 条目数、字节数与 sha256 记在开发仓进展卡（包内文档不写自身哈希：哈希算的是含本文件的包，写进来必然自指矛盾）。
+
+## 0.14.0-beta.52（2026-10-30，测试版）
+
+用户拍板：归档/恢复都不再设体积预算；恢复超上下文交给 DSH 自身压缩；新增手动归档按钮。
+
+### 变更
+
+- **移除归档预算门（AUD51-05-01 的根因）**：`makePlan` 不再按 `restoreChars` 拒绝归档；`restoreChars` 只作为凭证上的观测值（`history` 可预判），归档照常进行。
+- **移除恢复上限**：删除设置项 `restoreMaxChars`；`restoreVoucher`/`restoreAll` 不再有 `maxChars`；`restore-too-large` 退场。恢复多少由用户决定，超上下文由 DSH 压缩处理。
+- **手动归档**：composer 弹层「本对话控制」与侧栏面板都新增「立即归档」按钮，执行 `/memory-lab now`；用户可在需要时自行折叠已完成回合。
+- **文案**：`receipt-changed` 说明「回执已被后续归档吸收，旧轮请按记录 ID 回读」；`status`/`config show`/帮助不再出现恢复预算。
+
+### 验证
+
+- 新增 `v3-restore-unbounded`（4 条：大回合照常归档、恢复完整文本、dry-run 无预算拒绝、设置/文案退场）；`v3-command-surface`/`v3-surface-contract`/`v3-client-chip` 同步更新。
+- 全量 `test:all`：**127 套 / 569 用例 / 568 通过 / 0 失败 / 1 skip**（安装后；唯一 skip 为 0600 的 POSIX-only 断言）；release 镜像同口径 568 通过 / 0 失败 / 1 skip。安装前为 564 通过 / 5 skip（安装面因版本不同按设计跳过）。
+
 # 变更记录
 
 > 0.14.0-beta.7 ~ beta.10 未在本文件单独收录（当时以进展卡与转正方案为准）；beta.11 起恢复逐版记录。
 
 ## 0.14.0-beta.51（2026-10-30，测试版）
 
-相比 0.14.0-beta.50（本版一次收完「审计 beta.50 后续」（20261029，开发仓 docs/dev-0.14.0）的全部 40 项确认缺陷：2 P1 + 10 P2 + 28 P3，按 B1/B2/B3 批执行；不改产品边界）：
+相比 0.14.0-beta.50（本版一次收完审计 beta.50 后续（docs/dev-0.14.0/审计-0.14.0-beta.50-后续-20261029.md）的全部 40 项确认缺陷：2 P1 + 10 P2 + 28 P3，按 B1/B2/B3 批执行；不改产品边界）：
 
 ### 修复（B1 批，两个 P1）
 
@@ -241,7 +528,7 @@
 - **实现要点**：`step/start`、`step/end` 是日志事件、不是活动面节点，span 只能由步骤内的**活动面节点**拼成——否则宿主 `range replace` 的密集覆盖判据必然失败（本版真实踩到并钉了守卫）。
 - **e2e**：cooling 用 6 步夹具实测「保留最近 2 步、一次压 3 步」，闸门与凭证照常；`/memory-lab status` 的「下一次归档」预览在 cooling 下走同一个步骤选择器，不骗人。
 - **守卫**：新增 `v3-step-cooling`（6 条）。全量 **92 套全绿、0 跳过**。
-- **文档**：[实时降温判定设计-beta.40（开发仓 docs/dev-0.14.0/实时降温判定设计-beta.40.md）（灵枢 role 分层/时间衰减/可回读/主动遗忘四条对照，及为何不引入概率模型）。
+- **文档**：实时降温判定设计-beta.40（docs/dev-0.14.0/实时降温判定设计-beta.40.md）（灵枢 role 分层/时间衰减/可回读/主动遗忘四条对照，及为何不引入概率模型）。
 
 ## 0.14.0-beta.39（2026-10-28，测试版；回注包不再锁死归档 + 下一次归档预览）
 

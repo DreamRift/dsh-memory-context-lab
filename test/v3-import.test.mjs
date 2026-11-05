@@ -39,25 +39,37 @@ test('export → adopt：空会话导入后正文可回读，且拒绝非空会�
   const engineB = attachV3Engine(ctxB, { v3Root: root })
   try {
     const sessionA = createFakeSession({ id: 'session-a' })
-    sessionA.pushUser('第一问：可分享')
-    sessionA.pushAssistant('第一答：可分享')
+    sessionA.pushUser('第一问：可分享'.repeat(30))
+    sessionA.pushAssistant('第一答：可分享'.repeat(30))
+    sessionA.pushUser('当前问题')
     await ctxA.callPreStep(sessionA)
     await settle(engineA)
+    const inspected = await engineA.inspectCompact('session-a', sessionA)
+    assert.equal(inspected.executable, true, JSON.stringify(inspected))
+    const prepared = await engineA.prepareCompact('session-a', sessionA, {
+      candidate_id: inspected.candidate_id,
+      summary: { shortText: '可分享摘要正文-ZQ4', detail: '可分享详细摘要' },
+    })
+    assert.equal(prepared.status, 'prepared', JSON.stringify(prepared))
     const exported = await engineA.exportSession('session-a')
     assert.equal(exported.error, undefined)
+    assert.equal(exported.counts.summaries, 1)
     const fileName = path.basename(exported.file)
 
     const sessionB = createFakeSession({ id: 'session-b' })
     const imported = await engineB.importSession('session-b', fileName, sessionB)
     assert.equal(imported.error, undefined, JSON.stringify(imported))
-    assert.equal(imported.imported, 2)
+    assert.equal(imported.imported, 3)
+    // P3-4：摘要未导入必须显式报告（不得静默丢弃）。
+    assert.deepEqual(imported.summaries, { available: 1, imported: 0, skipped: 1, reason: 'summaries-not-imported' })
     const again = await engineB.importSession('session-b', fileName, sessionB)
     assert.equal(again.error, 'session-not-empty')
 
     const exportedB = await engineB.exportSession('session-b')
     const parsed = JSON.parse(await readFile(exportedB.file, 'utf8'))
-    assert.equal(parsed.records.length, 2)
+    assert.equal(parsed.records.length, 3)
     assert.equal(JSON.stringify(parsed).includes('第一问'), true)
+    assert.equal(parsed.summaries.length, 0, '本版 adopt 不导入摘要（已在结果里报告）')
   } finally {
     await engineA._waitForIdle().catch(() => {})
     await engineB._waitForIdle().catch(() => {})
@@ -73,21 +85,34 @@ test('adoptFrom：同一引擎父会话 → 空子会话（原生 fork 记忆复
   const engine = attachV3Engine(ctx, { v3Root: root })
   try {
     const parent = createFakeSession({ id: 'parent-a' })
-    parent.pushUser('父问题')
-    parent.pushAssistant('父回答')
+    parent.pushUser('父问题'.repeat(60))
+    parent.pushAssistant('父回答'.repeat(60))
+    parent.pushUser('当前问题')
     await ctx.callPreStep(parent)
     await settle(engine)
+    const inspected = await engine.inspectCompact('parent-a', parent)
+    assert.equal(inspected.executable, true, JSON.stringify(inspected))
+    const prepared = await engine.prepareCompact('parent-a', parent, {
+      candidate_id: inspected.candidate_id,
+      summary: { shortText: '父摘要正文-ZQ5', detail: '父详细摘要' },
+    })
+    assert.equal(prepared.status, 'prepared', JSON.stringify(prepared))
 
+    // H5：adopt-from 默认拒绝，父会话必须显式授权（本套件锁的是复制链，不是授权面）。
+    const consent = await engine.setAdoptAllow('parent-a', true)
+    assert.equal(consent.allow, true)
     const child = createFakeSession({ id: 'child-b' })
     const result = await engine.adoptFrom('child-b', 'parent-a', child)
     assert.equal(result.error, undefined, JSON.stringify(result))
-    assert.equal(result.imported, 2)
+    assert.equal(result.imported, 3)
+    // P3-4：父会话摘要同样不在复制面内，计数与原因必须可见。
+    assert.deepEqual(result.summaries, { available: 1, imported: 0, skipped: 1, reason: 'summaries-not-imported' })
     const again = await engine.adoptFrom('child-b', 'parent-a', child)
     assert.equal(again.error, 'session-not-empty')
 
     const exported = await engine.exportSession('child-b')
     const parsed = JSON.parse(await readFile(exported.file, 'utf8'))
-    assert.equal(parsed.records.length, 2)
+    assert.equal(parsed.records.length, 3)
     assert.match(JSON.stringify(parsed), /父问题/)
   } finally {
     await engine._waitForIdle().catch(() => {})

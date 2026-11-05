@@ -18,6 +18,11 @@
  *   没有任何槽位注册 = 页面上没有任何设置界面，**与 Config 是否存在无关**。
  * - 于是「配置页」= 客户端半（本文件）+ 宿主半的 Config，两件缺一不可。
  *
+ * **0.15.0 起设置面只保留组件行入口**：本插件曾在 `plugins.bundle.config` 再挂一份
+ * 同样的表单，bundle 详情页因此出现「外面一层」设置块，与点进组件行后的设置页重复。
+ * 用户拍板（2026-11-03）只保留组件行页（`plugins.row.config`），bundle 页只留说明、
+ * 组件列表与来源信息；两处同一张表单的漂移风险也随之消失。
+ *
  * beta.11 删客户端面时删掉的是**文件**，却保留/连带移除了**声明**；beta.11 的 P0-A
  * 只证明「声明在、文件不在 → 装配期抛 ClientPackageCompositionError」，
  * 推不出「声明该删」。正确修复是补齐文件——本文件。
@@ -34,12 +39,10 @@
  *    本文件只用其中两个；**不能用相对路径 require**（entry 与 chunk 不允许同步 require
  *    另一个相对 client*.js 输出），所以本文件是自足的，常量在宿主半与这里各有一份，
  *    由 `test/v3-client-surface.test.mjs` 钉住一致性。
- * 3. **表单来源只有两条**：
- *    - 页面给 `form`（`plugins.row.config` 的详情页在命名空间已服务时传
- *      `{state, mutate}`）；
- *    - 页面不给（`plugins.bundle.config` 只传 `view`）时自己从 `configForms`
- *      服务取 `ConfigFormController`（`getSnapshot` / `subscribe` / `mutate`）。
- *    两条都只写这一个组件，避免两份表单漂移。
+ * 3. **表单来源**：只保留页面给的 `form`（`plugins.row.config` 的详情页在命名空间
+ *    已服务时传 `{state, mutate}`）。自取 `ConfigFormController` 的兜底仍留在 Card 里
+ *    作为防御（页面不给 form 时不至于空转），但正常路径不再依赖它。
+ *    `view === 'summary'` 时只渲染一行摘要（行详情页在缺少包描述时用它）。
  * 4. **不 dispose 共享 form**：`configForms.get(ns)` 是提供方缓存并拥有的对象，
  *    提供方在自身卸载时统一 dispose。这里 dispose 会把缓存里的实例标记为已废，
  *    同一页面里插件行「关掉再打开」就再也读不到配置（静默变成 loading）。
@@ -89,6 +92,7 @@ window.__ModuleLoader__.load({
       {
         key: 'turnBasis',
         kind: 'string',
+        // 选项顺序跟随 schema 枚举（human / dsh），「哪边是默认」由 label 与当前值表达。
         options: [{ value: 'human', label: 'turnBasisHuman' }, { value: 'dsh', label: 'turnBasisDsh' }],
         label: 'turnBasisLabel',
         hint: 'turnBasisHint',
@@ -97,14 +101,23 @@ window.__ModuleLoader__.load({
       { key: 'autoRestore', kind: 'boolean', label: 'autoRestoreLabel', hint: 'autoRestoreHint' },
       { key: 'limit', kind: 'number', min: 1, max: 20, step: 1, label: 'limitLabel', hint: 'limitHint' },
       { key: 'coolingGate', kind: 'number', min: 0, max: 95, step: 1, label: 'coolingGateLabel', hint: 'coolingGateHint' },
-      { key: 'restoreMaxChars', kind: 'number', min: 1000, max: 200000, step: 100, label: 'restoreMaxCharsLabel', hint: 'restoreMaxCharsHint' },
+      { key: 'coolingBatchSize', kind: 'number', min: 1, max: 200, step: 1, label: 'coolingBatchSizeLabel', hint: 'coolingBatchSizeHint' },
       { key: 'packMinScore', kind: 'number', min: 0, max: 50, step: 0.1, label: 'packMinScoreLabel', hint: 'packMinScoreHint' },
       { key: 'previewChars', kind: 'number', min: 40, max: 4000, step: 10, label: 'previewCharsLabel', hint: 'previewCharsHint' },
       { key: 'queryMaxChars', kind: 'number', min: 32, max: 4000, step: 16, label: 'queryMaxCharsLabel', hint: 'queryMaxCharsHint' },
+      // G5（0.15.0 候选，默认关闭）：缓存友好的归档调度门槛。客户端是浏览器侧 bundle，
+      // 不能相对 import 宿主模块，因此字段/范围在这里**各写一份**（与 status-projection 同策略），
+      // 唯一真源仍是 src/v3/contracts/archive-schedule-policy.mjs 的 BOUNDS；数字不一致由测试交叉核对。
+      { key: 'offlineDiagnostics', kind: 'boolean', label: 'offlineDiagnosticsLabel', hint: 'offlineDiagnosticsHint' },
+      { key: 'schedulePolicy', kind: 'boolean', label: 'schedulePolicyLabel', hint: 'schedulePolicyHint' },
+      { key: 'scheduleMinGrowthMessages', kind: 'number', min: 0, max: 400, step: 1, label: 'scheduleMinGrowthMessagesLabel', hint: 'scheduleMinGrowthMessagesHint' },
+      { key: 'scheduleMinRequestGap', kind: 'number', min: 0, max: 400, step: 1, label: 'scheduleMinRequestGapLabel', hint: 'scheduleMinRequestGapHint' },
+      { key: 'scheduleMaxRequestGap', kind: 'number', min: 1, max: 4000, step: 1, label: 'scheduleMaxRequestGapLabel', hint: 'scheduleMaxRequestGapHint' },
+      { key: 'scheduleBacklogCoalesceUnits', kind: 'number', min: 1, max: 2000, step: 1, label: 'scheduleBacklogCoalesceUnitsLabel', hint: 'scheduleBacklogCoalesceUnitsHint' },
     ]
 
     /** 与宿主半 `SETTINGS_DEFAULTS` 同值：只用于「宿主还没答」时的占位显示，不参与写。 */
-    const DEFAULTS = { enabled: true, fullHistory: true, turnBasis: 'human', planFirst: false, autoRestore: true, limit: 10, coolingGate: 20, restoreMaxChars: 16000, packMinScore: 0.5, previewChars: 160, queryMaxChars: 512 }
+    const DEFAULTS = { enabled: true, fullHistory: true, turnBasis: 'dsh', planFirst: false, autoRestore: true, limit: 10, coolingGate: 20, coolingBatchSize: 10, packMinScore: 0.5, previewChars: 160, queryMaxChars: 512, offlineDiagnostics: false, schedulePolicy: false, scheduleMinGrowthMessages: 8, scheduleMinRequestGap: 4, scheduleMaxRequestGap: 40, scheduleBacklogCoalesceUnits: 30 }
 
     /** 会话弹层可覆盖的数值项（全局默认在插件设置页；这里只写本对话）。 */
     /**
@@ -135,9 +148,9 @@ window.__ModuleLoader__.load({
       fullHistoryLabel: '默认全历史模式',
       fullHistoryHint: '新会话默认把已完成历史归档成可恢复回执；关闭后改用压力闸门驱动的普通降温。',
       turnBasisLabel: '按轮归档的轮次判定',
-      turnBasisHint: '真人消息：只有你发新消息才算下一轮（默认，压得慢）。DSH 轮次：按界面「N 轮」计数，目标自动继续的每一轮都算，压得更快；被压的原话仍可按 ID 恢复。',
-      turnBasisHuman: '真人消息（默认）',
-      turnBasisDsh: 'DSH 轮次',
+      turnBasisHint: 'DSH 轮次：按界面「N 轮」计数，目标自动继续的每一轮都算（默认，长程单回合也会归档）。真人消息：只有你发新消息才算下一轮，压得慢；被压的原话仍可按 ID 恢复。',
+      turnBasisHuman: '真人消息',
+      turnBasisDsh: 'DSH 轮次（默认）',
       invalidChoice: '请选择下拉框里的选项。',
       planFirstLabel: '计划先行默认',
       planFirstHint: '计划期间暂停归档与自动回注，计划工件受保护。',
@@ -146,8 +159,8 @@ window.__ModuleLoader__.load({
       limitLabel: '默认单次回注条数',
       coolingGateLabel: '按步归档闸门（占用 %）',
       coolingGateHint: '上下文占用达到该百分比才压缩旧步骤；0 = 每步都判断（最省 token、最费前缀缓存）。',
-      restoreMaxCharsLabel: '恢复正文上限（字符）',
-      restoreMaxCharsHint: '恢复体积（正文+工具调用参数）超过它的完成回合不会写恢复凭证；1000–200000。',
+      coolingBatchSizeLabel: '按步归档批量（步骤数）',
+      coolingBatchSizeHint: '工作集外的完整步骤攒够多少个才归档一批（1–200，默认 10）；批内按保护洞切段并逐段提交，阈值外的候选留给后续批次，只影响按步归档。',
       gateLabel: '按步归档闸门',
       gateHint: '本对话的闸门百分比（跟随全局 = 留空）；0 = 每步都判断。',
       limitHint: '新会话默认；本对话可在 composer 面板覆盖（1–20）。',
@@ -157,6 +170,18 @@ window.__ModuleLoader__.load({
       previewCharsHint: '每条命中在回注包里保留多少个首部字符（40–4000）。',
       queryMaxCharsLabel: '查询词上限',
       queryMaxCharsHint: '查询词只取人类消息的前 N 个字符（32–4000）；整条长消息会把检索拖成「必须命中整句」。',
+      offlineDiagnosticsLabel: '离线诊断（默认关闭）',
+      offlineDiagnosticsHint: '打开后 /memory-lab status 会多打印离线诊断行（Warm/Compiler/Recall/shadow 的装配与执行情况）。它只多打印观察信息，不改变归档、回注或任何生产行为；默认关闭。',
+      schedulePolicyLabel: '缓存友好的归档节奏（候选，默认关闭）',
+      schedulePolicyHint: '开启后按「距上次提交的增长量 / 请求间隔 / 积压」决定现在归档还是等一下。只改变调度时机：安全边界、pin、净收益与 H=200 一概不绕；默认关闭时行为与现版逐字节一致。',
+      scheduleMinGrowthMessagesLabel: '增长下限（消息条数）',
+      scheduleMinGrowthMessagesHint: '自上次提交以来活动面至少增长多少条消息才考虑归档（0–400，默认 8）。',
+      scheduleMinRequestGapLabel: '请求间隔下限（次）',
+      scheduleMinRequestGapHint: '距上次提交至少经过多少次真实请求（一次 pre-step = 一次；重试也算新请求）（0–400，默认 4）。',
+      scheduleMaxRequestGapLabel: '请求间隔硬上限（次）',
+      scheduleMaxRequestGapHint: '到点必须允许一次归档，防止小步持续增长把归档饿死（1–4000，默认 40）。',
+      scheduleBacklogCoalesceUnitsLabel: '积压合并门槛（段）',
+      scheduleBacklogCoalesceUnitsHint: '积压段数达到它就合并成一次提交；合并的只是调度意图，段/回执/事件不合并（1–2000，默认 30）。',
       chipLabel: '记忆上下文',
       chipLabelCount: '记忆上下文 · {count}',
       chipLabelCoverage: '记忆上下文 · {count} 可检索',
@@ -169,25 +194,46 @@ window.__ModuleLoader__.load({
       panelCompact: '压缩摘要',
       panelHistory: '历史',
       panelExport: '导出',
+      panelArchiveNow: '立即归档',
+      archiveNowLabel: '手动归档',
+      archiveNowAction: '立即归档',
+      archiveNowHint: '把已完成的旧回合立刻折叠成回执（执行 /memory-lab now）',
       panelSettings: '回注设置',
       panelNoSettings: '设置服务未就绪，暂时只能查看状态；可到插件设置页修改。',
       panelHint: '改动即时生效。完整观测：/memory-lab status。',
-      statusReady: '已摄入 {ingested} · 可检索 {searchable} · 回注 {injected}',
-      statusReadyNoSearchable: '已摄入 {ingested} · 可检索 未知 · 回注 {injected}',
-      statusSearchableOnly: '可检索 {searchable} · 回注 {injected}',
-      statusReadyUnknownCount: '已摄入 状态未知 · 回注 {injected} 次',
-      statusLast: '上次结局：{status}',
-      statusAttempted: '尝试 {attempted} 次 · 跳过 {skipped} · 失败 {failed}',
+      // 数字都要带单位、说清是什么（用户反馈：旧文案「已摄入 144」「尝试 4 次」看不懂）。
+      statusReady: '已存历史 {ingested} 条 · 可检索 {searchable} 条 · 本会话回注 {injected} 次',
+      statusReadyNoSearchable: '已存历史 {ingested} 条 · 可检索 未知 · 本会话回注 {injected} 次',
+      statusSearchableOnly: '可检索 {searchable} 条 · 本会话回注 {injected} 次',
+      statusReadyUnknownCount: '已存历史 未知 · 本会话回注 {injected} 次',
+      statusArchivedCount: '已归档 {archived} 段（每段一张凭证，可 restore 还原）',
+      statusArchivedCountUnknown: '已归档 未知（凭证账本读不到）',
+      statusAttempted: '回注尝试 {attempted} 次 · 跳过 {skipped} 次 · 失败 {failed} 次',
       statusIngesting: '摄入中…',
       statusPending: '正在建立影子库…',
       statusAbsent: '本会话尚未摄入（发出任意一条消息后开始）',
       hostPlanOn: '宿主计划模式：开（用「计划」按钮或 /plan off 退出；插件的「计划先行」只暂停归档与回注，两者不是同一个开关）',
       statusFailed: '建库失败（{code}）',
       statusUnknown: '状态未知',
-      statusMode: '模式：{mode}',
+      diagUnknown: '未知 / 不可判定',
+      diagStatus: '诊断状态：{status}',
+      diagCoverage: '{layer}：{state} · {observed}/{total} · {ratio}',
+      diagCoverageUnknown: '{layer}：{state} · {observed}/{total} · 不可计算',
+      diagCanonicalUnknown: '供应商命中率：不可计算（门槛未满足）',
+      diagLocalRatio: '本地诊断（semantics=unverified）：{ratio}；不是供应商命中率',
+      diagUnpaired: '请求配对：unpaired',
+      diagNoSeam: 'Wire：no-seam；命中率未知',
+      diagPartial: '不完整 / 仍有未覆盖',
+      diagUnavailable: '能力当前不可用（不是没有命中）',
+      diagStale: '结果已过期：请重新读取或准备，不要续用旧 handle',
+      diagConflict: '发生冲突：不自动重试或覆盖',
+      diagRejected: '请求被拒绝：修正参数后再试，不重试同参数',
+      diagFailed: '操作失败',
+      diagNative: '原生文本：',
+      diagErrorAction: '请按错误 code 执行建议操作',
       statusPlanFirst: '计划先行：开',
-      statusArchived: '已归档到 seq {seq}',
-statusArchivedAt: '已按步归档（{time}）',
+      statusArchived: '上次归档位置：seq {seq}',
+      statusArchivedAt: '上次归档时间：{time}',
 statusStateError: '状态文件异常：{code}（值已按默认回落）',
       modeFullHistory: '按轮归档',
       modeCooling: '按步归档',
@@ -230,9 +276,9 @@ statusStateError: '状态文件异常：{code}（值已按默认回落）',
       fullHistoryLabel: 'Default full-history mode',
       fullHistoryHint: 'New chats archive completed history into restorable receipts; off switches to pressure-gated cooling.',
       turnBasisLabel: 'Full-history turn basis',
-      turnBasisHint: 'Human messages: a new turn only starts with your message (default, archives slower). DSH turns: count like the "N turns" chip, so every goal auto-continuation counts; archived originals stay restorable by ID.',
-      turnBasisHuman: 'Human messages (default)',
-      turnBasisDsh: 'DSH turns',
+      turnBasisHint: 'DSH turns: count like the "N turns" chip, so every goal auto-continuation counts (default; long single-turn sessions still archive). Human messages: a new turn only starts with your message, archives slower; archived originals stay restorable by ID.',
+      turnBasisHuman: 'Human messages',
+      turnBasisDsh: 'DSH turns (default)',
       invalidChoice: 'Pick one of the options in the list.',
       planFirstLabel: 'Default plan-first',
       planFirstHint: 'Pause archiving and auto recall while a plan is active; plan artifacts stay protected.',
@@ -241,8 +287,8 @@ statusStateError: '状态文件异常：{code}（值已按默认回落）',
       limitLabel: 'Default matches per recall',
       coolingGateLabel: 'Per-step archive gate (occupancy %)',
       coolingGateHint: 'Compress old steps only after context occupancy reaches this percent; 0 = judge every step (cheapest tokens, most prefix churn).',
-      restoreMaxCharsLabel: 'Restore text budget (chars)',
-      restoreMaxCharsHint: 'Completed turns whose restore size (text + tool-call args) exceeds it get no voucher; 1000–200000.',
+      coolingBatchSizeLabel: 'Per-step batch size (steps)',
+      coolingBatchSizeHint: 'How many completed steps must leave the working set before a batch is archived (1–200, default 10); the batch is split at protection holes and each safe run is committed separately, extra candidates wait for later batches. Affects per-step archiving only.',
       gateLabel: 'Per-step archive gate',
       gateHint: 'Gate percent for this chat (blank = follow global); 0 = judge every step.',
       limitHint: 'Default for new chats; this chat can override it in the composer panel (1–20).',
@@ -252,6 +298,18 @@ statusStateError: '状态文件异常：{code}（值已按默认回落）',
       previewCharsHint: 'How many leading characters each match keeps in the pack (40–4000).',
       queryMaxCharsLabel: 'Query cap',
       queryMaxCharsHint: 'The query uses only the first N characters of the human message (32–4000).',
+      offlineDiagnosticsLabel: 'Offline diagnostics (off by default)',
+      offlineDiagnosticsHint: 'When on, /memory-lab status prints extra offline diagnostic lines (Warm/Compiler/Recall/shadow assembly and execution). It only prints observations; it does not change archiving, injection or any production behavior. Off by default.',
+      schedulePolicyLabel: 'Cache-friendly archive rhythm (candidate, off by default)',
+      schedulePolicyHint: 'When on, archiving waits for growth / request-gap / backlog thresholds. Only the timing changes: safety, pins, positive net gain and H=200 are never bypassed; with the default (off) behaviour is byte-identical to the current release.',
+      scheduleMinGrowthMessagesLabel: 'Growth floor (messages)',
+      scheduleMinGrowthMessagesHint: 'How many surface messages must be added since the last commit before archiving is considered (0–400, default 8).',
+      scheduleMinRequestGapLabel: 'Request-gap floor (requests)',
+      scheduleMinRequestGapHint: 'How many real requests must pass since the last commit (one pre-step = one request; a retry counts as a new request) (0–400, default 4).',
+      scheduleMaxRequestGapLabel: 'Request-gap ceiling (requests)',
+      scheduleMaxRequestGapHint: 'At this many requests one archive is always allowed, so slow growth cannot starve the queue (1–4000, default 40).',
+      scheduleBacklogCoalesceUnitsLabel: 'Backlog coalesce units (segments)',
+      scheduleBacklogCoalesceUnitsHint: 'When the backlog reaches this many segments the scheduling intent is coalesced into one commit; segments, receipts and events are never merged (1–2000, default 30).',
       chipLabel: 'Memory context',
       chipLabelCount: 'Memory context · {count}',
       chipLabelCoverage: 'Memory context · {count} searchable',
@@ -264,25 +322,45 @@ statusStateError: '状态文件异常：{code}（值已按默认回落）',
       panelCompact: 'Compact',
       panelHistory: 'History',
       panelExport: 'Export',
+      panelArchiveNow: 'Archive now',
+      archiveNowLabel: 'Manual archive',
+      archiveNowAction: 'Archive now',
+      archiveNowHint: 'Fold completed older turns into a receipt now (/memory-lab now)',
       panelSettings: 'Recall settings',
       panelNoSettings: 'The settings service is not ready; status only for now. Edit in the plugin settings page.',
       panelHint: 'Changes apply live. Full detail: /memory-lab status.',
-      statusReady: '{ingested} ingested · {searchable} searchable · {injected} recalls',
-      statusReadyNoSearchable: '{ingested} ingested · searchable unknown · {injected} recalls',
-      statusSearchableOnly: '{searchable} searchable · {injected} recalls',
-      statusReadyUnknownCount: 'Ingestion unknown · {injected} recalls',
-      statusLast: 'Last: {status}',
-      statusAttempted: 'Attempted {attempted} · skipped {skipped} · failed {failed}',
+      statusReady: '{ingested} history items stored · {searchable} searchable · {injected} recalls this session',
+      statusReadyNoSearchable: '{ingested} history items stored · searchable unknown · {injected} recalls this session',
+      statusSearchableOnly: '{searchable} searchable · {injected} recalls this session',
+      statusReadyUnknownCount: 'Stored history unknown · {injected} recalls this session',
+      statusArchivedCount: '{archived} archived spans (one receipt each, restorable)',
+      statusArchivedCountUnknown: 'Archived spans unknown (voucher ledger unreadable)',
+      statusAttempted: 'Recall attempts {attempted} · skipped {skipped} · failed {failed}',
       statusIngesting: 'ingesting…',
       statusPending: 'Creating the shadow store…',
       statusAbsent: 'Nothing ingested in this session yet (send a message to start)',
       hostPlanOn: 'Host plan mode: on (exit with the plan button or /plan off; the plugin’s plan-first only pauses archiving and recall — they are different switches)',
       statusFailed: 'Store creation failed ({code})',
       statusUnknown: 'Status unknown',
-      statusMode: 'Mode: {mode}',
+      diagUnknown: 'Unknown / indeterminate',
+      diagStatus: 'Diagnostic status: {status}',
+      diagCoverage: '{layer}: {state} · {observed}/{total} · {ratio}',
+      diagCoverageUnknown: '{layer}: {state} · {observed}/{total} · not computable',
+      diagCanonicalUnknown: 'Provider hit rate: not computable (gates unmet)',
+      diagLocalRatio: 'Local diagnostic (semantics=unverified): {ratio}; not a provider hit rate',
+      diagUnpaired: 'Request pairing: unpaired',
+      diagNoSeam: 'Wire: no-seam; hit rate unknown',
+      diagPartial: 'Incomplete / coverage remains',
+      diagUnavailable: 'Capability currently unavailable (not an empty result)',
+      diagStale: 'Stale result: read or prepare again; do not reuse the old handle',
+      diagConflict: 'Conflict: no automatic retry or overwrite',
+      diagRejected: 'Rejected: correct the input; do not retry unchanged',
+      diagFailed: 'Operation failed',
+      diagNative: 'Native text: ',
+      diagErrorAction: 'Follow the safe action for this error code',
       statusPlanFirst: 'Plan-first: on',
-      statusArchived: 'Archived through seq {seq}',
-statusArchivedAt: 'Archived per step ({time})',
+      statusArchived: 'Last archive position: seq {seq}',
+      statusArchivedAt: 'Last archive time: {time}',
 statusStateError: 'State file error: {code} (defaults in effect)',
       modeFullHistory: 'archive per turn',
       modeCooling: 'archive per step',
@@ -317,33 +395,46 @@ statusStateError: 'State file error: {code} (defaults in effect)',
     const NOTE_STYLE = { fontSize: 11, opacity: 0.7 }
 
     /**
-     * 设置卡片。同一个组件挂在两个键控槽位上：
-     * - `plugins.bundle.config`（键 = 包名）→ bundle 详情页内联一节，页面不给 `form`；
-     * - `plugins.row.config`（键 = 包名#行 id）→ 该行的「配置」页，页面给 `form`。
+     * 设置卡片（0.15.0 起只挂在组件行的键控槽位上）。
+     * - `plugins.row.config`（键 = 包名#行 id）→ 该组件行的「配置」页，页面给 `form`。
+     * bundle 详情页不再挂设置块（0.15.0 用户拍板，见文件头）。`view === 'summary'`
+     * 时只渲染一行摘要，供行详情页在缺少包描述时使用。
      *
      * @param props - 槽位属性：`view`、`t`，以及可能的 `form`（`{state, mutate}`）。
      * @returns 摘要一行（`view === 'summary'`）或设置表单。
      */
     function Card(props) {
       const t = props.t
+      // P1-11：摘要行**不依赖**设置服务。`applyScope` 来自可选 inject（`configForms`），
+      // 且 `configForms.get(NS)` 在宿主设置面尚未就绪时可能返回 undefined；旧实现在
+      // 这个早退之前就 `scope.getSnapshot()`，宿主用 `{view:'summary'}` 渲染行描述时
+      // 抛 TypeError → slot entry 记成 crashed → 配置区整块消失。
+      // 摘要只需一行文案：必须在任何 hook / scope 解引用之前返回。
+      if (props.view === 'summary') return t('summary')
       // 组件定义在 apply 内，scope 是其闭包：每个插件实例一张表，互不串。
-      const scope = applyScope
+      // 可选依赖按「可能缺席」使用，不做裸解引用（同一根因的第二处）。
+      const scope = applyScope ?? null
       const pageForm = props.form
       const pageState = pageForm === undefined ? undefined : pageForm.state
 
-      const [snapshot, setSnapshot] = React.useState(() => pageState ?? scope.getSnapshot())
+      const [snapshot, setSnapshot] = React.useState(() => pageState ?? (scope === null ? undefined : scope.getSnapshot()))
       const [draft, setDraft] = React.useState({})
       const [outcome, setOutcome] = React.useState(null)
 
-      // 页面自己会重渲染并传来新 state；bundle 页没有 form，只能自己订阅。
+      // 页面自己会重渲染并传来新 state；没有 form 时才自己订阅——设置服务缺席就不订阅，
+      // 也不假装在加载（P1-11：可选依赖缺席是「不可用」，不是无限 loading）。
       React.useEffect(() => {
         if (pageState !== undefined) {
           setSnapshot(pageState)
           return undefined
         }
+        if (scope === null) {
+          setSnapshot(undefined)
+          return undefined
+        }
         setSnapshot(scope.getSnapshot())
         return scope.subscribe(() => setSnapshot(scope.getSnapshot()))
-      }, [pageState])
+      }, [pageState, scope])
 
       // 宿主答了新 revision（含写完回折）就丢弃草稿：草稿的存在意义只是「还没提交的编辑」。
       const revision = snapshot === undefined ? undefined : snapshot.revision
@@ -352,9 +443,7 @@ statusStateError: 'State file error: {code} (defaults in effect)',
         setOutcome(null)
       }, [revision])
 
-      if (props.view === 'summary') return t('summary')
-
-      const status = snapshot === undefined ? 'loading' : snapshot.status
+      const status = snapshot === undefined ? (scope === null ? 'unavailable' : 'loading') : snapshot.status
       if (status === 'unavailable') return React.createElement('p', { style: NOTE_STYLE }, t('unavailable'))
       if (status !== 'ready' || snapshot.value === undefined) {
         return React.createElement('p', { style: NOTE_STYLE }, t('loading'))
@@ -674,13 +763,106 @@ statusStateError: 'State file error: {code} (defaults in effect)',
       return out
     }
 
+    const MCL_STATUS_LABELS = Object.freeze({
+      ok: '正常', partial: '部分', unknown: '未知', unavailable: '不可用',
+      stale: '已过期', conflict: '冲突', failed: '失败', rejected: '已拒绝',
+    })
+    const COVERAGE_ORDER = Object.freeze(['plugin-surface', 'logical-request', 'wire', 'provider-usage'])
+
+    /**
+     * 诊断包渲染（I5 合同实现）。**当前未接线，且这是有意为之**（P3-08，0.15.1 §3.3）。
+     *
+     * 事实：宿主投影 (`status-projection.mjs` 的 `statusViewSchema`) 的字段集合里**没有**
+     * `diagnostics`，入口 `statusText` 也不产出它——所以这段渲染在生产路径上恒拿到
+     * `undefined` 并在第一行返回。它是死分支，但**不是**可以一删了之的东西：
+     *
+     * - 诊断包需要的四个事实今天**都没有生产方**：公共状态（`mcl.status/v1`）、四层覆盖度
+     *   （`mcl.coverage/v1`）、usage 三门槛、Native 原文（来自 dsh-ops 的 PTC 结果面，
+     *   本仓库无该适配器）。没有真值来源就临时造一个键，等于用伪造事实喂 UI。
+     * - 因此结论是「保持未接线 + 如实标注」，而不是「接通投影」或「整块删除」：
+     *   删掉会让将来接线的人重新踩一遍脱敏/词表/失败关闭的坑，接通则无数据可接。
+     *
+     * 判据与纪律仍被 `test/v3-client-i5-diagnostics.test.mjs` 钉住（八状态封闭词表、
+     * 未知输入失败关闭、脱敏、四层固定顺序、**缺键时一行诊断都不出**）。将来真正接上
+     * `diagnostics` 时，这套用例会自动从「死分支护栏」变成「接线护栏」。
+     */
+    function diagnosticLines(input, t) {
+      if (input === undefined) return []
+      if (input === null || typeof input !== 'object' || Array.isArray(input)
+        || Object.keys(input).some((key) => !['status', 'code', 'nextAction', 'coverage', 'usage', 'native'].includes(key))) {
+        return [t('diagUnknown')]
+      }
+      const lines = []
+      const state = Object.hasOwn(MCL_STATUS_LABELS, input.status) ? input.status : 'unknown'
+      lines.push(t('diagStatus', { status: MCL_STATUS_LABELS[state] }))
+      if (typeof input.code === 'string' && input.code.length > 0) lines.push('code: ' + safeCode(input.code))
+      if (typeof input.nextAction === 'string' && input.nextAction.length > 0) lines.push(t('diagErrorAction'))
+      if (state === 'partial') lines.push(t('diagPartial'))
+      if (state === 'unavailable') lines.push(t('diagUnavailable'))
+      if (state === 'stale') lines.push(t('diagStale'))
+      if (state === 'conflict') lines.push(t('diagConflict'))
+      if (state === 'rejected') lines.push(t('diagRejected'))
+      if (state === 'failed') lines.push(t('diagFailed'))
+      if (input.native !== undefined) {
+        if (typeof input.native === 'string') {
+          const safeText = input.native
+            .replace(/(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, '[redacted]')
+            .replace(/[A-Z]:\\Users\\[^\s]+/gi, '<home>')
+            .replace(/\/(?:home|Users)\/[^\s]+/g, '<home>')
+          lines.push(t('diagNative') + safeText)
+        }
+        else lines.push(t('diagUnknown'))
+      }
+      if (input.coverage !== undefined) {
+        if (!Array.isArray(input.coverage) || input.coverage.length !== 4) lines.push(t('diagUnknown'))
+        else {
+          const rows = new Map(input.coverage.map((row) => [row?.layer, row]))
+          for (const layer of COVERAGE_ORDER) {
+            const row = rows.get(layer)
+            if (!row || !['observed', 'partial', 'unobservable', 'not-wired', 'no-seam'].includes(row.state)
+              || !Number.isInteger(row.observedRows) || row.observedRows < 0
+              || !Number.isInteger(row.totalRows) || row.totalRows < 0
+              || (row.ratio !== null && (!Number.isFinite(row.ratio) || row.ratio < 0 || row.ratio > 1))) { lines.push(t('diagUnknown')); continue }
+            const ratio = row.totalRows === 0 ? null : (row.ratio === null ? null : row.ratio)
+            const shown = ratio === null ? t('diagCoverageUnknown', { layer, state: row.state, observed: row.observedRows, total: row.totalRows })
+              : t('diagCoverage', { layer, state: row.state, observed: row.observedRows, total: row.totalRows, ratio: Math.round(ratio * 100) + '%' })
+            lines.push(shown)
+          }
+          lines.push(t('diagCanonicalUnknown'))
+        }
+      }
+      if (input.usage !== undefined) {
+        const u = input.usage
+        if (u === null || typeof u !== 'object' || Array.isArray(u)) lines.push(t('diagUnknown'))
+        else {
+          const gates = u.providerVerified === true && u.requestPaired === true && u.inputIncludesCache === true
+          // 当前合同无真实 provider 核验，客户端不计算 canonical 命中率。
+          lines.push(t('diagCanonicalUnknown'))
+          if (u.request === null || u.requestPaired === false) lines.push(t('diagUnpaired'))
+          if (u.wire === 'no-seam') lines.push(t('diagNoSeam'))
+          if (u.cacheReadRatioOf !== undefined) {
+            const local = u.cacheReadRatioOf
+            if (local && local.semantics === 'unverified' && Number.isFinite(local.value) && local.value >= 0 && local.value <= 1)
+              lines.push(t('diagLocalRatio', { ratio: Math.round(local.value * 100) + '%' }))
+            else lines.push(t('diagUnknown'))
+          }
+          if (!gates) lines.push(t('diagUnknown'))
+        }
+      }
+      return lines
+    }
+
+    function safeCode(code) {
+      // code 仅接受安全标识符，避免错误正文/凭据/路径进入 UI。
+      return /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'EUNKNOWN'
+    }
+
     /** 投影状态 → 弹层里的几行文案。任何未知形状都落到「状态未知」，不抛错。 */
     function statusLines(status, t) {
       if (status === null || typeof status !== 'object') return [t('statusUnknown')]
-      const modeLabel = status.mode === 'full-history'
-        ? t('modeFullHistory')
-        : status.mode === 'cooling' ? t('modeCooling') : t('modeRecallOnly')
-      const prefix = [t('statusMode', { mode: modeLabel })]
+      // 用户拍板（0.14.0-beta.53）：弹层不再显示「模式：…」——模式在下面的选择器里本来
+      // 就有一份，重复一行只是噪音。计划先行是异常态，保留提示。
+      const prefix = []
       if (status.planFirst === true) prefix.push(t('statusPlanFirst'))
       if (Number.isInteger(status.surface?.lastArchiveEndSeq) && status.surface.lastArchiveEndSeq >= 0) {
         prefix.push(t('statusArchived', { seq: status.surface.lastArchiveEndSeq }))
@@ -693,7 +875,7 @@ statusStateError: 'State file error: {code} (defaults in effect)',
         // B3-18：状态文件异常（state.json 损坏/不可读）必须可见，不能静默显示默认值
         prefix.push(t('statusStateError', { code: status.stateError }))
       }
-      const withPrefix = (lines) => [...prefix, ...lines]
+      const withPrefix = (lines) => [...prefix, ...lines, ...diagnosticLines(status.diagnostics, t)]
       const injected = Number.isInteger(status.injected) && status.injected >= 0 ? status.injected : 0
       if (status.state === 'ready') {
         const ingested = Number.isInteger(status.ingested) && status.ingested >= 0 ? status.ingested : null
@@ -706,9 +888,11 @@ statusStateError: 'State file error: {code} (defaults in effect)',
           : (searchable !== null
             ? t('statusSearchableOnly', { searchable, injected })
             : t('statusReadyUnknownCount', { injected }))]
-        if (typeof status.lastStatus === 'string' && status.lastStatus.length > 0) {
-          lines.push(t('statusLast', { status: status.lastStatus }))
-        }
+        // 用户拍板（0.14.0-beta.53）：去掉「上次结局：injected」——它是内部状态码
+        // （injected/skipped/failed），对用户没有可执行含义；真正有用的「尝试/跳过/失败」
+        // 计数在下面一行，那里已经带了单位。
+        const archived = Number.isInteger(status.archived) && status.archived >= 0 ? status.archived : null
+        lines.push(archived === null ? t('statusArchivedCountUnknown') : t('statusArchivedCount', { archived }))
         const attempted = Number.isInteger(status.attempted) && status.attempted >= 0 ? status.attempted : 0
         if (attempted > 0) {
           lines.push(t('statusAttempted', {
@@ -724,11 +908,8 @@ statusStateError: 'State file error: {code} (defaults in effect)',
       if (status.state === 'absent') return withPrefix([t('statusAbsent')])
       if (status.state === 'failed') {
         const code = typeof status.errorCode === 'string' && status.errorCode.length > 0 ? status.errorCode : 'EUNKNOWN'
-        const lines = [t('statusFailed', { code })]
-        if (typeof status.lastStatus === 'string' && status.lastStatus.length > 0) {
-          lines.push(t('statusLast', { status: status.lastStatus }))
-        }
-        return withPrefix(lines)
+        // 失败态同样不再显示内部状态码（lastStatus），只给错误码。
+        return withPrefix([t('statusFailed', { code })])
       }
       return withPrefix([t('statusUnknown')])
     }
@@ -1110,6 +1291,16 @@ statusStateError: 'State file error: {code} (defaults in effect)',
             className: 'mcl-hint',
             key: 'remote-unavailable',
           }, t('remoteUnavailable')),
+          React.createElement('div', { className: 'mcl-row', key: 'archive-now', 'data-mcl-field': 'session.archive-now' }, [
+            React.createElement('span', { className: 'mcl-label', key: 'label', title: t('archiveNowHint') }, t('archiveNowLabel')),
+            React.createElement('span', { className: 'mcl-field', key: 'control' }, React.createElement('button', {
+              type: 'button',
+              className: 'mcl-btn',
+              disabled: !canEdit,
+              'data-mcl-action': 'archive-now',
+              onClick: () => { void run('/memory-lab now') },
+            }, t('archiveNowAction'))),
+          ]),
           React.createElement('div', { className: 'mcl-row', key: 'fork' }, [
             React.createElement('span', { className: 'mcl-label', key: 'label' }, t('forkMemory')),
             React.createElement('span', { className: 'mcl-field', key: 'control' }, React.createElement('button', {
@@ -1212,6 +1403,7 @@ statusStateError: 'State file error: {code} (defaults in effect)',
           }, options),
         React.createElement('div', { className: 'mcl-panel-row', key: 'actions' }, [
           button(t('panelStatus'), '/memory-lab status'),
+          button(t('panelArchiveNow'), '/memory-lab now'),
           button(t('panelCompact'), '/memory-lab compact'),
           button(t('panelHistory'), '/memory-lab history'),
           button(t('panelExport'), '/memory-lab export'),
@@ -1236,14 +1428,27 @@ statusStateError: 'State file error: {code} (defaults in effect)',
     /**
      * 浏览器半的**服务声明**（不是 `package.json` 的 `dsh.client.inject` 图依赖）。
      *
-     * `remote.commands` 必须显式声明：客户端动态门面按 `inject` 判权，未声明时
-     * `ctx.remote.commands` 会在代理 `get` 陷阱里抛错（H-103 的真机错误原文：
-     * `cannot get property "remote.commands" without inject`）。声明后弹层才拿得到
-     * 命令通道；通道本身不可用时 `remoteOf` 仍回 null，控件禁用并说明。
+     * ⚠ 这份数组是**硬依赖**，不是「判权清单」：宿主 `dsh-cordis-client-runner` 把
+     * `Object.keys(fiber.inject)` 当成等待集合（`waitingFor` 过滤 `ctx.get(name) === undefined`），
+     * 只要有一个服务没注册，**整个客户端半就停在 waiting、永不 apply**——chip、侧栏面板、
+     * 设置页一起消失（P2-13）。所以这里只能放「缺了就完全没法工作」的东西。
      *
-     * slots / locale 仍是硬依赖；configForms 继续走 `ctx.inject` 可选接入。
+     * 只有 slots / locale 够格：没有槽位就没有任何 UI 可挂，没有字典就只能显示键名。
+     * `remote` 也是硬依赖（弹层与面板都需要命令通道）。
+     *
+     * `remote.commands` / `uiWorkspace` **不再是硬依赖**（P2-13）：它们只影响「能不能执行
+     * 斜杠命令 / 能不能切换工作区」，而 `remoteOf`/`uiWorkspaceOf` 本来就把缺失当成
+     * 「通道不可用 → 控件禁用 + 文案说明」。把它们写进硬 inject 会让宿主少给一个服务就
+     * 整块 UI 消失，代价与收益完全不成比例。
+     *
+     * 判权仍然需要声明（宿主代理按 `declared` 拦截 `ctx.remote.commands` 读取，H-103 原文
+     * `cannot get property "remote.commands" without inject`），因此改用 `ctx.inject([...], cb)`
+     * 做**可选接入**：服务在时在回调里拿到 ctx 并存给 `hostCtx`，服务缺席时这段不执行、
+     * UI 照常挂载（弹层显示「通道不可用」）。
      */
-    const inject = ['slots', 'locale', 'remote', 'remote.commands', 'uiWorkspace']
+    const inject = ['slots', 'locale', 'remote']
+    /** 可选服务：缺席不影响挂载，只影响对应的写通道（命令 / 工作区）。 */
+    const OPTIONAL_INJECTS = [['remote.commands'], ['uiWorkspace']]
 
     /**
      * 挂载两个面：① composer 的 chip + 弹层（无条件，等槽位出现）；② 设置表单（命名空间被服务时才注册）。
@@ -1274,6 +1479,16 @@ statusStateError: 'State file error: {code} (defaults in effect)',
         key: 'memory-context-lab',
       }, LabPanel))
 
+      // P2-13：可选服务（命令通道 / 工作区）——缺席时这一段不启动，UI 照常挂载，
+      // 弹层按 `remoteOf`/`uiWorkspaceOf` 的 null 走到「通道不可用 + 控件禁用」。
+      // 这里不 dispose 任何东西：服务生命周期由宿主拥有。
+      for (const names of OPTIONAL_INJECTS) {
+        ctx.inject(names, (optionalCtx) => {
+          // 可选上下文里 `ctx.get` 能看到该服务；把可用状态同步给渲染面。
+          hostCtx = optionalCtx ?? ctx
+        })
+      }
+
       // 可选依赖：settings 服务缺席时这一段不启动，chip 只显示状态。
       ctx.inject(['configForms'], (settingsCtx) => {
         // 提供方（@deepseek-ai/dsh-client-ui-settings）拥有并缓存这张表；这里不 dispose，
@@ -1281,8 +1496,8 @@ statusStateError: 'State file error: {code} (defaults in effect)',
         publishScope(settingsCtx.configForms.get(NS))
 
         settingsCtx.effect(() => settingsCtx.configForms.whileServed([NS], () => {
+          // 0.15.0 只注册组件行页：bundle 详情页不再有「外面一层」设置块。
           const disposers = [
-            settingsCtx.slots.register({ name: 'plugins.bundle.config', key: BUNDLE, locale: LOCALE_NS }, Card),
             settingsCtx.slots.register({ name: 'plugins.row.config', key: ROW_KEY, locale: LOCALE_NS }, Card),
           ]
           return () => {
@@ -1305,6 +1520,7 @@ statusStateError: 'State file error: {code} (defaults in effect)',
     module.exports.PROJECTION_KEY = PROJECTION_KEY
     module.exports.apply = apply
     module.exports.inject = inject
+    module.exports.OPTIONAL_INJECTS = OPTIONAL_INJECTS
     return module.exports
   },
 })

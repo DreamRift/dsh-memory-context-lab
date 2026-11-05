@@ -1,0 +1,116 @@
+{
+  "name": "r06-control-call-without-result-turn",
+  "kind": "control",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：c2 有 tool/call 无 result——当前实现唯一能识别的未完成形态；必须保护（null）。",
+  "mode": "turn",
+  "turnBasis": "human",
+  "surfaceNodes": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u0"
+          }
+        ]
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "tool-call",
+              "id": "c1",
+              "name": "read",
+              "arguments": "{}"
+            },
+            {
+              "type": "tool-call",
+              "id": "c2",
+              "name": "grep",
+              "arguments": "{}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "tool/call",
+      "data": {
+        "callId": "c1",
+        "name": "read",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "tool/result",
+      "data": {
+        "callId": "c1",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c1",
+          "source": {
+            "kind": "tool",
+            "callId": "c1"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "type": "tool/call",
+      "data": {
+        "callId": "c2",
+        "name": "grep",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 5,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u5"
+          }
+        ]
+      }
+    }
+  ],
+  "select": {
+    "maxOperations": 1
+  },
+  "expect": {
+    "selection": null,
+    "why": "安全对照：已见 call 无 result 必须保护整组"
+  }
+}

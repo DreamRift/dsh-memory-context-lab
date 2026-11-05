@@ -80,3 +80,24 @@ test('H-38 合法 limit 语义不变：默认 10、显式 0 是空结果、正�
     assert.equal(three.display.length, 3)
   })
 })
+/**
+ * G1（C-G1-02）：`matchedCount` 是「本索引快照里通过覆盖门槛的文档数」——可信计数，
+ * 不是窗口长度。分页的 total 只取它；索引不存在时必须是 **null**（未知），不能是 0
+ * （0 会让「索引没建好」冒充「查了没有」）。
+ */
+test('G1：limit 不改变 matchedCount；索引缺失时 matchedCount=null（未知≠0）', async () => {
+  await withRuntime(async (runtime) => {
+    const one = await runtime.provider.search('记忆', { limit: 1 })
+    const many = await runtime.provider.search('记忆', { limit: 100 })
+    assert.equal(typeof one.matchedCount, 'number')
+    assert.equal(one.matchedCount, many.matchedCount, '可信计数不得随 limit 变化（旧缺陷：拿 slice 后长度当 total）')
+    assert.ok(one.matchedCount >= many.display.length)
+    assert.ok(one.display.length <= 1)
+    // 删除索引并禁止热路径重建 → 如实报 indexAbsent + matchedCount null
+    await rm(path.join(runtime.store.directory, 'lexical-index.json'), { force: true })
+    const absent = await runtime.provider.search('记忆', { limit: 5, allowRebuild: false })
+    assert.equal(absent.indexAbsent, true)
+    assert.equal(absent.matchedCount, null, '索引不存在是未知，不是 0 条')
+    assert.deepEqual(absent.display, [])
+  })
+})

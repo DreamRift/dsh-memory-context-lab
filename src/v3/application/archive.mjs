@@ -10,12 +10,17 @@
  *
  * 这里不做压力/保留策略的“决定”，只执行已选 span；策略在 domain/archive/candidates。
  */
-import { V3ContractViolation } from '../contracts/index.mjs'
+import { RESTORE_SOURCE_FORM, V3ContractViolation } from '../contracts/index.mjs'
+// G5：调度候选的配置合同（contracts，零外部依赖）与纯策略（domain）。两者都不引观测
+// 模块——观测数据只能经 POLICY_INPUT_PORT 校验后**以参数**进来（C7 边界保持）。
+import { normalizeSchedulePolicyConfig } from '../contracts/archive-schedule-policy.mjs'
+import { evaluateSchedulePolicy, nextSchedulePolicyState } from '../domain/archive/schedule-policy.mjs'
 import { renderArchiveReceipt } from '../domain/archive/receipt.mjs'
 import { restoreEligibilityOf, settleRestore } from '../domain/archive/restore.mjs'
 import { selectArchiveSpan } from '../domain/archive/candidates.mjs'
-import { selectStepSpan } from '../domain/archive/steps.mjs'
+import { STEP_BATCH_DEFAULT, selectStepSpan } from '../domain/archive/steps.mjs'
 import { summarizeRecords } from '../domain/compress/summary.mjs'
+import { wrapInjectedPayload } from '../domain/security/untrusted.mjs'
 
 function textOfRecord(record) {
   if (record === null || typeof record !== 'object') return ''
@@ -66,10 +71,44 @@ function noCandidate(rejection) {
   return { ...(rejection ?? {}), status: 'no-candidate', reason }
 }
 
-export function createArchiveService({ store, host, clock, intent = null } = {}) {
+/**
+ * 调度候选（G5）运行时上下文：**未传 policy，或候选已关闭且配置合法 → null**。
+ *
+ * 返回 null 时下面的路径与 0.15.0 逐字节一致——off 路径唯一的分叉点就在这里（用测试钉死）。
+ * 配置**非法**时不返回 null：要让调用方/status 看得到「候选被失败关闭」，
+ * 而不是静默当成"没启用"（§11：非法值失败关闭 + 说明原因）。
+ */
+function schedulePolicyRuntimeOf(policy) {
+  if (policy === null || policy === undefined) return null
+  if (typeof policy !== 'object' || Array.isArray(policy)) return null
+  const normalized = normalizeSchedulePolicyConfig(policy.config)
+  if (normalized.ok === true && normalized.config.enabled !== true) return null
+  return { config: policy.config, state: policy.state ?? null, input: policy.input ?? null }
+}
+
+/**
+ * 策略决策 → 结果面（另加两个只读事实）：`scheduled` = 策略闸门是否放行本次调度，
+ * `safeCandidates` = 现场安全候选段数（0 时如实说明"允许调度但没有安全候选"）。
+ */
+function schedulePolicyViewOf(decision, scheduled, safeCandidates) {
+  if (decision === null) return null
+  return { ...decision, scheduled, safeCandidates }
+}
+
+export function createArchiveService({ store, host, clock, intent = null, random = null, abandon = null } = {}) {
   if (store === null || typeof store !== 'object') throw new V3ContractViolation('v3 archive: 需要 store')
   if (host === null || typeof host !== 'object') throw new V3ContractViolation('v3 archive: 需要 host')
+  // R2-01（2026-10-30）：intentId 由 random 端口生成——application 层禁 import node:*，
+  // 随机性按「只在 composition 出现」的约定经端口注入（composition.mjs random.uuid）。
+  if (random === null || typeof random?.uuid !== 'function') {
+    throw new V3ContractViolation('v3 archive: 需要 random.uuid 端口（R2-01 intentId 生成，composition 注入）')
+  }
   const journal = intent !== null && typeof intent === 'object' ? intent : null
+  // P1-07：补凭证失败的**有界**放弃阈值。默认 5 次 / 6 小时——磁盘满这类瞬时故障通常
+  // 在几分钟内被用户处理掉；中段损坏（永久性）不该让归档无限期停摆，也不该让该段
+  // 永久无法恢复。两条任一命中即放弃（放弃前先把孤儿回执落盘）。
+  const abandonAfterAttempts = Number.isInteger(abandon?.afterAttempts) && abandon.afterAttempts > 0 ? abandon.afterAttempts : 5
+  const abandonAfterMs = Number.isFinite(abandon?.afterMs) && abandon.afterMs > 0 ? abandon.afterMs : 6 * 60 * 60 * 1000
 
   async function recordsOf(recordIds) {
     const rows = []
@@ -83,7 +122,7 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
     return { ok: true, rows }
   }
 
-  async function plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = false, restoreMaxChars = null }) {
+  async function plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = true }) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
     // 拒绝原因（AUD-09 附带项）：选择器只回 null，原因经 onReject 带出，供 status 直读。
@@ -103,62 +142,227 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       onReject: (row) => { rejection = rejection ?? row },
     })
     if (span === null) return noCandidate(rejection)
-    return await makePlan(span, { summary, seqToRecordId, unitLabel: mode === 'cooling' ? '步骤数' : '回合数', restoreMaxChars })
+    return await makePlan(span, { summary, seqToRecordId, unitLabel: mode === 'cooling' ? '步骤数' : '回合数' })
   }
 
   /**
    * span → 回执计划（回合级与步骤级共用）。
    * 净收益门槛在这里只有一处：回执本身也是上下文税，小段（回执比原文长）归档会让占用变大。
    */
-  async function makePlan(span, { summary = false, seqToRecordId, unitLabel = '操作数', restoreMaxChars = null } = {}) {
+  async function makePlan(span, { summary = false, seqToRecordId, unitLabel = '操作数' } = {}) {
     const recordIds = span.recordSeqs.map((seq) => seqToRecordId.get(seq))
-    if (recordIds.some((id) => typeof id !== 'string' || id.length === 0)) return null
+    if (recordIds.some((id) => typeof id !== 'string' || id.length === 0)) {
+      // P2-04：记录 ID 映射缺失是**数据面异常**，不是「没有候选」。旧实现返回 null，
+      // 回合级调用方把它与「选择器没选出 span」混成同一个 `no-candidate`——于是
+      // /memory-lab status 说「暂无可归档」，而实际上有候选、只是映射丢了（按步级
+      // 早就返回结构化失败，两个入口口径相反）。这里返回结构化失败，让两个入口同口径：
+      // 缺哪些 seq 一并带回，便于定位是摄入断点还是索引漂移。
+      const missingSeqs = span.recordSeqs.filter((seq) => {
+        const id = seqToRecordId.get(seq)
+        return typeof id !== 'string' || id.length === 0
+      })
+      return {
+        status: 'failed',
+        phase: 'plan',
+        reason: 'record-id-missing',
+        seqs: missingSeqs,
+        span,
+        recordIds,
+      }
+    }
     const loaded = await recordsOf(recordIds)
     if (!loaded.ok) return { status: 'failed', reason: 'record-read-failed', error: loaded.error, span, recordIds }
+    // 原文总字数必须先算：摘要预算 = max(0, sourceChars - 基础回执字数 - 安全余量)，
+    // 否则固定 220 字摘要会让小步骤（原文约 200 字）的回执 ≥ 原文，永远判负死锁。
+    const sourceChars = loaded.rows.reduce((sum, row) => sum + textOfRecord(row).length, 0)
     const summaryText = summary === true ? summarizeRecords(loaded.rows) : ''
-    // B3-11：回执正文打印**记录 seq 范围**（recordSeqs 首尾）——吸收旧回执后 span.startSeq
-    // 是被吸收回执的 seq（数值上可能大于 endSeq），不是已归档记录的范围。
+    // 回执正文打印**记录 seq 范围**（recordSeqs 首尾）：span 起点可能是回注包这类
+    // 无记录节点（它不该出现在「已把 seq A–B」的账目里）。
     const receiptStart = span.recordSeqs.length > 0 ? span.recordSeqs[0] : span.startSeq
     const receiptEnd = span.recordSeqs.length > 0 ? span.recordSeqs[span.recordSeqs.length - 1] : span.endSeq
-    const receiptText = renderArchiveReceipt({ startSeq: receiptStart, endSeq: receiptEnd, recordIds, operations: span.operations, unitLabel, summary: summaryText })
-    const sourceChars = loaded.rows.reduce((sum, row) => sum + textOfRecord(row).length, 0)
-    // AUD50-02-02（B1-2）：净收益为正 ≠ 恢复得回来。恢复体积按 restoreTextOfRecord
-    // （正文 + toolCalls 参数文本）在**写凭证前**对照生效预算；超限回合不写凭证、
-    // 不改活动面，返回 no-candidate/restore-budget-exceeded——拒绝可重试（调高预算后
-    // 同一轮会重新归档），不进 not-worth 游标，也不做隐式截断（截断是产品决策）。
+    const receiptText = renderArchiveReceipt({
+      startSeq: receiptStart,
+      endSeq: receiptEnd,
+      recordIds,
+      operations: span.operations,
+      unitLabel,
+      summary: summaryText,
+      sourceChars,
+    })
+    // 0.14.0-beta.52（用户拍板）：归档不再有恢复体积预算。restoreChars 只作为
+    // 凭证上的观测值（history 可预判），不再阻止归档；超上下文交给宿主压缩。
     const restoreChars = loaded.rows.reduce((sum, row) => sum + restoreTextOfRecord(row).length, 0)
-    if (Number.isInteger(restoreMaxChars) && restoreMaxChars >= 1 && restoreChars > restoreMaxChars) {
-      return { status: 'no-candidate', reason: 'restore-budget-exceeded', chars: restoreChars, maxChars: restoreMaxChars, span, recordIds }
-    }
     // AUD48-04-01：sourceChars === 0（空正文/纯 metaOnly 回合）时旧条件被短路，160 字回执
     // 替换 0 字正文 → 活动面净增。回执本身也是上下文税，0 源必须判负；结构（toolCalls）
     // 的可恢复性不改变「可见正文为 0」这一事实，不能拿它给负收益开绿灯。
     if (receiptText.length >= sourceChars) {
       return { status: 'not-worth', span, recordIds, receiptText, sourceChars, receiptChars: receiptText.length }
     }
-    return { ...span, recordIds, receiptText, summaryText, restoreChars }
+    // P4：候选预算随计划透出（工具 inspect 与 commit 同源；旧调用方多两个只读字段不改变行为）。
+    return { ...span, recordIds, receiptText, summaryText, restoreChars, receiptChars: receiptText.length, sourceChars }
   }
 
   /**
    * 步骤级计划（普通降温 / 实时压缩）：在当前回合内压已完成步骤。
    * 与回合级共用回执与净收益口径，只是候选选择换成 steps.mjs。
+   *
+   * P3（0.15.0）：一批候选按保护洞切成多个安全 run，这里**逐段**做回执与净收益判断，
+   * 返回 items（可提交段）与 skipped（判负段）。自动 / 预览 / 手动走同一个 planner，
+   * lane 只决定是否绕闸门（manual），不改变安全/闭包/H=200/净收益判据。
+   *
+   * G5（0.15.0 候选，默认关闭）：`policy` 在**安全闭包之后、回执与正净收益之前**多出一道
+   * 显式策略闸门（增长量/请求间隔/积压），只决定「现在调度还是等一下」：
+   * - 安全判据、段边界、H=200、净收益判据一概不变（它只看得到选择器已经选出的安全段）；
+   * - `policy` 未传 / 已关闭 → 本函数行为与 0.15.0 逐字节一致；
+   * - 关闭状态下不读记录、不写任何东西；`policy-deferred` 同样不改 surface、不占 intent。
    */
-  async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false, restoreMaxChars = null } = {}) {
+  async function planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = null, batchSteps = STEP_BATCH_DEFAULT, bypassBatch = false, pinnedSeqs = new Set(), minStartSeq = -1, summary = true, lane = 'auto', policy = null } = {}) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new V3ContractViolation('v3 archive: sessionId 必填')
     if (!(seqToRecordId instanceof Map)) throw new V3ContractViolation('v3 archive: seqToRecordId 必须是 Map')
     let rejection = null
-    const span = selectStepSpan({
+    // G5：off 路径的唯一分叉点（runtime 为 null ⇒ 后面的代码与 0.15.0 完全一致）。
+    const policyRuntime = schedulePolicyRuntimeOf(policy)
+    const batch = selectStepSpan({
       surfaceNodes,
       events,
       retainSteps,
       maxSteps,
+      batchSteps,
+      bypassBatch: bypassBatch === true || lane === 'manual',
       pinnedSeqs,
       minStartSeq,
       hasRecord: (seq) => seqToRecordId.has(seq),
       onReject: (row) => { rejection = rejection ?? row },
     })
-    if (span === null) return noCandidate(rejection)
-    return await makePlan(span, { summary, seqToRecordId, unitLabel: '步骤数', restoreMaxChars })
+    if (batch === null) {
+      const rejected = noCandidate(rejection)
+      if (policyRuntime === null) return rejected
+      // 压力/节奏已满足但没有安全候选 → 如实报告（不为降 token 丢数据：不压、不改判据）。
+      const idle = evaluateSchedulePolicy({
+        config: policyRuntime.config,
+        state: policyRuntime.state,
+        input: policyRuntime.input,
+        lane,
+        facts: { pendingUnits: 0, batchSteps: 0, safeSegments: 0 },
+      })
+      return { ...rejected, policy: schedulePolicyViewOf(idle, false, 0) }
+    }
+    // G5：显式策略闸门（在安全闭包之后、回执/净收益之前）。
+    const policyDecision = policyRuntime === null ? null : evaluateSchedulePolicy({
+      config: policyRuntime.config,
+      state: policyRuntime.state,
+      input: policyRuntime.input,
+      lane,
+      facts: {
+        pendingUnits: batch.eligible,
+        batchSteps: batch.totalSteps,
+        safeSegments: batch.segments.length,
+      },
+    })
+    if (policyDecision !== null && policyDecision.decision === 'defer') {
+      // 只"等"，不动任何东西：surface / intent / voucher / 记录都不碰，候选原样留在活动面。
+      return {
+        status: 'policy-deferred',
+        reason: policyDecision.reason,
+        segments: batch.segments,
+        blocked: batch.blocked,
+        threshold: batch.threshold,
+        eligible: batch.eligible,
+        scanned: batch.scanned,
+        steps: batch.totalSteps,
+        policy: schedulePolicyViewOf(policyDecision, false, batch.segments.length),
+      }
+    }
+    // P3-3（G5 审查）：策略**放行后**的三个「没有可提交段」返回同样要带轨迹——
+    // 否则 status/命令面看不到触发理由（"允许调度但没有正收益段"成了唯一不可解释的路径）。
+    // off 路径 policyDecision 为 null ⇒ 下面三处展开为空对象，字节不变。
+    const policyTrace = policyDecision === null ? {} : { policy: schedulePolicyViewOf(policyDecision, true, batch.segments.length) }
+    const items = []
+    const skipped = []
+    for (let index = 0; index < batch.segments.length; index += 1) {
+      const planned = await makePlan(batch.segments[index], { summary, seqToRecordId, unitLabel: '步骤数' })
+      if (planned === null) {
+        // 记录 ID 映射缺失是数据面异常（不是「没有候选」）：失败关闭，不提交任何段。
+        return { status: 'failed', phase: 'plan', reason: 'record-id-missing', segments: batch.segments, blocked: batch.blocked, ...policyTrace }
+      }
+      if (planned.status === 'failed') return { ...planned, segments: batch.segments, blocked: batch.blocked, ...policyTrace }
+      if (planned.status === 'not-worth') { skipped.push({ index, planned }); continue }
+      items.push({ index, planned })
+    }
+    if (items.length === 0) {
+      if (skipped.length > 0) {
+        // 没有可提交段：把**最后一个**判负段交回入口推进游标（同批判负一次跳过，
+        // 避免每个 pre-step 都从同一段队头重读记录）。
+        const last = skipped[skipped.length - 1].planned
+        return { ...last, status: 'not-worth', segments: batch.segments, skipped: skipped.map((entry) => summarizeSkipped(entry)), blocked: batch.blocked, ...policyTrace }
+      }
+      return {
+        status: 'no-candidate',
+        reason: batch.blocked?.reason ?? 'no-candidate',
+        segments: batch.segments,
+        blocked: batch.blocked,
+        ...(batch.blocked ?? {}),
+        ...policyTrace,
+      }
+    }
+    return {
+      status: 'planned',
+      lane,
+      segments: batch.segments,
+      items,
+      skipped,
+      steps: items.reduce((sum, item) => sum + (item.planned.steps ?? 0), 0),
+      startSeq: items[0].planned.startSeq,
+      endSeq: items[items.length - 1].planned.endSeq,
+      recordIds: items.flatMap((item) => item.planned.recordIds),
+      receiptChars: items.reduce((sum, item) => sum + (item.planned.receiptText?.length ?? 0), 0),
+      threshold: batch.threshold,
+      eligible: batch.eligible,
+      scanned: batch.scanned,
+      truncated: batch.truncated,
+      reachedLimit: batch.reachedLimit,
+      blocked: batch.blocked,
+      // G5：策略放行时带出轨迹（触发理由可打印）；off 路径不产生这个键。
+      ...(policyDecision === null ? {} : { policy: schedulePolicyViewOf(policyDecision, true, batch.segments.length) }),
+    }
+  }
+
+  /** 判负段的可观察摘要（不把整张回执搬进结果面）。 */
+  function summarizeSkipped(entry) {
+    return {
+      index: entry.index,
+      startSeq: entry.planned?.span?.startSeq ?? null,
+      endSeq: entry.planned?.span?.endSeq ?? null,
+      recordIds: entry.planned?.recordIds ?? [],
+      sourceChars: entry.planned?.sourceChars ?? null,
+      receiptChars: entry.planned?.receiptChars ?? null,
+      reason: 'not-worth',
+    }
+  }
+
+  /**
+   * 提交前重验证（P3 §3.3）：同批多段提交会连续改活动面，后一段在提交前必须
+   * 重新核对「它覆盖的节点仍是当前活动面上的一段密集区间」。计划里的记录正文
+   * 已由 makePlan 读取；这里不做全量 hash，只拒绝**范围漂移**——
+   * 不用过期计划去盖新面（宿主压缩/另进程改动都会让范围消失）。
+   */
+  async function revalidatePlanned({ host: hostPort, planned }) {
+    if (typeof hostPort?.surfaceNodes !== 'function') return { ok: true }
+    let nodes
+    try {
+      nodes = await hostPort.surfaceNodes()
+    } catch (error) {
+      return { ok: false, reason: 'surface-read-failed', error }
+    }
+    const startIdx = nodes.indexOf(planned.startSeq)
+    const endIdx = nodes.indexOf(planned.endSeq)
+    if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return { ok: false, reason: 'surface-changed' }
+    const shadowed = nodes.slice(startIdx, endIdx + 1)
+    if (shadowed.length !== planned.sourceEventSeqs.length
+      || shadowed.some((seq, index) => seq !== planned.sourceEventSeqs[index])) {
+      return { ok: false, reason: 'surface-changed' }
+    }
+    return { ok: true }
   }
 
   /** 只预览，不触碰 surface/store。 */
@@ -169,28 +373,180 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
   }
 
   /** 执行一次归档；失败绝不推进 state。 */
-  async function archiveOnce({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = false, restoreMaxChars = null, txn = 1 }) {
-    const planned = await plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations, lastArchiveEndSeq, maxOperations, pinnedSeqs, minStartSeq, turnBasis, currentTurn, summary, restoreMaxChars })
+  async function archiveOnce({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations = 5, lastArchiveEndSeq = -1, maxOperations = 1, pinnedSeqs = new Set(), minStartSeq = -1, turnBasis = 'human', currentTurn = null, summary = true, txn = 1 }) {
+    const planned = await plan({ sessionId, events, surfaceNodes, seqToRecordId, mode, retainOperations, lastArchiveEndSeq, maxOperations, pinnedSeqs, minStartSeq, turnBasis, currentTurn, summary })
     return await commitPlanned({ sessionId, planned, txn, mode: mode === 'cooling' ? 'cooling' : 'full-history' })
   }
 
   /**
-   * 执行一次**步骤级**归档（普通降温 / 实时压缩）：当前回合内已完成步骤。
-   * 与回合级共用宿主 range replace、voucher 与失败语义；不推进 lastArchiveEndSeq
-   * （那是回合级位点，步骤级用磁盘上的真实节点判幂等，重复压缩不会重复计费）。
+   * 执行一次**步骤级批量**归档（普通降温 / 实时压缩）：当前回合内已完成步骤。
+   *
+   * P3（0.15.0）：同一批的多个安全 run **逐段**提交——每段各自占 intent、改面、记 voucher，
+   * 中途失败立即停下并如实回报「已提交 / 失败段 / 未提交」。跨区间没有宿主级原子性，
+   * 不假装整批成功；也不因一段失败回滚已提交的段（那需要宿主提供事务，本版没有）。
+   * 不推进 lastArchiveEndSeq（那是回合级位点，步骤级用磁盘上的真实节点判幂等）。
    */
-  async function archiveStepOnce({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = 3, pinnedSeqs = new Set(), minStartSeq = -1, summary = false, restoreMaxChars = null, txn = 1 } = {}) {
-    const planned = await planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps, maxSteps, pinnedSeqs, minStartSeq, summary, restoreMaxChars })
-    return await commitPlanned({ sessionId, planned, txn, mode: 'cooling' })
+  async function archiveStepBatch({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps = 4, maxSteps = null, batchSteps = STEP_BATCH_DEFAULT, bypassBatch = false, pinnedSeqs = new Set(), minStartSeq = -1, summary = true, txn = 1, lane = 'auto', policy = null } = {}) {
+    const planned = await planSteps({ sessionId, events, surfaceNodes, seqToRecordId, retainSteps, maxSteps, batchSteps, bypassBatch, pinnedSeqs, minStartSeq, summary, lane, policy })
+    if (planned.status !== 'planned') return planned
+    // G5：off（policy 未传/已关闭）时 planned.policy 不存在 ⇒ policyFields 为空对象，
+    // 下面所有返回对象与 0.15.0 逐字节一致。提交成功才产出新的策略状态（nextState），
+    // 由调用方按会话持久化；本层不写盘。
+    const policyFieldsOf = (committedCount) => {
+      if (planned.policy === undefined) return {}
+      if (committedCount < 1) return { policy: { ...planned.policy, scheduled: false } }
+      const nextState = nextSchedulePolicyState({ config: policy?.config, state: policy?.state, input: policy?.input })
+      return { policy: { ...planned.policy, ...(nextState === null ? {} : { nextState }) } }
+    }
+    const committed = []
+    let failure = null
+    let stoppedIndex = planned.items.length
+    for (let index = 0; index < planned.items.length; index += 1) {
+      const item = planned.items[index]
+      const check = await revalidatePlanned({ host, planned: item.planned })
+      if (check.ok !== true) {
+        failure = { index: item.index, phase: 'revalidate', reason: check.reason, error: check.error }
+        stoppedIndex = index
+        break
+      }
+      const result = await commitPlanned({ sessionId, planned: item.planned, txn: txn + index, mode: 'cooling' })
+      if (result.status === 'archived') { committed.push(result); continue }
+      failure = { index: item.index, ...result }
+      stoppedIndex = index
+      break
+    }
+    // 只有**已经处理过**的判负段才能推进游标；失败点之后的段没有评估/提交，
+    // 不能因为同批计划里算出了 not-worth 就提前跳过（失败恢复后还要重试）。
+    const stopAt = failure === null ? Number.POSITIVE_INFINITY : planned.items[stoppedIndex].index
+    const processedSkipped = planned.skipped.filter((entry) => entry.index < stopAt)
+    const notWorthThroughSeq = processedSkipped.reduce((max, entry) => {
+      const endSeq = entry.planned?.span?.endSeq
+      return Number.isInteger(endSeq) && endSeq > max ? endSeq : max
+    }, -1)
+    const skipped = processedSkipped.map((entry) => summarizeSkipped(entry))
+    // 未提交集合 = 失败段及其之后的所有段（失败段不是「已提交」，不能从账目里消失）。
+    const remaining = planned.items.slice(stoppedIndex).map((item) => ({
+      startSeq: item.planned.startSeq,
+      endSeq: item.planned.endSeq,
+      steps: item.planned.steps,
+      recordIds: item.planned.recordIds,
+    }))
+    if (committed.length === 0) {
+      if (failure === null) {
+        // 计划里至少有一项可提交，却一段都没成——只可能是并发/占槽把第一段挡下。
+        return { status: 'failed', phase: 'commit', reason: 'no-segment-committed', segments: planned.segments, blocked: planned.blocked, ...policyFieldsOf(0) }
+      }
+      return {
+        status: 'failed',
+        phase: failure.phase,
+        reason: failure.reason,
+        error: failure.error,
+        existing: failure.existing ?? null,
+        intentKept: failure.intentKept ?? false,
+        span: planned.items[stoppedIndex]?.planned ?? null,
+        segments: planned.segments,
+        blocked: planned.blocked,
+        skipped,
+        notWorthThroughSeq: notWorthThroughSeq >= 0 ? notWorthThroughSeq : null,
+        remaining,
+        ...policyFieldsOf(0),
+      }
+    }
+    return {
+      status: failure === null ? 'archived' : 'partial',
+      // 已提交段的真实账目（逐段 receiptSeq/范围）。
+      segments: committed,
+      committedCount: committed.length,
+      steps: committed.reduce((sum, row) => sum + (row.steps ?? 0), 0),
+      startSeq: committed[0].startSeq,
+      endSeq: committed[committed.length - 1].endSeq,
+      recordIds: committed.flatMap((row) => row.recordIds),
+      receiptSeq: committed[committed.length - 1].receiptSeq,
+      receiptSeqs: committed.map((row) => row.receiptSeq),
+      // P2-19：顶层 `receiptText` 曾经只取**首段**（`committed[0].receiptText`），而
+      // `receiptChars` 是**各段之和**——同一份结果里两个字段量的是两件事：拿到 receiptText 的
+      // 调用方以为它是本批全部回执（实际只有第一段），按它算长度/比对必然对不上。
+      // 现在顶层字段按段序拼接（与 receiptChars 同一口径），逐段原文另给 `receiptTexts`。
+      // 注意：单段批（最常见）拼出来与旧值**逐字节相同**，所以既有单段消费方不受影响。
+      receiptText: committed.map((row) => row.receiptText).join(''),
+      // P2-19：`receiptChars` 必须与上面的 `receiptText` 是**同一份正文**的长度（旧实现里
+      // receiptText 只有首段、receiptChars 却是各段之和，两个字段互相矛盾）。
+      receiptChars: committed.map((row) => row.receiptText).join('').length,
+      // 计划面事实：本批候选数、跳过的判负段、批尾阻塞原因（status 可解释）。
+      plannedSegments: planned.segments.length,
+      plannedCount: planned.items.length,
+      threshold: planned.threshold,
+      eligible: planned.eligible,
+      reachedLimit: planned.reachedLimit,
+      blocked: planned.blocked,
+      skipped,
+      notWorthThroughSeq: notWorthThroughSeq >= 0 ? notWorthThroughSeq : null,
+      failed: failure === null ? null : {
+        index: failure.index,
+        phase: failure.phase,
+        reason: failure.reason,
+        error: failure.error,
+        existing: failure.existing ?? null,
+        intentKept: failure.intentKept ?? false,
+      },
+      failedSegment: failure === null ? null : (planned.items[stoppedIndex]?.planned ?? null),
+      remaining,
+      ...policyFieldsOf(committed.length),
+    }
   }
 
-  /** 落面 + 记 voucher（失败保留 intent，绝不假装成功）。 */
-  async function commitPlanned({ sessionId, planned, txn = 1, mode = 'full-history' }) {
+  /**
+   * 清 intent（best-effort，AUD51-05-03）：`journal.clear` 可能是**同步**实现（返回
+   * undefined）。旧实现直接 `.catch()`，同步实现会抛 TypeError——归档已经成功落面，
+   * 却因为这个收尾动作把整次调用变成异常。这里同时接受 Promise 与非 Promise；
+   * 同步抛错同样吞掉（清 intent 是收尾动作，不是归档成败的判据）。
+   *
+   * R3-02（2026-10-30）：清理带**身份**（expected intent）——journal 实现据此在锁内
+   * 比对后再删，迟到的旧清理不再可能删除后来创建的新意图。旧 journal 合同
+   * （clear 不接受参数）忽略 expected，行为不变。
+   */
+  async function clearIntentOf(journal, expected = undefined) {
+    if (journal === null || journal === undefined || journal.clear === undefined) return
+    try {
+      const pending = journal.clear(expected)
+      if (pending !== null && typeof pending?.then === 'function') await pending
+    } catch {
+      // 清 intent 失败不影响已落面的事实：下一次 pre-step 对账会再清一次。
+    }
+  }
+
+  /**
+   * 同 clearIntentOf 但带回结果（recoverIntent 的清理必须可观测）：
+   * journal 返回 {ok:false,status:'conflict'|'unreadable'} 或抛错时如实上报
+   * 「没删成」，不能冒充清理成功（R3-02）。
+   */
+  async function clearIntentWithResult(journal, expected) {
+    if (journal === null || journal === undefined || journal.clear === undefined) return { cleared: true }
+    try {
+      const pending = journal.clear(expected)
+      const result = pending !== null && typeof pending?.then === 'function' ? await pending : pending
+      if (result !== null && typeof result === 'object' && result.ok === false) {
+        return { cleared: false, status: result.status, existing: result.existing ?? null, error: result.error }
+      }
+      return { cleared: true }
+    } catch (error) {
+      return { cleared: false, status: 'error', error }
+    }
+  }
+  /** 落面 + 记 voucher（失败保留 intent，绝不假装成功）。
+   *
+   * 0.15.0 P4：`summaryRef` / `proposalId` 随 intent 与 voucher 落盘——崩溃补账使用
+   * **原字节**（不重跑生成器、不改回执），摘要只作为派生引用的
+   * {summaryId, hash, sourceSetFingerprint} 三元组，不把正文复制进凭证。
+   */
+  async function commitPlanned({ sessionId, planned, txn = 1, mode = 'full-history', summaryRef = null, proposalId = null }) {
     if (planned === null) return { status: 'no-candidate', reason: 'no-candidate' }
     // no-candidate 现在带 reason（选择器拒绝原因），必须原样透传，不能在这里重新拼成空对象。
     if (planned.status === 'no-candidate' || planned.status === 'failed' || planned.status === 'not-worth') return planned
     const intent = {
       schemaVersion: 1,
+      // R2-01（2026-10-30）：稳定操作身份——占槽/对账/清理都按它比对，恢复补凭证沿用。
+      intentId: random.uuid(),
       sessionId,
       // C-D（0.14.0-beta.48）：崩溃恢复必须知道是回合级还是步骤级——按步归档的
       // 恢复绝不能写 lastArchiveEndSeq（那会成为回合级选择的永久下限）。
@@ -204,9 +560,30 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       receiptText: planned.receiptText,
       // AUD50-02-02：恢复体积随 intent 落盘，崩溃对账补凭证时体积估计不丢。
       restoreChars: Number.isInteger(planned.restoreChars) ? planned.restoreChars : null,
+      // P4：摘要引用只存身份/hash（正文在 summaries.jsonl，不可变）。旧 intent 没有这两个
+      // 字段，恢复路径按缺省处理，行为与旧版一致。
+      ...(summaryRef === null ? {} : { summaryRef }),
+      ...(typeof proposalId === 'string' && proposalId.length > 0 ? { proposalId } : {}),
       createdAt: clock.now(),
     }
-    if (journal?.write !== undefined) await journal.write(intent)
+    // R2-01：先占槽再落面。槽位已被未对账意图占用（或不可读）→ 结构化阻断：
+    // 不写 intent、不碰宿主面、不追加凭证；正常对话与只读能力不受影响。
+    // 有 reserve 的 journal（真实存储）走锁内占槽校验；旧 journal 合同（仅 write）
+    // 退回原写入，行为不变。
+    if (journal?.reserve !== undefined) {
+      const reserved = await journal.reserve(intent)
+      if (reserved !== null && typeof reserved === 'object' && reserved.ok === false) {
+        return {
+          status: 'failed',
+          phase: 'intent',
+          reason: reserved.status === 'unreadable' ? 'intent-unreadable' : 'intent-pending',
+          error: reserved.error,
+          existing: reserved.existing ?? null,
+        }
+      }
+    } else if (journal?.write !== undefined) {
+      await journal.write(intent)
+    }
     let receiptSeq
     try {
       const confirmation = await host.surfaceOp({
@@ -240,13 +617,21 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
         receiptText: planned.receiptText,
         summaryText: planned.summaryText ?? '',
         restoreChars: Number.isInteger(planned.restoreChars) ? planned.restoreChars : null,
+        ...(summaryRef === null ? {} : { summaryRef, summaryId: summaryRef.summaryId }),
+        ...(typeof proposalId === 'string' && proposalId.length > 0 ? { proposalId } : {}),
         txn: Number.isInteger(txn) && txn >= 1 ? txn : 1,
       })
     } catch (error) {
       // 保留 intent：下个 pre-step 可按 receiptText 找到 surface 节点补 voucher。
-      return { status: 'failed', phase: 'voucher', error, receiptSeq, span: planned }
+      // P1-07：提交失败本身就是第 1 次失败——把 attempts/firstFailedAt 随 intent 落盘，
+      // 放弃阈值覆盖「提交失败」而不是从下一次对账才开始计数。
+      const now = clock.now()
+      try {
+        await journal?.write?.({ ...intent, attempts: 1, firstFailedAt: now, lastFailedAt: now, lastError: error?.code ?? 'EINTERNAL' })
+      } catch { /* 记不上不影响对账：下一次失败会重新从 1 开始计数（只多挡几步，不会误放弃） */ }
+      return { status: 'failed', phase: 'voucher', error, receiptSeq, span: planned, attempts: 1 }
     }
-    if (journal?.clear !== undefined) await journal.clear().catch(() => {})
+    await clearIntentOf(journal, intent)
     return {
       status: 'archived',
       receiptSeq,
@@ -256,7 +641,24 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
       receiptText: planned.receiptText,
       operations: planned.operations,
       steps: Number.isInteger(planned.steps) ? planned.steps : undefined,
+      voucherId: 'v-' + receiptSeq,
+      summaryId: summaryRef?.summaryId ?? null,
     }
+  }
+
+  /**
+   * 提交一个已准备计划（P4 工具/提案路径）。与自动归档走**同一个** commitPlanned：
+   * 占槽、intent、宿主 replace、凭证、清理全部复用，不新增第二套提交器。
+   *
+   * @param {object} input
+   * @param {object} input.plan 已包含 receiptText/recordIds/…（由统一 planner 的候选构造）
+   * @param {object|null} [input.summaryRef] {summaryId, hash, sourceSetFingerprint}
+   */
+  async function commitPrepared({ sessionId, plan, txn = 1, mode = 'full-history', summaryRef = null, proposalId = null } = {}) {
+    if (plan === null || typeof plan !== 'object') return { status: 'failed', phase: 'plan', error: new V3ContractViolation('v3 archive: commitPrepared 需要计划') }
+    if (typeof plan.receiptText !== 'string' || plan.receiptText.length === 0) return { status: 'failed', phase: 'plan', reason: 'receipt-missing' }
+    if (!Array.isArray(plan.recordIds) || plan.recordIds.length === 0) return { status: 'failed', phase: 'plan', reason: 'records-missing' }
+    return await commitPlanned({ sessionId, planned: plan, txn, mode, summaryRef, proposalId })
   }
 
   /**
@@ -272,16 +674,19 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
     const nodes = (surfaceNodes ?? []).filter((seq) => Number.isInteger(seq) && seq > intent.endSeq)
     const receiptSeq = await firstEligibleSeq(nodes, intent.receiptText, surfaceTextOf)
     if (receiptSeq === null) {
-      if (journal?.clear !== undefined) await journal.clear().catch(() => {})
-      return { recovered: false, cleared: true, mode }
+      // R3-02：按身份清理——对账期间槽位被新意图占走（conflict）时**不删**，
+      // 如实上报 cleared:false，让下一次对账接手（新意图属于新事务）。
+      const cleared = await clearIntentWithResult(journal, intent)
+      return { recovered: false, cleared: cleared.cleared, clearStatus: cleared.cleared ? undefined : cleared.status, mode }
     }
-    // 幂等（审计 C-C）：崩溃窗口「voucher 已追加、intent 未清」会重进这里。
-    // 旧实现无条件再追加一次，同一 receiptSeq 产生两条同 ID 凭证（v-4 / v-4），
-    // history 与 restoreAll 的条数、下标全部失真。已有同 ID 凭证就只清 intent。
+    // 幂等（审计 C-C / H6）：崩溃窗口「voucher 已追加、intent 未清」会重进这里。
+    // 旧实现在**锁外**用本句柄的内存视图 .some() 判重：另一进程刚追加的凭证它看不到，
+    // 于是两进程各写一条 v-<seq>，history/restoreAll 的条数与 restore(序号) 的下标全部错位。
+    // 现在把「刷新 → 判重 → 追加」交给存储层在跨进程写锁内完成（appendVoucher），
+    // 重复由 ESTORE_DUPLICATE_VOUCHER 表达，这里只是把冲突翻译成 duplicateSkipped。
     let duplicateSkipped = false
     try {
-      duplicateSkipped = store.listVouchers().some((voucher) => voucher?.voucherId === 'v-' + receiptSeq)
-      if (!duplicateSkipped) {
+      {
         await store.appendVoucher({
           schemaVersion: 2,
           voucherId: 'v-' + receiptSeq,
@@ -293,15 +698,79 @@ export function createArchiveService({ store, host, clock, intent = null } = {})
           targetEventId: receiptSeq,
           receiptText: intent.receiptText,
           restoreChars: Number.isInteger(intent.restoreChars) ? intent.restoreChars : null,
+          // P4：摘要引用随 intent 补账（使用原字节；不重跑生成器）。
+          ...(intent.summaryRef === undefined || intent.summaryRef === null ? {} : { summaryRef: intent.summaryRef, summaryId: intent.summaryRef.summaryId }),
+          ...(typeof intent.proposalId === 'string' && intent.proposalId.length > 0 ? { proposalId: intent.proposalId } : {}),
           // C-E：用 intent 里的事务号（旧版 intent 没有 txn → 1，与旧行为一致）。
           txn: Number.isInteger(intent.txn) && intent.txn >= 1 ? intent.txn : 1,
         })
       }
-    } catch {
-      return { recovered: false, kept: true, receiptSeq, mode }
+    } catch (error) {
+      if (error?.code === 'ESTORE_DUPLICATE_VOUCHER') {
+        // 另一进程/重放已经补过同 ID 凭证：幂等成功，继续清 intent。
+        duplicateSkipped = true
+      } else {
+        // P1-07：补账失败必须**有界**。旧实现每次都 kept:true——磁盘满或 vouchers.jsonl 中段
+        // 损坏时，该段原文永远没有凭证（restore 找不到），槽位被占又**永久停掉该会话的新归档**。
+        //
+        // 现在累计尝试次数与首败时间（随 intent 落盘）：未到阈值 → 保留并重试；到阈值 →
+        // 放弃：先把回执正文 + recordIds 落进 orphan-receipts.jsonl（restore 的兜底线索），
+        // 再按身份清槽。孤儿账本写失败就**不放弃**（宁可继续挡，也不丢恢复线索）。
+        const now = clock.now()
+        const attempts = (Number.isInteger(intent.attempts) && intent.attempts > 0 ? intent.attempts : 0) + 1
+        const firstFailedAt = Number.isFinite(intent.firstFailedAt) ? intent.firstFailedAt : now
+        const lastError = error?.code ?? 'EINTERNAL'
+        const giveUp = attempts >= abandonAfterAttempts || (now - firstFailedAt) >= abandonAfterMs
+        if (!giveUp) {
+          try {
+            await journal?.write?.({ ...intent, attempts, firstFailedAt, lastFailedAt: now, lastError })
+          } catch {
+            // 记不上就下次再试：绝不因为「记不上」而谎报放弃（attempts 只在内存推进）。
+          }
+          return { recovered: false, kept: true, receiptSeq, mode, error: lastError, attempts, retryAt: firstFailedAt + abandonAfterMs }
+        }
+        if (typeof store.appendOrphanReceipt !== 'function') {
+          // 存储实现没有孤儿账本（旧替身）：不能放弃——放弃就等于丢恢复线索。
+          return { recovered: false, kept: true, receiptSeq, mode, error: lastError, attempts, abandonFailed: 'store-no-orphan-ledger' }
+        }
+        let orphanId = null
+        try {
+          const appended = await store.appendOrphanReceipt({
+            receiptSeq,
+            receiptText: intent.receiptText,
+            recordIds: Array.isArray(intent.recordIds) ? [...intent.recordIds] : [],
+            startSeq: Number.isInteger(intent.startSeq) ? intent.startSeq : null,
+            endSeq: Number.isInteger(intent.endSeq) ? intent.endSeq : null,
+            sourceEventSeqs: Array.isArray(intent.sourceEventSeqs) ? [...intent.sourceEventSeqs] : [],
+            restoreChars: Number.isInteger(intent.restoreChars) ? intent.restoreChars : null,
+            mode,
+            txn: Number.isInteger(intent.txn) ? intent.txn : null,
+            attempts,
+            firstFailedAt,
+            abandonedAt: now,
+            lastError,
+          })
+          orphanId = appended?.id ?? null
+        } catch (orphanError) {
+          return { recovered: false, kept: true, receiptSeq, mode, error: lastError, attempts, abandonFailed: orphanError?.code ?? 'orphan-append-failed' }
+        }
+        // 清槽用**磁盘上那份 intent** 的身份（放弃分支没有改写 attempts，指纹仍匹配）。
+        const cleared = await clearIntentWithResult(journal, intent)
+        return { recovered: false, abandoned: true, orphanId, receiptSeq, mode, attempts, error: lastError, cleared: cleared.cleared, clearStatus: cleared.cleared ? undefined : cleared.status }
+      }
     }
-    if (journal?.clear !== undefined) await journal.clear().catch(() => {})
-    return { recovered: true, receiptSeq, endSeq: intent.endSeq, mode, duplicateSkipped }
+    // 成功路径同样按身份清理（R3-02）：conflict（对账期间槽位被新意图占走）时
+    // 不删并如实上报——凭证已补上，新意图留给下一次对账。
+    const cleared = await clearIntentWithResult(journal, intent)
+    return {
+      recovered: true,
+      receiptSeq,
+      endSeq: intent.endSeq,
+      mode,
+      duplicateSkipped,
+      cleared: cleared.cleared,
+      ...(cleared.cleared ? {} : { clearStatus: cleared.status }),
+    }
   }
 
   /**
@@ -331,41 +800,95 @@ async function replaceVoucherReceipt(index, expected, next) {
     const targetSeq = await firstEligibleSeq(await host.surfaceNodes(), expected, (seq) => host.surfaceTextAt(seq))
     if (targetSeq === null) return { changed: false, reason: 'receipt-changed' }
     try {
-      await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: next })
-      return { changed: true }
+      const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: next })
+      // P1-08：把**新节点 seq** 带回给调用方（redact 要落进 redactions.jsonl）。
+      return { changed: true, seq: Number.isInteger(confirmation?.seq) ? confirmation.seq : null }
     } catch (error) {
       return { changed: false, reason: 'surface-rejected', error }
     }
   }
 
-  /** 遗忘级联：把含已遗忘记录的回执替换成不含正文的标记（可 undo 还原）。 */
+  /**
+   * 遗忘级联：把含已遗忘记录的回执替换成不含正文的标记（可 undo 还原）。
+   *
+   * H4（2026-11-04 审计）：持久标记失败**不得被吞**。旧实现 `.catch(() => {})` 后仍返回
+   * `changed:true`，命令面于是显示「N 段回执已清除」，而 history/export 读不到
+   * redactions 标记，会把该回执正文原样带出。现在把标记结果作为返回值的一部分：
+   * `marked:false` + `markError`，调用方据此计入失败，不再谎报全部清除。
+   */
   async function redactVoucher(index) {
     const voucher = store.listVouchers()[index]
     if (voucher === undefined) return { changed: false, reason: 'voucher-not-found' }
-    const result = await replaceVoucherReceipt(index, voucher.receiptText, REDACTED_RECEIPT)
-    if (result.changed === true) {
-      // D-C：持久标记（history 同步读取；不依赖宿主活动面）。标记失败不影响本次清除事实。
-      if (typeof store.markVoucherRedacted === 'function') {
-        await store.markVoucherRedacted(voucher.voucherId, true).catch(() => {})
-      }
+    let result = await replaceVoucherReceipt(index, voucher.receiptText, REDACTED_RECEIPT)
+    if (result.changed !== true && result.reason === 'receipt-changed') {
+      // P2-05（可收敛）：表面**已经**是清除标记、只是上次标记写失败 → 本次是补标记的
+      // 重试机会，不能因为「没有可替换的正文」就提前返回（那样这张回执的 redactions
+      // 行永远补不上，history/export 会一直把它的正文当可导出）。
+      const already = await firstEligibleSeq(await host.surfaceNodes(), REDACTED_RECEIPT, (seq) => host.surfaceTextAt(seq))
+      if (already !== null) result = { changed: false, reason: 'already-redacted', seq: already }
     }
-    return result
+    if (result.changed !== true && result.reason !== 'already-redacted') return result
+    if (typeof store.markVoucherRedacted !== 'function') return { ...result, marked: false, markError: 'store-no-redaction-ledger' }
+    try {
+      const marked = await store.markVoucherRedacted(voucher.voucherId, true, { seq: result.seq })
+      // 同一判据两处（redact / unredact）：changed:false 且状态不对 = 标记没写成功。
+      return marked?.changed === false && marked?.redacted !== true
+        ? { ...result, marked: false, markError: 'redaction-mark-noop' }
+        : { ...result, marked: true, ...(result.changed === true ? {} : { repaired: true }) }
+    } catch (error) {
+      return { ...result, marked: false, markError: error?.code ?? error?.message ?? String(error) }
+    }
   }
 
   async function unredactVoucher(index) {
     const voucher = store.listVouchers()[index]
     if (voucher === undefined) return { changed: false, reason: 'voucher-not-found' }
-    const result = await replaceVoucherReceipt(index, REDACTED_RECEIPT, voucher.receiptText)
-    if (result.changed === true) {
-      if (typeof store.markVoucherRedacted === 'function') {
-        await store.markVoucherRedacted(voucher.voucherId, false).catch(() => {})
-      }
+    if (typeof host.surfaceNodes !== 'function' || typeof host.surfaceTextAt !== 'function') {
+      return { changed: false, reason: 'host-no-surface-text' }
     }
-    return result
+    // P1-08：undo 必须按「清除时落下的新节点 seq」定位。旧实现按正文逐字节比对，而**所有**
+    // 已清除回执的正文都是同一个常量串 REDACTED_RECEIPT——两块都被清后 unredact(#1) 会把
+    // #1 的正文写进 #0 的槽位，位置与内容互换，history 却都显示 redacted:false。
+    let result = null
+    let targetSeq = typeof store.redactionSeqOf === 'function' ? store.redactionSeqOf(voucher.voucherId) : null
+    if (!Number.isInteger(targetSeq)) {
+      // 老账本没有 seq：只有「当前恰好只有这一张已清除回执」时映射才无歧义；
+      // 多于一张就失败关闭——宁可 undo 不成立，也不把别人的正文写到错位置。
+      let redacted = null
+      try { redacted = store.redactedVoucherIds() } catch { redacted = null }
+      if (redacted === null || redacted.length !== 1 || redacted[0] !== voucher.voucherId) {
+        return { changed: false, reason: 'redaction-seq-missing' }
+      }
+      targetSeq = await firstEligibleSeq(await host.surfaceNodes(), REDACTED_RECEIPT, (seq) => host.surfaceTextAt(seq))
+      if (targetSeq === null) return { changed: false, reason: 'receipt-changed' }
+    } else {
+      // seq 定位后仍要复核表面正文：节点可能已被宿主压缩/改写（那就不能覆盖）。
+      const nodes = await host.surfaceNodes()
+      if (!nodes.includes(targetSeq)) return { changed: false, reason: 'receipt-changed' }
+      if ((await host.surfaceTextAt(targetSeq)) !== REDACTED_RECEIPT) return { changed: false, reason: 'receipt-changed' }
+    }
+    try {
+      const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: voucher.receiptText })
+      result = { changed: true, seq: Number.isInteger(confirmation?.seq) ? confirmation.seq : null }
+    } catch (error) {
+      return { changed: false, reason: 'surface-rejected', error }
+    }
+    if (typeof store.markVoucherRedacted !== 'function') return { ...result, marked: false, markError: 'store-no-redaction-ledger' }
+    try {
+      // P2-05：旧实现**不看返回值**，于是标记没写成功也报 marked:true——命令面显示
+      // 「N 段已还原」，history 里却仍是 redacted:true（观察面与事实分叉）。判据与
+      // redactVoucher 同源：changed:false 且状态仍为「已清除」= 没写成功。
+      const marked = await store.markVoucherRedacted(voucher.voucherId, false)
+      return marked?.changed === false && marked?.redacted === true
+        ? { ...result, marked: false, markError: 'redaction-mark-noop' }
+        : { ...result, marked: true }
+    } catch (error) {
+      return { ...result, marked: false, markError: error?.code ?? error?.message ?? String(error) }
+    }
   }
 
-  /** 恢复一个凭证：正文逐字节相等 + 限制长度，失败关闭。 */
-  async function restoreVoucher(index, { maxChars = 16000 } = {}) {
+  /** 恢复一个凭证：正文逐字节相等，失败关闭；不设体积上限（超上下文交给宿主压缩）。 */
+  async function restoreVoucher(index) {
     let vouchers
     try { vouchers = store.listVouchers() } catch (error) { return { restored: false, reason: 'vouchers-unreadable', error } }
     const voucher = vouchers[index]
@@ -375,6 +898,15 @@ async function replaceVoucherReceipt(index, expected, next) {
     }
     if (typeof host.surfaceNodes !== 'function' || typeof host.surfaceTextAt !== 'function') {
       return { restored: false, reason: 'host-no-surface-text' }
+    }
+    // P2-07：凭证任一记录已被物理清除 → 该段不可恢复（先判，不去碰宿主面）。
+    try {
+      const purgedNow = typeof store.listPurged === 'function' ? new Set(store.listPurged()) : null
+      if (purgedNow !== null && (voucher.recordIds ?? []).some((id) => purgedNow.has(id))) {
+        return { restored: false, reason: 'record-purged' }
+      }
+    } catch {
+      return { restored: false, reason: 'purge-ledger-unreadable' }
     }
     const targetSeq = await firstEligibleSeq(await host.surfaceNodes(), voucher.receiptText, (seq) => host.surfaceTextAt(seq))
     if (targetSeq === null) return { restored: false, reason: 'receipt-changed' }
@@ -388,21 +920,58 @@ async function replaceVoucherReceipt(index, expected, next) {
     }
     const text = loaded.rows.map(restoreTextOfRecord).filter((part) => part.length > 0).join('\n\n')
     if (text.length === 0) return { restored: false, reason: 'no-restorable-text' }
-    if (text.length > maxChars) return { restored: false, reason: 'restore-too-large', chars: text.length, maxChars }
+    // AUD48-08-01：恢复正文首尾加插件来源标记（模型据此知道这是资料，不是新指令），
+    // 并声明本次落面的 source.form = restore（与归档回执区分开）。正文本身一字不改。
+    const next = wrapInjectedPayload('restore', text, {
+      startSeq: voucher.startSeq, endSeq: voucher.endSeq, count: loaded.rows.length,
+    })
     try {
-      const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text })
+      const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: next, sourceForm: RESTORE_SOURCE_FORM })
       return { restored: true, seq: confirmation?.seq, chars: text.length, voucherIndex: index }
     } catch (error) {
       return { restored: false, reason: 'surface-rejected', error }
     }
   }
 
-  async function restoreAll({ maxChars = 16000 } = {}) {
+  /**
+   * P1-07：恢复一条**孤儿回执**（补凭证放弃后的兜底）。落面口径与 restoreVoucher 同源：
+   * 按回执正文定位节点 → 读记录 → 包来源标记后 replace；正文被宿主改写/记录已遗忘都失败关闭。
+   */
+  async function restoreOrphan(orphan) {
+    if (typeof host.surfaceNodes !== 'function' || typeof host.surfaceTextAt !== 'function') {
+      return { restored: false, reason: 'host-no-surface-text' }
+    }
+    const targetSeq = await firstEligibleSeq(await host.surfaceNodes(), orphan.receiptText, (seq) => host.surfaceTextAt(seq))
+    if (targetSeq === null) return { restored: false, reason: 'receipt-changed' }
+    const loaded = await recordsOf(Array.isArray(orphan.recordIds) ? orphan.recordIds : [])
+    if (!loaded.ok) {
+      const reason = loaded.error?.code === 'EFORGOTTEN' ? 'record-forgotten'
+        : loaded.error?.code === 'ERECORD_NOT_FOUND' ? 'record-not-found'
+        : 'record-read-failed'
+      return { restored: false, reason, error: loaded.error }
+    }
+    const text = loaded.rows.map(restoreTextOfRecord).filter((part) => part.length > 0).join('\n\n')
+    if (text.length === 0) return { restored: false, reason: 'no-restorable-text' }
+    const facts = { count: loaded.rows.length }
+    if (Number.isInteger(orphan.startSeq) && Number.isInteger(orphan.endSeq)) {
+      facts.startSeq = orphan.startSeq
+      facts.endSeq = orphan.endSeq
+    }
+    const next = wrapInjectedPayload('restore', text, facts)
+    try {
+      const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: next, sourceForm: RESTORE_SOURCE_FORM })
+      return { restored: true, seq: confirmation?.seq, chars: text.length, orphanId: orphan.id }
+    } catch (error) {
+      return { restored: false, reason: 'surface-rejected', error }
+    }
+  }
+
+  async function restoreAll() {
     let vouchers
     try { vouchers = store.listVouchers() } catch (error) { return { restored: 0, skipped: 0, forgotten: 0, total: 0, rows: [], error } }
     const rows = []
     for (let index = 0; index < vouchers.length; index += 1) {
-      const result = await restoreVoucher(index, { maxChars })
+      const result = await restoreVoucher(index)
       rows.push({ index, ...result })
     }
     // D-B：会计走 N-11 三桶——restored + skipped + forgotten === total，
@@ -411,6 +980,18 @@ async function replaceVoucherReceipt(index, expected, next) {
       outcome: row.restored === true ? 'restored' : (row.reason === 'record-forgotten' ? 'forgotten' : 'skipped'),
       reason: row.restored === true ? undefined : row.reason,
     })))
+    // P1-07：孤儿回执是「放弃补凭证」留下的恢复线索——不恢复它，放弃就等于永久丢原文。
+    const orphanRows = []
+    let orphans = []
+    try {
+      orphans = typeof store.listOrphanReceipts === 'function' ? store.listOrphanReceipts() : []
+    } catch (error) {
+      // 孤儿账本读不到：如实报告，不把「读不到」当「没有」（那会让恢复静默少段）。
+      orphanRows.push({ orphanId: null, restored: false, reason: 'orphans-unreadable', error: error?.code ?? String(error) })
+    }
+    for (const orphan of orphans) {
+      orphanRows.push({ orphanId: orphan.id, receiptSeq: orphan.receiptSeq ?? null, ...(await restoreOrphan(orphan)) })
+    }
     return {
       total: settled.total,
       restored: settled.restored,
@@ -418,6 +999,10 @@ async function replaceVoucherReceipt(index, expected, next) {
       forgotten: settled.forgotten,
       balanced: settled.balanced,
       rows,
+      orphanTotal: orphans.length,
+      orphanRestored: orphanRows.filter((row) => row.restored === true).length,
+      orphanFailed: orphanRows.filter((row) => row.restored !== true).length,
+      orphans: orphanRows,
     }
   }
 
@@ -431,8 +1016,32 @@ async function replaceVoucherReceipt(index, expected, next) {
       // 标记账本损坏不阻断历史列表：只把 redacted 标为 null（未知），不伪造「未清除」。
       redactedIds = null
     }
+    // P2-07：**purge 事实优先于 redactions 标记**。物理清除删正文在前、回执清除在后，
+    // 中间任一步失败（redact 的 receipt-changed / 标记写失败）都会让 vouchers.jsonl 里
+    // 继续留着 ≤400 字原文首部——而读面只看 redactions 就把它当「未清除」导出去。
+    // 判据改为「凭证任一记录已被 purge ⇒ 该段正文一律不可见、不可恢复」，与 redact 解耦。
+    let purgedIds = new Set()
+    try {
+      purgedIds = new Set(typeof store.listPurged === 'function' ? store.listPurged() : [])
+    } catch {
+      // 读不到 purge 账本：按「未知」失败关闭——宁可整列按已清除显示，也不谎报可导出。
+      purgedIds = null
+    }
+    const purgedOf = (voucher) => {
+      if (purgedIds === null) return true
+      const ids = Array.isArray(voucher?.recordIds) ? voucher.recordIds : []
+      return ids.some((id) => purgedIds.has(id))
+    }
     return {
       total: vouchers.length,
+      // P1-07：孤儿回执数（补凭证放弃后仍可恢复的段）。读不到时如实返回 null，不报 0。
+      orphanCount: (() => {
+        try {
+          return typeof store.listOrphanReceipts === 'function' ? store.listOrphanReceipts().length : 0
+        } catch {
+          return null
+        }
+      })(),
       rows: vouchers.map((voucher, index) => ({
         index,
         targetEventId: voucher.targetEventId,
@@ -443,11 +1052,17 @@ async function replaceVoucherReceipt(index, expected, next) {
         // AUD50-02-02：归档时记录的恢复体积（旧凭证没有 → null，不猜）。
         restoreChars: Number.isInteger(voucher.restoreChars) ? voucher.restoreChars : null,
         summary: typeof voucher.summaryText === 'string' && voucher.summaryText.length > 0,
+        // P4：摘要引用（旧凭证没有 → null，不猜）。
+        summaryId: typeof voucher.summaryRef?.summaryId === 'string' ? voucher.summaryRef.summaryId : null,
         // D-C：隐私面已清除的回执在历史里必须看得出来（否则观察面以为它仍可恢复）。
-        redacted: redactedIds === null ? null : redactedIds.has(voucher.voucherId),
+        // P2-07：purge 事实同样算「已清除」——正文已被删除，无论 redact 成功与否。
+        redacted: redactedIds === null ? (purgedOf(voucher) ? true : null) : (redactedIds.has(voucher.voucherId) || purgedOf(voucher)),
+        // 观测面：区分「按 redactions 标记清除」与「按 purge 事实兜底」。后者说明级联没走完，
+        // history 消费者（含导出）不得把 receiptText 当可导出正文。
+        purged: purgedOf(voucher),
       })),
     }
   }
 
-  return { plan, planSteps, dryRun, archiveOnce, archiveStepOnce, recoverIntent, redactVoucher, unredactVoucher, restoreVoucher, restoreAll, history }
+  return { plan, planSteps, dryRun, archiveOnce, archiveStepBatch, commitPrepared, recoverIntent, redactVoucher, unredactVoucher, restoreVoucher, restoreAll, history }
 }

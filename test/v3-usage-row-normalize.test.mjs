@@ -83,10 +83,18 @@ test('H-50 一个可用数值都没有的行不构成样本', async () => {
   assert.equal(summary.badLines, 1)
 })
 
-test('H-48 全坏行 / 空文件 / 文件不存在：仍返回 null（语义不变）', async () => {
-  assert.equal(await readUsageSummary(await dirWith(['{坏', 'null'])), null)
-  assert.equal(await readUsageSummary(await dirWith([])), null)
-  assert.equal(await readUsageSummary(path.join(tmpdir(), 'mcl-不存在-' + Date.now())), null)
+test('H-48 全坏行：返回对象并披露 badLines（P3-02 改口径）', async () => {
+  // P3-02（0.15.1 §3.3）：旧实现在这里返回 null，与「没有样本」完全同形，badLines 丢失。
+  const summary = await readUsageSummary(await dirWith(['{坏', 'null']))
+  assert.notEqual(summary, null, '有行但有坏行：必须返回对象')
+  assert.equal(summary.samples, 0)
+  assert.equal(summary.badLines, 2)
+  assert.equal(summary.usable, false)
+})
+
+test('H-48 空文件 / 文件不存在：仍返回 null（真的没有样本）', async () => {
+  assert.equal(await readUsageSummary(await dirWith([])), null, '空文件 = 没有样本')
+  assert.equal(await readUsageSummary(path.join(tmpdir(), 'mcl-不存在-' + Date.now())), null, '文件不存在 = 没有样本')
 })
 
 test('H-48 正常样本：聚合口径不回归', async () => {

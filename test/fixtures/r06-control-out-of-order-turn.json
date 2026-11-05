@@ -1,0 +1,150 @@
+{
+  "name": "r06-control-out-of-order-turn",
+  "kind": "control",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：assistant 声明 c1,c2，结果按 c2→c1 到达（乱序）。闭包按集合成立，应可归档。",
+  "mode": "turn",
+  "turnBasis": "human",
+  "surfaceNodes": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u0"
+          }
+        ]
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "parallel"
+            },
+            {
+              "type": "tool-call",
+              "id": "c1",
+              "name": "read",
+              "arguments": "{}"
+            },
+            {
+              "type": "tool-call",
+              "id": "c2",
+              "name": "grep",
+              "arguments": "{}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "tool/call",
+      "data": {
+        "callId": "c2",
+        "name": "grep",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "tool/result",
+      "data": {
+        "callId": "c2",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c2",
+          "source": {
+            "kind": "tool",
+            "callId": "c2"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "type": "tool/call",
+      "data": {
+        "callId": "c1",
+        "name": "read",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 5,
+      "type": "tool/result",
+      "data": {
+        "callId": "c1",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c1",
+          "source": {
+            "kind": "tool",
+            "callId": "c1"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u6"
+          }
+        ]
+      }
+    }
+  ],
+  "select": {
+    "maxOperations": 1
+  },
+  "expect": {
+    "selection": "non-null",
+    "seqs": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "why": "正常对照：乱序结果仍构成完整闭包"
+  }
+}

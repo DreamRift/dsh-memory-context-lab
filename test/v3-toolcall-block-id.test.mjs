@@ -7,6 +7,7 @@
  * 修法：callId = block.callId 或 block.id（空串按缺失；两者同时在优先 callId）；
  * 去重键用解析后的 callId；name/arguments 照旧脱敏，text 不变。
  */
+import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -98,7 +99,7 @@ test('B2-2 端到端：restore 文本包含 (call_x)', async () => {
       const seq = seqOfDshEventId(provenance?.sourceEventId)
       if (seq !== null) seqMap.set(seq, recordId)
     }
-    const archive = createArchiveService({ store: runtime.store, host: runtime.host, clock: { now: () => 1 } })
+    const archive = createArchiveService({ random: { uuid: () => randomUUID() }, store: runtime.store, host: runtime.host, clock: { now: () => 1 } })
     const result = await archive.archiveOnce({
       sessionId: 's-callid',
       events: session.log,

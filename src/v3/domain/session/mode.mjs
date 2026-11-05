@@ -63,6 +63,9 @@ function normalizeReadLease(raw, errorRef) {
   const out = []
   for (const item of raw) {
     if (item === null || typeof item !== 'object' || Array.isArray(item)) { errorRef.value = 'ESTATE_READ_LEASE'; continue }
+    for (const key of Object.keys(item)) {
+      if (!['recordId', 'expiresAt'].includes(key)) errorRef.value = errorRef.value ?? 'ESTATE_UNKNOWN_FIELD'
+    }
     if (typeof item.recordId !== 'string' || item.recordId.length === 0) { errorRef.value = 'ESTATE_READ_LEASE'; continue }
     if (typeof item.expiresAt !== 'number' || !Number.isFinite(item.expiresAt)) { errorRef.value = 'ESTATE_READ_LEASE'; continue }
     if (!out.some((row) => row.recordId === item.recordId)) out.push({ recordId: item.recordId, expiresAt: item.expiresAt })
@@ -81,13 +84,17 @@ export function normalizeSessionState(raw, { defaultMode = 'recall-only' } = {})
     return { state: base, error: 'ESTATE_SHAPE' }
   }
   const errorRef = { value: null }
+  const allowed = new Set(['schemaVersion', 'mode', 'modeSource', 'planFirst', 'autoRestore', 'pins', 'readLease', 'surface', 'planFloorSeq', 'cooling', 'provider', 'updatedAt'])
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) { errorRef.value = errorRef.value ?? 'ESTATE_UNKNOWN_KEY'; break }
+  }
   let mode = base.mode
   if (raw.mode !== undefined) {
     if (SESSION_MODES.includes(raw.mode)) mode = raw.mode
     else errorRef.value = 'ESTATE_MODE'
   }
   const state = emptySessionState(mode)
-  if (raw.schemaVersion !== undefined && raw.schemaVersion !== SESSION_STATE_SCHEMA_VERSION) errorRef.value = 'ESTATE_VERSION'
+  if (raw.schemaVersion !== undefined && raw.schemaVersion !== SESSION_STATE_SCHEMA_VERSION) errorRef.value = errorRef.value ?? 'ESTATE_VERSION'
   if (raw.modeSource === 'default' || raw.modeSource === 'migration' || raw.modeSource === 'explicit') state.modeSource = raw.modeSource
   else if (raw.modeSource !== undefined) errorRef.value = 'ESTATE_MODE_SOURCE'
   for (const key of ['planFirst', 'autoRestore']) {
@@ -100,8 +107,13 @@ export function normalizeSessionState(raw, { defaultMode = 'recall-only' } = {})
   if (raw.surface !== undefined) {
     const surface = raw.surface
     if (surface === null || typeof surface !== 'object' || Array.isArray(surface)) errorRef.value = 'ESTATE_SURFACE'
-    else if (surface.lastArchiveEndSeq !== undefined
-      && (!Number.isInteger(surface.lastArchiveEndSeq) || surface.lastArchiveEndSeq < -1)) errorRef.value = 'ESTATE_SURFACE_SEQ'
+    else {
+      for (const key of Object.keys(surface)) {
+        if (!['lastArchiveEndSeq', 'lastArchiveAt'].includes(key)) errorRef.value = errorRef.value ?? 'ESTATE_UNKNOWN_FIELD'
+      }
+    }
+    if (surface !== null && typeof surface === 'object' && !Array.isArray(surface) && surface.lastArchiveEndSeq !== undefined
+      && (!Number.isInteger(surface.lastArchiveEndSeq) || surface.lastArchiveEndSeq < -1)) errorRef.value = errorRef.value ?? 'ESTATE_SURFACE_SEQ'
     else if (surface.lastArchiveEndSeq !== undefined) state.surface.lastArchiveEndSeq = surface.lastArchiveEndSeq
     if (surface.lastArchiveAt !== undefined) {
       if (surface.lastArchiveAt === null || (typeof surface.lastArchiveAt === 'number' && Number.isFinite(surface.lastArchiveAt) && surface.lastArchiveAt >= 0)) {
@@ -117,6 +129,9 @@ export function normalizeSessionState(raw, { defaultMode = 'recall-only' } = {})
     const cooling = raw.cooling
     if (cooling === null || typeof cooling !== 'object' || Array.isArray(cooling)) errorRef.value = 'ESTATE_COOLING'
     else {
+      for (const key of Object.keys(cooling)) {
+        if (!['open', 'lastOccupancy', 'lastRunAt', 'lastReason'].includes(key)) errorRef.value = errorRef.value ?? 'ESTATE_UNKNOWN_FIELD'
+      }
       if (typeof cooling.open === 'boolean') state.cooling.open = cooling.open
       else if (cooling.open !== undefined) errorRef.value = 'ESTATE_COOLING'
       if (cooling.lastOccupancy === null || (typeof cooling.lastOccupancy === 'number' && Number.isFinite(cooling.lastOccupancy))) state.cooling.lastOccupancy = cooling.lastOccupancy
@@ -131,6 +146,9 @@ export function normalizeSessionState(raw, { defaultMode = 'recall-only' } = {})
     const provider = raw.provider
     if (provider === null || typeof provider !== 'object' || Array.isArray(provider)) errorRef.value = 'ESTATE_PROVIDER'
     else {
+      for (const key of Object.keys(provider)) {
+        if (!['tier', 'reason'].includes(key)) errorRef.value = errorRef.value ?? 'ESTATE_UNKNOWN_FIELD'
+      }
       if (provider.tier !== 'T1' && provider.tier !== 'T2') errorRef.value = 'ESTATE_PROVIDER'
       else state.provider.tier = provider.tier
       if (typeof provider.reason === 'string') state.provider.reason = provider.reason
@@ -141,7 +159,7 @@ export function normalizeSessionState(raw, { defaultMode = 'recall-only' } = {})
     if (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) state.updatedAt = raw.updatedAt
     else errorRef.value = errorRef.value ?? 'ESTATE_UPDATED_AT'
   }
-  return { state, error: errorRef.value }
+  return { state, error: errorRef.value, schemaVersionMissing: !Object.hasOwn(raw, 'schemaVersion') }
 }
 
 /**

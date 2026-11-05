@@ -65,7 +65,8 @@ export async function negotiateMemoryBackend({ port, store, metrics, probe, t2Pr
       return { provider: t1, decision: { ...decision, tier: 'T1', provider: 'local', reason: 'T2 被选中但工厂缺位，如实回落 T1：' + decision.reason } }
     }
     try {
-      const t2 = await t2ProviderFactory(described, { t1, port, store })
+      // P5：能力报告随工厂下传（provider 据此决定 searchQuery/packExternal 是否生效）。
+      const t2 = await t2ProviderFactory(described, { t1, port, store, capabilities: decision.capabilities ?? null })
       return { provider: t2, decision }
     } catch (error) {
       await closeHandle(described)

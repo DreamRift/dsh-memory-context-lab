@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { attachV3Engine } from '../src/v3/entry/v3-entry.mjs'
+import { archiveLine } from '../src/index.mjs'
 import { createFakeSession } from './helpers/fake-session.mjs'
 
 function fakeCtx() {
@@ -83,17 +84,17 @@ test('not-worth 队头不再堵死归档：跳过判负 span，后续 span 照�
     const tinyEnd = tiny[tiny.length - 1].result
 
     // 预览与执行同一游标：不能把「下一次归档」报成一个永远压不了的判负 span。
-    const preview = await engine.dryRunArchive(id, session, {})
+    const preview = await engine.dryRunArchive(id, session, { coolingBatchSize: 1 })
     assert.equal(preview.status, 'planned', '预览必须越过判负队头：' + JSON.stringify(preview))
     assert.ok(preview.startSeq > tinyEnd, '预览应从判负 span 之后开始')
 
-    const first = await engine.archiveForStep(id, session, {})
+    const first = await engine.archiveForStep(id, session, { coolingBatchSize: 1 })
     assert.equal(first.status, 'archived', '判负队头不得让整步返回 not-worth：' + JSON.stringify(first))
     assert.ok(first.startSeq > tinyEnd, '归档必须从判负 span 之后开始')
     assert.equal((await engine.historyOf(id)).total, 1)
     assert.ok((await session.surface.nodes).includes(tiny[0].assistant), '判负 span 必须留在活动面上（不能被误压）')
 
-    const second = await engine.archiveForStep(id, session, {})
+    const second = await engine.archiveForStep(id, session, { coolingBatchSize: 1 })
     assert.equal(second.status, 'archived', '后续 span 必须继续归档，而不是永久停摆：' + JSON.stringify(second))
     assert.ok(second.startSeq > first.endSeq, '第二段必须接在第一段之后')
     assert.equal((await engine.historyOf(id)).total, 2)
@@ -141,7 +142,7 @@ test('按轮归档：判负回合不再堵死后续回合', async () => {
     assert.equal(preview.status, 'planned', '预览必须越过判负回合：' + JSON.stringify(preview))
     assert.ok(preview.startSeq > tinyResult.seq, '预览应从判负回合之后开始')
 
-    const first = await engine.archiveForStep(id, session, {})
+    const first = await engine.archiveForStep(id, session, { coolingBatchSize: 1 })
     assert.equal(first.status, 'archived', '判负队头不得让整步返回 not-worth：' + JSON.stringify(first))
     assert.ok(first.startSeq > tinyResult.seq, '归档必须从判负回合之后开始')
     assert.equal((await engine.historyOf(id)).total, 1)
@@ -190,6 +191,93 @@ test('空正文回合必须判负；status 与 now 如实报 not-worth（AUD48-0
     assert.equal(second.status, 'not-worth', 'now 应能重试并如实报判负：' + JSON.stringify(second))
 
     assert.deepEqual(await session.surface.nodes, [0, 1, 2, 3], '判负回合必须留在活动面，不得被遮蔽')
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+// —— 0.15.0 P5：观察面原因如实——「还在保留窗口」与「窗口外全不划算」不得互相冒充 ——
+
+async function openArchiveGate(root, id) {
+  const dir = path.join(root, 'sessions', id)
+  await mkdir(dir, { recursive: true })
+  await writeFile(path.join(dir, 'usage.jsonl'), JSON.stringify({ seq: 1, inputTokens: 300000, totalTokens: 300001 }) + '\n')
+}
+
+test('P5 观察面：确实还在保留窗口内 → retention-window（不得说成不划算）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-retention-honest-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  const id = 's-retention-honest'
+  try {
+    const session = createFakeSession({ id })
+    session.pushContextWindow(1000000)
+    session.pushUser('开始')
+    for (let index = 1; index <= 2; index += 1) pushTinyStep(session, index)
+    await ctx.callPreStep(session)
+    await settle(engine)
+    await engine.setState(id, { mode: 'cooling' })
+
+    // 窗口外 0 步（retain 4 覆盖全部 2 步）：真正的保留窗口原因。
+    const result = await engine.archiveForStep(id, session, { retainOperations: 4 }, { resetNotWorth: true })
+    assert.equal(result.status, 'no-candidate', JSON.stringify(result))
+    assert.equal(result.reason, 'retention-window', '确实在保留窗口内时必须如实报 retention-window')
+    assert.equal(result.skippedSegments, undefined, '没有判负段时不得伪造跳过汇总')
+    const line = archiveLine(result)
+    assert.match(line, /保留范围/)
+    assert.equal(line.includes('不划算'), false, '保留窗口不得被说成不划算')
+  } finally {
+    await engine._waitForIdle().catch(() => {})
+    engine.dispose()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+test('P5 观察面：窗口外全部不划算 → not-worth（带段数/最近 span 与字数，不得说成保留窗口）', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-all-not-worth-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  const id = 's-all-not-worth'
+  try {
+    const session = createFakeSession({ id })
+    session.pushContextWindow(1000000)
+    session.pushUser('开始')
+    for (let index = 1; index <= 6; index += 1) pushTinyStep(session, index)
+    await ctx.callPreStep(session)
+    await settle(engine)
+    await engine.setState(id, { mode: 'cooling' })
+    await openArchiveGate(root, id)
+    const before = await session.surface.nodes
+    const settings = { retainOperations: 1, coolingBatchSize: 1 }
+
+    // 窗口外 5 步全部判负：skip 循环走完后选择器只剩 retention-window，
+    // 观察面必须回到 not-worth，而不是把「不划算」说成「还在保留窗口」。
+    const result = await engine.archiveForStep(id, session, settings)
+    assert.equal(result.status, 'not-worth', JSON.stringify(result))
+    assert.equal(result.reason, 'not-worth')
+    assert.equal(result.windowReason, 'retention-window', '保留窗口只是选择器的退出事实，不是归档结论')
+    assert.equal(result.skippedSegments, 5, '必须带跳过段数：' + JSON.stringify(result.skipped))
+    assert.equal(result.skipped.length, 5, '沿用既有 skipped 汇总形状（每段一行）')
+    const latest = result.skipped[result.skipped.length - 1]
+    assert.ok(Number.isInteger(latest.startSeq) && Number.isInteger(latest.endSeq), '最近一次判负段必须带 span')
+    assert.ok(Number.isInteger(latest.sourceChars) && Number.isInteger(latest.receiptChars), '必须带字数事实')
+    assert.ok(latest.receiptChars >= latest.sourceChars, '判负事实：回执 ≥ 原文')
+    assert.equal(result.span.endSeq, latest.endSeq, '最近一次的 span 必须保留在结果面')
+    const line = archiveLine(result)
+    assert.match(line, /窗口外 5 段都不划算（回执≥原文）/)
+    assert.match(line, /最近 seq /)
+    assert.equal(line.includes('保留窗口'), false, '窗口外全不划算不得说成保留窗口')
+
+    // status 的「下一次归档」同口径（fallback 带上已有跳过汇总，不能重算成 0 段）。
+    const preview = await engine.dryRunArchive(id, session, settings)
+    assert.equal(preview.status, 'not-worth', JSON.stringify(preview))
+    assert.equal(preview.skippedSegments, 5)
+    assert.match(archiveLine(preview), /窗口外 5 段都不划算/)
+
+    assert.equal((await engine.historyOf(id)).total, 0, '判负不得产生凭证')
+    assert.deepEqual(await session.surface.nodes, before, '判负段必须留在活动面')
   } finally {
     await engine._waitForIdle().catch(() => {})
     engine.dispose()

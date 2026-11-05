@@ -10,16 +10,17 @@
  * metaOnly/metaReason/structure 随记录保留（AUD48-08-03）。
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
+import { summaryIntegrityOf } from '../compress/summary-artifact.mjs'
 import { redactText, redactValue } from '../security/redact.mjs'
 
 export const EXPORT_SCHEMA_VERSION = 1
 
-export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records = [], forgotten = [], vouchers = [], redactedVoucherIds = [], state = null } = {}) {
+export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records = [], forgotten = [], vouchers = [], redactedVoucherIds = [], summaries = [], state = null, sha256 = null } = {}) {
   if (typeof sessionKey !== 'string' || sessionKey.trim().length === 0) {
     throw new V3ContractViolation('v3 export: sessionKey 必填')
   }
-  if (!Array.isArray(records) || !Array.isArray(forgotten) || !Array.isArray(vouchers)) {
-    throw new V3ContractViolation('v3 export: records/forgotten/vouchers 必须是数组')
+  if (!Array.isArray(records) || !Array.isArray(forgotten) || !Array.isArray(vouchers) || !Array.isArray(summaries)) {
+    throw new V3ContractViolation('v3 export: records/forgotten/vouchers/summaries 必须是数组')
   }
   const forgottenSet = new Set(forgotten.filter((id) => typeof id === 'string'))
   const redactedSet = new Set(redactedVoucherIds.filter((id) => typeof id === 'string'))
@@ -67,6 +68,32 @@ export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records
     }
     return copy
   })
+  // P4（§7.4 R10）：详细摘要也是自有出口。来源含已忘记录的摘要**整条隐藏**
+  // （只留 ID 与原因），可见摘要的正文再脱敏一次——与记录同一道分享闸。
+  const exportedSummaries = summaries.map((artifact) => {
+    const sources = Array.isArray(artifact?.sources) ? artifact.sources : []
+    // 损坏/篡改的摘要行无法判定来源：整条隐藏（失败关闭，不让未知来源的正文进分享包）。
+    if (artifact === null || typeof artifact !== 'object' || !Array.isArray(artifact.sources)
+      || typeof artifact.shortText !== 'string' || typeof artifact.detail !== 'string') {
+      return { summaryId: typeof artifact?.summaryId === 'string' ? artifact.summaryId : null, hidden: true, reason: 'summary-invalid' }
+    }
+    // P2-4：导出路径必须用 sources 重算指纹并与落盘值对账。hash 不可用（未注入）
+    // 同样按不可信隐藏——失败关闭，不把「验不了」当成「没问题」。
+    const integrity = summaryIntegrityOf(artifact, sha256)
+    if (integrity.ok !== true) return { summaryId: artifact?.summaryId ?? null, hidden: true, reason: integrity.reason }
+    const hidden = sources.some((source) => forgottenSet.has(source?.recordId))
+    if (hidden) return { summaryId: artifact?.summaryId ?? null, hidden: true, reason: 'forgotten-source' }
+    return {
+      ...artifact,
+      shortText: redactText(artifact?.shortText ?? ''),
+      detail: redactText(artifact?.detail ?? ''),
+      goal: redactText(artifact?.goal ?? ''),
+      changes: Array.isArray(artifact?.changes) ? artifact.changes.map((item) => redactText(item)) : [],
+      decisions: Array.isArray(artifact?.decisions) ? artifact.decisions.map((item) => redactText(item)) : [],
+      openItems: Array.isArray(artifact?.openItems) ? artifact.openItems.map((item) => redactText(item)) : [],
+      hidden: false,
+    }
+  })
   return {
     schemaVersion: EXPORT_SCHEMA_VERSION,
     // B2-10：明确「分享包已再脱敏」——文本可能与原文不同，不能当原文包用。
@@ -79,10 +106,13 @@ export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records
       vouchers: vouchers.length,
       redactedVouchers: exportedVouchers.filter((voucher) => voucher.redacted === true).length,
       omittedForgotten: records.length - exportedRecords.length,
+      summaries: exportedSummaries.length,
+      hiddenSummaries: exportedSummaries.filter((summary) => summary.hidden === true).length,
     },
     records: exportedRecords,
     forgotten: [...forgottenSet],
     vouchers: exportedVouchers,
+    summaries: exportedSummaries,
     state: exportStateOf(state),
   }
 }

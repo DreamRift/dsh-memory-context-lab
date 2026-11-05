@@ -18,10 +18,40 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { createDshHostAdapter, normalizeDshEvent, V3_PLUGIN_SOURCE_KIND, V3_SURFACE_FORM } from '../src/v3/adapters/host/dsh-host.mjs'
 import { createSurfaceExecutor } from '../src/v3/application/surface-executor.mjs'
 import { planSlots } from '../src/v3/domain/context/slot-planner.mjs'
+import { contentHashOf, previewBlocksOf } from '../src/v3/domain/first-ingress/preview.mjs'
+import { FakeSession } from './helpers/fake-host.mjs'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const BIG = 'A'.repeat(9000)
+const LEGAL_HANDLE = 'v3r-' + 'ab'.repeat(8)
+
+/** 一个配平的活动面：assistant 声明 c1 + tool/result 落面。 */
+function sessionWithToolResult(id) {
+  const session = new FakeSession({ id })
+  session.append('system/message', { message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'sys' }] } }, { surfaceOp: 'append' })
+  session.append('assistant/message', {
+    message: { id: 'm1', role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }], source: { kind: 'model' } },
+  }, { surfaceOp: 'append' })
+  const { seq } = session.append('tool/result', {
+    message: { id: 'r1', role: 'tool', content: [{ type: 'text', text: BIG }], source: { kind: 'tool', callId: 'c1' }, toolCallId: 'c1', isError: false },
+  }, { surfaceOp: 'append' })
+  return { session, seq }
+}
+
+/** 取一个方法的源码体（到下一个方法注释为止）——源码守卫用。 */
+function functionBodyOf(source, name) {
+  const start = source.indexOf('async ' + name + '(')
+  if (start < 0) throw new Error('未找到方法 ' + name)
+  const end = source.indexOf('/** 当前活动面节点', start)
+  return source.slice(start, end === -1 ? undefined : end)
+}
 
 /** 假 DSH session：按真实契约（append 签名/确认面）。 */
 function fakeDshSession({ replaceBroken = false } = {}) {
@@ -151,4 +181,59 @@ test('组合：真实形状下 surface-executor R4 全链路成立', async () =>
   const next = await executor.executePlan({ plan: nextPlan, surfaceState: result.surfaceState, cardText: '新增量卡', decisionId: 'dec-2', sessionKey: 'sess-a' })
   assert.equal(next.fallbacks.length, 0)
   assert.equal(session.surface.nodes.includes(result.surfaceState.deltaSlotSeq), false, '多余槽位一步回收')
+})
+
+test('P2-1 受限改写：append 后复核失败报 EWRITE_UNCONFIRMED（不是「被拒绝」），并带 rewrittenSeq', async () => {
+  const { session, seq } = sessionWithToolResult('p2-unconfirmed')
+  const content = session.eventAt(seq).data.message.content
+  const preview = previewBlocksOf({ content, handle: LEGAL_HANDLE, sourceEventId: 'dsh-3', externalId: 'fi-' + 'ab'.repeat(8), surfaceContentHash: contentHashOf(content) })
+  const host = createDshHostAdapter({ session, sessionKey: 'p2-unconfirmed' })
+  const realAppend = session.append.bind(session)
+  // 替身：append 成功后把落面正文改成 TAMPERED（模拟宿主/另一写者让复核失败）
+  session.append = (type, data, opts) => {
+    const event = realAppend(type, data, opts)
+    if (type === 'tool/result' && opts?.surfaceOp?.op === 'replace') {
+      session.events[event.seq].data.message.content = [{ type: 'text', text: 'TAMPERED' }]
+    }
+    return event
+  }
+  const writtenSeq = session.events.length
+  await assert.rejects(
+    () => host.replaceToolResultContent({ seq, expectedContentHash: contentHashOf(content), content: preview }),
+    (error) => error?.code === 'EWRITE_UNCONFIRMED' && error?.rewrittenSeq === writtenSeq,
+  )
+  // 写入事实存疑但请求面确实已经变了：原文不在面上、派生消息是 TAMPERED
+  assert.equal(session.surface.nodes.includes(seq), false)
+  assert.equal(session.surface.nodes.includes(writtenSeq), true)
+  assert.equal(session.deriveMessages().at(-1).content[0].text, 'TAMPERED')
+})
+
+test('P2-2 受限改写绝不降级：被拒时不写 user/message、不动活动面（行为 + 源码双守卫）', async () => {
+  const { session, seq } = sessionWithToolResult('p2-no-degrade')
+  const content = session.eventAt(seq).data.message.content
+  const preview = previewBlocksOf({ content, handle: LEGAL_HANDLE, sourceEventId: 'dsh-3', externalId: 'fi-' + 'ab'.repeat(8), surfaceContentHash: contentHashOf(content) })
+  const host = createDshHostAdapter({ session, sessionKey: 'p2-no-degrade' })
+  const nodesBefore = [...session.surface.nodes]
+  const logLen = session.events.length
+  const realAppend = session.append.bind(session)
+  session.append = (type, data, opts) => {
+    if (type === 'tool/result' && opts?.surfaceOp?.op === 'replace') throw new Error('DSH: 拒绝受限改写')
+    return realAppend(type, data, opts)
+  }
+  await assert.rejects(
+    () => host.replaceToolResultContent({ seq, expectedContentHash: contentHashOf(content), content: preview }),
+    (error) => error?.code === 'EINTERNAL',
+  )
+  assert.deepEqual(session.surface.nodes, nodesBefore, '拒绝后活动面不得被别的形态顶掉')
+  assert.equal(session.events.length, logLen, '拒绝后不得 append 兜底消息')
+  assert.equal(session.events.slice(logLen).filter((event) => event.type === 'user/message').length, 0, '绝不写 user/message 兜底')
+
+  // 源码守卫：受限方法体（剥注释）不得出现 user/message / DSH_USER_MESSAGE / appendReceipt(
+  const source = await readFile(path.join(here, '..', 'src', 'v3', 'adapters', 'host', 'dsh-host.mjs'), 'utf8')
+  const body = functionBodyOf(source, 'replaceToolResultContent')
+  assert.ok(body.length > 1000, '量具自检：必须真的截到方法体（' + body.length + ' chars）')
+  const stripped = body
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+  assert.equal(/user\/message|DSH_USER_MESSAGE|appendReceipt\(/.test(stripped), false, 'catch 里改成 user/message replace 是 P2-2 的定点变异')
 })

@@ -13,10 +13,14 @@
 import { randomUUID } from 'node:crypto'
 
 import { assertPort } from '../../ports/index.mjs'
-import { PLUGIN_SOURCE_KIND, validateEvent as contractsValidateEvent, V3ContractViolation, v3Error } from '../../contracts/index.mjs'
+import { PLUGIN_SOURCE_KIND, RECEIPT_SOURCE_FORM, RESTORE_SOURCE_FORM, validateEvent as contractsValidateEvent, V3ContractViolation, v3Error } from '../../contracts/index.mjs'
+import { contentHashOf } from '../../domain/first-ingress/preview.mjs'
 
-/** v3 表面形态名（新引擎新号；v1 的 memory-lab2-* 是禁用符号）。 */
-export const V3_SURFACE_FORM = 'memory-lab3-surface'
+/**
+ * v3 表面形态名（新引擎新号；v1 的 memory-lab2-* 是禁用符号）。
+ * 字面值只在 contracts/sources.mjs 定义一次，这里只转发（与 V3_PLUGIN_SOURCE_KIND 同款）。
+ */
+export const V3_SURFACE_FORM = RECEIPT_SOURCE_FORM
 
 /**
  * 插件自有 source.kind：**只有一个定义**，在 contracts/sources.mjs。
@@ -29,6 +33,18 @@ const DSH_USER_MESSAGE = 'user/message'
 
 /** 归一化事件 ID 的前缀（H-01：断点反推与归一化必须用同一份形态，不得各写一遍）。 */
 const DSH_EVENT_ID_PREFIX = 'dsh-'
+
+/**
+ * P2-1（2026-11-01）：受限改写**已经 append**、但活动面复核失败。
+ *
+ * 与「被宿主拒绝（原文仍在面）」严格分开：此时请求面可能已经是预览，调用方不得
+ * 继续宣称原文全文仍在。错误带上 rewrittenSeq（未知时为 null），供用例与接线方定位。
+ */
+function writeUnconfirmedError(message, rewrittenSeq = null) {
+  const error = v3Error('EWRITE_UNCONFIRMED', message + '（已改写但确认失败；请求面可能已是预览，不得假设原文仍在）')
+  error.rewrittenSeq = rewrittenSeq
+  return error
+}
 
 /** 宿主 seq → v3 事件 ID（唯一生成点）。 */
 export function dshEventIdOfSeq(seq) {
@@ -100,13 +116,18 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
     throw new V3ContractViolation('v3 dsh-host: sessionKey 必须是非空字符串')
   }
 
-  function appendReceipt(text, options) {
+  /**
+   * @param {string} text 落面正文
+   * @param {object} [options] 宿主 surface options（区间 replace 等）
+   * @param {string} [sourceForm] 来源形态：回执（默认）或恢复（RESTORE_SOURCE_FORM）
+   */
+  function appendReceipt(text, options, sourceForm = V3_SURFACE_FORM) {
     try {
       const confirmation = session.append(DSH_USER_MESSAGE, {
         id: randomUUID(),
         role: 'user',
         content: [{ type: 'text', text }],
-        source: { kind: V3_PLUGIN_SOURCE_KIND, form: V3_SURFACE_FORM },
+        source: { kind: V3_PLUGIN_SOURCE_KIND, form: sourceForm },
       }, options)
       const seq = confirmation?.seq
       if (!Number.isInteger(seq) || seq < 1) {
@@ -146,12 +167,14 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
      * 密集覆盖被遮蔽的全部节点（宿主 dsh-session 的 assertSourceEventReferences 判据）。
      * 单节点 replace 仍走 targetEventId，兼容既有卡片执行器。
      */
-    async surfaceOp({ op, targetEventId, startSeq, endSeq, sourceEventSeqs, text } = {}) {
+    async surfaceOp({ op, targetEventId, startSeq, endSeq, sourceEventSeqs, text, sourceForm } = {}) {
       if (typeof text !== 'string' || text.length === 0) {
         throw new V3ContractViolation('v3 dsh-host: text 必须是非空字符串')
       }
+      // AUD48-08-01：调用方可以声明这次落面是「回执」还是「恢复」；缺省按回执。
+      const form = typeof sourceForm === 'string' && sourceForm.length > 0 ? sourceForm : V3_SURFACE_FORM
       if (op === 'append') {
-        return { seq: appendReceipt(text) }
+        return { seq: appendReceipt(text, undefined, form) }
       }
       if (op === 'replace') {
         let start = startSeq
@@ -191,7 +214,7 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
         const seq = appendReceipt(text, {
           surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
           sourceEventSeqs: [...sources],
-        })
+        }, form)
         // 确认面（apply-commit 同口径）：替换事件进面、被遮蔽节点全部出面
         if (typeof session.eventAt === 'function' && session.eventAt(seq) === undefined) {
           throw v3Error('EINTERNAL', '替换事件未进入活动面（宿主确认失败）')
@@ -204,6 +227,85 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
         return { seq }
       }
       throw new V3ContractViolation('v3 dsh-host: op 必须是 append/replace')
+    },
+
+    /**
+     * **P7 受限端口**：只改写「当前活动面上的单个 tool/result」的 message.content。
+     *
+     * 为什么单独一个方法、不放进通用 surfaceOp：
+     * - 宿主只允许 tool/result 替换恰好 1 个当前 tool/result、且除 message.content 外
+     *   data 深等（dsh-session lib/index.js:394-412）；通用 surfaceOp 写的是 user/message，
+     *   用它顶掉工具结果会留下未闭合的工具调用；
+     * - 写入前复核源 hash（调用方在持久化前取的原文指纹），写入后复核活动面与派生
+     *   消息——任何不符失败关闭，**绝不**降级成通用 replace；
+     * - append 之后的复核失败用 EWRITE_UNCONFIRMED（已改写但确认失败），不得报成
+     *   「被拒绝」；该分支不 append 任何 user/message 兜底（P2-2 守卫钉死）。
+     *
+     * 本方法默认没有任何调用方：P7 候选默认关闭，接线等 P0/P9 真机 seam 证据。
+     *
+     * @param {object} deps
+     * @param {number} deps.seq 目标 tool/result 的宿主 seq（必须在当前活动面）
+     * @param {string} deps.expectedContentHash 调用方写入前取的 content hash
+     * @param {Array<{type:'text',text:string}>} deps.content 新正文（纯文本块；预览）
+     * @returns {Promise<{seq:number, shadowedSeq:number}>} 替换事件 seq
+     */
+    async replaceToolResultContent({ seq, expectedContentHash, content } = {}) {
+      if (!Number.isInteger(seq) || seq < 0) {
+        throw new V3ContractViolation('v3 dsh-host: replaceToolResultContent 的 seq 必须是非负整数')
+      }
+      if (typeof expectedContentHash !== 'string' || !/^[0-9a-f]{16}$/.test(expectedContentHash)) {
+        throw new V3ContractViolation('v3 dsh-host: expectedContentHash 必须是 16 位小写十六进制')
+      }
+      if (!Array.isArray(content) || content.length === 0
+        || content.some((block) => block === null || typeof block !== 'object' || block.type !== 'text'
+          || typeof block.text !== 'string' || block.text.length === 0)) {
+        throw new V3ContractViolation('v3 dsh-host: 首次呈现只接受非空纯文本块（图文混排不在此端口）')
+      }
+      if (typeof session.eventAt !== 'function') {
+        throw v3Error('EINTERNAL', 'v3 dsh-host: 宿主缺 eventAt，无法复核源正文（失败关闭）')
+      }
+      const original = session.eventAt(seq)
+      if (original === null || typeof original !== 'object') {
+        throw v3Error('EINTERNAL', 'v3 dsh-host: 目标 seq 不存在：' + seq)
+      }
+      if (original.type !== 'tool/result') {
+        throw new V3ContractViolation('v3 dsh-host: 只有 tool/result 节点可由本端口改写（得到 ' + String(original.type) + '）')
+      }
+      const message = original.data?.message
+      if (message === null || typeof message !== 'object' || !Array.isArray(message.content)) {
+        throw v3Error('EINTERNAL', 'v3 dsh-host: 目标 tool/result 缺 message.content（失败关闭）')
+      }
+      if (contentHashOf(message.content) !== expectedContentHash) {
+        throw v3Error('EINTERNAL', 'v3 dsh-host: tool/result 源正文 hash 不匹配（已被别处改写或快照过期，拒绝覆盖）')
+      }
+      if (!surfaceNodes().includes(seq)) {
+        throw new V3ContractViolation('v3 dsh-host: 目标 seq 不在当前活动面（可能已被遮蔽）')
+      }
+      const next = { ...original.data, message: { ...message, content } }
+      let appended
+      try {
+        appended = session.append('tool/result', next, {
+          surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
+          sourceEventSeqs: [seq],
+        })
+      } catch (error) {
+        throw v3Error('EINTERNAL', 'tool/result 改写被宿主拒绝：' + (error?.message ?? String(error)))
+      }
+      const confirmationSeq = appended?.seq
+      if (!Number.isInteger(confirmationSeq) || confirmationSeq < 0) {
+        // append 已返回但 seq 非法：写没写不确定——按「已改写但确认失败」上报。
+        throw writeUnconfirmedError('tool/result 改写未返回 seq（宿主契约破坏）')
+      }
+      const written = session.eventAt(confirmationSeq)
+      if (written?.type !== 'tool/result'
+        || contentHashOf(written.data?.message?.content ?? []) !== contentHashOf(content)) {
+        throw writeUnconfirmedError('tool/result 改写未按预期落面（宿主确认失败）', confirmationSeq)
+      }
+      const after = surfaceNodes()
+      if (after.includes(seq) || !after.includes(confirmationSeq)) {
+        throw writeUnconfirmedError('tool/result 改写后活动面未替换（确认面失败）', confirmationSeq)
+      }
+      return { seq: confirmationSeq, shadowedSeq: seq }
     },
 
     /** 当前活动面节点（升序 seq）；历史归档按它选连续 span。 */
@@ -233,11 +335,15 @@ export function createDshHostAdapter({ session, sessionKey } = {}) {
       const log = typeof session.events === 'function' ? session.events() : (session.events ?? session.log ?? [])
       let contextWindow = null
       if (Array.isArray(log)) {
+        // P3-09（0.15.1 §3.3）：**最近一条 request/context 非法时继续往前找**。
+        // 旧实现在第一条 request/context 之后无条件 break：只要最新那条的 contextWindow
+        // 缺失/为 0/字符串，contextWindow 就是 null —— 按步闸门（占用 = latest/窗口）
+        // 因此永远不可判定、永不开闸，而更早那条完全有效的窗口被丢掉。
+        // 语义仍是「最近一条**有效**的窗口」：从新往旧扫，命中第一个有效值就停。
         for (let i = log.length - 1; i >= 0; i -= 1) {
           if (log[i]?.type !== 'request/context') continue
           const window = log[i]?.data?.contextWindow
-          if (Number.isFinite(window) && window > 0) contextWindow = window
-          break
+          if (Number.isFinite(window) && window > 0) { contextWindow = window; break }
         }
       }
       const cwd = session.header?.cwd ?? session.meta?.cwd ?? (typeof session.cwd === 'string' ? session.cwd : null)

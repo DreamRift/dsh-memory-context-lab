@@ -1,0 +1,223 @@
+{
+  "name": "r06-control-cancel-step",
+  "kind": "control",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：取消后宿主为未启动调用补 call/result 对（appendSkippedToolCall），闭包完整。",
+  "mode": "step",
+  "surfaceNodes": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    8,
+    11,
+    14
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 1
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "tool-call",
+              "id": "c1",
+              "name": "read",
+              "arguments": "{}"
+            },
+            {
+              "type": "tool-call",
+              "id": "c2",
+              "name": "grep",
+              "arguments": "{}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "tool/call",
+      "data": {
+        "callId": "c1",
+        "name": "read",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "tool/result",
+      "data": {
+        "callId": "c1",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c1",
+          "source": {
+            "kind": "tool",
+            "callId": "c1"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "type": "tool/call",
+      "data": {
+        "callId": "c2",
+        "name": "grep",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 5,
+      "type": "tool/result",
+      "data": {
+        "callId": "c2",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c2",
+          "source": {
+            "kind": "tool",
+            "callId": "c2"
+          },
+          "isError": true,
+          "content": [
+            {
+              "type": "text",
+              "text": "aborted before dispatch"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 1
+      }
+    },
+    {
+      "seq": 7,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 2
+      }
+    },
+    {
+      "seq": 8,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "a2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 2
+      }
+    },
+    {
+      "seq": 10,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 3
+      }
+    },
+    {
+      "seq": 11,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "a3"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 12,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 3
+      }
+    },
+    {
+      "seq": 13,
+      "type": "step/start",
+      "data": {
+        "turn": 1,
+        "step": 4
+      }
+    },
+    {
+      "seq": 14,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "a4"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 15,
+      "type": "step/end",
+      "data": {
+        "turn": 1,
+        "step": 4
+      }
+    }
+  ],
+  "select": {
+    "retainSteps": 3,
+    "maxSteps": 3
+  },
+  "expect": {
+    "selection": "non-null",
+    "seqs": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "why": "正常对照：取消已由宿主补成完整配对"
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "name": "r06-red-partial-turn",
+  "kind": "red",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：assistant 并行声明 c1,c2，只有 c1 的 call/result；c2 只存在于 assistant content 块。期望保护整组，当前实现会归档。",
+  "mode": "turn",
+  "turnBasis": "human",
+  "surfaceNodes": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u0"
+          }
+        ]
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "parallel"
+            },
+            {
+              "type": "tool-call",
+              "id": "c1",
+              "name": "read",
+              "arguments": "{}"
+            },
+            {
+              "type": "tool-call",
+              "id": "c2",
+              "name": "grep",
+              "arguments": "{}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "tool/call",
+      "data": {
+        "callId": "c1",
+        "name": "read",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "tool/result",
+      "data": {
+        "callId": "c1",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c1",
+          "source": {
+            "kind": "tool",
+            "callId": "c1"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "r1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u4"
+          }
+        ]
+      }
+    }
+  ],
+  "select": {
+    "maxOperations": 1
+  },
+  "expect": {
+    "selection": null,
+    "why": "assistant 声明的 c2 无结果：整组不可归档（调用闭包按结构取全集）"
+  }
+}

@@ -10,6 +10,12 @@
 /** 冒烟节点 ID：probeT2Isolated 写入/读回/清理的固定节点，永远不计入真实覆盖。 */
 export const T2_SMOKE_NODE_ID = 'mcl-smoke'
 
+/**
+ * 查询合同探针节点（0.15.0 P5）：写入两条同词节点后以 k=2 检索，验证
+ * cg read(query) 的参数与资格字段；与冒烟节点一样永远不计入覆盖率。
+ */
+export const T2_SMOKE_QUERY_NODE_IDS = Object.freeze(['mcl-smoke-q1', 'mcl-smoke-q2'])
+
 /** 真实镜像节点 ID：与本地 v3 记录 ID 同形，可按 ID 精确回读。 */
 export const T2_MIRROR_NODE_RE = /^v3r-[0-9a-f]{16}$/
 

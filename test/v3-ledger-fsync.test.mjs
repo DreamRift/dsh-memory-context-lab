@@ -83,8 +83,12 @@ test('B3-5 静态守卫：提交点走 fsync，可重建缓存不走（性能面
   const src = await readFile(fileURLToPath(new URL('../src/v3/adapters/storage/session-store.mjs', import.meta.url)), 'utf8')
   const lines = src.split('\n')
   const syncCalls = lines.filter((l) => l.includes('appendLine(') && l.includes('{ sync: true }'))
-  assert.equal(syncCalls.length, 5, 'commit + vouchers + forget + revoke + redaction 共 5 个提交点')
-  assert.ok(syncCalls.every((l) => /logPath, commitLine|vouchersPath, voucher|forgottenPath|redactionsPath/.test(l)), 'fsync 只落在提交点')
+  // 0.15.0 后续（H4）：purge 新增两个提交点——forget 行（读面立即生效）与 purged 行
+  // （对账识别合法缺失）。两者都是「不可回家的隐私事实」，必须 fsync。
+  // P1-07：孤儿回执账本是「放弃补凭证后的恢复线索」——丢了就永久丢原文，必须 fsync；
+  // 它与 vouchers 分账，因此是一个**独立**提交点。
+  assert.equal(syncCalls.length, 8, 'commit + vouchers + forget + revoke + redaction + purge(forget) + purge(purged) + orphan 共 8 个提交点')
+  assert.ok(syncCalls.every((l) => /logPath, commitLine|vouchersPath, voucher|forgottenPath|redactionsPath|PURGED_LOG|ORPHAN_LOG/.test(l)), 'fsync 只落在提交点')
   const plainAppends = lines.filter((l) => /appendLine\(path\.join/.test(l) && !l.includes('{ sync: true }'))
   assert.ok(plainAppends.every((l) => /REPAIR_LOG|CHECKPOINT_LOG/.test(l)), 'repair 审计/检查点缓存保持非 fsync 路径')
 })

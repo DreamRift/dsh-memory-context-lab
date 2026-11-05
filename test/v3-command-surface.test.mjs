@@ -26,9 +26,10 @@ test('B3-13 restoreFailureLine：三态与超限各有文案，不再 unknown', 
   const notFound = restoreFailureLine({ restored: false, reason: 'voucher-not-found' }, 3)
   assert.ok(notFound.includes('凭证不存在') && notFound.includes('history'), '凭证不存在要有指引')
   assert.ok(!notFound.includes('unknown'))
-  const tooLarge = restoreFailureLine({ restored: false, reason: 'restore-too-large', chars: 20000, maxChars: 16000 }, 3)
-  assert.ok(tooLarge.includes('20000') && tooLarge.includes('16000'), '超限保留体积与预算')
-  assert.ok(restoreFailureLine({ restored: false, reason: 'receipt-changed' }, 3).includes('receipt-changed'), '其余 reason 照实透传')
+  const changed = restoreFailureLine({ restored: false, reason: 'receipt-changed' }, 3)
+  // beta.53 起回执吸收已停用，文案不再说「被吸收」，而是「找不到逐字节相同的回执正文」+按 ID 回读。
+  assert.ok(changed.includes('逐字节') && changed.includes('ID'), 'receipt-changed 要说明判据与退路：' + changed)
+  assert.ok(restoreFailureLine({ restored: false, reason: 'surface-rejected' }, 3).includes('surface-rejected'), '其余 reason 照实透传')
 })
 
 test('B3-16 pinRecords：unpin 回报实际删除数', async () => {

@@ -119,7 +119,10 @@ test('recall：注入（首部切片+可执行句柄）；同回合拒、新回�
     const first = await recall({ query: '正文 切片', turn: 1 })
     assert.equal(first.injected, true)
     assert.ok(first.text.includes('回注包（命中 1 条'))
-    assert.ok(first.text.includes('首部：'))
+    // P5：行内不再固定「首部」，而是按查询选中的命中窗口（码点半开区间）。
+    // 查询词第一次出现的位置离开头很近时会被上下文填满并向左补到 0，此时仍是「首部」。
+    assert.match(first.text, /(首部：|命中片段（码点 \d+–\d+）)/)
+    assert.ok(first.text.includes('正文'), '窗口仍包含命中正文')
     // 句柄必须指向**真实存在**的入口：本版没有注册模型可见工具，
     // 旧文案 `memory_lab_recall(record_ids=…)` 会让模型去调一个不存在的工具。
     assert.ok(first.text.includes('/memory-lab read'), '句柄必须是实际存在的命令')

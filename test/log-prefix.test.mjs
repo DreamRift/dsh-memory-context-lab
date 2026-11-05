@@ -9,10 +9,16 @@
  *
  * ## 判据（改回去必红）
  * `src/` 下（含 `src/v2/`）任何文件都不得出现 `memory-context-lab2`。
+ *
+ * ## 量具自检（T5，2026-11-04 审计）
+ * 旧「自检」只断言一个写死的字符串包含 `memory-context-lab2`——不写文件、不跑扫描器，
+ * 怎么写都绿（恒真假绿）。现在把扫描器抽成可注入目录的函数，自检**真的造一个含旧前缀
+ * 的临时源文件**并跑同一扫描器：扫不到就是量具坏了。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readdir, readFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -32,24 +38,37 @@ async function sourceFiles(dir) {
   return out
 }
 
-test('src/ 下不得出现 memory-context-lab2 前缀（日志前缀漂移无其他守卫）', async () => {
-  const files = await sourceFiles(SRC)
-  assert.ok(files.length > 30, `只扫到 ${files.length} 个源文件，扫描器可能失效`)
+/** 扫描任意目录：返回 { count, offenders }。生产判据与自检共用这一份。 */
+async function scanPrefix(root) {
+  const files = await sourceFiles(root)
   const offenders = []
   for (const file of files) {
-    const text = await readFile(file, 'utf8')
-    const lines = text.split('\n')
+    const lines = (await readFile(file, 'utf8')).split('\n')
     for (const [index, line] of lines.entries()) {
       if (line.includes('memory-context-lab2')) {
-        offenders.push(`${path.relative(SRC, file)}:${index + 1} ${line.trim()}`)
+        offenders.push(path.relative(root, file) + ':' + (index + 1) + ' ' + line.trim())
       }
     }
   }
+  return { count: files.length, offenders }
+}
+
+test('src/ 下不得出现 memory-context-lab2 前缀（日志前缀漂移无其他守卫）', async () => {
+  const { count, offenders } = await scanPrefix(SRC)
+  assert.ok(count > 30, `只扫到 ${count} 个源文件，扫描器可能失效`)
   assert.deepEqual(offenders, [], '日志前缀必须统一为 memory-context-lab:\n' + offenders.join('\n'))
 })
 
-test('日志前缀守卫自身有效：注入一行旧前缀必须被抓到', async () => {
-  // 量具自检：确保上面的判据不是「怎么写都绿」。
-  const probe = 'logger.warn(`memory-context-lab2: x`)'
-  assert.ok(probe.includes('memory-context-lab2'), '判据字符串写错了')
+test('日志前缀守卫量具自检：注入旧前缀的临时源文件必须被抓到', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mcl-log-prefix-'))
+  try {
+    await writeFile(path.join(dir, 'good.mjs'), 'logger.warn("memory-context-lab: ok")\n', 'utf8')
+    await writeFile(path.join(dir, 'bad.mjs'), 'logger.warn("memory-context-lab2: drift")\n', 'utf8')
+    const { count, offenders } = await scanPrefix(dir)
+    assert.equal(count, 2)
+    assert.equal(offenders.length, 1, '含旧前缀的文件必须被扫描器抓到：' + offenders.join('；'))
+    assert.match(offenders[0], /^bad\.mjs:1 /)
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
 })

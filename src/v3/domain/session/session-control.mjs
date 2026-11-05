@@ -56,8 +56,10 @@ export function normalizeSessionControl(raw, { defaultEnabled = true } = {}) {
     return { control, error: 'ECONTROL_SHAPE' }
   }
   let error = null
-  if (raw.schemaVersion !== undefined && raw.schemaVersion !== SESSION_CONTROL_SCHEMA_VERSION) {
-    error = 'ECONTROL_VERSION'
+  if (raw.schemaVersion !== undefined && raw.schemaVersion !== SESSION_CONTROL_SCHEMA_VERSION) error = 'ECONTROL_VERSION'
+  const allowed = new Set(['schemaVersion', 'enabled', 'recall', 'overrides', 'updatedAt'])
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) { error = error ?? 'ECONTROL_UNKNOWN_KEY'; break }
   }
   for (const key of ['enabled', 'recall']) {
     if (raw[key] === undefined) continue
@@ -80,7 +82,7 @@ export function normalizeSessionControl(raw, { defaultEnabled = true } = {}) {
     if (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) control.updatedAt = raw.updatedAt
     else error = error ?? 'ECONTROL_UPDATED_AT'
   }
-  return { control, error }
+  return { control, error, schemaVersionMissing: !Object.hasOwn(raw, 'schemaVersion') }
 }
 
 /**

@@ -5,11 +5,14 @@
  * - 真人 user/message 是操作边界；当前回合（最后一个真人消息及其后的节点）永不归档；
  * - 只选**连续 surface 节点**；`sourceEventSeqs` 必须覆盖被遮蔽的全部节点；
  * - 插件自己的回执/恢复节点不参与归档，也不跨过它们拼 span；
+ * - **不做回执吸收**（0.14.0-beta.53，AUD51-05-02）：每次归档保留独立回执节点。
+ *   吸收（B3-11）会把旧回执的正文从活动面抹掉，而 restore 是按「回执正文逐字节
+ *   在活动面找节点」定位的——旧凭证因此永久不可恢复（实测 restore all 1/5）。
  * - M2 只归档「每个节点都有 v3 记录」的 span：没有记录就无法按 ID 恢复，不做不可恢复的遮蔽。
  * - full-history：所有已完成操作；cooling：只保留最近 retainOperations 个完成操作，等压力闸门。
  */
 import { V3ContractViolation } from '../../contracts/errors.mjs'
-import { callIdOf, isHumanUserEvent, isPluginSurfaceEvent, isRecallPackEvent, isStructuralSurfaceEvent } from './event-shape.mjs'
+import { callIdOf, createToolCallIndex, indexToolCallEvent, isHumanUserEvent, isPluginSurfaceEvent, isRecallPackEvent, isStructuralSurfaceEvent, toolCallDeclarationsOf, toolClosureOfRange } from './event-shape.mjs'
 
 // —— B3-8（AUD50-04-03）增量投影缓存 ——
 // 选择器每个 pre-step 都被调用，旧实现每次全量扫 events 建全量 Map（bySeq + dsh 的
@@ -37,7 +40,7 @@ export function _resetCandidatesCacheStats() {
 function cachedBySeq(events) {
   let entry = bySeqCache.get(events)
   if (entry === undefined || events.length < entry.upto) {
-    entry = { upto: 0, bySeq: new Map() }
+    entry = { upto: 0, bySeq: new Map(), toolIndex: createToolCallIndex() }
     bySeqCache.set(events, entry)
     cacheStats.builds += 1
   } else {
@@ -47,12 +50,15 @@ function cachedBySeq(events) {
     for (let i = entry.upto; i < events.length; i += 1) {
       const event = events[i]
       if (Number.isInteger(event?.seq)) entry.bySeq.set(event.seq, event)
+      // R06：同一趟增量遍历维护「callId → 声明/调用/结果所在 seq」索引，
+      // 用于证明候选范围没有把一次调用拆到范围外（不额外扫全会话）。
+      indexToolCallEvent(entry.toolIndex, event)
     }
     cacheStats.mergedEvents += events.length - entry.upto
     cacheStats.merges += 1
     entry.upto = events.length
   }
-  return entry.bySeq
+  return entry
 }
 
 /** dsh 分组的轮次投影：seq → 最近一次 turn/start|step/start 的 turn（回执节点除外）。 */
@@ -116,25 +122,43 @@ export function groupSurfaceOperations({ surfaceNodes, events, turnBasis = 'huma
   if (!Array.isArray(surfaceNodes) || !Array.isArray(events)) {
     throw new V3ContractViolation('v3 archive/candidates: surfaceNodes/events 必须是数组')
   }
-  const bySeq = cachedBySeq(events)
+  const entry = cachedBySeq(events)
   return turnBasis === 'dsh'
-    ? groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn })
-    : groupByHumanTurn({ surfaceNodes, bySeq })
+    ? groupByDshTurn({ surfaceNodes, entry, events, currentTurn })
+    : groupByHumanTurn({ surfaceNodes, entry })
 }
 
 /** DSH 轮次判定：真人消息只是普通节点，轮次边界由宿主自己的 turn 计数给出。 */
-function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
+function groupByDshTurn({ surfaceNodes, entry, events, currentTurn }) {
+  const { bySeq, toolIndex } = entry
   // B3-8：轮次投影走增量缓存（append-only 日志，只合并新增段）
   const { turnAt, lastTurn } = cachedTurnProjection(events)
   // 旧宿主/旧夹具没有 turn 计数：退回真人判定（= 切换前的行为），不猜轮次。
-  if (lastTurn === null) return groupByHumanTurn({ surfaceNodes, bySeq })
+  // 注意传的是入口对象（entry 内含 bySeq 与 toolIndex）：直接传 bySeq 会让被调方
+  // 解构不到 entry.bySeq（Cannot destructure property 'bySeq'）。等价回退必须同源。
+  if (lastTurn === null) return groupByHumanTurn({ surfaceNodes, entry })
   const groups = []
   let current = null
   function finish(group) {
     if (group === null) return
-    group.hasUnfinished = [...group.calls].some((callId) => !group.results.has(callId))
+    // 闭包判据唯一实现在 event-shape：范围内两侧相等，且没有单边留在范围外
+    // （缺结果 = 操作没做完；孤立结果/声明留外 = 会拆散一次操作，单边遮蔽）。
+    const closure = toolClosureOfRange({
+      invocationIds: [...group.declared, ...group.calls],
+      resultIds: [...group.results],
+      malformed: group.malformedDeclaration,
+      index: toolIndex,
+      startSeq: group.startSeq,
+      endSeq: group.endSeq,
+    })
+    group.hasUnfinished = closure.closed !== true
+    group.missingCallIds = closure.missingIds
+    group.orphanCallIds = closure.orphanIds
+    group.splitCallIds = closure.splitIds ?? []
+    delete group.declared
     delete group.calls
     delete group.results
+    delete group.malformedDeclaration
     groups.push(group)
   }
   for (const seq of surfaceNodes) {
@@ -148,7 +172,7 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
     if (turn === undefined) { finish(current); current = null; continue }
     if (current === null || current.turn !== turn) {
       finish(current)
-      current = { startSeq: seq, endSeq: seq, seqs: [seq], turn, current: false, hasPlugin: false, transient: [], calls: new Set(), results: new Set() }
+      current = { startSeq: seq, endSeq: seq, seqs: [seq], turn, current: false, hasPlugin: false, transient: [], declared: new Set(), calls: new Set(), results: new Set(), malformedDeclaration: false }
     } else {
       current.seqs.push(seq)
       current.endSeq = seq
@@ -157,6 +181,12 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
       if (isRecallPackEvent(event)) current.transient.push(seq)
       else current.hasPlugin = true
     }
+    // R06（0.15.0）：调用全集以 assistant 结构块声明为准（tool/call 在真实宿主是
+    // log-only）。只认独立 tool/call 会把「已声明、结果未到」的调用当成不存在；
+    // 缺 id 的畸形块按「未知」保护，id/callId 冲突则两个候选都收（不静默偏爱）。
+    const declaration = toolCallDeclarationsOf(event)
+    for (const declaredId of declaration.ids) current.declared.add(declaredId)
+    if (declaration.malformed) current.malformedDeclaration = true
     const callId = callIdOf(event)
     if (event.type === 'tool/call' && callId !== null) current.calls.add(callId)
     if (event.type === 'tool/result' && callId !== null) current.results.add(callId)
@@ -183,14 +213,30 @@ function groupByDshTurn({ surfaceNodes, bySeq, events, currentTurn }) {
 }
 
 /** 真人回合判定（默认）：边界 = 真人 user/message。 */
-function groupByHumanTurn({ surfaceNodes, bySeq }) {
+function groupByHumanTurn({ surfaceNodes, entry }) {
+  const { bySeq, toolIndex } = entry
   const groups = []
   let current = null
   function finish(group) {
     if (group === null) return
-    group.hasUnfinished = [...group.calls].some((callId) => !group.results.has(callId))
+    // 闭包判据唯一实现在 event-shape：范围内两侧相等，且没有单边留在范围外
+    // （缺结果 = 操作没做完；孤立结果/声明留外 = 会拆散一次操作，单边遮蔽）。
+    const closure = toolClosureOfRange({
+      invocationIds: [...group.declared, ...group.calls],
+      resultIds: [...group.results],
+      malformed: group.malformedDeclaration,
+      index: toolIndex,
+      startSeq: group.startSeq,
+      endSeq: group.endSeq,
+    })
+    group.hasUnfinished = closure.closed !== true
+    group.missingCallIds = closure.missingIds
+    group.orphanCallIds = closure.orphanIds
+    group.splitCallIds = closure.splitIds ?? []
+    delete group.declared
     delete group.calls
     delete group.results
+    delete group.malformedDeclaration
     groups.push(group)
   }
   for (const seq of surfaceNodes) {
@@ -200,7 +246,7 @@ function groupByHumanTurn({ surfaceNodes, bySeq }) {
     if (isStructuralSurfaceEvent(event)) { finish(current); current = null; continue }
     if (isHumanUserEvent(event)) {
       finish(current)
-      current = { startSeq: seq, endSeq: seq, seqs: [seq], current: false, hasPlugin: false, transient: [], calls: new Set(), results: new Set() }
+      current = { startSeq: seq, endSeq: seq, seqs: [seq], current: false, hasPlugin: false, transient: [], declared: new Set(), calls: new Set(), results: new Set(), malformedDeclaration: false }
       continue
     }
     if (current === null) continue
@@ -211,6 +257,12 @@ function groupByHumanTurn({ surfaceNodes, bySeq }) {
       if (isRecallPackEvent(event)) current.transient.push(seq)
       else current.hasPlugin = true
     }
+    // R06（0.15.0）：调用全集以 assistant 结构块声明为准（tool/call 在真实宿主是
+    // log-only）。只认独立 tool/call 会把「已声明、结果未到」的调用当成不存在；
+    // 缺 id 的畸形块按「未知」保护，id/callId 冲突则两个候选都收（不静默偏爱）。
+    const declaration = toolCallDeclarationsOf(event)
+    for (const declaredId of declaration.ids) current.declared.add(declaredId)
+    if (declaration.malformed) current.malformedDeclaration = true
     const callId = callIdOf(event)
     if (event.type === 'tool/call' && callId !== null) current.calls.add(callId)
     if (event.type === 'tool/result' && callId !== null) current.results.add(callId)
@@ -218,31 +270,6 @@ function groupByHumanTurn({ surfaceNodes, bySeq }) {
   finish(current)
   if (groups.length > 0) groups[groups.length - 1].current = true
   return groups
-}
-
-/**
- * B3-11（AUD50-05-01）：回执吸收——把紧邻 span 起点之前的**连续回执节点**吸收进本次
- * replace。新回执落位后旧回执随之消失，活动面恒只留最新一张（一进一出，不逐轮累积）。
- * 吸收的回执进 sourceEventSeqs（被遮蔽），不进 recordSeqs（它没有 v3 记录）；
- * 回注包不吸收（一次性注入，不是回执链成员）；被 pin 的回执不吸收（用户意图优先）。
- * 恢复语义不变：被吸收回执的凭证仍按 voucher recordIds 记账，恢复时按「回执正文
- * 逐字节比对」如实记 skipped（锚点已被吸收，不猜）。
- * @returns {{ absorbed: number[], startIdx: number }} 吸收的 seq（升序）与新起点下标
- */
-export function absorbPrecedingReceipts({ surfaceNodes, startIdx, events, pinnedSeqs = new Set() } = {}) {
-  const bySeq = cachedBySeq(events)
-  const absorbed = []
-  let idx = startIdx
-  while (idx > 0) {
-    const prevSeq = surfaceNodes[idx - 1]
-    if (pinnedSeqs.has(prevSeq)) break
-    const prevEvent = bySeq.get(prevSeq)
-    if (prevEvent === undefined) break
-    if (!isPluginSurfaceEvent(prevEvent) || isRecallPackEvent(prevEvent)) break
-    absorbed.unshift(prevSeq)
-    idx -= 1
-  }
-  return { absorbed, startIdx: idx }
 }
 
 /**
@@ -295,10 +322,21 @@ export function selectArchiveSpan({ surfaceNodes, events, hasRecord, mode, retai
   // 注意 break 只表示「不再往后拼」，**已经选到的完成操作照常归档**；
   // 因此诊断信息只在「一段都没选到」时才作为拒绝原因上报。
   const selected = []
+  // 回合数按「本次选中的组」计数（AUD51-09-01）：与是否发生回执改道无关。
+  let operations = 0
   let stop = null
   for (const group of eligible) {
     if (group.hasPlugin) { stop = { reason: 'plugin-boundary', seq: group.endSeq }; break }
-    if (group.hasUnfinished === true) { stop = { reason: 'unfinished-tool', seq: group.endSeq }; break }
+    if (group.hasUnfinished === true) {
+      stop = {
+        reason: 'unfinished-tool',
+        seq: group.endSeq,
+        callIds: group.missingCallIds,
+        orphanCallIds: group.orphanCallIds,
+        splitCallIds: group.splitCallIds,
+      }
+      break
+    }
     // 保护/缺记录必须作为**整组边界**：不能把同一个操作切一半归档（恢复/回执都会失真）。
     // 回注包没有记录也不需要记录；其余节点必须有记录、且未被 pin（整组边界，不切半个操作）。
     const pinned = group.seqs.filter((seq) => pinnedSeqs.has(seq))
@@ -306,31 +344,28 @@ export function selectArchiveSpan({ surfaceNodes, events, hasRecord, mode, retai
     const missing = group.seqs.filter((seq) => !transient.has(seq) && !hasRecord(seq))
     if (missing.length > 0) { stop = { reason: 'missing-record', seqs: missing, count: missing.length }; break }
     selected.push(...group.seqs)
+    operations += 1
   }
   if (selected.length === 0) return reject(stop ?? { reason: 'no-candidate' })
   selected.sort((a, b) => a - b)
-  let startSeq = selected[0]
+  const startSeq = selected[0]
   const endSeq = selected[selected.length - 1]
   // 必须连续地在当前 surface 中（宿主 range replace 的硬前提）。
   const foundIdx = surfaceNodes.indexOf(startSeq)
   const endIdx = surfaceNodes.indexOf(endSeq)
   if (foundIdx === -1 || endIdx === -1 || foundIdx > endIdx) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
-  // B3-11：吸收紧邻起点的连续回执（一进一出）；吸收后起点前移，span 仍是连续区间。
-  const { absorbed, startIdx } = absorbPrecedingReceipts({ surfaceNodes, startIdx: foundIdx, events, pinnedSeqs })
-  const shadowed = surfaceNodes.slice(startIdx, endIdx + 1)
-  const expected = [...absorbed, ...selected]
-  if (shadowed.length !== expected.length || shadowed.some((seq, index) => seq !== expected[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
-  if (absorbed.length > 0) startSeq = absorbed[0]
-  // recordSeqs 只收有记录的节点：回注包被遮蔽了也还不了（它本来就没入库）；
-  // 吸收的回执同样没有记录（它是旧 span 的替代节点，凭证按 recordIds 记账）。
-  const absorbedSet = new Set(absorbed)
-  const recordSeqs = shadowed.filter((seq) => !transient.has(seq) && !absorbedSet.has(seq))
+  // span 严格等于本次选中的组（不吸收前驱回执）：每轮归档各留一张独立回执，
+  // 旧凭证的正文永远留在活动面，restore 才找得到（AUD51-05-02）。
+  const shadowed = surfaceNodes.slice(foundIdx, endIdx + 1)
+  if (shadowed.length !== selected.length || shadowed.some((seq, index) => seq !== selected[index])) return reject({ reason: 'not-dense', seqs: [startSeq, endSeq] })
+  // recordSeqs 只收有记录的节点：回注包被遮蔽了也还不了（它本来就没入库）。
+  const recordSeqs = shadowed.filter((seq) => !transient.has(seq))
   if (recordSeqs.length === 0) return reject('empty-records', { seqs: shadowed, count: shadowed.length })
   return {
     startSeq,
     endSeq,
     sourceEventSeqs: shadowed,
     recordSeqs,
-    operations: eligible.filter((group) => group.startSeq >= startSeq && group.endSeq <= endSeq).length,
+    operations,
   }
 }

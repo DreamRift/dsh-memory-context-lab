@@ -67,7 +67,7 @@ test('H-42 单行取表面正文抛错 → 只该行 skipped，整批仍结算�
   assert.equal(result.settled.skipped, 1)
   assert.equal(result.settled.balanced, true, 'N-11 会计恒等式必须成立')
   assert.match(result.settled.rowResults[1].reason, /^internal-failure/)
-  assert.equal(result.receiptFirstLine, '已恢复 2/3 段', '首行必须如实反映部分失败')
+  assert.equal(result.receiptFirstLine.startsWith('可恢复 2/3 段'), true, 'P2-06：未接线路径必须如实说「可恢复」而不是「已恢复」：' + result.receiptFirstLine)
 })
 
 test('H-42 全部行都抛错 → 全 skipped、零 restored，仍不抛', async () => {
@@ -80,14 +80,14 @@ test('H-42 全部行都抛错 → 全 skipped、零 restored，仍不抛', async
   assert.equal(result.settled.restored, 0)
   assert.equal(result.settled.skipped, 3)
   assert.equal(result.settled.balanced, true)
-  assert.equal(result.receiptFirstLine, '已恢复 0/3 段')
+  assert.equal(result.receiptFirstLine.startsWith('可恢复 0/3 段'), true, 'P2-06：未接线路径必须说「可恢复」而不是「已恢复」')
 })
 
 test('H-42 正常路径与「一条对不上」语义不变', async () => {
   const lifecycle = createSessionLifecycle({ store: makeStore(threeVouchers()), clock, random })
   const all = await lifecycle.disableSession({ autoRestore: true, guardRefused: false, surfaceTextOf: (v) => v.receiptText })
   assert.equal(all.settled.restored, 3)
-  assert.equal(all.receiptFirstLine, '已恢复 3/3 段')
+  assert.equal(all.receiptFirstLine.startsWith('可恢复 3/3 段'), true, 'P2-06：首行以「可恢复」开头：' + all.receiptFirstLine)
 
   const oneOff = await lifecycle.disableSession({
     autoRestore: true, guardRefused: false,

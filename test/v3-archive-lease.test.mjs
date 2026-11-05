@@ -18,6 +18,11 @@
  * 3. `no-completed-group`（只有当前回合）与 `pinned` 可区分——旧实现两者都是
  *    裸 `no-candidate`，线上只能反推。
  * 4. 按步归档（cooling）仍吃租约：它压的是**当前回合内**的旧步骤，刚读过的记录不能撤。
+ *    **P1-09 更新（2026-11-04）**：队头被租约钉住时只读跳过它（节点留在活动面、不遮蔽），
+ *    它之后的安全步照常成段——旧断言「整批 no-candidate」正是队头死锁本身（一条租约
+ *    让同回合后面所有步骤永久压不了）。租约的不变量改成：被钉的 seq 绝不进入遮蔽范围。
+ *    0.15.0 起回执默认带摘要，摘要行计入净收益；夹具因此放大到每步 1000 字（旧 200 字
+ *    在带摘要后 207 字回执已被判负，测不到租约本身）。解租后同时断言回执带摘要。
  * 5. `/memory-lab status` 的「下一次归档」把原因翻成中文（观察面落地）。
  *
  * ## 不适用条件与已知边界
@@ -186,7 +191,11 @@ test('按步归档（cooling）仍吃读租约：当前回合内刚读过的步�
   session.pushUser('第一问'.repeat(60))
   for (let step = 1; step <= 6; step += 1) {
     session.append('step/start', { turn: 1, step })
-    session.pushAssistant(('第' + step + '步输出').repeat(40))
+    // 0.15.0 起归档回执默认带确定性摘要（产品口径），摘要行本身是上下文税：
+    // 旧夹具每步 200 字，带摘要的回执 207 字已判负（not-worth），租约用例会退化成
+    // 在测「净收益」而不是「租约」。这里把每步正文放大到 1000 字，保持本用例的原判据
+    // ——租约挡住 / 解租后归档——同时下面显式断言回执确实带摘要（新口径更强）。
+    session.pushAssistant(('第' + step + '步输出').repeat(200))
     session.append('step/end', { turn: 1, step })
   }
   try {
@@ -205,13 +214,29 @@ test('按步归档（cooling）仍吃读租约：当前回合内刚读过的步�
     await engine.setState('session-fake', {
       readLease: [{ recordId: pinnedStep.recordId, expiresAt: Date.now() + 5 * 60 * 1000 }],
     })
-    const blocked = await engine.archiveForStep('session-fake', session, { retainOperations: 2 })
-    assert.equal(blocked.status, 'no-candidate', '按步归档压的是当前回合内旧步骤：租约必须仍然生效')
-    assert.equal(blocked.reason, 'pinned')
-    // 对照（防误杀）：清掉租约后同一份夹具有候选并归档。
+    // P1-09 语义更新：队头被租约钉住时**只读跳过**（不遮蔽、不丢正文），它后面的安全步
+    // 照常成段。旧期望「整批 no-candidate / reason=pinned」正是队头死锁本身：一条租约
+    // 就能让同一回合里它后面的步骤永远压不了。租约的真实不变量（被钉的记录不得被撤）
+    // 仍然成立并被下面断言钉死。
+    const whileLeased = await engine.archiveForStep('session-fake', session, { retainOperations: 2, coolingBatchSize: 1 })
+    assert.equal(whileLeased.status, 'archived', '队头租约只挡它自己，不挡后面的步骤：' + JSON.stringify(whileLeased))
+    assert.notEqual(whileLeased.startSeq, pinnedStep.seq, '被租约钉住的步骤绝不能被压：' + JSON.stringify(whileLeased))
+    assert.ok((await session.surface.nodes).includes(pinnedStep.seq), '被租约钉住的节点必须仍在活动面（只读跳过，不遮蔽）')
+    // 对照（防误杀）：清掉租约后，被钉的那一步（旧队头）立刻可压。
     await engine.setState('session-fake', { readLease: [] })
-    const archived = await engine.archiveForStep('session-fake', session, { retainOperations: 2 })
+    const archived = await engine.archiveForStep('session-fake', session, { retainOperations: 2, coolingBatchSize: 1 })
     assert.equal(archived.status, 'archived', JSON.stringify(archived))
+    assert.notEqual(archived.reason, 'pinned', '解租后不得再报 pin/租约')
+    assert.equal(archived.startSeq, pinnedStep.seq, '解租后从最旧的一步（步骤 1 的输出）开始：' + JSON.stringify(archived))
+    assert.equal(archived.endSeq, 3)
+    assert.equal(archived.steps, 1)
+    // 0.15.0 产品口径：归档回执默认带摘要（本轮明确变更）。旧断言只要求 archived，
+    // 这里加断言钉死「归档回执确实有摘要行」，比旧断言更强；夹具正文已放大到摘要
+    // 仍为正净收益的规模，所以这条断言不是靠放宽阈值换来的。
+    assert.match(archived.receiptText, /摘要：/, '归档默认带摘要：' + JSON.stringify(archived.receiptText))
+    // 归档真的改了活动面：被压掉的步骤 1 输出不再留在工作集里。
+    const after = await engine.workingSet('session-fake')
+    assert.equal(after.rows.some((item) => item.seq === 3), false, '步骤 1 的输出必须已离开活动面：' + JSON.stringify(after.rows))
   } finally {
     await engine._waitForIdle().catch(() => {})
     engine.dispose()

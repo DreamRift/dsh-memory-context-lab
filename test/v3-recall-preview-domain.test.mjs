@@ -75,11 +75,12 @@ test('H-47 超过包硬顶：失败关闭（旧：静默当成「全要」）', 
   )
 })
 
-test('H-47 边界：0 合法（只剩 id 与相关度），等于硬顶也合法', async () => {
+test('H-47 边界：0 合法（P2-08：纯壳不注入），等于硬顶也合法', async () => {
   const zero = await recallOnce(0)
-  assert.equal(zero.injected, true)
-  assert.equal(zero.text.includes('正文'), false, 'previewChars=0 → 不回注正文')
-  assert.match(zero.text, /v3r-00000000000000ab/)
+  // P2-08 语义更新（2026-11-05）：previewChars=0 时每行正文为空（只剩「…」），整包即纯壳。
+  // 旧断言要求 `injected:true`（只给 id 与相关度）——那正是「纯壳占配额」的缺陷行为。
+  assert.equal(zero.injected, false, 'previewChars=0 → 纯壳不注入：' + JSON.stringify(zero)?.slice(0, 200))
+  assert.equal(/纯壳/.test(String(zero.reason ?? '')), true, '原因必须说清是纯壳：' + String(zero.reason))
 
   const atCap = await recallOnce(RECALL_PACK_MAX_CHARS)
   assert.equal(atCap.injected, true)

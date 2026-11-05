@@ -193,8 +193,10 @@ test('schema 仍严格：overrides 少键/多键都必须抛错（不是放宽�
 })
 
 test('STATUS_PROJECTION_VERSION 已提升：旧检查点必须被宿主丢弃重折', () => {
-  assert.equal(STATUS_PROJECTION_VERSION, 2,
-    'view 形状变了（overrides 多一个键）；不升版本，旧检查点会带着一条键的 state 冷恢复')
+  // v2（beta.45）：overrides 多一个键（gate）；v3（beta.53）：view 多一个字段（archived）。
+  // 每次改 view 形状都必须再升一级，否则旧检查点会带着旧键集冷恢复。
+  assert.equal(STATUS_PROJECTION_VERSION, 3,
+    'view 形状变了（新增 archived）；不升版本，旧检查点会缺字段冷恢复')
 })
 /**
  * 审计 F-A（beta.46 排查）：`status` 在「本会话尚未摄入」分支把**全局**回注计数

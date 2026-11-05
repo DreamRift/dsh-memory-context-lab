@@ -12,8 +12,9 @@ import { assertPort } from '../../ports/index.mjs'
 import { v3Error, V3ContractViolation } from '../../contracts/index.mjs'
 import { restoreEligibilityOf } from '../../domain/archive/restore.mjs'
 import { openV3SessionStore, repairSessionJournals } from './session-store.mjs'
-import { withCrossProcessWriteLock, withWriteLock } from './write-lock.mjs'
+import { withCrossProcessWriteLock } from './write-lock.mjs'
 import { buildLexicalIndex, isIndexStale, readLexicalIndex, writeLexicalIndex } from './lexical-index.mjs'
+import { buildChunkIndex, writeChunkIndex } from './chunk-index.mjs'
 
 /**
  * 打开并装配 SessionStore 端口。
@@ -81,13 +82,19 @@ export async function createSessionStorePort(root, sessionKey) {
       entries.push({ id, text: record.payload.text })
     }
     const index = buildLexicalIndex(entries, { sourceCount: committedIds.length, forgottenCount: forgotten.size })
-    if (write) await writeLexicalIndex(store, index)
-    return index
+    // 0.15.0 P5：chunk 索引是同一批 entries 的派生引用（只存码点 span），
+    // 与词法索引一起落盘；其中任一派生物缺失/换代都不挡检索（查询侧降级现扫）。
+    const chunkIndex = buildChunkIndex(entries, { sourceCount: committedIds.length, forgottenCount: forgotten.size })
+    if (write) {
+      await writeLexicalIndex(store, index)
+      await writeChunkIndex(store, chunkIndex)
+    }
+    return { index, chunkIndex }
   }
 
   /** 锁内全量重建（调用方必须已持锁）。 */
   async function rebuildIndex() {
-    return buildIndex({ write: true })
+    return (await buildIndex({ write: true })).index
   }
 
   /**
@@ -104,36 +111,47 @@ export async function createSessionStorePort(root, sessionKey) {
     try {
       await store.refreshForgotten?.()
       const before = await store.freshness()
-      const index = await buildIndex({ write: false })
+      const indexes = await buildIndex({ write: false })
       const after = await store.freshness()
-      built = { index, baseline: after, stable: JSON.stringify(before) === JSON.stringify(after) }
+      built = { indexes, baseline: after, stable: JSON.stringify(before) === JSON.stringify(after) }
     } catch {
       built = null // 构建失败不掩盖：锁内重建会如实抛出
     }
-    return withCrossProcessWriteLock(dir, async () => {
+    return withCrossProcessWriteLock(dir, async (ownership) => {
       await store.syncFromLog()
+      ownership.assertOwned() // R3-03：失锁后不落索引短写，退回锁内全量也一并不做
       if (built !== null && built.stable === true) {
         const current = await store.freshness()
         if (JSON.stringify(current) === JSON.stringify(built.baseline)) {
-          await writeLexicalIndex(store, built.index)
-          return built.index
+          // 两份派生物在同一持锁窗口内短写：词法索引先落，chunk 索引后落；
+          // 中间崩溃只会留下「chunk 索引较旧」，读取侧按 stale 降级现扫，不误用旧窗口。
+          await writeLexicalIndex(store, built.indexes.index)
+          await writeChunkIndex(store, built.indexes.chunkIndex)
+          return built.indexes.index
         }
       }
       return rebuildIndex()
     })
   }
 
-  // 来源事件 ID 缓存：进程内惰性构建，任何写操作后失效（H-01：断点必须能从库反推）
-  let sourceEventCache = null
+  // 来源事件 → 记录 ID 缓存：进程内惰性构建，任何写操作后失效（H-01：断点必须能从库反推）。
+  // P7 首次呈现复用这张表定位「这次 tool/result 已经有哪条记录」，不新建记录类型/第二套冷库。
+  let sourceEventMap = null
   let sourceEventFailure = null
 
-  async function sourceEventIds() {
+  /**
+   * 来源事件 ID → 记录 ID。
+   *
+   * 重复摄入（同 sourceEventId 多份拷贝）时**固定取字典序最小的记录 ID**：
+   * H-01 的「最早 createdAt」是检索面口径，而句柄必须逐次稳定；两份拷贝正文相同，
+   * 取哪份不影响可读性，取最小 ID 保证跨进程/跨次调用同一个句柄。
+   * 含已遗忘记录：遗忘是「不可见」，不是「从未摄入」；读正文时仍会 EFORGOTTEN。
+   */
+  async function sourceEventMapOf() {
     if (sourceEventFailure !== null) throw sourceEventFailure
-    if (sourceEventCache !== null) return [...sourceEventCache]
-    const out = new Set()
+    if (sourceEventMap !== null) return sourceEventMap
+    const out = new Map()
     for (const id of await store.listRecordIds()) {
-      // 含已遗忘记录：遗忘是「不可见」，不是「从未摄入」。按可读集反推会让断点回退，
-      // 重放时把已遗忘正文重新落成新记录（H-02 隐私回退）。这里只取 provenance，不读正文。
       let provenance
       try {
         provenance = await store.readProvenance(id)
@@ -143,17 +161,34 @@ export async function createSessionStorePort(root, sessionKey) {
         throw error
       }
       const sourceEventId = provenance?.sourceEventId
-      if (typeof sourceEventId === 'string' && sourceEventId.length > 0) out.add(sourceEventId)
+      if (typeof sourceEventId !== 'string' || sourceEventId.length === 0) continue
+      const prev = out.get(sourceEventId)
+      if (prev === undefined || id < prev) out.set(sourceEventId, id)
     }
-    sourceEventCache = out
-    return [...out]
+    sourceEventMap = out
+    return out
+  }
+
+  async function sourceEventIds() {
+    return [...(await sourceEventMapOf()).keys()]
+  }
+
+  /** 单条来源事件 → 记录 ID；没有则 null（不猜、不扫描正文）。 */
+  async function recordIdOfSourceEvent(sourceEventId) {
+    if (typeof sourceEventId !== 'string' || sourceEventId.length === 0) {
+      throw new V3ContractViolation('v3 store: recordIdOfSourceEvent 的 sourceEventId 必须是非空字符串')
+    }
+    return (await sourceEventMapOf()).get(sourceEventId) ?? null
   }
 
   const impl = {
     /** 单笔事务：锁内提交，提交后重建索引（遗忘记录不入索引）。 */
     async transaction(records, { at } = {}) {
-      const txn = await withCrossProcessWriteLock(dir, async () => {
+      const txn = await withCrossProcessWriteLock(dir, async (ownership) => {
       await store.syncFromLog() // H-10-b：锁内增量视图同步，多句柄/多进程提交不漏
+        // R3-03：失锁（被接管/心跳失败）后的提交失败关闭——已发生的写入保留事务
+        // 恢复证据，这里只保证不再继续往可能易主的目录里追加新提交。
+        ownership.assertOwned()
         const committed = await store.submitTransaction(records, { at })
         // B2-8：检查点与提交同一把锁内追加（纯缓存：失败只损失下次打开的速度，
         // 下次打开回退全量扫描并重建基线，绝不影响正确性）。
@@ -165,15 +200,58 @@ export async function createSessionStorePort(root, sessionKey) {
         } catch { /* 检查点追加失败不回滚提交 */ }
         return committed
       })
-      sourceEventCache = null
+      sourceEventMap = null
       return txn
     },
 
     /** 已提交记录的来源事件 ID 清单（摄入断点反推用；派生物，写后失效）。 */
     sourceEventIds,
 
+    /** 单条来源事件 → 记录 ID（P7 首次呈现复用既有记录；读不到返回 null）。 */
+    recordIdOfSourceEvent,
+
     async readRecord(id) {
       return store.readRecord(id)
+    },
+
+    /**
+     * 物理清除（H4）：整批预检 + 逐条 store.purge + 重建索引。
+     * 与 forget 的差别只有一点：正文文件真的删掉，undo 永久不可用。
+     */
+    async purge(recordIds) {
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        throw new V3ContractViolation('v3 store: purge 的 recordIds 必须是非空数组')
+      }
+      for (const id of recordIds) {
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new V3ContractViolation('v3 store: purge 的每个 id 必须是非空字符串')
+        }
+      }
+      return withCrossProcessWriteLock(dir, async (ownership) => {
+        await store.syncFromLog()
+        const committed = new Set(await store.listRecordIds())
+        const missing = recordIds.filter((id) => !committed.has(id))
+        if (missing.length > 0) {
+          throw v3Error('ESTORE_TXN_CONFLICT', 'purge 目标不存在或未提交（整批拒绝，一条都未清除）：' + missing.join('、'))
+        }
+        ownership.assertOwned()
+        let purged = 0
+        try {
+          for (const id of recordIds) {
+            const row = await store.purge(id)
+            if (row.alreadyPurged !== true) purged += 1
+          }
+        } finally {
+          await rebuildIndex()
+        }
+        const index = await readLexicalIndex(store)
+        return { purgedCount: purged, indexedCount: index?.indexedCount ?? 0 }
+      })
+    },
+
+    /** 已物理清除 ID（undo 可用性判定）。 */
+    listPurged() {
+      return typeof store.listPurged === 'function' ? store.listPurged() : []
     },
 
     /** 记录 ID 清单（归档需要宿主 seq → recordId；只给 ID，不读正文）。 */
@@ -198,9 +276,10 @@ export async function createSessionStorePort(root, sessionKey) {
     async saveCheckpointBaseline(txn, pairs) {
       if (!Number.isInteger(txn) || txn < 1) return { written: false, reason: 'no-txn' }
       if (!(pairs instanceof Map) || pairs.size === 0) return { written: false, reason: 'empty' }
-      return withCrossProcessWriteLock(dir, async () => {
+      return withCrossProcessWriteLock(dir, async (ownership) => {
         await store.syncFromLog()
         if (store.health().maxTxn !== txn) return { written: false, reason: 'stale' }
+        ownership.assertOwned() // R3-03
         await store.appendCheckpointBaseline(txn, [...pairs])
         return { written: true }
       })
@@ -210,7 +289,10 @@ export async function createSessionStorePort(root, sessionKey) {
     async appendVoucher(voucher) {
       // B3-7（AUD50-03-06）：凭证追加与其它写原语共用同一把跨进程写锁——裸追加在
       // 两进程并发时会产生半行/丢失，repair 也会误判。已持锁的调用方走 ALS 重入，不死锁。
-      return withCrossProcessWriteLock(dir, () => store.appendVoucher(voucher))
+      return withCrossProcessWriteLock(dir, (ownership) => {
+        ownership.assertOwned() // R3-03：失锁后拒绝追加凭证
+        return store.appendVoucher(voucher)
+      })
     },
 
     /**
@@ -248,7 +330,7 @@ export async function createSessionStorePort(root, sessionKey) {
           throw new V3ContractViolation('v3 store: forget 的每个 id 必须是非空字符串')
         }
       }
-      return withCrossProcessWriteLock(dir, async () => {
+      return withCrossProcessWriteLock(dir, async (ownership) => {
       await store.syncFromLog() // H-10-b：锁内增量视图同步，多句柄/多进程提交不漏
         // 预检：全部 id 必须已提交（幂等允许「已遗忘」，但**不允许**「从未提交」）
         const committed = new Set(await store.listRecordIds())
@@ -256,6 +338,7 @@ export async function createSessionStorePort(root, sessionKey) {
         if (missing.length > 0) {
           throw v3Error('ESTORE_TXN_CONFLICT', 'forget 目标不存在或未提交（整批拒绝，一条都未遗忘）：' + missing.join('、'))
         }
+        ownership.assertOwned() // R3-03：失锁后拒绝继续遗忘
         try {
           for (const id of recordIds) await store.forget(id)
         } finally {
@@ -276,8 +359,9 @@ export async function createSessionStorePort(root, sessionKey) {
      * 锁内先 syncFromLog：事务号基于最新日志分配。索引重建留在锁外（避免长临界区）。
      */
     async importRecords(records) {
-      const result = await withCrossProcessWriteLock(dir, async () => {
+      const result = await withCrossProcessWriteLock(dir, async (ownership) => {
         await store.syncFromLog() // 锁内增量视图同步：多句柄/多进程提交不漏
+        ownership.assertOwned() // R3-03：失锁后拒绝导入
         const imported = await store.importRecords(records)
         try {
           // B2-8：导入事务也记账（pairs 为空——导入记录没有宿主事件映射），
@@ -304,13 +388,19 @@ export async function createSessionStorePort(root, sessionKey) {
           throw new V3ContractViolation('v3 store: revokeForget 的每个 id 必须是非空字符串')
         }
       }
-      return withCrossProcessWriteLock(dir, async () => {
+      return withCrossProcessWriteLock(dir, async (ownership) => {
         await store.syncFromLog()
         const committed = new Set(await store.listRecordIds())
+        const purged = new Set(typeof store.listPurged === 'function' ? store.listPurged() : [])
+        const purgedHit = recordIds.filter((id) => purged.has(id))
+        if (purgedHit.length > 0) {
+          throw v3Error('ESTORE_TXN_CONFLICT', '记录已被物理清除（forget purge），不可撤销：' + purgedHit.join('、'))
+        }
         const missing = recordIds.filter((id) => !committed.has(id))
         if (missing.length > 0) {
           throw v3Error('ESTORE_TXN_CONFLICT', '撤销遗忘目标不存在或未提交（整批拒绝）：' + missing.join('、'))
         }
+        ownership.assertOwned() // R3-03
         try {
           for (const id of recordIds) await store.revokeForget(id)
         } finally {
@@ -368,10 +458,36 @@ export async function createSessionStorePort(root, sessionKey) {
       return typeof store.redactedVoucherIds === 'function' ? store.redactedVoucherIds() : []
     },
 
-    async markVoucherRedacted(voucherId, redacted) {
+    async markVoucherRedacted(voucherId, redacted, options = {}) {
       if (typeof store.markVoucherRedacted !== 'function') return { changed: false }
-      // B3-7：隐私面清除标记同样进写锁（所有写原语一个锁的纪律）
-      return withCrossProcessWriteLock(dir, () => store.markVoucherRedacted(voucherId, redacted))
+      // B3-7：隐私面清除标记同样进写锁（所有写原语一个锁的纪律）。
+      // P1-08：options（`{seq}`）必须透传——端口漏传会让「清除时落新节点 seq」静默失效，
+      // undo 只能退回正文扫描（多段错位的根因）。
+      return withCrossProcessWriteLock(dir, (ownership) => {
+        ownership.assertOwned() // R3-03：失锁后拒绝改隐私标记
+        return store.markVoucherRedacted(voucherId, redacted, options)
+      })
+    },
+
+    /** P1-08：已清除回执的节点 seq（老账本/测试替身缺席时返回 null）。 */
+    redactionSeqOf(voucherId) {
+      return typeof store.redactionSeqOf === 'function' ? store.redactionSeqOf(voucherId) : null
+    },
+
+    /** P1-07：孤儿回执（补凭证放弃后的恢复线索）。写进同一把会话写锁。 */
+    async appendOrphanReceipt(row) {
+      if (typeof store.appendOrphanReceipt !== 'function') {
+        throw new V3ContractViolation('v3 store: 实现缺 appendOrphanReceipt')
+      }
+      return withCrossProcessWriteLock(dir, (ownership) => {
+        ownership.assertOwned()
+        return store.appendOrphanReceipt(row)
+      })
+    },
+
+    /** P1-07：列孤儿回执；测试替身缺席时按空（不影响既有归档路径）。 */
+    listOrphanReceipts() {
+      return typeof store.listOrphanReceipts === 'function' ? store.listOrphanReceipts() : []
     },
 
     // 会话目录只读暴露（usage 聚合落盘/观察面 stats 用；不承诺更多）

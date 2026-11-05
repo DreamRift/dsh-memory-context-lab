@@ -38,39 +38,31 @@ async function listSourceFiles(dir) {
  * 接线或删除后请把条目摘掉，白名单只缩不涨。
  */
 const EXPORT_WHITELIST = new Map(Object.entries({
-  apply: '宿主插件入口（DSH 经插件协议调用 apply，src 内零消费是协议必然）',
   Config: '宿主设置页入口（dsh-settings 读 fiber.runtime.Config 生成表单，消费方在宿主侧；src 内零消费是协议必然）；v3-surface-contract 锁「五个 volatile 字段 + ~standard 默认值」',
-  evaluatePressureGate: '定案·白名单：闸门判定纯函数（v3-pressure-gate 套件锁 G1-G4 判据）；触发动作属①②④缓议项（2026-10-25 用户拍板），接线后摘除',
   _candidatesCacheStats: '测试钩子（B3-8）：v3-candidates-cache 套件锁「选择器不随历史长度线性变慢」的计数器，src 内零消费是设计',
   _resetCandidatesCacheStats: '测试钩子（B3-8）：v3-candidates-cache 套件复位计数用，src 内零消费是设计',
-  _sessionDirGateStats: '测试钩子（B3-9）：v3-status-file-gate 套件锁「每 tick stat 次数上限」的计数器，src 内零消费是设计',
   // —— 测试钩子（*ForTest），生产不消费是设计而非缺口 ——  // —— P0-4 待逐个三选一（接线/删除/白名单定案），见进展卡-beta.9 ——  // —— v3 M0 骨架（dev-0.14.0/进展卡-M0）：M3 composition root 接线后逐项摘除 ——
-  assertPort: 'v3 M0：装配期端口校验，消费者是 M3 的 index.mjs composition root（尚未入驻）；v3 套件锁「缺方法必点名」',
-  isV3Error: 'v3 M0：错误信封判别，M3 边界转换消费；v3-session-isolation 套件锁信封形状',
-  sessionIsolationKey: 'v3 M0：会话隔离键，M3 processTurn 消费；v3-session-isolation 套件锁归一与失败关闭',
-  negotiateMemoryProvider: 'v3 M1：能力协商纯函数，消费者是 M5 dsh-memory adapter（尚未入驻）；v3-capabilities 套件锁 fail-closed 回 T1',
-  applyMinScore: 'v3 M1：双面门槛，消费者是 M4 检索装包（尚未入驻）；套件锁 display/pack/dropped 三分',
-  acquireWriteLock: 'v3 M2：跨进程写锁，消费者是 M3 写路径与 M2 存储事务（接线随 SessionStore 端口装配）；v3-write-lock 套件锁两阶段/心跳/接管',
-  searchLexical: 'v3 M2：tf 口径检索，BM25 主路径在 t1-provider（打分不复用）；留作索引冒烟与降级路径',
-  readLexicalIndex: 'v3 M2：索引读取，消费者是 M4 provider 与 staleness 检查；套件锁损坏不静默重建',
-  rebuildLexicalIndex: 'v3 M2：索引重建，消费者是 M3/M4 写路径维护点（尚未入驻）；套件锁从记录完整重建',
-  isIndexStale: 'v3 M2：新鲜度判定，消费者是检索入口（尚未入驻）；套件锁计数不一致即 stale',
-  createProcessTurn: 'v3 M3：processTurn 用例工厂，composition root 在 M5 宿主接线时消费；v3-process-turn 套件锁全链路五态',
-  createSessionStorePort: 'v3 M3：SessionStore 端口装配，composition root 在 M5 消费；套件锁端口面与真实适配器组合',
-  createSessionLifecycle: 'v3 M3：生命周期用例工厂（enable/disable/restore/forget），composition root 在 M5 消费；v3-session-lifecycle 套件锁 Q-01/G3/N-11',
-  planSlots: 'v3 M4：双槽规划，消费者是 M5 surface 执行层（尚未入驻）；v3-slot-planner 套件锁稳态双槽',
-  createT1Provider: 'v3 M4：T1 提供者工厂，backend-negotiation 与 composition 消费；v3-t1-recall 套件锁 BM25/OOV/双面门槛/自动重建',
-  negotiateMemoryBackend: 'v3 M5：记忆后端协商（D3 fail-closed），消费者是 composition root 切换处（T2 实测登记后接入）；v3-backend-negotiation 套件锁各回落分支',
-  gateRecallInjection: 'v3 M4：回注闸便捷封装（category=recall-injection），消费者是 M5 surface 执行层；recall 用例走 domain 直连（application 不依赖 projection）',
-  createSurfaceExecutor: 'v3 M4：投影执行器工厂，composition root 在 M5 消费；v3-surface-executor 套件锁 R4 降级/一步恢复',
-  placeholderReceipt: 'v3 M4：占位回执模板，executePlan 消费且导出供 M5 回执渲染复用；套件锁一行占位',
-  createDshHostAdapter: 'v3 M5：HostSurface 端口的 DSH 实现，composition root 在 M5 消费；v3-dsh-host 套件锁宿主契约逐字对齐',
-  normalizeDshEvent: 'v3 M5：DSH 事件→v3 封闭集归一化，消费者是 M5 事件入口（processTurn 前置）；套件锁四类映射/system 拒绝',
-  createV3Runtime: 'v3 M5：composition root，消费者是 entry/v3-entry（影子挂载）与未来插件入口；v3-composition 套件锁端到端四链路',
-  attachV3Engine: 'v3 M5：影子模式挂载（只摄入不动表面），消费者是插件主入口（挂载决策属产品发布面，M6 前不入 index.mjs）；v3-entry 套件锁增量摄入/dispose',
-  textOfDshEvent: 'v3 M5：DSH 事件正文提取，v3-entry 消费；套件锁 content 数组与裸 text 两形态',
-  createRecall: 'v3 M4：recall 用例工厂，composition root 在 M5 消费；v3-t1-recall 套件锁纯壳不注入/首部切片/P3',
+  // —— 以下 5 项的「理由」于 0.15.0 收尾时按实测重写：原写法声称了并不存在的生产消费者 ——
+  isV3Error: '**仅测试消费**：src 内唯一引用是 contracts/index.mjs 的 barrel re-export（re-export 不是调用）。生产错误判读一律走鸭子类型 error?.code ?? \'EINTERNAL\'（实测 src 内 instanceof V3ContractViolation 为 0 处）；v3-pressure-gate 套件锁信封形状',
+  searchLexical: '**仅测试消费**：BM25 主路径在 t1-provider（打分不复用），生产没有降级分支调用它；v3-index-prototype / v3-vouchers-index 两个套件用它锁词元覆盖计数与确定性排序',
+  rebuildLexicalIndex: '**仅测试消费**：注释里点名的「M3/M4 写路径维护点」至今未入驻，src 内零调用；v3-vouchers-index 套件用它锁「从记录完整重建」',
+  gateRecallInjection: '**仅测试消费**：注释里点名的「M5 surface 执行层」消费者至今不存在，src 内除定义行外零引用；v3-slot-planner 套件锁回注闸（category=recall-injection）判据',
+  textOfDshEvent: '**仅测试消费**：v3-entry 里它只是 extractEventBody(raw).text 的薄包装，自身零调用；生产消费点是内部 extractEventBody（v3-entry.mjs:2680）。8 个套件用它锁「content 数组 / 裸 text / 工具结果」三种形态',
+  sliceByChars: 'P5：命中窗口不再按 UTF-16 切片，应用层唯一使用点被 selectExcerpt 取代；保留导出给 v3-t1-recall 锁代理对边界（码点纪律）',
+  createFirstIngressRecordPort: 'P7 候选（默认关闭）：复用既有 tool/result 记录的端口，**当前 src 内零调用**（「未来 entry 接线」尚未发生）；v3-p7-records-adapter 锁真实 store 的查找/遗忘/导出/导入链'
 }))
+
+test('P0-5⓪：导出白名单只缩不涨，且每条理由必须成句', () => {
+  // 「只缩不涨」此前只写在注释里，没有任何东西钉住它——注释不是守卫。
+  // 这里钉死条目数：接线或删除后请**同步下调**下面的数字（下调是允许的，上涨必须解释）。
+  assert.equal(EXPORT_WHITELIST.size, 10,
+    '白名单条目数变了：' + [...EXPORT_WHITELIST.keys()].join('、') +
+    '。新增条目必须先证明「为什么不消费」，并在本行显式上调数字；接线/删除后请下调。')
+  for (const [name, reason] of EXPORT_WHITELIST) {
+    assert.equal(typeof reason, 'string', name + ' 的白名单理由必须是字符串')
+    assert.ok(reason.trim().length >= 12, name + ' 的白名单理由过短，必须写清「为什么不消费」')
+  }
+})
 
 test('P0-5①：src 导出符号必须被 src 消费或在白名单（附理由）', async () => {
   const files = await listSourceFiles(SRC)

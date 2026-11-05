@@ -60,7 +60,9 @@ test('尾部半行：dry-run 不动字节；apply 截断 + 写审计 + 重开后
     const audit = JSON.parse(auditText.trim().split('\n')[0])
     assert.equal(audit.file, 'transactions.jsonl')
     assert.equal(audit.removedBytes > 0, true)
-    assert.match(audit.removedPreview, /^\{"action":"commit"/)
+    assert.match(audit.removedDigest, /^sha256:[0-9a-f]{16}$/)
+    assert.equal(typeof audit.removedBytesFromTail, 'number')
+    assert.equal('removedPreview' in audit, false, 'M5：审计行不得包含被截内容原文')
 
     const reopened = await openV3SessionStore(root, 's-repair')
     assert.equal(reopened.health().healthy, true, JSON.stringify(reopened.health()))

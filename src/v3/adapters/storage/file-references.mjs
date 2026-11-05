@@ -19,6 +19,9 @@ const LEDGER = 'file-references.json'
 const READ_TOOL_NAMES = new Set([
   'read', 'read_file', 'readfile', 'readFile',
   'workspaceFiles_read', 'workspace_files_read', 'file_read',
+  // 0.15.1：bundle 内的定制 dsh-ops 默认替换官方 read/glob/grep；
+  // 它的读文件工具也必须进核证账本，否则启用替换后文件引用面恒空。
+  'ops_inspect_local_file',
 ])
 
 export function fileReferencesPath(directory) {
@@ -44,10 +47,25 @@ export async function readFileReferences(directory) {
   return { exists: true, refs: parsed.refs }
 }
 
+/**
+ * M6（2026-11-04 审计）：绝对路径（含用户名/目录结构）**不落盘**。
+ * `workspaceRoot` 只活在进程内，用于本次核验；持久化时换成不可逆的 `workspaceId`
+ * （路径的 sha256 前 16 字符）。重开后核验按当前会话 cwd 重新计算 id 比对，
+ * 不一致即 `workspace-changed`（不猜旧路径）。
+ */
+function workspaceIdOf(root) {
+  return 'ws-' + createHash('sha256').update(path.resolve(root)).digest('hex').slice(0, 16)
+}
+
 export async function writeFileReferences(directory, refs) {
   if (!Array.isArray(refs)) throw new Error('v3 file-references: refs 必须是数组')
   await mkdir(directory, { recursive: true })
-  const body = JSON.stringify({ schemaVersion: FILE_REFERENCES_SCHEMA_VERSION, refs }, null, 2) + '\n'
+  const sanitized = refs.map((ref) => {
+    if (ref === null || typeof ref !== 'object') return ref
+    const { workspaceRoot: _workspaceRoot, ...rest } = ref
+    return rest
+  })
+  const body = JSON.stringify({ schemaVersion: FILE_REFERENCES_SCHEMA_VERSION, refs: sanitized }, null, 2) + '\n'
   await writeFileAtomic(fileReferencesPath(directory), body)
   return refs.length
 }
@@ -88,10 +106,11 @@ export async function captureFileReference({ event, recordId, cwd, maxBytes = FI
   const root = path.resolve(cwd)
   const absolute = path.resolve(root, target.path)
   if (!within(root, absolute)) {
-    return { id: refIdOf(recordId, target.path), recordId, tool: target.tool, path: target.path, status: 'unverifiable', reason: 'outside-workspace', capturedAt: Date.now() }
+    // 工作区外引用不保留用户原始路径（可能含主目录/用户名），只留文件名。
+    return { id: refIdOf(recordId, target.path), recordId, tool: target.tool, path: path.basename(target.path), outsideWorkspace: true, status: 'unverifiable', reason: 'outside-workspace', capturedAt: Date.now() }
   }
   const relPath = path.relative(root, absolute) || '.'
-  const base = { id: refIdOf(recordId, relPath), recordId, tool: target.tool, path: relPath, workspaceRoot: root, capturedAt: Date.now() }
+  const base = { id: refIdOf(recordId, relPath), recordId, tool: target.tool, path: relPath, workspaceId: workspaceIdOf(root), workspaceRoot: root, capturedAt: Date.now() }
   try {
     const real = await realpath(absolute)
     if (!within(root, real)) return { ...base, status: 'unverifiable', reason: 'symlink-outside-workspace' }
@@ -113,14 +132,20 @@ export async function captureFileReference({ event, recordId, cwd, maxBytes = FI
 }
 
 /** 重新核验一个引用；不改入参。 */
-export async function verifyFileReference(ref, { maxBytes = FILE_REFERENCE_MAX_BYTES } = {}) {
+export async function verifyFileReference(ref, { maxBytes = FILE_REFERENCE_MAX_BYTES, workspaceRoot = null } = {}) {
   if (ref === null || typeof ref !== 'object' || typeof ref.path !== 'string') {
     return { ...ref, status: 'unverifiable', reason: 'bad-reference' }
   }
-  if (typeof ref.workspaceRoot !== 'string' || ref.workspaceRoot.length === 0) {
-    return { ...ref, status: 'unverifiable', reason: 'no-workspace-root' }
+  // 根来源优先级：调用方给的当前 cwd → 进程内 ref.workspaceRoot → 旧账本里的绝对路径。
+  // 只有 workspaceId 对得上才用当前 cwd，避免「换工作区后拿新根去核旧引用」。
+  const candidate = typeof workspaceRoot === 'string' && workspaceRoot.length > 0
+    ? workspaceRoot
+    : (typeof ref.workspaceRoot === 'string' && ref.workspaceRoot.length > 0 ? ref.workspaceRoot : null)
+  if (candidate === null) return { ...ref, status: 'unverifiable', reason: 'no-workspace-root' }
+  if (typeof ref.workspaceRoot !== 'string' && typeof ref.workspaceId === 'string' && ref.workspaceId !== workspaceIdOf(candidate)) {
+    return { ...ref, status: 'unverifiable', reason: 'workspace-changed' }
   }
-  const root = path.resolve(ref.workspaceRoot)
+  const root = path.resolve(candidate)
   const absolute = path.resolve(root, ref.path)
   if (!within(root, absolute)) return { ...ref, status: 'unverifiable', reason: 'outside-workspace' }
   try {

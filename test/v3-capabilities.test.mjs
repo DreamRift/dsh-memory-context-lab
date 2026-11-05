@@ -44,7 +44,9 @@ const ISOLATED = {
 }
 
 test('已实测清单登记 0.9.10：直连齐全探测结果升 T2', () => {
-  assert.deepEqual([...TESTED_DSH_MEMORY_VERSIONS], ['0.9.10'], '前置：0.9.10 已完成真实冒烟并登记')
+  // P5（2026-11-01）：0.9.17 完成隔离 MCP 冒烟 + cg read(query,k) 探针，但只登记为
+  // candidate（默认启用会把生产从 T1 切到 T2，属产品决策）；默认名单仍只有 0.9.10。
+  assert.deepEqual([...TESTED_DSH_MEMORY_VERSIONS], ['0.9.10'], '前置：默认启用的已实测清单仍只有 0.9.10')
   const result = negotiateMemoryProvider(FULL)
   assert.equal(result.tier, 'T2')
   assert.match(result.reason, /已实测版本/)

@@ -33,7 +33,7 @@ function buildSession(id) {
 
 test('冷却：gate95 preview=执行=cooling-closed；gate0 归档后 lastArchiveAt 可见且回合位点不变', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'mcl-cooling-gate-'))
-  const settings = { fullHistory: true, planFirst: false, autoRestore: true, coolingGate: 95 }
+  const settings = { fullHistory: true, planFirst: false, autoRestore: true, coolingGate: 95, coolingBatchSize: 1 }
   const hooks = []
   const ctx = { on(name, handler) { hooks.push(handler); return () => {} }, logger: { warn() {}, info() {} } }
   const engine = attachV3Engine(ctx, { v3Root: root, settingsNow: () => settings, defaultEnabled: true })

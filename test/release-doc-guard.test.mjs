@@ -21,7 +21,7 @@ const pluginRoot = path.join(here, '..')
 const releaseRoot = path.join(pluginRoot, '..', 'release')
 
 // 公开文档允许的包内相对链接目标（发布包 files 集合内的文件）。
-const LINK_WHITELIST = new Set(['./CHANGELOG.md', './LICENSE'])
+const LINK_WHITELIST = new Set(['./CHANGELOG.md', './LICENSE', './INSTALL.md'])
 
 async function exists(p) {
   try { await readFile(path.join(releaseRoot, p)); return true } catch { return false }

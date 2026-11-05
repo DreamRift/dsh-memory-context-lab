@@ -190,6 +190,35 @@ export class FakeSession {
   deriveMessages() {
     return this.nodes.map((seq) => this.deriveEventMessage(this.eventAt(seq))).filter(Boolean)
   }
+
+  /**
+   * 请求派生期的严格工具配对校验（P7 候选新增，显式调用，不改默认行为）。
+   *
+   * 为什么需要：append 期的平衡检查只拦「有结果无调用」（#recomputeBalance 的负值），
+   * 拦不住「有调用无结果」——例如用 user/message 顶掉单个 tool/result、留下未闭合调用。
+   * 真实宿主在 append 期也不拦这种情况（dsh-session 只校验 tool/result 替换的
+   * content-only 形状），但下一次请求会带着未闭合调用发给 provider：离线夹具必须能
+   * 把这种「能过 append、过不了请求」的非法改写判红，否则 P7 的合法性证明是假的。
+   *
+   * 判据：按活动面顺序累计 assistant 的 tool-call 块数，每个 tool/result 关闭一个；
+   * 任何位置出现「结果多于调用」或收尾时仍有未闭合调用 → SurfaceError。
+   *
+   * @returns {true} 配对闭合
+   */
+  assertRequestBalanced() {
+    let open = 0
+    for (const seq of this.nodes) {
+      const event = this.events[seq]
+      if (event?.type === 'assistant/message') {
+        open += (event.data?.message?.content ?? []).filter((block) => block?.type === 'tool-call').length
+      } else if (event?.type === 'tool/result') {
+        if (open <= 0) throw new SurfaceError('request derivation: a tool/result at surface seq ' + seq + ' has no matching call')
+        open -= 1
+      }
+    }
+    if (open !== 0) throw new SurfaceError('request derivation: ' + open + ' tool call(s) left without a result')
+    return true
+  }
 }
 
 /** Rough token meter; the real one is the host's, but only ratios matter here. */

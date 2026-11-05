@@ -11,6 +11,14 @@
 import { assertPort } from '../../ports/index.mjs'
 import { applyMinScore, rankResults, tokenizeQuery } from '../../domain/retrieval/query.mjs'
 import { indexStampOf, isIndexStale, readLexicalIndex } from '../storage/lexical-index.mjs'
+import {
+  chunkIndexStampOf,
+  chunkRecordTruncated,
+  chunkSpansOf,
+  isChunkIndexCompatible,
+  isChunkIndexStale,
+  readChunkIndex,
+} from '../storage/chunk-index.mjs'
 import { v3Error, V3ContractViolation } from '../../contracts/index.mjs'
 
 const K1 = 1.2
@@ -45,6 +53,42 @@ export function createT1Provider({ port, store, metrics } = {}) {
   // 戳读失败会抛出；文件被替换则戳必变。
   let cachedIndex = null
   let cachedStamp = null
+  // chunk 索引解析缓存（与词法索引分开戳/失效：一份损坏或换代不连坐另一份）。
+  let cachedChunkIndex = null
+  let cachedChunkStamp = null
+
+  /**
+   * 读取 chunk 索引（带文件戳缓存 + 版本/损坏降级）。
+   * @returns {Promise<{state: 'ok'|'absent'|'incompatible'|'corrupt', index: object|null}>}
+   */
+  async function loadChunkIndex() {
+    let stamp
+    try {
+      stamp = await chunkIndexStampOf(store)
+    } catch {
+      return { state: 'corrupt', index: null }
+    }
+    if (stamp === 'absent') return { state: 'absent', index: null }
+    if (cachedChunkIndex !== null && cachedChunkStamp === stamp) return { state: 'ok', index: cachedChunkIndex }
+    let index
+    try {
+      index = await readChunkIndex(store)
+    } catch (error) {
+      if (error?.code !== 'ESTORE_CORRUPT') throw error
+      metrics?.counter?.('v3.t1.chunkIndexCorrupt', 1)
+      return { state: 'corrupt', index: null }
+    }
+    if (index === null) return { state: 'absent', index: null }
+    if (!isChunkIndexCompatible(index)) {
+      metrics?.counter?.('v3.t1.chunkIndexIncompatible', 1)
+      cachedChunkIndex = null
+      cachedChunkStamp = stamp
+      return { state: 'incompatible', index: null }
+    }
+    cachedChunkIndex = index
+    cachedChunkStamp = stamp
+    return { state: 'ok', index }
+  }
 
   async function freshIndex(allowRebuild = true) {
     // 解析缓存：索引是十几–二十几 MB 的 JSON（本机 4014 文档实测 22.6MB），每次检索 parse 约 250ms——
@@ -145,25 +189,31 @@ export function createT1Provider({ port, store, metrics } = {}) {
       // 不去重会让同一处出现被重复计分，也让覆盖门槛把「重复词元」当成「多个不同的词」。
       const terms = [...new Set(tokenizeQuery(query))]
       if (terms.length === 0) {
-        return { display: [], pack: [], dropped: [], oovTerms: [] } // 纯符号查询不造通配
+        // 纯符号查询不造通配：没有可枚举的命中集，total 精确为 0（不是未知）。
+        return { display: [], pack: [], dropped: [], oovTerms: [], matchedCount: 0 }
       }
       const index = await freshIndex(allowRebuild)
       // 热路径可能拿不到索引（见 freshIndex 的 allowRebuild 分支）：此时**如实回空**，
       // 由调用方按「索引尚未追上」处置。不得在这里回退成一次重建——那正是要禁止的事。
       if (index === null) {
         metrics?.counter?.('v3.t1.indexAbsent', 1)
-        return { display: [], pack: [], dropped: [], oovTerms: [], indexAbsent: true }
+        // matchedCount=null：索引不存在 ≠「0 条命中」（0 会让人以为「查了没有」）。
+        return { display: [], pack: [], dropped: [], oovTerms: [], indexAbsent: true, matchedCount: null }
       }
       const { scores, hitCounts, oovTerms } = scoreIndex(index, terms)
       // 查询覆盖门槛（2026-10-25 拍板；beta.11 修正单位）：按**不同**词元计半数，
       // 且上限 COVERAGE_MIN_HITS_CAP——查询是整条用户消息时，门槛不得随字数膨胀。
       const minHits = Math.max(1, Math.min(COVERAGE_MIN_HITS_CAP, Math.ceil(terms.length / 2)))
-      const ranked = rankResults([...scores].map(([id, score]) => ({ id, score })))
+      const matchedAll = rankResults([...scores].map(([id, score]) => ({ id, score })))
         .filter((r) => (hitCounts.get(r.id) ?? 0) >= minHits)
-        .slice(0, limit)
+      // G1（C-G1-02）：**可信计数**——本索引快照里通过覆盖门槛、且过结果面阈值的文档数。
+      // 这是「可穷尽枚举」的事实，不是 top-k 截断后的长度；分页的 total 只能取它。
+      // 注意它必须在 slice 之前算：旧实现拿 slice 之后的 length 当 total，这就是 F01。
+      const matchedCount = matchedAll.filter((r) => r.score >= resultMinScore).length
+      const ranked = matchedAll.slice(0, limit)
       const gated = applyMinScore(ranked, { resultMinScore, packMinScore })
       metrics?.counter?.('v3.t1.search', 1)
-      return { ...gated, oovTerms }
+      return { ...gated, oovTerms, matchedCount }
     },
 
     /**
@@ -236,8 +286,69 @@ export function createT1Provider({ port, store, metrics } = {}) {
       }
     },
 
+    /**
+     * 记录的 chunk 窗口引用（0.15.0 P5）：只返回**码点 span**，正文仍由 read 提供。
+     *
+     * - ok：索引存在、版本匹配且新鲜；
+     * - absent：索引尚未生成（首次建库/派生被删）；
+     * - incompatible：schema/tokenizer 换代（不得混用旧尺子）；
+     * - stale：已提交数/遗忘数变了（索引落后，不能拿旧窗口）；
+     * - corrupt：索引损坏（派生物，读取侧回退现扫）。
+     * 任何非 ok 状态都不抛错：窗口选择回退到现扫，检索本身不受影响。
+     */
+    async chunksOf(recordId) {
+      if (typeof recordId !== 'string' || recordId.length === 0) {
+        throw new V3ContractViolation('v3 t1-provider: chunksOf 需要非空 recordId')
+      }
+      const loaded = await loadChunkIndex()
+      if (loaded.state !== 'ok') {
+        return { state: loaded.state, spans: [], truncated: false, indexTruncatedRecords: null, schemaVersion: null, tokenizerVersion: null }
+      }
+      if (await isChunkIndexStale(store, loaded.index)) {
+        metrics?.counter?.('v3.t1.chunkIndexStale', 1)
+        return {
+          state: 'stale',
+          spans: [],
+          truncated: false,
+          indexTruncatedRecords: null,
+          schemaVersion: loaded.index.schemaVersion,
+          tokenizerVersion: loaded.index.tokenizerVersion,
+        }
+      }
+      return {
+        state: 'ok',
+        spans: chunkSpansOf(loaded.index, recordId),
+        // P3：单记录 chunk 被硬顶截断时，这块记录的 chunk **不覆盖全文**。
+        // 如实上报（truncated + 索引级 truncatedRecords），查询侧据此回退现扫。
+        truncated: chunkRecordTruncated(loaded.index, recordId),
+        indexTruncatedRecords: Number.isInteger(loaded.index.truncatedRecords) ? loaded.index.truncatedRecords : (loaded.index.truncatedIds?.length ?? 0),
+        schemaVersion: loaded.index.schemaVersion,
+        tokenizerVersion: loaded.index.tokenizerVersion,
+      }
+    },
+
     capabilities() {
       return { name: T1_BACKEND_NAME, tier: 'T1', live: true }
+    },
+
+    /**
+     * 分页快照描述（0.15.0 G1 / C-G1-05、C-G1-07）。
+     *
+     * T1 是**可穷尽枚举**：结果来自本地词法索引全量打分，排序由 rankResults 确定性给出
+     * （score 降序、同分 id 升序——U2 的 tie-break 证据在 domain/retrieval/query.mjs）。
+     * 因此分页可以用「稳定排序 + 偏移」推进，只要能证明两次请求看到的是**同一份索引**。
+     * generation = 索引文件戳（mtimeNs + size + 头 64 字节 sha1，见 file-stamp.mjs）：
+     * 索引被原子替换（摄入重建 / 遗忘后重建 / 损坏重建）就变，游标随之显式 stale。
+     * 读不到戳时 generation=null（exhaustive 仍为 true，但调用方不得铸造游标）。
+     */
+    async retrievalSnapshot() {
+      let stamp
+      try {
+        stamp = await indexStampOf(store)
+      } catch {
+        return { tier: 'T1', exhaustive: true, generation: null }
+      }
+      return { tier: 'T1', exhaustive: true, generation: typeof stamp === 'string' ? stamp : null }
     },
 
     /**
@@ -249,6 +360,8 @@ export function createT1Provider({ port, store, metrics } = {}) {
     close() {
       cachedIndex = null
       cachedStamp = null
+      cachedChunkIndex = null
+      cachedChunkStamp = null
     },
   }
 

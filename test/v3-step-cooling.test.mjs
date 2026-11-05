@@ -15,7 +15,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildStepUnits, selectStepSpan } from '../src/v3/domain/archive/steps.mjs'
+import { buildStepUnits, selectStepSpan as selectStepSpanRaw, STEP_BATCH_MAX } from '../src/v3/domain/archive/steps.mjs'
+
+/**
+ * 本套件只钉选择判据（工作集/边界/闭包），批量阈值与攒批等待关掉（bypassBatch）——
+ * 默认攒批 10 与 short-run-flush 的行为由 v3-step-batch 专测；这样每条用例的期望 span
+ * 不被攒批等待掩盖，maxSteps 仍是这些用例的唯一上限。
+ * headOnly：本套件钉「队头单段」；保护洞之后的同批安全段由 P3 多段提交负责。
+ */
+const selectStepSpan = (args) => selectStepSpanRaw({ batchSteps: STEP_BATCH_MAX, bypassBatch: true, headOnly: true, ...args })
 
 const hasRecord = () => true
 

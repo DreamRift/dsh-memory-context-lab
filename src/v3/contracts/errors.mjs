@@ -20,10 +20,20 @@ export const ERROR_CODES = Object.freeze([
   'ERECORD_NOT_FOUND',
   'ESTORE_DAMAGED',
   'ESTORE_TXN_CONFLICT',
+  // H6（2026-11-04 审计）：凭证 ID 唯一性由存储层在跨进程锁内强制——并发对账不能
+  // append 两条同 ID 凭证（restore 按下标定位会错位）。冲突码与事务冲突区分开。
+  'ESTORE_DUPLICATE_VOUCHER',
   'ESTORE_CLOSED',
   'ELOCKED',
+  // R3-03（2026-10-30）：事务期间失锁（被接管/心跳失败）——失锁后的后续提交失败关闭。
+  'ELOCK_LOST',
   'EFORGOTTEN',
   'ECONTROL_RANGE',
+  // AUD51-03-01（beta.53）：记录 ID 形状白名单（路径穿越的第一道闸）。
+  'EINVALID_ID',
+  // P7 P2-1（2026-11-01）：受限改写已 append 但活动面复核失败——写入事实存疑，
+  // 必须与「被拒绝、原文仍在」分开上报，不得让调用方以为面没变。
+  'EWRITE_UNCONFIRMED',
 ])
 
 const CODE_KIND = new Map([
@@ -35,10 +45,14 @@ const CODE_KIND = new Map([
   ['ERECORD_NOT_FOUND', 'invalid'],
   ['ESTORE_DAMAGED', 'corrupt'],
   ['ESTORE_TXN_CONFLICT', 'conflict'],
+  ['ESTORE_DUPLICATE_VOUCHER', 'conflict'],
   ['ESTORE_CLOSED', 'unavailable'],
   ['ELOCKED', 'conflict'],
+  ['ELOCK_LOST', 'conflict'],
   ['EFORGOTTEN', 'unavailable'],
   ['ECONTROL_RANGE', 'invalid'],
+  ['EINVALID_ID', 'invalid'],
+  ['EWRITE_UNCONFIRMED', 'internal'],
 ])
 
 /**

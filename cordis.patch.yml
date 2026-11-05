@@ -1,4 +1,41 @@
+# 本 bundle 声明两个组件行：记忆上下文自身 + 定制版 dsh-ops。
+#
+# dsh-ops 以 vendored 依赖（package.json 的 file:./vendor/dsh-ops）随本包安装，
+# 不在 dsh.profile.bundles 里单独出现；插件页「包含的组件」因此显示两行，
+# 点进 dsh-ops 行就是它自己的完整设置页。
+#
+# 默认值（2026-11-04 用户拍板）：
+# - bash: true          随包携带完整 Windows x64 Bash 载荷（PortableGit + bash 5.3.15）
+# - hidePwsh: false     不夺走宿主 pwsh
+# - hideOfficialTools: true  用 ops_* 替换官方 read/glob/grep（可在组件设置页关闭）
+# - dynamicTools: false 会话中途不改工具 schema（缓存纪律）
 - insert:
     - id: memory-context-lab
       name: dsh-memory-context-lab
       config: {}
+
+    - id: dsh-ops
+      name: dsh-ops
+      config:
+        global:
+          bash: true
+          hidePwsh: false
+          hideOfficialTools: true
+          dynamicTools: false
+        minimal:
+          enabled: true
+        standard:
+          enabled: true
+          residentTools: true
+        ptc:
+          enabled: true
+          residentTools: true
+        cordis:
+          enabled: true
+          residentTools: true
+        discovery:
+          enabled: false
+        panel:
+          enabled: false
+        tui:
+          enabled: false

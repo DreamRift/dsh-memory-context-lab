@@ -16,9 +16,24 @@
  * cg forget）后登记；未来版本未实测前继续 fail-closed。
  */
 import { V3ContractViolation } from './errors.mjs'
+import { T2_VERSION_CONTRACTS, t2CapabilitiesOf } from './t2-contract.mjs'
 
-/** 已实测（工具面 + 冒烟）通过的 dsh-memory 版本；未实测的版本不得预先登记。 */
-export const TESTED_DSH_MEMORY_VERSIONS = Object.freeze(['0.9.10'])
+/**
+ * 已实测（工具面 + 冒烟）通过的 dsh-memory 版本；未实测的版本不得预先登记。
+ * 单一真源是 contracts/t2-contract.mjs 的版本合同表（status='tested'），这里只派生。
+ */
+export const TESTED_DSH_MEMORY_VERSIONS = Object.freeze(
+  Object.keys(T2_VERSION_CONTRACTS).filter((version) => T2_VERSION_CONTRACTS[version].status === 'tested'),
+)
+
+/**
+ * 候选版本：合同与隔离冒烟已通过，但**尚未默认启用**（0.15.0 P5 的 0.9.17）。
+ * 版本列表默认切换会把所有环境从 T1 切到新的 T2 写入路径，属于产品决策；
+ * 这里只登记事实，协商仍 fail-closed 回 T1，启用须显式提升合同状态。
+ */
+export const CANDIDATE_DSH_MEMORY_VERSIONS = Object.freeze(
+  Object.keys(T2_VERSION_CONTRACTS).filter((version) => T2_VERSION_CONTRACTS[version].status === 'candidate'),
+)
 
 /** 直连 T2 必须提供的工具面（历史路线；M5 按实测修订）。 */
 export const REQUIRED_T2_TOOLS = Object.freeze(['memory_store', 'memory_search', 'memory_read'])
@@ -61,12 +76,18 @@ export function negotiateMemoryProvider(described) {
     if (smokePassed !== true) return t1('隔离 T2 冒烟未通过或未执行' + detail)
     if (typeof version !== 'string' || version.length === 0) return t1('隔离 T2 版本未知（fail-closed 回 T1）')
     if (!TESTED_DSH_MEMORY_VERSIONS.includes(version)) {
+      if (CANDIDATE_DSH_MEMORY_VERSIONS.includes(version)) {
+        return t1('隔离 T2 候选版本已通过隔离冒烟但未默认启用：' + version
+          + '（启用须显式提升版本合同状态；避免版本列表默认切换造成生产风险）')
+      }
       return t1('隔离 T2 版本未实测通过：' + version + '（已实测清单：' + (TESTED_DSH_MEMORY_VERSIONS.join('/') || '空') + '）')
     }
     return {
       tier: 'T2',
       provider: 'dsh-memory-isolated',
       reason: '隔离 MDCG_ROOT + cg 工具面 + 冒烟通过（' + version + '）',
+      // P5：分能力协商；features 里的 off/contract 是**降级事实**，不是「不可用即失败」。
+      capabilities: t2CapabilitiesOf(described),
     }
   }
   const missing = REQUIRED_T2_TOOLS.filter((tool) => !tools.includes(tool))

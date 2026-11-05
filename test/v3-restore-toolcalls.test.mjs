@@ -6,6 +6,7 @@
  * 105,975 字参数在 restore 后不可恢复。修法 A：摄入侧把调用块（脱敏后）写进
  * payload.structure.toolCalls，text 不变；restore 依据 structure 渲染确定性块。
  */
+import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -93,7 +94,7 @@ test('归档恢复：restore 带回工具名与参数，且不把参数混进 te
     assert.equal(callRecord.payload.text, '好的，读取 a.txt', 'text 不含参数')
     assert.equal(callRecord.payload.structure.toolCalls[0].arguments.token, '[REDACTED]')
 
-    const archive = createArchiveService({ store: runtime.store, host: runtime.host, clock: { now: () => 1 } })
+    const archive = createArchiveService({ random: { uuid: () => randomUUID() }, store: runtime.store, host: runtime.host, clock: { now: () => 1 } })
     const seqToRecordId = await seqMapOf(runtime.store)
     const result = await archive.archiveOnce({
       sessionId: 's-toolcall',

@@ -135,3 +135,21 @@ test('不可读命中不得把 ID 挪到别的正文上（收缩路径）', asyn
   assert.ok(!lines[0].includes('v3r-0000000000000001'), '不得标成不可读命中的 ID')
   assert.ok(out.text.includes('读取失败：1 条'), '不可读仍要如实留痕')
 })
+
+/**
+ * G6b 扩展（既有回注套件追加，不改本套件既有判据）：
+ * 可见片段去重是**候选、默认关闭**——不传开关时输出形状与旧行为一致（不出现 dedupe 字段），
+ * 只有显式 dedupeVisible=true 才进入判定路径。行为细节见 v3-g6b-recall-dedupe。
+ */
+test('G6b 候选默认关闭：既有调用面不受影响（无 dedupe 字段、无 visibility 端口）', async () => {
+  const hits = hitsOf(2, 20)
+  const recall = createRecall({ provider: providerOf(hits, []), sessionKey: 's-g6b-default-off' })
+  const out = await recall({ query: '正文', turn: 1, limit: 2 })
+  assert.equal(out.injected, true)
+  assert.equal(Object.hasOwn(out, 'dedupe'), false, '默认关闭时不得出现候选字段')
+  // 开启但缺端口必须失败关闭（不让「拿不到活动面」静默退化成「全部可见」）
+  assert.throws(
+    () => createRecall({ provider: providerOf(hits, []), sessionKey: 's-g6b-on', dedupeVisible: true }),
+    /visibility 端口/,
+  )
+})

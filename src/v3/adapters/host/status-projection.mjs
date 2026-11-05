@@ -47,9 +47,10 @@ export const STATUS_PROJECTION_KEY = 'memoryContextLabStatus'
 /**
  * 状态结构变化时递增；检查点版本不匹配会被宿主丢弃并重折。
  * v2（0.14.0-beta.45）：`control.overrides` 增加 `gate` 键（AUD-01）。
+ * v3（0.14.0-beta.53）：视图增加 `archived`（已归档段数 = 凭证数），面板要显示归档数量。
  * 旧检查点只有 `{sessionId, tick}`，重折无成本，故直接丢弃重建。
  */
-export const STATUS_PROJECTION_VERSION = 2
+export const STATUS_PROJECTION_VERSION = 3
 
 /** 视图允许的状态枚举（封闭集；未知状态按 failed 处理，不伪装成 ready）。 */
 const VIEW_STATES = new Set(['ready', 'pending', 'absent', 'failed', 'unavailable'])
@@ -138,6 +139,9 @@ function viewOf(readStatus, state) {
     // 可检索数（0.14.0-beta.38）：来源是词法索引 indexedCount，不是「已摄入」。
     // null = 索引缺失/损坏/尚未生成——客户端必须显示「未知」，不得回落成 0。
     searchable: nullableInt(raw.searchable, 0),
+    // 已归档段数（= 凭证数，可 restore 的段数）。null = 未知（读不到凭证账本），
+    // 客户端必须显示「未知」，不得回落成 0——「0 段」与「不知道」是两件事。
+    archived: nullableInt(raw.archived, 0),
     lastSeq: nullableInt(raw.lastSeq, -1),
     ingesting: raw.ingesting === true,
     attempted: nullableInt(raw.attempted, 0) ?? 0,
@@ -179,7 +183,7 @@ export const statusViewSchema = Object.freeze({
   parse(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) invalid('view', value)
     const expected = [
-      'state', 'ingested', 'searchable', 'lastSeq', 'ingesting', 'attempted', 'injected', 'skipped', 'failed',
+      'state', 'ingested', 'searchable', 'archived', 'lastSeq', 'ingesting', 'attempted', 'injected', 'skipped', 'failed',
       'lastStatus', 'lastReason', 'lastInjectedAt', 'lastErrorCode', 'errorCode', 'errorMessage', 'control',
       'mode', 'modeSource', 'planFirst', 'autoRestore', 'surface', 'cooling', 'provider', 'stateError',
     ]
@@ -190,6 +194,7 @@ export const statusViewSchema = Object.freeze({
     if (!VIEW_STATES.has(value.state)) invalid('view.state', value.state)
     if (value.ingested !== null && (!Number.isInteger(value.ingested) || value.ingested < 0)) invalid('view.ingested', value.ingested)
     if (value.searchable !== null && (!Number.isInteger(value.searchable) || value.searchable < 0)) invalid('view.searchable', value.searchable)
+    if (value.archived !== null && (!Number.isInteger(value.archived) || value.archived < 0)) invalid('view.archived', value.archived)
     if (value.lastSeq !== null && (!Number.isInteger(value.lastSeq) || value.lastSeq < -1)) invalid('view.lastSeq', value.lastSeq)
     if (value.lastInjectedAt !== null && (typeof value.lastInjectedAt !== 'number' || !Number.isFinite(value.lastInjectedAt) || value.lastInjectedAt < 0)) invalid('view.lastInjectedAt', value.lastInjectedAt)
     for (const key of ['lastStatus', 'lastReason', 'lastErrorCode', 'errorCode', 'errorMessage']) {

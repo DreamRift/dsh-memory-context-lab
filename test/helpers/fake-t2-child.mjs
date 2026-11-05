@@ -13,6 +13,7 @@ export function createFakeT2Child({
   hangOn = null,
   exitOn = null,
   exitCode = 1,
+  serverVersion = '0.9.10',
 } = {}) {
   const child = new EventEmitter()
   child.stdin = new PassThrough()
@@ -58,7 +59,7 @@ export function createFakeT2Child({
       reply(message.id, {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'mdcg-mcp', version: '0.9.10' },
+        serverInfo: { name: 'mdcg-mcp', version: serverVersion },
       })
       return
     }

@@ -140,7 +140,7 @@ function tOf(key, vars) {
 }
 
 const READY_STATUS = {
-  state: 'ready', ingested: 12, searchable: 9, lastSeq: 8, ingesting: false,
+  state: 'ready', ingested: 12, searchable: 9, archived: 4, lastSeq: 8, ingesting: false,
   mode: 'recall-only',
   planFirst: false,
   surface: { lastArchiveEndSeq: 120 },
@@ -242,8 +242,12 @@ test('manifest / 常量：chip 槽位、remote 依赖与投影 key 成对', asyn
   assert.equal(module.CHIP_ID, 'memory-context-lab')
   assert.equal(module.CHIP_ORDER, 20)
   assert.equal(module.PROJECTION_KEY, STATUS_PROJECTION_KEY)
-  assert.ok(module.inject.includes('remote.commands'),
-    'remote.commands 必须写进客户端 inject：动态门面按 inject 判权，未声明时 ctx.remote.commands 会抛 cannot get property ... without inject')
+  // P2-13：`remote.commands` 不能留在**硬** inject 里——宿主 runner 把硬 inject 当等待集合
+  // （waitingFor），缺一个服务整块 UI 就不 apply。判权仍需声明，所以走可选 ctx.inject。
+  assert.deepEqual(module.inject, ['slots', 'locale', 'remote'],
+    '硬 inject 只能是「缺了就完全没法工作」的服务（slots/locale/remote）')
+  assert.ok(module.OPTIONAL_INJECTS.some((names) => names.includes('remote.commands')),
+    'remote.commands 必须声明（可选接入）：动态门面按 inject 判权，未声明时读取会抛 cannot get property ... without inject')
   assert.ok(module.inject.includes('remote'), 'remote 根服务与宿主命令插件同样声明')
 })
 
@@ -277,8 +281,10 @@ test('会话覆盖项 ⊆ 全局设置页字段：limit 同域（命令改的全
 test('apply：chip 走 slots.inject；configForms 仍是设置页的可选依赖', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
-  assert.deepEqual(run.module.inject, ['slots', 'locale', 'remote', 'remote.commands', 'uiWorkspace'])
-  assert.deepEqual(run.optionalInjects, [['configForms']])
+  assert.deepEqual(run.module.inject, ['slots', 'locale', 'remote'],
+    'P2-13：硬 inject 只留 slots/locale/remote')
+  assert.deepEqual(run.optionalInjects, [['remote.commands'], ['uiWorkspace'], ['configForms']],
+    '命令通道与工作区改为可选接入；configForms 仍是设置页的可选依赖')
   assert.deepEqual(run.slotInjects.map((row) => row.name), ['conversation.input.left', 'sidebar.panellist', 'main'])
   const sidebar = run.slots.find((row) => row.registration.name === 'sidebar.panellist')
   assert.equal(sidebar.registration.id, 'memory-context-lab')
@@ -326,8 +332,8 @@ test('弹层：本对话三个开关走 /memory-lab 命令', async () => {
     collect(node.props?.children)
   }
   collect(panel.get())
-  assert.deepEqual(fields.sort(), ['override.limit', 'session.enabled', 'session.mode', 'session.planfirst', 'session.recall'],
-    'composer 保留本对话五项（模式切换入口）；底层参数（装包阈/首部/查询上限）不得出现')
+  assert.deepEqual(fields.sort(), ['override.limit', 'session.archive-now', 'session.enabled', 'session.mode', 'session.planfirst', 'session.recall'],
+    'composer 保留本对话控制 + 手动归档入口；底层参数（装包阈/首部/查询上限）不得出现')
 
   switchOf('session.enabled').props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
@@ -335,10 +341,15 @@ test('弹层：本对话三个开关走 /memory-lab 命令', async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
   switchOf('session.planfirst').props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
+  const archiveNow = findElement(panel.get(), (node) => node.props?.['data-mcl-action'] === 'archive-now')
+  assert.ok(archiveNow, '弹层必须有手动归档按钮')
+  archiveNow.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
   assert.deepEqual(run.commands.map((row) => row.line), [
     '/memory-lab off',
     '/memory-lab inject off',
     '/memory-lab planfirst on',
+    '/memory-lab now',
   ])
 })
 
@@ -621,7 +632,9 @@ test('入口：sessionProjections 可选注入，缺席时插件照常启动', a
       sessionProjections: { register(definition) { registrations.push(definition); return () => {} } },
     }
     await module.apply(stub, {})
-    assert.deepEqual(injects, [['sessionProjections']], '投影必须走可选注入')
+    // P2-1：tools 晚就绪也走可选注入订阅（不是静默 return）；投影仍走可选注入。
+    assert.deepEqual(injects.find((deps) => deps.includes('sessionProjections')), ['sessionProjections'], '投影必须走可选注入')
+    assert.deepEqual(injects.find((deps) => deps.includes('tools')), ['tools'], 'tools 晚就绪必须订阅等待')
     assert.equal(registrations.length, 1)
     assert.equal(registrations[0].key, STATUS_PROJECTION_KEY)
     assert.equal(registrations[0].stateVersion, STATUS_PROJECTION_VERSION)
@@ -947,6 +960,69 @@ test('B3-18：stateError 与按步归档事实在弹层可见（cooling 不推�
   const dict = run.dictionaries[0].dict
   assert.match(dict.zh.statusStateError, /状态文件异常/)
   assert.match(dict.en.statusStateError, /State file error/i)
-  assert.match(dict.zh.statusArchivedAt, /已按步归档/)
-  assert.match(dict.en.statusArchivedAt, /Archived per step/i)
+  assert.match(dict.zh.statusArchivedAt, /上次归档时间/)
+  assert.match(dict.en.statusArchivedAt, /Last archive time/i)
+})
+
+
+/**
+ * 用户拍板（0.14.0-beta.53）：弹层状态行去噪音、补「已归档段数」、数字带单位。
+ *
+ * 用户原话：「最上面的『模式』就不用显示了，『上次结局』也不需要了，剩下的数据改得
+ * 更直白明确一点（尝试什么了？已摄入是什么意思？加个单位），然后添加一个归档数量的显示」。
+ *
+ * 钉住（每条都对应一句用户要求）：
+ * 1. 不再出现「模式：…」行（模式在下面的选择器里已经有）；
+ * 2. 不再出现「上次结局：…」行（内部状态码 injected/skipped/failed 对用户无含义）；
+ * 3. 已摄入/可检索/回注**都带单位**（条 / 条 / 次），且文案里说清是「已存历史」；
+ * 4. 新增「已归档 N 段」；archived 未知时显示「未知」而不是 0（0 与不知道是两件事）；
+ * 5. 尝试/跳过/失败三个计数都带「次」。
+ */
+test('beta.53 弹层状态行：去「模式/上次结局」、数字带单位、新增已归档段数', async () => {
+  const entry = await loadClient()
+  const run = runApply(entry)
+  /** 渲染弹层并把所有可见字符串摊平（文案断言统一走这里）。 */
+  const textsOf = (status) => {
+    const fresh = runApply(entry)
+    const pop = openPanel(fresh, {}, status)
+    const panel = fresh.bind(pop.type, pop.props).get()
+    const out = []
+    const walk = (node) => {
+      if (node === null || node === undefined) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (typeof node === 'string') { out.push(node); return }
+      if (typeof node !== 'object') return
+      walk(node.children)
+      walk(node.props?.children)
+    }
+    walk(panel)
+    return out
+  }
+  const lines = textsOf(READY_STATUS)
+  assert.equal(lines.some((line) => line.includes('statusMode')), false, '不得再有「模式」行：' + JSON.stringify(lines))
+  assert.equal(lines.some((line) => line.includes('statusLast')), false, '不得再有「上次结局」行：' + JSON.stringify(lines))
+  const archivedLine = lines.find((line) => line.startsWith('statusArchivedCount'))
+  assert.ok(archivedLine, '必须有「已归档」行：' + JSON.stringify(lines))
+  assert.match(archivedLine, /archived=4/, '已归档段数必须来自投影 archived：' + archivedLine)
+  const readyLine = lines.find((line) => line.startsWith('statusReady'))
+  assert.ok(readyLine, '必须有覆盖行：' + JSON.stringify(lines))
+  const attemptedLine = lines.find((line) => line.startsWith('statusAttempted'))
+  assert.ok(attemptedLine, '必须有一次尝试计数行：' + JSON.stringify(lines))
+
+  // 文案本身：单位与「说清是什么」。字典是唯一真源，直接断言字典值。
+  const dict = run.dictionaries[0].dict
+  assert.match(dict.zh.statusReady, /已存历史 \{ingested\} 条/);
+  assert.match(dict.zh.statusReady, /可检索 \{searchable\} 条/);
+  assert.match(dict.zh.statusReady, /回注 \{injected\} 次/);
+  assert.match(dict.zh.statusAttempted, /尝试 \{attempted\} 次/);
+  assert.match(dict.zh.statusArchivedCount, /已归档 \{archived\} 段/);
+  assert.equal('statusMode' in dict.zh, false, '「模式」文案行已退场（用户拍板）')
+  assert.equal('statusLast' in dict.zh, false, '「上次结局」文案行已退场（用户拍板）')
+  assert.equal('statusMode' in dict.en, false)
+  assert.equal('statusLast' in dict.en, false)
+
+  // archived 未知（null）必须显示「未知」，不得回落成 0（0 段与不知道是两件事）。
+  const unknownLines = textsOf({ ...READY_STATUS, archived: null })
+  const unknownArchived = unknownLines.find((line) => line.startsWith('statusArchivedCountUnknown'))
+  assert.ok(unknownArchived, 'archived=null 必须走「未知」分支：' + JSON.stringify(unknownLines))
 })

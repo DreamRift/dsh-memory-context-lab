@@ -12,10 +12,17 @@ import { V3ContractViolation } from '../contracts/index.mjs'
 import { restoreActionOf, settleRestore } from '../domain/archive/restore.mjs'
 import { assertPort } from '../ports/index.mjs'
 
-/** 回执首行：与 disable 的三种结局一一对应（不得在未恢复时印「已恢复 N/M」）。 */
-export function disableReceiptFirstLine({ action, restored, total, skippedByGuard }) {
+/**
+ * 回执首行：与 disable 的结局一一对应（**不得在未恢复时印「已恢复 N/M」**）。
+ *
+ * P2-06（0.15.1）：`wired=false` 表示这条路径只做了**资格裁决**、没有执行真实 surface
+ * 恢复（M5 未接线的死路径）。此时旧文案仍印「已恢复 N/M 段」——用户以为关掉就自动还原了，
+ * 实际原文还在冷库。默认 `wired=true` 保持既有语义（接线后自然回到「已恢复」口径）。
+ */
+export function disableReceiptFirstLine({ action, restored, total, skippedByGuard, wired = true }) {
   if (action === 'skip-by-setting') return '按设置未恢复：原文已沉入冷库（' + total + ' 段可随时恢复）'
   if (action === 'skip-by-guard') return '守卫拒绝：恢复会超出安全窗口（' + skippedByGuard + '/' + total + ' 段保留回执）'
+  if (wired !== true) return '可恢复 ' + restored + '/' + total + ' 段（本次未执行恢复；原文仍在冷库，/memory-lab restore 可还原）'
   return '已恢复 ' + restored + '/' + total + ' 段'
 }
 
@@ -72,15 +79,22 @@ export function createSessionLifecycle({ store, clock, random, metrics }) {
     }
     const settled = settleRestore(rows) // N-11：三桶恒等，异常行只落 skipped
     const skippedByGuard = rows.filter((r) => r.reason === 'guard-refused').length
+    // P2-06：这条路径**只做资格裁决**，不执行真实 surface 恢复（M5 未接线）。
+    // 旧实现把 eligible 直接记成 outcome:'restored' 并印「已恢复 N/M 段」——观察面与事实
+    // 分叉（关掉不代表还原了）。这里如实带出「资格通过但未恢复」的行数，并让回执首行
+    // 用「可恢复 N/M」口径；会计三桶与既有行结果保持不变（不改变资格语义）。
+    const eligibleNotRestored = settled.restored
+    const wired = false
     const receiptFirstLine = disableReceiptFirstLine({
       action: action.action === 'restore' ? 'restore' : (action.reason === 'by-setting' ? 'skip-by-setting' : 'skip-by-guard'),
       restored: settled.restored,
       total: settled.total,
       skippedByGuard,
+      wired,
     })
     metrics?.counter?.('v3.lifecycle.disabled', 1)
     metrics?.observe?.('v3.lifecycle.restoreRatio', settled.total === 0 ? 0 : settled.restored / settled.total)
-    return { action, settled, receiptFirstLine, rowResults: settled.rowResults }
+    return { action, settled, receiptFirstLine, rowResults: settled.rowResults, wired, eligibleNotRestored }
   }
 
   /** 单凭证恢复（供 /memory-lab restore 单段语义，M5 接宿主）。 */

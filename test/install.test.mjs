@@ -258,8 +258,9 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   assert.equal(ctx._projections.length, 1, '宿主提供 sessionProjections 时必须注册只读状态投影')
   assert.equal(ctx._projections[0].key, 'memoryContextLabStatus', '客户端 dock 读的就是这个 key')
   // beta.45 起投影视图多一个覆盖键（limit + gate），stateVersion 1→2 让宿主的旧检查点
-  // 一并丢弃重折；state 仍只有 {sessionId, tick}，重折没有成本。
-  assert.equal(ctx._projections[0].stateVersion, 2)
+  // 一并丢弃重折；beta.53 视图增加 archived（已归档段数），2→3。state 仍只有
+  // {sessionId, tick}，重折没有成本。
+  assert.equal(ctx._projections[0].stateVersion, 3)
   assert.equal(typeof ctx._projections[0].wire?.view, 'function')
   assert.equal(typeof ctx._projections[0].wire?.viewSchema?.parse, 'function')
   // Both features ride `agent/pre-step`: the cooler delegates then cools, and
@@ -270,14 +271,31 @@ test('the installed host half loads, registers its surface, and finds dsh-memory
   // `domain/changed` is the archive signal: the archive set is the `workspace`
   // domain's global singleton, so watching it catches every archive — including an
   // idle session, which never dispatches `workspace/session-stop`.
-  assert.deepEqual([...ctx._listeners.keys()].sort(), ['agent/pre-step'])
+  // 0.15.0：除 agent/pre-step 外还注册一个 **session/event** 观测监听（R04 回注确认：
+  // 原始 usage/事件 → 观测账本，见 src/index.mjs 的 `ctx.on('session/event', ...)`）。
+  // 它不是归档/回注链路，而是「回注到底有没有真的落到宿主事件面」的正向证据面；
+  // 监听集合因此是两个事件，不再只有一个。
+  assert.deepEqual([...ctx._listeners.keys()].sort(), ['agent/pre-step', 'session/event'],
+    '0.15.0 的监听面：pre-step（归档 + 回注）与 session/event（回注确认观测）')
+  // 观测监听必须真的存在且是单份：它一旦缺席，回注确认永远停在 pending，
+  // 结果就是每回合一次的成功回注被记成 busy（R04 的回归形态）。
+  const observeListeners = ctx._listeners.get('session/event') ?? []
+  assert.equal(observeListeners.length, 1, 'session/event 观测监听必须恰好注册一个')
+  assert.equal(typeof observeListeners[0], 'function', 'session/event 观测监听必须是同步函数（宿主不 await 监听器）')
   // v3 单引擎：两个 pre-step 监听——引擎摄入（push，最内）与回注（prepend，最外）。
   assert.equal(ctx._listeners.get('agent/pre-step').length, 2,
     '摄入 + 回注：两个监听，缺一个都意味着 v3 少了半条链路')
   assert.deepEqual(ctx._prependEvents, ['agent/pre-step'], '只有回注需要 prepend（先于内层拿到 decision 再追加）')
 
-  // v3 不注册模型可见工具（工具集恒定是缓存纪律，不是「暂时没做」）。
-  assert.equal(ctx._tools.length, 0, 'v3 单引擎不增删模型可见工具')
+  // 0.15.0 P4：**版本加载时一次性注册三个固定管理工具**（工具集恒定是缓存纪律——
+  // 一增一减就作废整段前缀缓存，因此它们不随 on/off、T1/T2、会话状态变化）。
+  // 这里钉死名单与份数：少一个 = 工具面残缺；多一个/重复注册 = 前缀缓存与
+  // 「摄入侧 own-source 判定」名单不同源。名单真源 = src/v3/contracts/tools.mjs。
+  assert.deepEqual(
+    ctx._tools.map((definition) => definition.name),
+    ['memory_context_search', 'memory_context_read', 'memory_context_compact'],
+    '0.15.0 固定三工具：search / read / compact，一次注册一份',
+  )
 
   // The whole point of the DSH-home fallback: no compatibility warning here.
   assert.deepEqual(ctx._warnings, [], `the installed load must resolve cleanly, got: ${ctx._warnings.join(' | ')}`)
@@ -301,11 +319,13 @@ test('不依赖 tools：拿不到 tools 服务时插件照常加载', async (t) 
   const ctx = createStubContext({ withTools: false })
   await module.apply(ctx, {})
 
-  // v3 根本不碰 tools：唯一命令与两个钩子必须在，且不应产生任何告警。
+  // 拿不到 tools 服务时插件照常加载：唯一命令、投影与两个钩子必须都在，且零告警。
+  // 三个固定工具此时**不注册**（登记「等待注入」，服务后到才注册），因此工具面为空；
+  // 「服务缺席」本身不是失败，也不能让插件不启动。
   assert.deepEqual(ctx._commands.map((command) => command.name), ['memory-lab'])
   assert.equal(ctx._projections.length, 1, '不依赖 tools 不影响状态投影注册')
   assert.equal(ctx._listeners.get('agent/pre-step').length, 2)
-  assert.equal(ctx._tools.length, 0, 'v3 不注册工具')
+  assert.equal(ctx._tools.length, 0, 'tools 服务缺席时不注册工具（等待注入），不是失败关闭')
   assert.deepEqual(ctx._warnings, [], `v3 不依赖 tools，不应有告警：${ctx._warnings.join(' | ')}`)
 })
 

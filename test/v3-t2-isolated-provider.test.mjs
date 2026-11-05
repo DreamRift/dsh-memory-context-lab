@@ -45,7 +45,7 @@ function fakeClient({ onCall } = {}) {
     async callTool(name, args) {
       calls.push({ name, args })
       if (typeof onCall === 'function') return await onCall(name, args, calls)
-      if (args.op === 'write') return { ok: true, node_id: args.node_id }
+      if (args.op === 'write') return { ok: true, node_id: args.node_id, state: 'ACCEPT' }
       if (args.op === 'forget') return { ok: true }
       if (args.op === 'read' && typeof args.node_id === 'string') {
         return {
@@ -111,7 +111,10 @@ test('search：T1 与外部融合；外部失败只损失外部（T1 分数不�
     const result = await provider.search('查询', { limit: 10, packMinScore: 0.5 })
     assert.deepEqual(result.display.map((hit) => hit.id), [LOCAL_A, LOCAL_B])
     assert.equal(result.display[0].score, 10, '外部失败时不得改动 T1 分数')
-    assert.match(result.sourceLabel, /T2 无新增命中/)
+    // P5：外部失败是**可见的降级状态**（不再与「T2 无新增命中」同形）。
+    assert.equal(result.status, 'failed')
+    assert.equal(result.t1Fallback, true)
+    assert.match(result.sourceLabel, /回退 T1/)
   }
 })
 
@@ -124,7 +127,7 @@ test('read：本地命中不访问外部；本地不存在才读隔离根', asyn
     assert.equal(client.calls.length, 0)
   }
   {
-    const t1 = fakeT1({ read: async (id) => { throw v3Error('ESTORE_CORRUPT', '记录不存在：' + id) } })
+    const t1 = fakeT1({ read: async (id) => { throw v3Error('ERECORD_NOT_FOUND', '记录不存在：' + id) } })
     const client = fakeClient()
     const { provider } = makeProvider({ client, t1 })
     const result = await provider.read(EXTERNAL_ONLY)
@@ -132,6 +135,7 @@ test('read：本地命中不访问外部；本地不存在才读隔离根', asyn
     assert.equal(client.calls[0].args.op, 'read')
     assert.equal(client.calls[0].args.node_id, EXTERNAL_ONLY)
     assert.equal(result.record.provenance.sourceForm, 't2-mirror')
+    assert.match(result.text, /^\[T2 六要素包装镜像副本；非本地原始正文\]/)
   }
 })
 
@@ -168,7 +172,8 @@ test('mirrorRecord：串行写入隔离根，正文含六要素与原文', async
   assert.match(args.content, /^# 验证方式：/m)
   assert.match(args.content, /^# 不适用条件：/m)
   assert.match(args.content, /原始正文/)
-  assert.deepEqual(provider.mirrorStats(), { mirrored: 1, mirrorFailed: 0, mirrorDropped: 0, pending: 0, forgetFailed: 0, lastError: null })
+  // P2-16：`recentFailures` 是新增的**有界失败历史**（不同原因不再互相覆盖）；此处无失败 → 空。
+  assert.deepEqual(provider.mirrorStats(), { mirrored: 1, mirrorFailed: 0, mirrorUnverified: 0, mirrorRejected: 0, mirrorDropped: 0, pending: 0, forgetFailed: 0, lastError: null, recentFailures: [] })
 })
 
 test('mirrorRecord：空正文/非法 ID 跳过；外部失败只计数不回滚', async () => {
@@ -222,6 +227,9 @@ test('close：先 flush 再关闭 client，幂等', async () => {
   await provider.close()
   assert.equal(client.closed, 1)
   assert.equal(client.calls.filter((call) => call.args.op === 'write').length, 1)
+  provider.mirrorRecord({ id: LOCAL_B, payload: { text: 'closed drop' } })
+  assert.equal(provider.mirrorStats().mirrorDropped, 1)
+  assert.match(provider.mirrorStats().lastError, /provider closed/)
 })
 
 test('indexStats：复用 T1 索引统计，不额外访问外部；失败如实回状态', async () => {
@@ -270,4 +278,42 @@ test('health/capabilities：如实报 T2 isolated 与镜像状态', async () => 
   const health = await provider.health()
   assert.equal(health.healthy, true)
   assert.equal(health.t2.isolated, true)
+})
+
+test('mirrorRecord：callTool 解码后只按顶层精确审核态三分，不默认 ACCEPT、不重试', async () => {
+  // 真实 t2-mcp-client.callTool 将 MCP text JSON.parse 后直接返回 parsed 顶层对象；
+  // 不提供 structuredContent。此处替身复现这条真实返回形状。
+  for (const [state, expected] of [['ACCEPT', 'mirrored'], ['DEFER', 'mirrorRejected'], ['REJECT', 'mirrorRejected'], ['BLINDSPOT', 'mirrorRejected'], [undefined, 'mirrorUnverified'], ['MAYBE', 'mirrorUnverified'], ['accept', 'mirrorUnverified']]) {
+    const client = fakeClient({ onCall: async (name, args) => args.op === 'write'
+      ? JSON.parse(JSON.stringify(state === undefined ? {} : { state }))
+      : { ok: true } })
+    const { provider } = makeProvider({ client })
+    provider.mirrorRecord({ id: LOCAL_A, payload: { text: 'body' } })
+    await provider.flush()
+    const stats = provider.mirrorStats()
+    assert.equal(stats[expected], 1, String(state) + ' 归类')
+    assert.equal(client.calls.filter((call) => call.args.op === 'write').length, 1, '审核态不得触发自动重试')
+    assert.equal(stats.mirrored, state === 'ACCEPT' ? 1 : 0)
+    if (state !== 'ACCEPT') assert.match(stats.lastError, new RegExp(expected))
+    const health = await provider.health()
+    assert.equal(health.t2[expected], 1, 'health 诊断也必须暴露审核态结果')
+  }
+  // 即使有类似 SDK 扩展字段，也不能以 structuredContent 取代缺失的顶层 state。
+  const client = fakeClient({ onCall: async (name, args) => args.op === 'write'
+    ? { structuredContent: { state: 'ACCEPT' } }
+    : { ok: true } })
+  const { provider } = makeProvider({ client })
+  provider.mirrorRecord({ id: LOCAL_A, payload: { text: 'body' } })
+  await provider.flush()
+  assert.equal(provider.mirrorStats().mirrorUnverified, 1)
+})
+
+test('read：损坏错误原样失败关闭；两侧缺失是 invalid ERECORD_NOT_FOUND', async () => {
+  const corrupt = v3Error('ESTORE_CORRUPT', '记录损坏')
+  const damaged = makeProvider({ t1: fakeT1({ read: async () => { throw corrupt } }) })
+  await assert.rejects(() => damaged.provider.read(EXTERNAL_ONLY), (error) => error === corrupt)
+  assert.equal(damaged.client.calls.length, 0)
+  const missingClient = fakeClient({ onCall: async () => ({ content: '' }) })
+  const missing = makeProvider({ client: missingClient, t1: fakeT1({ read: async () => { throw v3Error('ERECORD_NOT_FOUND', 'missing') } }) })
+  await assert.rejects(() => missing.provider.read(EXTERNAL_ONLY), (error) => error.code === 'ERECORD_NOT_FOUND' && error.kind === 'invalid')
 })

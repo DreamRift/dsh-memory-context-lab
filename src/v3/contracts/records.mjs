@@ -16,8 +16,29 @@ export const RECORD_KINDS = Object.freeze(['operation', 'message-user', 'message
 /** 顶层字段封闭集（M2 存储守卫与序列化共用）。 */
 export const RECORD_FIELDS = Object.freeze(['id', 'kind', 'sessionKey', 'createdAt', 'payload', 'provenance'])
 
-/** 记录 ID 形状：v3r-<16 位小写十六进制>（生成经 Random 端口，此处只验形状）。 */
-const RECORD_ID_PATTERN = /^v3r-[0-9a-f]{16}$/
+/**
+ * 记录 ID 形状：v3r-<16 位小写十六进制>（生成经 Random 端口，此处只验形状）。
+ *
+ * AUD51-03-01：这个形状同时是**路径安全判据**——store.readRecord 直接把它拼进
+ * `records/<id>.json`，接受 `../x` 就能穿出 records/ 读到本会话目录里任何合法
+ * 形状的 JSON。读路径必须先过形状白名单（失败关闭 EINVALID_ID）。
+ */
+export const RECORD_ID_PATTERN = /^v3r-[0-9a-f]{16}$/
+
+/** 是否合法记录 ID（唯一判据；store/命令面/检索侧共用，不许各写一份正则）。 */
+export function isRecordId(value) {
+  return typeof value === 'string' && RECORD_ID_PATTERN.test(value)
+}
+
+/**
+ * tool/result 错误态写进记录正文时的确定性标记（单一真源）。
+ *
+ * 记录 payload **不另存 isError 字段**（封闭 schema，见 validateRecord）；错误态对
+ * 可读正文的唯一标记就是 v3-entry 追加的这一行。首次呈现端口据此核对调用方声明的
+ * isError 是否与已保存记录一致——不核对就等于把「成功/失败」当参数照抄，记录里的
+ * 错误态可以被预览静默改写口径。
+ */
+export const TOOL_RESULT_ERROR_MARKER = '[工具结果：错误态]'
 
 /**
  * 结构校验：输入是外部/落盘数据，返回结构化结果而不抛错（与编程错误的

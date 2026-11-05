@@ -1,4 +1,3 @@
-<!-- release mirror: 与 plugin/src/v3/README.md 同文；仅此标记用于区分镜像与源文档。 -->
 # v3 源码目录（0.14.0 线）
 
 按《开发计划-v3》§2 建立的模块化单体，**0.14.0-beta.10 起是插件的唯一引擎**：
@@ -46,7 +45,7 @@ v3 只使用 `<DSH_HOME>/.memory-context-lab/v3/`；clean 只处理 v3 自有目
 - `composition/composition.mjs`：composition root（唯一看全层的装配点；`handleDshEvent` / `handleDshEventBatch` 归一化与 own-source 裁决；Date.now/randomUUID 只出现在这里）。
 - `adapters/host/dsh-host.mjs`：DSH 宿主适配器（surfaceOp 逐字对齐真实契约：append+surfaceOp{replace,startSeq,endSeq}+sourceEventSeqs；确认面 eventAt/surface.nodes；P1 source.kind 自有；normalizeDshEvent 四类映射）。
 - `application/surface-executor.mjs`：投影执行（R4：replace 被拒→降级 append+cardReplaceFallbacks+一步恢复；宿主确认必须带 seq；新卡未落面不推进状态）。
-- `adapters/retrieval/t1-provider.mjs`：T1 检索提供者（BM25；查询词元去重；覆盖门槛按不同词元并设上限；索引按文件戳缓存、损坏即重建、`allowRebuild:false` 供热路径；read 顶层 text 恒非空；capabilities 报实际生效后端）。
+- `adapters/retrieval/t1-provider.mjs`：T1 检索提供者（BM25；查询词元去重；覆盖门槛按不同词元并设上限；索引按文件戳缓存、损坏即重建、`allowRebuild:false` 供热路径；read 顶层 text 恒非空；`chunksOf` 报 ok/absent/corrupt/incompatible/stale 五态；capabilities 报实际生效后端）。
 - `application/recall.mjs`：recall 用例（纯壳不注入；首部切片按码点；P3 同回合一次；OOV 去重有界；超硬顶拒绝注入；单条命中读取失败不废整包；回读句柄是真实命令 `/memory-lab read`）。
 - `domain/context/slot-planner.mjs`：双槽规划（Q3-A/B：注入即替换/稳态双槽/占位回执；gateRecallInjection P3 回注闸；决策归 domain）。
 - `application/session-lifecycle.mjs`：enable/disable/restore/forget 用例（Q-01 三结局回执；G3 unknown 守卫；N-11 会计；forget 幂等+隐私面）。
@@ -56,19 +55,24 @@ v3 只使用 `<DSH_HOME>/.memory-context-lab/v3/`；clean 只处理 v3 自有目
 - `adapters/storage/lexical-index.mjs`：可重建词法索引（倒排 tf；tokenizeQuery 同尺；损坏 ESTORE_CORRUPT 不静默；缺失 null 可重建；stale 判定）。
 - `adapters/storage/write-lock.mjs`：跨进程写锁（两阶段创建 / token 心投校验 / stale 墓碑接管 / deadline 内 ELOCKED；withWriteLock 同进程串行+重入，队列排空自清理）。
 - `adapters/storage/session-store.mjs`：M2 会话存储（原子写 randomUUID 临时名 + **fsync**；事务协议 payload→commit 行→txnNext；崩溃对账：残留隔离/号不复用/推进对账/尾损坏判 damaged 读允许写拒绝且字节不动；账本各自损坏时**按账本**拒绝追加；记录读写校验会话归属；遗忘集合读前按文件戳刷新；close 后 ESTORE_CLOSED）。
-- `domain/retrieval/query.mjs`：查询规范化（CJK 单字+相邻双字、ASCII 小写）/ 双面 min_score 门槛 / 确定性排序。
+- `domain/retrieval/query.mjs`：查询规范化（CJK 单字+相邻双字、ASCII 小写）/ 双面 min_score 门槛 / 确定性排序 / `TOKENIZER_VERSION`。
+- `domain/retrieval/excerpt.mjs`：命中窗口（码点半开区间；字面 needle 保留错误码/路径/标识符；长查询强词元优先 + 首尾保留；chunk 命中内选窗，缺失/无命中即现扫；`boundQuery` 首尾保留）。
+- `domain/retrieval/chunks.mjs`：chunk 派生 span（固定长度+重叠、schema/tokenizer 版本、单记录硬顶）；不复制正文。
+- `adapters/storage/chunk-index.mjs`：可重建 chunk 索引（recordId→码点 span；缺失/损坏/换代/落后降级现扫，不挡检索）。
+- `adapters/storage/file-stamp.mjs`：词法与 chunk 索引共用的文件戳（mtimeNs+size+头 64 字节摘要）。
 - `domain/archive/restore.mjs`：恢复资格（逐字节重建）/ 停用动作（Q-01 正交 + G3 unknown fail-closed）/ 会计结算（N-11 三桶恒等）。
 - `domain/session/turn.mjs`：回合判定（真实用户=非插件来源的 user 事件；turn 0 禁止注入；oncePerTurnGate 同回合同类只放行一次）。
 - `contracts/events.mjs`：归一化事件合同（四类型封闭集；保留宿主原始 event id/source）。
 - `contracts/decisions.mjs`：裁决合同（五 kind / 三 effect 封闭集；basis 必填；sealDecision 深冻结）。
 - `shared/deep-freeze.mjs`：深冻结原语（shared 层首个模块）。
 - `contracts/records.mjs`：记录合同（封闭字段集 / kind 封闭集 / bytes 必须等于 UTF-8 字节长度——v2「按字符数算 size」教训锁死）。
-- `contracts/capabilities.mjs`：T1/T2 能力协商（D3：未知版本 fail-closed 回 T1；直连要求 memory_*，隔离路线要求 cg + isolated=true；0.9.10 真实冒烟后登记）。
+- `contracts/capabilities.mjs`：T1/T2 能力协商（D3：未知版本 fail-closed 回 T1；直连要求 memory_*，隔离路线要求 cg + isolated=true；0.9.10 真实冒烟后登记；0.9.17 只登记 candidate，默认不启用）。
 - `adapters/host/t2-environment.mjs`：定位 dsh-memory 包根与 Python（`MEMORY_LAB_T2_REPO` / `MEMORY_LAB_T2_PYTHON` / `MEMORY_LAB_T2=0`）；找不到按 T1。
 - `adapters/retrieval/t2-mcp-client.mjs`：隔离 MCP 逐行 JSON-RPC（initialize/tools/list/tools/call/shutdown；超时/退出/协议错误失败关闭；`spawnImpl` 可注入）。
 - `adapters/retrieval/t2-token.mjs`：隔离根内独立令牌库（不读写 `~/.mdcg/_tokens.json`；明文 0600）。
-- `adapters/retrieval/t2-probe.mjs`：四步冒烟（initialize / tools/list / 写六要素 / 读回 / forget），成功交回已握手 client。
-- `adapters/retrieval/t2-isolated-provider.mjs`：T1 + 隔离灵枢复合 provider（融合检索、镜像队列、遗忘同步、诊断计数）。
+- `adapters/retrieval/t2-probe.mjs`：基础冒烟（initialize / tools/list / 写六要素 / 读回 / forget）+ 查询合同探针（cg read(query,k=2)：行字段/条数/warning）；成功交回已握手 client 与 `schemaDigest`。
+- `adapters/retrieval/t2-isolated-provider.mjs`：T1 + 隔离灵枢复合 provider（按版本合同发 k/兼容参数；state→eligible/deferred/rejected/unknown；partial/超时/取消回退 T1；RRF 名次分不穿本地 pack 门；镜像队列、遗忘同步、诊断计数）。
+- `contracts/t2-contract.mjs`：灵枢版本合同表（0.9.10 tested / 0.9.17 candidate）、分能力报告与 schemaDigest；`packExternal` 默认 off。
 - `contracts/sources.mjs`：消息来源标识单一真源（`PLUGIN_SOURCE_KIND` = 包名，守卫钉住；`HUMAN_SOURCE_KIND` = 'user'）。
 - `domain/session/user-input.mjs`：从 pre-step 的 `payload.messages` 取人类输入（只认 `source.kind==='user'`，不用「排除已知污染源」的启发式）。
 - `domain/session/isolation-key.mjs`：会话隔离键归一（M1 首个纯函数）。

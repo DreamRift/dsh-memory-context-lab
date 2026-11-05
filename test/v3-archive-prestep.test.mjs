@@ -107,7 +107,7 @@ test('cooling：占用达到 0.2 才开闸；未知占用失败关闭', async ()
     await mkdir(usageDir, { recursive: true })
     await writeFile(path.join(usageDir, 'usage.jsonl'), JSON.stringify({ seq: 1, inputTokens: 300000, totalTokens: 300001 }) + '\n')
 
-    const result = await engine.archiveForStep('session-fake', session, { retainOperations: 2 })
+    const result = await engine.archiveForStep('session-fake', session, { retainOperations: 2, coolingBatchSize: 3 })
     assert.equal(result.status, 'archived', JSON.stringify(result))
     assert.equal(result.steps, 3, '六个完整步骤里保留最近两步；单次上限 3 步（减少前缀抖动）')
     assert.equal(engine.stateOf('session-fake').cooling.open, true)

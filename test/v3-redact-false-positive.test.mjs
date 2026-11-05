@@ -2,6 +2,10 @@
  * B3-3（AUD50-02-08）过度脱敏收敛——author/authMode 不是凭据键；
  * token 类键与文本规则的值仅在像凭据时替换（纯字母词/纯数字放行，已知前缀/数字混排/标点仍替换）。
  * 安全底线不回退：真实密钥、短口令（password 类键）一律照旧脱敏。
+ *
+ * AUD51-07-01（0.14.0-beta.53）：收敛**只保留给 token 键**。password / secret / api_key /
+ * credential / cookie / session_id 这些「值的键」不再看形态——纯字母口令（DB_PASSWORD=swordfish）
+ * 原样入库是真漏洞，宁可误伤配置词（password: enabled 也脱敏）。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -9,9 +13,12 @@ import { redactText, redactValue, isSensitiveKey, credentialShapedValue } from '
 
 test('文本：普通词形态不再误伤', () => {
   assert.equal(redactText('the token: appears'), 'the token: appears')
-  assert.equal(redactText('token: oauth'), 'token: oauth')
+  assert.equal(redactText('token: oauth'), 'token: oauth', 'token 键 + 已知形态词仍放行（B3-3 不回退）')
   assert.equal(redactText('{"author":"张三"}'), '{"author":"张三"}')
-  assert.equal(redactText('password: 密码错误'), 'password: 密码错误', '纯中文普通词不误伤')
+  // AUD51-07-01（beta.53）改了这条口径：password/secret/api_key 这类**硬凭据键**的值
+  // 一律脱敏（纯字母口令 swordfish 也必须是凭据）。原先的「纯中文解释句不误伤」让位给
+  // 失败关闭——真正保留下来的是 token 键的普通词放行（下面两条）与非凭据键名。
+  assert.equal(redactText('password: 密码错误'), 'password: [REDACTED]', '硬凭据键无条件下手')
   assert.equal(redactText('token: 12345'), 'token: 12345', '纯数字不误伤')
 })
 

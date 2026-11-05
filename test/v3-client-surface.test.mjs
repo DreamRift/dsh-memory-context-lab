@@ -204,11 +204,14 @@ function runApply(entry, options = {}) {
     },
     inject(deps, callback) {
       optionalInjects.push([...deps])
-      // 真实 cordis 在依赖可用时启动子插件；这里 configForms 总是可用（本套件的前提）。
+      // 真实 cordis 在依赖可用时启动子插件。P1-11 用 options.configForms 模拟两种真实形状：
+      // 'absent' = 服务整个缺席（回调根本不跑）；'pending' = 服务在、本命名空间还没就绪
+      // （`get(NS)` 返回 undefined，宿主在设置面加载中就是这个形状）。
+      if (options.configForms === 'absent') return
       callback(ctx)
     },
     configForms: {
-      get: () => form,
+      get: () => (options.configForms === 'pending' ? undefined : form),
       // 复刻宿主 whileServed 的门：**没有任何被跟随的命名空间被服务时不注册**。
       whileServed(namespaces, register) {
         assert.deepEqual(namespaces, [module.NS], '只跟随自己的命名空间')
@@ -263,11 +266,12 @@ test('注册键必须与宿主侧 id 对齐：命名空间 = patch 行 id，行�
   assert.equal(module.ROW_KEY, manifest.name + '#' + rowId, 'plugins.row.config 的键是 <包名>#<行 id>')
 })
 
-test('apply：命名空间被服务时同时注册 bundle 配置与行配置两个槽位', async () => {
+test('apply：命名空间被服务时只注册组件行配置槽位（0.15.0 去掉 bundle 层设置块）', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
-  assert.deepEqual(run.slots.map((row) => row.registration.name), ['plugins.bundle.config', 'plugins.row.config'])
-  assert.deepEqual(run.slots.map((row) => row.registration.key), [run.module.BUNDLE, run.module.ROW_KEY])
+  assert.deepEqual(run.slots.map((row) => row.registration.name), ['plugins.row.config'],
+    '设置面只保留组件行页；bundle 详情页不再挂「外面一层」设置块')
+  assert.deepEqual(run.slots.map((row) => row.registration.key), [run.module.ROW_KEY])
   assert.equal(run.dictionaries.length, 1, '字典必须注册（页面按 locale 命名空间取文案）')
   assert.deepEqual(run.dictionaries[0].ns, run.module.NS)
 
@@ -275,8 +279,8 @@ test('apply：命名空间被服务时同时注册 bundle 配置与行配置两�
   // 本套件的 slots.register 只收设置面（inject 回调不执行），但 inject 本身必须被发起。
   assert.deepEqual(run.slotInjects.map((row) => row.name), [run.module.CHIP_SLOT, 'sidebar.panellist', 'main'],
     'chip 与侧栏面板必须走 ctx.slots.inject 等槽位声明（直接 register 在页面未渲染时会落空）')
-  assert.deepEqual(run.optionalInjects, [['configForms']],
-    '设置服务必须是可选注入：服务缺席时 chip 仍要渲染')
+  assert.deepEqual(run.optionalInjects, [['remote.commands'], ['uiWorkspace'], ['configForms']],
+    '设置服务与命令通道/工作区都必须是可选注入：任一缺席时 chip 仍要渲染（P2-13）')
 
   // 命名空间没被服务（插件未装载 / 宿主没给 Config）时不得注册任何槽位。
   const absent = runApply(entry, { served: [] })
@@ -335,6 +339,26 @@ test('摘要视图只回一行文案：bundle 列表里的卡片不带表单', a
   assert.equal(tree.get(), 'summary')
 })
 
+test('P1-11 摘要视图不依赖设置服务：服务未就绪 / 整个缺席都不崩', async () => {
+  const entry = await loadClient()
+  // pending：行配置槽位已注册，但 configForms.get(NS) 还是 undefined（applyScope = undefined）。
+  const pending = runApply(entry, { configForms: 'pending' })
+  const summary = pending.bind(pending.slots[0].component, { view: 'summary', t: (key) => key })
+  assert.equal(summary.get(), 'summary', '摘要必须是一行纯文案：不得在早退前解引用设置服务')
+
+  // absent：服务整个缺席 → 可选 inject 的回调不跑，apply 本身不得抛错。
+  const absent = runApply(entry, { configForms: 'absent' })
+  assert.deepEqual(absent.slots, [], '服务缺席时设置面不注册（chip 仍要渲染）')
+})
+
+test('P1-11 设置服务未就绪：配置页说「未加载」，不崩溃也不无限 loading', async () => {
+  const entry = await loadClient()
+  const run = runApply(entry, { configForms: 'pending' })
+  const tree = run.bind(run.slots[0].component, { view: 'page', t: (key) => key }).get()
+  assert.equal(tree.type, 'p', '不得因 scope 缺失而抛 TypeError')
+  assert.equal(tree.children, 'unavailable', '缺席要说不可用（真话），不能永远显示 reading…')
+})
+
 test('就绪态渲染出全部字段；改开关 + 保存只提交真正变化的项', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
@@ -367,7 +391,7 @@ test('就绪态渲染出全部字段；改开关 + 保存只提交真正变化�
 test('越界值在本地拦下：不发写请求，字段下方给可读提示', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
-  const rendered = run.bind(run.slots[1].component, { view: 'page', t: (key) => key })
+  const rendered = run.bind(run.slots[0].component, { view: 'page', t: (key) => key })
   const input = findElement(rendered.get(), (node) => node.type === 'input' && node.props['aria-label'] === 'limitLabel')
   assert.ok(input, '条数字段必须是可编辑的数字输入')
   input.props.onChange({ target: { value: '99' } })
@@ -379,7 +403,7 @@ test('越界值在本地拦下：不发写请求，字段下方给可读提示',
   assert.ok(hint, '越界提示要落在该字段下方')
 })
 
-test('行配置页用页面传入的 form（bundle 页没有 form 才自取 configForms）', async () => {
+test('行配置页用页面传入的 form（设置面只保留组件行页）', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
   const pageWrites = []
@@ -387,7 +411,7 @@ test('行配置页用页面传入的 form（bundle 页没有 form 才自取 conf
     state: { status: 'ready', value: { ...run.module.DEFAULTS }, user: {}, revision: 7, writable: true },
     mutate: async (ops, revision) => { pageWrites.push({ ops, revision }); return true },
   }
-  const rendered = run.bind(run.slots[1].component, { view: 'page', t: (key) => key, form: pageForm })
+  const rendered = run.bind(run.slots[0].component, { view: 'page', t: (key) => key, form: pageForm })
   const toggle = findElement(rendered.get(), (node) => node.type === run.Switch)
   toggle.props.onChange(false)
   const save = findElement(rendered.get(), (node) => node.type === run.Button && node.props['data-mcl-save'] === true)
@@ -423,17 +447,20 @@ test('命名空间未被服务时页面说明「插件未加载」，不渲染�
 test('轮次判定字段是下拉框：切到 DSH 轮次提交字符串值，未改动不提交', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
-  const rendered = run.bind(run.slots[1].component, { view: 'page', t: (key) => key })
+  const rendered = run.bind(run.slots[0].component, { view: 'page', t: (key) => key })
   const select = findElement(rendered.get(), (node) => node.type === 'select' && node.props['aria-label'] === 'turnBasisLabel')
   assert.ok(select, '轮次判定必须渲染成下拉框（开关说不出哪边是默认）')
-  assert.equal(select.props.value, 'human', '默认必须是真人消息')
+  // 0.15.1 用户裁定：默认改 dsh（§1★9）。下拉框的初始值必须等于宿主 schema 的默认值。
+  assert.equal(select.props.value, 'dsh', '默认必须是 DSH 轮次（与 Config 默认值同源）')
   const options = (select.children ?? []).flat(2).filter((node) => node !== null && typeof node === 'object')
   assert.deepEqual(options.map((node) => node.props.value), ['human', 'dsh'], '两个选项都要在')
 
-  select.props.onChange({ target: { value: 'dsh' } })
+  // 从默认值切到**另一个**值才算「真正变化的项」（默认 dsh → human）；
+  // 提交的必须只有 turnBasis 一条，其它字段一个都不动。
+  select.props.onChange({ target: { value: 'human' } })
   const save = findElement(rendered.get(), (node) => node.type === run.Button && node.props['data-mcl-save'] === true)
   save.props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
-  assert.deepEqual(run.writes, [{ ops: [{ op: 'set', path: ['turnBasis'], value: 'dsh' }], revision: 3 }],
+  assert.deepEqual(run.writes, [{ ops: [{ op: 'set', path: ['turnBasis'], value: 'human' }], revision: 3 }],
     '只提交轮次判定的字符串值，其它字段不动')
 })

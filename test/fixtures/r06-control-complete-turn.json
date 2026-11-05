@@ -1,0 +1,104 @@
+{
+  "name": "r06-control-complete-turn",
+  "kind": "control",
+  "synthetic": true,
+  "note": "合成夹具（非真实会话数据）：旧式成功配对——tool/call 与 tool/result 都在，回合完成后应可归档。",
+  "mode": "turn",
+  "turnBasis": "human",
+  "surfaceNodes": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "events": [
+    {
+      "seq": 0,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u0"
+          }
+        ]
+      }
+    },
+    {
+      "seq": 1,
+      "type": "assistant/message",
+      "data": {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "a1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "type": "tool/call",
+      "data": {
+        "callId": "c1",
+        "name": "read",
+        "arguments": "{}"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "tool/result",
+      "data": {
+        "callId": "c1",
+        "message": {
+          "role": "tool",
+          "toolCallId": "c1",
+          "source": {
+            "kind": "tool",
+            "callId": "c1"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "ok"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "type": "user/message",
+      "data": {
+        "source": {
+          "kind": "user"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "u4"
+          }
+        ]
+      }
+    }
+  ],
+  "select": {
+    "maxOperations": 1
+  },
+  "expect": {
+    "selection": "non-null",
+    "seqs": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "why": "正常对照：调用与结果成对，回合应可归档"
+  }
+}
