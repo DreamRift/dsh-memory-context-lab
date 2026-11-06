@@ -7,7 +7,7 @@
 | 项目 | 值 |
 |---|---|
 | 文件 | `dist/dsh-memory-context-lab-0.15.3.tgz` |
-| 大小 | 165,575,688 B（约 165.6 MB） |
+| 大小 | 165,575,697 B（约 165.6 MB） |
 | 条目 | 10,248 |
 | sha256 | `E459A334E98923B1FD266A015DFE2D7668026BEC043223B5B6EC3BEB7AC95E78` |
 | 分发 | GitHub Release asset（**不走 npm**，原因见下） |
