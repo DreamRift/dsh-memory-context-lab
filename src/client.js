@@ -1428,27 +1428,17 @@ statusStateError: 'State file error: {code} (defaults in effect)',
     /**
      * 浏览器半的**服务声明**（不是 `package.json` 的 `dsh.client.inject` 图依赖）。
      *
-     * ⚠ 这份数组是**硬依赖**，不是「判权清单」：宿主 `dsh-cordis-client-runner` 把
-     * `Object.keys(fiber.inject)` 当成等待集合（`waitingFor` 过滤 `ctx.get(name) === undefined`），
-     * 只要有一个服务没注册，**整个客户端半就停在 waiting、永不 apply**——chip、侧栏面板、
-     * 设置页一起消失（P2-13）。所以这里只能放「缺了就完全没法工作」的东西。
+     * DSH 0.2.2 的 dynamicCordisContext 只放行白名单内的生命周期方法与**当前插件**
+     * 声明的服务；`ctx.inject(...)` 不在白名单内。它创建的子插件声明也不会加入父插件
+     * 的 fiber.inject，因此不能靠它给 `remote.commands` 取得读取权限。
      *
-     * 只有 slots / locale 够格：没有槽位就没有任何 UI 可挂，没有字典就只能显示键名。
-     * `remote` 也是硬依赖（弹层与面板都需要命令通道）。
-     *
-     * `remote.commands` / `uiWorkspace` **不再是硬依赖**（P2-13）：它们只影响「能不能执行
-     * 斜杠命令 / 能不能切换工作区」，而 `remoteOf`/`uiWorkspaceOf` 本来就把缺失当成
-     * 「通道不可用 → 控件禁用 + 文案说明」。把它们写进硬 inject 会让宿主少给一个服务就
-     * 整块 UI 消失，代价与收益完全不成比例。
-     *
-     * 判权仍然需要声明（宿主代理按 `declared` 拦截 `ctx.remote.commands` 读取，H-103 原文
-     * `cannot get property "remote.commands" without inject`），因此改用 `ctx.inject([...], cb)`
-     * 做**可选接入**：服务在时在回调里拿到 ctx 并存给 `hostCtx`，服务缺席时这段不执行、
-     * UI 照常挂载（弹层显示「通道不可用」）。
+     * 对话控制是本插件的核心功能，命令通道与官方 dsh-client-ui-commands 一样正式声明；
+     * 宿主缺少该服务时保持 waiting，而不是渲染一个所有控制都禁用的假可用面板。
+     * `uiWorkspace` 只提供 fork 的附加入口，仍用可选接入（在真实 Cordis ctx 上有效）。
      */
-    const inject = ['slots', 'locale', 'remote']
-    /** 可选服务：缺席不影响挂载，只影响对应的写通道（命令 / 工作区）。 */
-    const OPTIONAL_INJECTS = [['remote.commands'], ['uiWorkspace']]
+    const inject = ['slots', 'locale', 'remote', 'remote.commands']
+    /** 非核心的可选服务：缺席时只禁用对应附加入口。 */
+    const OPTIONAL_INJECTS = [['uiWorkspace']]
 
     /**
      * 挂载两个面：① composer 的 chip + 弹层（无条件，等槽位出现）；② 设置表单（命名空间被服务时才注册）。
@@ -1479,8 +1469,8 @@ statusStateError: 'State file error: {code} (defaults in effect)',
         key: 'memory-context-lab',
       }, LabPanel))
 
-      // P2-13：可选服务（命令通道 / 工作区）——缺席时这一段不启动，UI 照常挂载，
-      // 弹层按 `remoteOf`/`uiWorkspaceOf` 的 null 走到「通道不可用 + 控件禁用」。
+      // 非核心可选服务（工作区）：缺席时这一段不启动，fork 入口按
+      // `uiWorkspaceOf` 的 null 禁用；命令服务已由上面的正式 inject 声明。
       // 这里不 dispose 任何东西：服务生命周期由宿主拥有。
       for (const names of OPTIONAL_INJECTS) {
         ctx.inject(names, (optionalCtx) => {

@@ -279,8 +279,8 @@ test('apply：命名空间被服务时只注册组件行配置槽位（0.15.0 �
   // 本套件的 slots.register 只收设置面（inject 回调不执行），但 inject 本身必须被发起。
   assert.deepEqual(run.slotInjects.map((row) => row.name), [run.module.CHIP_SLOT, 'sidebar.panellist', 'main'],
     'chip 与侧栏面板必须走 ctx.slots.inject 等槽位声明（直接 register 在页面未渲染时会落空）')
-  assert.deepEqual(run.optionalInjects, [['remote.commands'], ['uiWorkspace'], ['configForms']],
-    '设置服务与命令通道/工作区都必须是可选注入：任一缺席时 chip 仍要渲染（P2-13）')
+  assert.deepEqual(run.optionalInjects, [['uiWorkspace'], ['configForms']],
+    '设置服务与工作区可选；命令通道是正式依赖（DSH 0.2.2 动态门面契约）')
 
   // 命名空间没被服务（插件未装载 / 宿主没给 Config）时不得注册任何槽位。
   const absent = runApply(entry, { served: [] })

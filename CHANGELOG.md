@@ -1,3 +1,28 @@
+## 0.15.3（2026-11-06，DSH 0.2.2 命令通道兼容修复）
+
+### 根因
+
+升级到 DSH Desktop `0.2.2-rc.1` 后，记忆上下文的 composer 弹层显示「命令通道不可用」，导致本对话启用、回注、计划先行等开关无法写入。OPS 组件本身可启用，宿主 `ops_*` 工具也正常执行；问题只出在浏览器客户端的命令服务声明。
+
+新版宿主的 `dynamicCordisContext` 只放行白名单生命周期方法与**当前插件**声明的服务，且不再转发 `ctx.inject(...)`。旧实现把 `remote.commands` 放进可选 `ctx.inject`，该子插件声明不会进入父插件的 `fiber.inject`，因此动态门面读取 `ctx.remote.commands` 时被拒绝，弹层只能降级为禁用状态。
+
+### 修法
+
+- 浏览器半正式声明 `['slots', 'locale', 'remote', 'remote.commands']`，与官方 `dsh-client-ui-commands` 一致；命令通道缺失时保持 waiting，而不是渲染一个所有控制都禁用的假可用面板。
+- `uiWorkspace` 保留为可选接入，仅影响 fork 附加入口；设置页 `configForms` 仍按既有可选逻辑处理。
+- 宿主契约探针更新 `turn/start` 字段检查：0.2.2 的事件形状是 `session.append('turn/start', { turn })`，不再依赖旧正则里的 `event.data.turn`。
+
+### 守卫与验证
+
+- 新增/改写 `v3-client-optional-injects.test.mjs`：钉住命令服务正式声明、缺服务不装配、正常服务下 chip/面板/字典装配。
+- plugin 源码树 `node scripts/test-all.mjs`：**239/239 套件通过**（exit 0，win32-x64）。
+- release 镜像相关客户端测试与宿主探针：**57/57 通过**，`probe:host` 对 DSH `0.2.2-rc.1` 11/11 PASS。
+- `npm pack`：`dsh-memory-context-lab-0.15.3.tgz`，10,248 文件；vendor dsh-ops 与 Bash 载荷仍在包内。精确字节数与 sha256 见 `RELEASE.md`。
+
+### 验收边界
+
+未安装到 desktop profile、未重启 DSH，真实浏览器点击验收待做。恢复使用时安装新 tgz 并重启，再在对话中点击记忆上下文开关确认 `/memory-lab on` 可执行。
+
 ## 0.15.2（2026-11-05）
 
 > 本版是相对上一个正式版本 **v0.13.1** 的发布版本。0.14.0-beta.1 … beta.51、0.15.0、0.15.1 全部是开发期过渡号，

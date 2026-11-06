@@ -2,9 +2,9 @@
 
 按 **DSH 会话** 启用的上下文管理插件（**v3 单引擎**）：把会话事件摄入本会话的隔离影子库，每一步按当前用户输入检索历史、把命中要点回注到本步上下文；composer chip 弹层只放**本对话控制**，底层参数在插件设置页。
 
-> **当前源码版本 0.15.2（发布镜像）**；唯一命令 `/memory-lab`，变更见[变更记录](./CHANGELOG.md)。
+> **当前源码版本 0.15.3（发布镜像）**；唯一命令 `/memory-lab`，变更见[变更记录](./CHANGELOG.md)。
 >
-> **0.15.2 是相对 v0.13.1（上一个正式版）的一次大版本跨越**：引擎换成 v3 单引擎、历史检索（回注）成为主路径、按步归档与按轮归档双模式、归档回执带摘要、bundle 内随包捆绑定制 **dsh-ops** 组件与完整 Bash 载荷。本版自身只修一处真机死锁（按步归档在真实宿主上「压完一批就永久停摆」）——详见[Release 说明](https://github.com/DreamRift/dsh-memory-context-lab/releases/latest)与 [CHANGELOG](./CHANGELOG.md)。
+> **0.15.3 修复 DSH 0.2.2 升级后的命令通道兼容问题**；它建立在 0.15.2 的 v3 单引擎、历史检索回注、按步/按轮归档、回执摘要与随包 dsh-ops 组件之上。详见[Release 说明](https://github.com/DreamRift/dsh-memory-context-lab/releases/latest)与 [CHANGELOG](./CHANGELOG.md)。
 
 ## 它做什么、不做什么
 
@@ -27,7 +27,7 @@
 
 | 项目 | 值 |
 |---|---|
-| DSH Desktop | `0.2.1-rc.5`（宿主契约按 `app.asar` 内 `dsh-commands` / `dsh-agent-loop` / `cordis` / `dsh-client-modules` / `dsh-settings` 源码核验） |
+| DSH Desktop | `0.2.2-rc.1`（宿主契约按 `app.asar` 内 `dsh-commands` / `dsh-agent-loop` / `dsh-cordis-client-runner` / `cordis` / `dsh-client-modules` / `dsh-settings` 源码核验） |
 | 数据根 | `$DSH_HOME/.memory-context-lab/v3/sessions/<会话隔离键>/`（非常规会话 id 用 `hash-<sha256 前 16>`，原名存 `session-manifest.json`） |
 | 检索后端 | 本地 Node store + 本地词法索引（T1）；检测到 `@furongjun1999/dsh-memory` 0.9.10（含 `md_cg/`）且 Python 可用时，按会话启动**独立 MDCG_ROOT 的隔离 MCP**（T2），搜索融合本地与隔离灵枢；探测/冒烟失败如实回 T1 |
 | 依赖的宿主接口 | `agent/pre-step`、`commands.register`、`ctx.effect`、`dsh-settings`、`dsh-client-modules`、`dsh-session-projection`、`dsh-client-ui-conversation`、`ctx.remote.commands.execute`；写入经 `decision.messages`，由宿主 `session.append` 落面 |
@@ -113,32 +113,12 @@ composer 工具行左侧的「记忆上下文」chip（宿主 `conversation.inpu
 - 写事务走每会话跨进程写锁（`.write-lock/`）；账本与派生索引的原子写用 `randomUUID` 临时名 + rename，崩溃残留可重建；
 - 插件只清理 `$DSH_HOME/.memory-context-lab/` 自有数据，从不写正式灵枢根；T2 的令牌、镜像与冒烟节点都只落在本会话的 `t2-mdcg/`。
 
-## 安装
+## 安装与卸载
 
-1. 在 [Releases](https://github.com/DreamRift/dsh-memory-context-lab/releases) 页面下载 `dsh-memory-context-lab-0.15.2.tgz`。
-2. 装进 desktop profile：
+从 [Releases](https://github.com/DreamRift/dsh-memory-context-lab/releases) 下载与 manifest 同号的 tgz，再按 [INSTALL.md](./INSTALL.md) 安装、升级或回滚；安装后需重启 DSH。卸载不会自动删除 `$DSH_HOME/.memory-context-lab/v3/` 中的会话数据。
 
-```powershell
-dsh plugin --profile desktop add "<下载路径>\dsh-memory-context-lab-0.15.2.tgz"
-```
-
-3. 重启 DSH。
-
-安装包约 165 MB：其中携带了完整的 Windows x64 Bash 载荷（约 411 MB 解压后），所以第一次装会比普通插件慢，属正常。升级、回滚、磁盘占用与卸载见 [INSTALL.md](./INSTALL.md)。
-
-> **暂不提供 npm 分发**：本包携带 411 MB 的 Bash 载荷，打包后单文件约 165 MB，超出 npm registry 对单次发布请求的实际承受范围，多次尝试均以 PUT 失败告终。因此 0.15.2 只通过 GitHub Release 分发。
+安装包约 165 MB，内含完整 Windows x64 Bash 载荷；只通过 GitHub Release 分发，不入 git，也不走 npm。
 
 ## 致谢：dsh-ops
 
-本插件包内捆绑了一份**针对记忆上下文定制适配的 [dsh-ops](https://github.com/T-Auto/dsh-ops)**（上游作者 [T-Auto](https://github.com/T-Auto)，MIT 许可）。
-
-- **为什么捆绑**：记忆上下文的核心目标是省 token，而工具调用的输入输出本身就是上下文增长的大头。dsh-ops 的 `ops_*` 系列工具用更紧凑的返回、带行号的结构化输出和更明确的错误反馈来压低这部分开销，和归档/回注是同一个目标的两条路径——所以把它作为第二组件一起分发，而不是让用户再单独装一遍、再对一遍配置。
-- **做了哪些适配**：关掉上游的动态工具发现入口（`discovery.enabled: false`；代码里 `consumer/gates.ts` 与 `consumer/mount.ts` 对这条是**硬关**，不跟随设置开关），避免 ops 在会话中途通过发现机制新增工具、把工具清单搅动一遍；默认用 `ops_*` 替换官方 `read`/`glob`/`grep`（可在组件页关），`pwsh` 默认保留；文件核证白名单加进 `ops_inspect_local_file`，替换后仍进 `file-references` 账本。常驻工具面在版本加载时固定下来，`dynamicTools` 是「发现入口」开关（默认 `true`，本包 patch 里设为 `false`），与「会话中途增删工具」不是同一件事。所有定制版 ops 的功能（文件工具、PTC、面板、TUI、设置页）都保留。
-- **怎么用**：装好本插件就已经包含 ops 组件，不需要另外安装。侧边栏「插件」→ `dsh-memory-context-lab` →「包含的组件」里有 `dsh-ops` 一行，点进去是它自己的完整设置页；不想用就在那一行关掉，记忆上下文本身不受影响。
-- **边界**：ops 的源码、文档与发布归上游项目所有，本仓库只放构建产物 `vendor/dsh-ops`（不进 git，随 tgz 分发）。上游的 issue、PR、版本节奏请走 [T-Auto/dsh-ops](https://github.com/T-Auto/dsh-ops)。
-
-## 发布资产
-
-- 0.15.2 的 tgz 在 `dist/dsh-memory-context-lab-0.15.2.tgz`，作为 **GitHub Release asset** 上传。
-- 单文件约 165 MB，超过 GitHub 仓库单文件 100 MB 限制，`dist/` 不进 git。
-- 卸载：在插件管理器移除 `dsh-memory-context-lab`；会话数据在 `$DSH_HOME/.memory-context-lab/v3/`，按需删除。
+包内捆绑定制版 [dsh-ops](https://github.com/T-Auto/dsh-ops)（MIT），以紧凑的 `ops_*` 工具结果减少上下文开销。本包默认关闭动态发现、固定会话工具面，并保留 `pwsh`；官方 `read`/`glob`/`grep` 替换可在组件页关闭。源码和发布归上游项目，本仓只随 tgz 分发构建产物与许可。

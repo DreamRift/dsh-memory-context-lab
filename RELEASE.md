@@ -1,15 +1,15 @@
 # 发布资产与 GitHub 上传说明
 
-当前版本：**0.15.2**（2026-11-05）。本文件面向维护者，说明发布包放哪、为什么不在 git 里、以及 GitHub Release 该怎么传。
+当前版本：**0.15.3**（2026-11-06，DSH 0.2.2 命令通道兼容修复）。本文件面向维护者，说明发布包放哪、为什么不在 git 里、以及 GitHub Release 该怎么传。
 
 ## 当前资产
 
 | 项目 | 值 |
 |---|---|
-| 文件 | `dist/dsh-memory-context-lab-0.15.2.tgz` |
-| 大小 | 165,572,123 B（约 165.6 MB） |
+| 文件 | `dist/dsh-memory-context-lab-0.15.3.tgz` |
+| 大小 | 165,575,688 B（约 165.6 MB） |
 | 条目 | 10,248 |
-| sha256 | `BAC735A05BCFA60096481165A084837F2527B12170051E67FE9D904D0CA450BE` |
+| sha256 | `E459A334E98923B1FD266A015DFE2D7668026BEC043223B5B6EC3BEB7AC95E78` |
 | 分发 | GitHub Release asset（**不走 npm**，原因见下） |
 | 安装说明 | [INSTALL.md](./INSTALL.md) |
 | 变更记录 | [CHANGELOG.md](./CHANGELOG.md) |
@@ -19,7 +19,7 @@
 单文件约 165.5 MB，超过 GitHub 仓库单文件 **100 MB** 限制。直接 `git add` 会在推送时被拒绝，Git LFS 也会占用大额配额；因此：
 
 - `release/.gitignore` 忽略 `dist/`；
-- `dist/dsh-memory-context-lab-0.15.2.tgz` 只作为 **GitHub Release asset** 上传；
+- `dist/dsh-memory-context-lab-0.15.3.tgz` 只作为 **GitHub Release asset** 上传；
 - 仓库里保留源码、`cordis.patch.yml`、`README.md`、`CHANGELOG.md`、`INSTALL.md`、`LICENSE` 与测试。
 
 ## 为什么不在 npm 上
@@ -44,15 +44,15 @@ npm pack --pack-destination ../dist
 
 ## 上传到 GitHub Release
 
-1. 在 GitHub 仓库创建与 `package.json` 同号的 tag：`v0.15.2`。
-2. Release 说明写「相对上一个正式版本 v0.13.1」的变化，大项优先。
-3. 上传资产 `dist/dsh-memory-context-lab-0.15.2.tgz`。
+1. 在 GitHub 仓库创建与 `package.json` 同号的 tag：`v0.15.3`。
+2. Release 说明使用 `CHANGELOG.md` 的本版条目。
+3. 上传资产 `dist/dsh-memory-context-lab-0.15.3.tgz`。
 4. 上传后核对 GitHub 显示的 asset digest 与上面的 sha256 一致。
 
 如果使用 `gh`：
 
 ```powershell
-gh release create v0.15.2 "dist/dsh-memory-context-lab-0.15.2.tgz" --title "0.15.2" --notes-file release-notes.md
+gh release create v0.15.3 "dist/dsh-memory-context-lab-0.15.3.tgz" --title "0.15.3" --notes-file release-notes.md
 ```
 
 **不要**把 tgz 提交进仓库。
@@ -65,8 +65,8 @@ gh release create v0.15.2 "dist/dsh-memory-context-lab-0.15.2.tgz" --title "0.15
 $env:HTTPS_PROXY='http://127.0.0.1:7890'
 $tok = & gh auth token
 curl.exe -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/octet-stream' `
-  --data-binary '@C:\Windows\Temp\mcl-0.15.2.tgz' `
-  'https://uploads.github.com/repos/DreamRift/dsh-memory-context-lab/releases/<release-id>/assets?name=dsh-memory-context-lab-0.15.2.tgz'
+  --data-binary '@C:\Windows\Temp\mcl-0.15.3.tgz' `
+  'https://uploads.github.com/repos/DreamRift/dsh-memory-context-lab/releases/<release-id>/assets?name=dsh-memory-context-lab-0.15.3.tgz'
 ```
 
 - `curl --data-binary '@路径'` 的路径必须纯 ASCII：含中文或空格的路径会报 `error encountered when reading a file`。先把 tgz 复制到 `C:\Windows\Temp\`。

@@ -93,7 +93,7 @@ try {
     // 宿主源码逐条核验命中。
     ['dsh-agent-loop: pre-step payload.turn（position 展开进 waterfall）', () => /waterfall\(\s*["']agent\/pre-step["'][\s\S]{0,120}\.\.\.position/.test(source.loop)],
     ['dsh-agent-loop: pre-step payload.messages', () => /waterfall\(\s*["']agent\/pre-step["'][\s\S]{0,80}messages:\s*claimed/.test(source.loop)],
-    ['dsh-agent-loop: turn/start data.turn', () => /lastTurn:\s*event\.data\.turn/.test(source.loop)],
+    ['dsh-agent-loop: turn/start data.turn', () => /lastTurn:\s*event\.data\.turn/.test(source.loop) || /this\.session\.append\(["']turn\/start["'],\s*\{\s*turn\s*\}\)/.test(source.loop) && /const turn = this\.phase\.kind === ["']running["'] \? this\.phase\.turn : this\.phase\.lastTurn/.test(source.loop)],
     ['dsh-session: session.log（事件日志数组）', () => /this\.log\s*=/.test(source.session)],
     ['dsh-session: session.surface.nodes', () => /get surface\(\)\s*\{\s*return this\.surfaceManager/.test(source.session) && /get nodes\(\)/.test(source.session)],
   ]

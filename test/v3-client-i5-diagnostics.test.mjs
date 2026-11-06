@@ -186,7 +186,7 @@ test('⑨保持旧 slot/key/commands 与恒定工具集，不增动态 schema', 
   const x = await setup()
   assert.equal(x.module.CHIP_SLOT, 'conversation.input.left')
   assert.equal(x.module.PROJECTION_KEY, 'memoryContextLabStatus')
-  assert.deepEqual(x.module.inject, ['slots', 'locale', 'remote'])
+  assert.deepEqual(x.module.inject, ['slots', 'locale', 'remote', 'remote.commands'])
   assert.equal(x.slots.filter((s) => s.registration.name === 'conversation.input.left').length, 1)
 })
 

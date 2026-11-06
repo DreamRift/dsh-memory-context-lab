@@ -242,12 +242,11 @@ test('manifest / 常量：chip 槽位、remote 依赖与投影 key 成对', asyn
   assert.equal(module.CHIP_ID, 'memory-context-lab')
   assert.equal(module.CHIP_ORDER, 20)
   assert.equal(module.PROJECTION_KEY, STATUS_PROJECTION_KEY)
-  // P2-13：`remote.commands` 不能留在**硬** inject 里——宿主 runner 把硬 inject 当等待集合
-  // （waitingFor），缺一个服务整块 UI 就不 apply。判权仍需声明，所以走可选 ctx.inject。
-  assert.deepEqual(module.inject, ['slots', 'locale', 'remote'],
-    '硬 inject 只能是「缺了就完全没法工作」的服务（slots/locale/remote）')
-  assert.ok(module.OPTIONAL_INJECTS.some((names) => names.includes('remote.commands')),
-    'remote.commands 必须声明（可选接入）：动态门面按 inject 判权，未声明时读取会抛 cannot get property ... without inject')
+  // DSH 0.2.2：dynamicCordisContext 不转发 ctx.inject，子插件声明也不能给父插件判权。
+  assert.deepEqual(module.inject, ['slots', 'locale', 'remote', 'remote.commands'],
+    '命令通道必须正式声明，与官方 dsh-client-ui-commands 一致')
+  assert.equal(module.OPTIONAL_INJECTS.some((names) => names.includes('remote.commands')), false,
+    '命令通道不能靠新版动态门面无法转发的可选 ctx.inject 取得')
   assert.ok(module.inject.includes('remote'), 'remote 根服务与宿主命令插件同样声明')
 })
 
@@ -281,10 +280,10 @@ test('会话覆盖项 ⊆ 全局设置页字段：limit 同域（命令改的全
 test('apply：chip 走 slots.inject；configForms 仍是设置页的可选依赖', async () => {
   const entry = await loadClient()
   const run = runApply(entry)
-  assert.deepEqual(run.module.inject, ['slots', 'locale', 'remote'],
-    'P2-13：硬 inject 只留 slots/locale/remote')
-  assert.deepEqual(run.optionalInjects, [['remote.commands'], ['uiWorkspace'], ['configForms']],
-    '命令通道与工作区改为可选接入；configForms 仍是设置页的可选依赖')
+  assert.deepEqual(run.module.inject, ['slots', 'locale', 'remote', 'remote.commands'],
+    '命令通道是核心依赖；官方命令客户端同样这样声明')
+  assert.deepEqual(run.optionalInjects, [['uiWorkspace'], ['configForms']],
+    '工作区与 configForms 保留可选依赖')
   assert.deepEqual(run.slotInjects.map((row) => row.name), ['conversation.input.left', 'sidebar.panellist', 'main'])
   const sidebar = run.slots.find((row) => row.registration.name === 'sidebar.panellist')
   assert.equal(sidebar.registration.id, 'memory-context-lab')

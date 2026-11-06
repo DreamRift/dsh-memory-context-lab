@@ -1,5 +1,5 @@
-# 发布 tgz 是 GitHub Release asset 与 npm 包，不进 git：单文件约 165 MB，
-# 超过 GitHub 仓库单文件 100 MB 限制。本地 npm pack 输出放 dist/。
+# 发布 tgz 是 GitHub Release asset，不进 git：单文件约 165 MB，超过 GitHub
+# 仓库单文件 100 MB 限制。本地 npm pack 输出放 dist/，上传 Release 时再取。
 dist/
 node_modules/
 
