@@ -13,7 +13,7 @@
  *   （不死锁）；不同目录互不阻塞（W-01）。
  * 时间经注入（now 函数），测试用虚拟时钟确定性驱动。
  */
-import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
@@ -35,6 +35,11 @@ const MAX_ACQUIRE_ATTEMPTS = 1000
 /** owner.json 读取的瞬态错误（Windows 上 rename/rm 期间的 EPERM/EBUSY 常见）。 */
 const TRANSIENT_READ_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
 const OWNER_READ_RETRIES = 3
+// T-02（0.15.4）：心跳原子替换路径的**只对 EPERM** 的有界重试。
+// 3 次尝试 / 退避 2ms、8ms（上界 20ms）——必须远小于 `heartbeatIntervalOf(ttl)`，
+// 否则重试本身就会把一个心跳周期拖过去。
+const REPLACE_RETRY_ATTEMPTS = 3
+const REPLACE_RETRY_DELAYS_MS = [2, 8]
 /**
  * 续约间隔按**实际 TTL** 推导（R3-03）：TTL 的三分之一，且必须小于 TTL——
  * 旧实现固定按默认 60s 推导（Math.max(1000, 20000)），自定义小 TTL 的长事务
@@ -211,6 +216,72 @@ function isTransient(error) {
   return ['EPERM', 'EBUSY', 'ENOENT', 'EACCES', 'EEXIST', 'ENOTEMPTY'].includes(error?.code) || error?.code === undefined
 }
 
+/**
+ * T-02（0.15.4）：**原地覆写** owner.json，不产生 rename。
+ *
+ * owner.json 是固定形状的小对象，心跳只改 `heartbeatAt` 一个字段。原地覆写的好处：
+ * 不新建 inode、不替换目标 → **不会撞上「目标正被别的句柄打开」的 EPERM 窗口**，
+ * 而那个窗口正是旧实现在 Windows 上误失锁的根因。
+ *
+ * 代价（如实登记）：单次写入不再是原子的。写到一半断电/被杀会留下半截 JSON。这比
+ * 误失锁安全：`readOwner` 对损坏按失败关闭处理，绝不会把半截文件当成「别人的合法
+ * token」，持有者会在下次心跳/释放时如实看到错误，而不是被悄悄摘掉锁。
+ *
+ * @returns {Promise<{ok: boolean, reason?: string}>} 不可原地覆写时 ok=false（交给调用方回退）
+ */
+async function overwriteInPlace(filePath, payload) {
+  let handle
+  try {
+    handle = await open(filePath, 'r+')
+  } catch (error) {
+    // 文件不在（被接管/删除）或不允许写：本路径不适用，交回退路径判定。
+    return { ok: false, reason: error?.code ?? 'open-failed' }
+  }
+  try {
+    const bytes = Buffer.from(payload, 'utf8')
+    const { size } = await handle.stat()
+    // 只在「新内容不会超过旧长度」时原地写：超出就得靠回退路径（截断会留下残尾）。
+    if (bytes.length > size) return { ok: false, reason: 'would-grow' }
+    await handle.write(bytes, 0, bytes.length, 0)
+    // 旧内容比新内容长时，截掉尾部残字（正常不会发生：字段长度稳定）。
+    if (bytes.length < size) await handle.truncate(bytes.length)
+    await handle.sync()
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, reason: error?.code ?? 'write-failed' }
+  } finally {
+    await handle.close().catch(() => {})
+  }
+}
+
+/**
+ * T-02（0.15.4，B+A 的 B）：原子替换 + **只对 EPERM 的有界重试**。
+ *
+ * 用户拍板：只重试 EPERM（这才是「目标被占用」的瞬态信号），其它错误码不重试
+ * （EACCES/ENOSPC/ENOENT 是真实故障，重试只会拖延上报）；次数与总时长都有上界；
+ * **每次失败都记日志**，不静默吞。
+ *
+ * 注意：用户明确拒绝了原生 `ReplaceFile` 路径，这里只用「临时文件 + rename + 退避」。
+ */
+async function replaceWithRetry(filePath, payload) {
+  const { writeFileAtomic } = await import('./session-store.mjs')
+  const attempts = REPLACE_RETRY_ATTEMPTS
+  let lastReason = null
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await writeFileAtomic(filePath, payload)
+      return { ok: true, attempts: attempt }
+    } catch (error) {
+      lastReason = error?.code ?? 'replace-failed'
+      if (error?.code !== 'EPERM') return { ok: false, reason: lastReason } // 只吸收 EPERM
+      if (attempt === attempts) break
+      // 有界退避：2ms、8ms、20ms（上界 30ms，不拖长心跳）
+      await new Promise((resolve) => setTimeout(resolve, REPLACE_RETRY_DELAYS_MS[Math.min(attempt - 1, REPLACE_RETRY_DELAYS_MS.length - 1)]))
+    }
+  }
+  return { ok: false, reason: lastReason }
+}
+
 function buildHandle({ dir, lockDir, token, now, ttlMs }) {
   let lost = false
   return {
@@ -223,9 +294,32 @@ function buildHandle({ dir, lockDir, token, now, ttlMs }) {
         lost = true // 不覆盖新持有者的凭证（D-06）
         return 'lost'
       }
-      const { writeFileAtomic } = await import('./session-store.mjs')
-      await writeFileAtomic(path.join(lockDir, OWNER_FILE), JSON.stringify({ ...current, heartbeatAt: now() }) + '\n')
-      return 'ok'
+      // T-02（0.15.4，P1）**心跳与 rename 解耦**。
+      //
+      // 缺陷：旧实现走 `writeFileAtomic`（写 .tmp → fsync → rename 替换）。在 Windows 上
+      // rename 一个正被别的进程/句柄打开着的目标会拿到瞬态 EPERM/EBUSY。心跳每
+      // `heartbeatIntervalOf(ttl)` 打一次，只要碰上一次就**整段续约失败**；而失败在
+      // 单飞结构里会把 `lost` 置位/或让下一次判 stale → 活着的持有者被误判为失锁，
+      // 或直接 ELOCK_LOST 打挂正在进行的归档。
+      //
+      // 修法（用户拍板 B+A）：
+      //   A = 心跳**不再替换文件**。owner.json 是固定大小的小对象，凭证内容只在
+      //       `heartbeatAt` 一个字段上变化，所以**原地覆写**（open 'r+' + 定位 0 写入）
+      //       就够——不产生 rename、不产生第二个 inode、不触发目标被占用的 EPERM 窗口。
+      //       代价是单次写入不是原子的：若写到一半断电，owner.json 会半截。这**可接受**
+      //       且比误失锁更安全——半截 JSON 由 `readOwner` 按「损坏 → 失败关闭」处理
+      //       （不会伪造出一个别人的合法 token），持有者下次心跳或释放时会如实报错。
+      //   B = 只对 **EPERM** 做有界重试（其它错误码不重试）：EPERM 才是我要吸收的
+      //       瞬态；EACCES/ENOSPC/ENOENT 是真实故障，重试只会拖延上报。
+      //       次数与间隔都有上界，且**每次都记日志**，不静默吞。
+      const payload = JSON.stringify({ ...current, heartbeatAt: now() }) + '\n'
+      const written = await overwriteInPlace(path.join(lockDir, OWNER_FILE), payload)
+      if (written.ok) return 'ok'
+      // 原地覆写不可用（文件被独占打开、或读写长度受限）→ 退回原子替换 + EPERM 有界重试。
+      const replaced = await replaceWithRetry(path.join(lockDir, OWNER_FILE), payload)
+      if (replaced.ok) return 'ok'
+      // 两种路径都失败：如实上报，不假装续约成功（失败可见优于误判存活）。
+      return 'error'
     },
     async release() {
       if (lost) return 'lost'
@@ -308,6 +402,21 @@ export async function withCrossProcessWriteLock(dir, body, options = {}) {
     const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
     let lost = null
     let renewing = false
+    // T-02：最近一次心跳写失败的错误码（诊断用）。**不代表失锁**——失锁只看 token。
+    let lastHeartbeatError = null
+    // 心跳失败日志：默认走 stderr（worktree 无 logger 注入点时也能看见），限流防刷屏。
+    let heartbeatLogCount = 0
+    const logHeartbeatFailure = (kind, error) => {
+      lastHeartbeatError = error?.code ?? kind
+      heartbeatLogCount += 1
+      // 只记前 5 次 + 每 50 次一次，避免持续故障把日志刷爆（失败可见 ≠ 无限刷屏）。
+      if (heartbeatLogCount <= 5 || heartbeatLogCount % 50 === 0) {
+        try {
+          process.stderr.write('[memory-context-lab] v3 写锁心跳' + (kind === 'heartbeat-threw' ? '抛错' : '写失败')
+            + '（第 ' + heartbeatLogCount + ' 次）：' + (lastHeartbeatError ?? '未知') + '\n')
+        } catch { /* 日志失败绝不影响锁语义 */ }
+      }
+    }
     const renew = setInterval(() => {
       if (renewing || lost !== null) return // 单飞：上一次心跳未结算不重入；失锁即停
       renewing = true
@@ -318,12 +427,24 @@ export async function withCrossProcessWriteLock(dir, body, options = {}) {
           if (result === 'lost') {
             lost = { reason: 'lost' }
             clearInterval(renew)
+            return
+          }
+          // T-02（0.15.4）：心跳**写失败**与**失锁**是两件事，不能混为一谈。
+          // 旧实现只认 'lost'，心跳抛错会走下面的 catch → 直接判失锁并摘掉续约。
+          // 但「owner.json 这次没写进去」不等于「锁已经不属于我」：真正的判据是
+          // `heartbeat()` 内部读回的 token 是否仍是我（那才是 'lost'）。
+          // 所以这里**不摘锁、不置 lost**，只记日志（失败可见），下一次心跳继续尝试；
+          // 若锁真的被接管，下一次 heartbeat() 读回别人的 token 会如实返回 'lost'。
+          if (result === 'error') {
+            lastHeartbeatError = 'error'
+            logHeartbeatFailure('heartbeat-write-failed')
           }
         })
         .catch((error) => {
           renewing = false
-          lost = { reason: 'error', error }
-          clearInterval(renew)
+          // 抛错同理：不立刻判失锁，只记录（失败可见）。真正的失锁由 token 复核判定。
+          lastHeartbeatError = error?.code ?? 'heartbeat-threw'
+          logHeartbeatFailure('heartbeat-threw', error)
         })
     }, heartbeatIntervalOf(ttlMs))
     renew.unref?.()

@@ -15,6 +15,21 @@ import { redactText, redactValue } from '../security/redact.mjs'
 
 export const EXPORT_SCHEMA_VERSION = 1
 
+/**
+ * 摘要工件的自由文本字段（S-09，0.15.4）。
+ *
+ * 与 `domain/compress/summary-artifact.mjs` 的 `DRAFT_FIELDS` 同源：
+ * - 单值字段：`shortText` / `detail` / `goal`；
+ * - 列表字段：`changes` / `decisions` / `openItems` / `evidenceRefs`；
+ * - **不是**自由文本：`outcome`（枚举，`SUMMARY_OUTCOMES` 之一）、`sourceSpans`（数值区间）。
+ *
+ * 旧导出实现手写枚举了六项，漏了 `evidenceRefs`（明文出境）与 `outcome`。
+ * `outcome` 本身是枚举不泄密，但仍按「清单之外一律过脱敏」兜底——
+ * 这样将来把 `outcome` 改成自由文本时不会静默开口子。
+ */
+const SUMMARY_FREE_TEXT_FIELDS = Object.freeze(['shortText', 'detail', 'goal'])
+const SUMMARY_FREE_TEXT_LIST_FIELDS = Object.freeze(['changes', 'decisions', 'openItems', 'evidenceRefs'])
+
 export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records = [], forgotten = [], vouchers = [], redactedVoucherIds = [], summaries = [], state = null, sha256 = null } = {}) {
   if (typeof sessionKey !== 'string' || sessionKey.trim().length === 0) {
     throw new V3ContractViolation('v3 export: sessionKey 必填')
@@ -25,10 +40,25 @@ export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records
   const forgottenSet = new Set(forgotten.filter((id) => typeof id === 'string'))
   const redactedSet = new Set(redactedVoucherIds.filter((id) => typeof id === 'string'))
   const exportedRecords = []
+  // S-12（0.15.4）：分别精确计数，不再用「输入数 − 导出数」倒推。
+  //
+  // 旧实现只有 `omittedForgotten: records.length - exportedRecords.length` 一个数，
+  // 而这个差值把**两类完全不同的原因**混在一起：
+  // - 真的被 forgot 掉的记录（隐私面，应当如实计入 forgotten）；
+  // - 形状非法、根本不该导出的记录（数据损坏，不是「已遗忘」）。
+  // 实测 4 条输入里 2 条非法 → 报「2 条已遗忘」，把损坏伪装成了遗忘——
+  // 用户据此会以为「这些内容是我主动删的」，而实际是数据坏了、需要修。
+  let invalidRecords = 0
+  let forgottenOmitted = 0
   for (const record of records) {
-    if (record === null || typeof record !== 'object') continue
-    if (typeof record.id !== 'string') continue
-    if (forgottenSet.has(record.id)) continue // 已遗忘正文一律不导出
+    if (record === null || typeof record !== 'object' || typeof record.id !== 'string') {
+      invalidRecords += 1
+      continue
+    }
+    if (forgottenSet.has(record.id)) {
+      forgottenOmitted += 1
+      continue
+    }
     // AUD48-08-03：metaOnly / structure 是记录可读性与工具调用恢复的一部分，
     // 旧导出只留 text/bytes，导入后 metaOnly 变「空正文损坏」、工具参数丢失。
     // AUD50-07-01：文本再脱敏；bytes 按导出文本重算（记录合同 bytes==UTF-8 字节长，
@@ -83,16 +113,30 @@ export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records
     if (integrity.ok !== true) return { summaryId: artifact?.summaryId ?? null, hidden: true, reason: integrity.reason }
     const hidden = sources.some((source) => forgottenSet.has(source?.recordId))
     if (hidden) return { summaryId: artifact?.summaryId ?? null, hidden: true, reason: 'forgotten-source' }
-    return {
-      ...artifact,
-      shortText: redactText(artifact?.shortText ?? ''),
-      detail: redactText(artifact?.detail ?? ''),
-      goal: redactText(artifact?.goal ?? ''),
-      changes: Array.isArray(artifact?.changes) ? artifact.changes.map((item) => redactText(item)) : [],
-      decisions: Array.isArray(artifact?.decisions) ? artifact.decisions.map((item) => redactText(item)) : [],
-      openItems: Array.isArray(artifact?.openItems) ? artifact.openItems.map((item) => redactText(item)) : [],
-      hidden: false,
+    // S-09（0.15.4）：自由文本字段**按清单统一脱敏**，不再逐个手写。
+    //
+    // 缺陷：旧实现列了 shortText/detail/goal/changes/decisions/openItems 六项，
+    // 漏掉 `outcome` 与 `evidenceRefs` 两个同样自由的文本字段——它们直接明文出境。
+    // 手写枚举的失败模式就是「加字段的人不知道这里还有一处要改」，
+    // 所以改成「清单 + 派生」：新增自由文本字段时只改清单。
+    const copy = { ...artifact }
+    for (const key of SUMMARY_FREE_TEXT_FIELDS) {
+      copy[key] = redactText(typeof artifact?.[key] === 'string' ? artifact[key] : '')
     }
+    for (const key of SUMMARY_FREE_TEXT_LIST_FIELDS) {
+      copy[key] = Array.isArray(artifact?.[key]) ? artifact[key].map((item) => redactText(String(item))) : []
+    }
+    // 其余未被清单覆盖的字符串字段（未来新增的）也要保全：**失败关闭**——
+    // 宁可多脱敏，也不让一个没登记的自由文本字段悄悄明文出境。
+    for (const [key, value] of Object.entries(artifact)) {
+      if (SUMMARY_FREE_TEXT_FIELDS.includes(key)) continue
+      if (SUMMARY_FREE_TEXT_LIST_FIELDS.includes(key)) continue
+      if (typeof value === 'string') copy[key] = redactText(value)
+      else if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {
+        copy[key] = value.map((item) => redactText(item))
+      }
+    }
+    return { ...copy, hidden: false }
   })
   return {
     schemaVersion: EXPORT_SCHEMA_VERSION,
@@ -105,7 +149,9 @@ export function buildExportBundle({ sessionKey, exportedAt = Date.now(), records
       forgotten: forgottenSet.size,
       vouchers: vouchers.length,
       redactedVouchers: exportedVouchers.filter((voucher) => voucher.redacted === true).length,
-      omittedForgotten: records.length - exportedRecords.length,
+      // S-12：`omittedForgotten` 只算真的被 forgot 掉的；损坏/形状非法的单独计数。
+      omittedForgotten: forgottenOmitted,
+      invalidRecords,
       summaries: exportedSummaries.length,
       hiddenSummaries: exportedSummaries.filter((summary) => summary.hidden === true).length,
     },

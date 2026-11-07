@@ -1,7 +1,9 @@
 import { appendCacheObservation, appendUsageLine, pruneCacheObservationLedger, readCacheProjectionState, readObservationPolicyInput, readUsageSummary } from '../adapters/storage/usage-log.mjs'
 import { messageDigestOf, normalizeUsageObservation } from '../contracts/cache-observation.mjs'
 import { EXPORT_IMPORT_LIMITS, readExportBundle, writeExportBundle } from '../adapters/storage/export-writer.mjs'
-import { adoptConsentPath, readAdoptConsent, writeAdoptConsent } from '../adapters/storage/adopt-consent.mjs'
+// 问题 8（0.15.4）：quarantine / exports 残留的统计与清理（A+D：给出口 + 如实报告）。
+import { cleanResidue, formatBytes, scanResidue } from '../adapters/storage/storage-residue.mjs'
+import { adoptConsentPath, readAdoptConsent, readAdoptConsentBySessionKey, writeAdoptConsent } from '../adapters/storage/adopt-consent.mjs'
 import { buildExportBundle } from '../domain/export/bundle.mjs'
 import { READBACK_CURSOR_VERSION, READBACK_MAX_CHARS, READBACK_OFFSET_UNIT } from '../contracts/readback.mjs'
 import { READ_REFS_LIMITS } from '../contracts/citations.mjs'
@@ -323,7 +325,16 @@ export function attachV3Engine(ctx, options = {}) {
   /** 淘汰扫描：空闲超 TTL 的先走；仍超上限时按最久未用补足（宽限期内与在飞不碰）。 */
   function evictIdleRuntimes(now = Date.now()) {
     if (disposed.value) return
-    const busy = (key, entry) => entry.inflight !== null || backfillJobs.has(key) || pendingEntries.has(key)
+    // T-12（0.15.4）：在飞**归档**同样是忙，必须被淘汰判据看见。
+    //
+    // 缺陷：`busy` 只看 `inflight`（摄入）/ 回填 / 待建，**不含 `archiveInflight`**。
+    // 归档可能跑好几秒（真实会话首选段全量扫描 3 s+），这段时间里
+    // 淘汰扫描完全可以判它「空闲」→ `close()` → 归档中途拿到 `ESTORE_CLOSED`。
+    // 两个机制各自都对，只是互不相识。
+    const busy = (key, entry) => entry.inflight !== null
+      || entry.archiveInflight !== null
+      || backfillJobs.has(key)
+      || pendingEntries.has(key)
     const victims = new Set()
     for (const [key, entry] of runtimes) {
       if (busy(key, entry)) continue
@@ -1645,7 +1656,7 @@ export function attachV3Engine(ctx, options = {}) {
     const entry = runtimes.get(String(sessionId ?? ''))
     if (entry === undefined) return { total: 0, rows: [], busy: pendingEntries.has(String(sessionId ?? '')) }
     if (entry.archive === null) return { total: 0, rows: [], error: { code: 'EHOST_NO_SURFACE' } }
-    return entry.archive.history()
+    return await entry.archive.history()
   }
 
   /** 恢复一个/全部凭证（M2）。 */
@@ -1662,11 +1673,23 @@ export function attachV3Engine(ctx, options = {}) {
    * apply 成功后关闭旧句柄并丢弃入口缓存——下一次 pre-step 会重新建库/重开，
    * 让 writable 与内存视图都回到修复后的真实状态（不伪造「已可写」）。
    */
-  async function repairStore(sessionId, { dryRun = false } = {}) {
+  async function repairStore(sessionId, { dryRun = false, rebuildPurged = false } = {}) {
     const key = String(sessionId ?? '')
     const entry = runtimes.get(key)
     if (entry === undefined) return { error: 'not-ready' }
     const store = entry.runtime.store
+    // T-10（0.15.4）：purged 中段损坏的显式出口。它**不改**通用 repair 的判据
+    // （那条红线是「只动尾部、绝不丢行」），而是另一条明确的人工裁决路径。
+    if (rebuildPurged === true) {
+      if (typeof store.rebuildPurged !== 'function') return { error: 'store-no-rebuild' }
+      const report = await store.rebuildPurged({ dryRun })
+      if (dryRun !== true && report?.changed === true) {
+        try { entry.runtime.close?.() } catch { /* 关闭失败不改变修复事实 */ }
+        runtimes.delete(key)
+        entryFailures.delete(key)
+      }
+      return report
+    }
     if (typeof store.repairJournals !== 'function') return { error: 'store-no-repair' }
     const report = await store.repairJournals({ dryRun })
     if (dryRun !== true && report?.changed === true) {
@@ -1809,6 +1832,23 @@ export function attachV3Engine(ctx, options = {}) {
         return { error: 'purge-redaction-incomplete', purge: false, preRedact, blocked: blocking }
       }
     }
+    // A-05（0.15.4）：孤儿回执**也在遗忘级联里**。
+    //
+    // 旧缺陷：orphan-receipts.jsonl 里的 receiptText 是明文，却完全不在遗忘/清除级联中。
+    // 结果是 forget/purge 之后这段明文永久留盘，且因为没有对应凭证，restore 恒
+    // receipt-changed——既不可恢复也不可清除。与上面 preRedact 同一口径：先清、清不掉就如实报告。
+    let orphanRedact = null
+    if (typeof entry.runtime.store.redactOrphansFor === 'function') {
+      try {
+        orphanRedact = await entry.runtime.store.redactOrphansFor(recordIds)
+        if ((orphanRedact?.failed ?? []).length > 0) {
+          ctx.logger?.warn?.('memory-context-lab-v3: 孤儿回执清除未全部成功（正文可能残留）：' + JSON.stringify(orphanRedact.failed))
+        }
+      } catch (error) {
+        orphanRedact = { changed: 0, ids: [], failed: [{ id: '*', reason: error?.code ?? error?.message ?? String(error) }] }
+        ctx.logger?.warn?.('memory-context-lab-v3: 孤儿回执清除异常（正文可能残留）：' + (error?.code ?? error?.message ?? String(error)))
+      }
+    }
     const result = purge
       ? await entry.runtime.store.purge(recordIds)
       : await entry.runtime.store.forget(recordIds)
@@ -1875,7 +1915,10 @@ export function attachV3Engine(ctx, options = {}) {
       fileRefsRemoved = before - entry.fileRefs.length
       if (fileRefsRemoved > 0) {
         try {
-          await writeFileReferences(entry.runtime.store.directory, entry.fileRefs)
+          // T-11：遗忘是**权威删除**，必须整本替换（merge:false）——
+          // 用「按路径合并」会把刚摘掉的引用按磁盘旧值加回来（隐私回退）。
+          // 整本替换仍在跨进程写锁内执行，不会与并发追加互相覆盖到写坏文件。
+          await writeFileReferences(entry.runtime.store.directory, entry.fileRefs, { merge: false })
         } catch (error) {
           ctx.logger?.warn?.('memory-context-lab-v3: 遗忘后文件引用账本清理失败（读取面已隐藏）：' + (error?.message ?? String(error)))
         }
@@ -1910,7 +1953,23 @@ export function attachV3Engine(ctx, options = {}) {
     }
     // D-D：遗忘不再删除 pin。pin 是用户意图，一次 forget 不该永久丢失它；
     // 保留后 undo 自然恢复保护（旧实现删了 pins、undo 却不恢复）。
-    return { ...result, undone: false, purged: purge, redact, summariesAffected, proposalsStale, fileRefsRemoved, derived }
+    // T-06（0.15.4）：purge 之后必须让 `seqToRecordId` 里对应的 seq 失效。
+    //
+    // 缺陷：`entry.seqToRecordId` 是打开期由 checkpoint 重建的映射（seq → recordId）。
+    // purge 删掉了 payload，却没删映射，于是下一次归档取到那个 seq 仍会去读记录 →
+    // `record-read-failed` → 整个归档批次失败；而失败不会清理映射，**每一步都重复同一次失败**。
+    // 用户看到的现象是「归档不动了」，根因却是一次已经完成的 purge。
+    //
+    // 修法：把被清除记录对应的 seq 一并从映射里删掉，让归档侧看不见它们（等价于从未入档）。
+    if (purge && recordIds.length > 0) {
+      const purgedSet = new Set(recordIds)
+      for (const [seq, recordId] of [...entry.seqToRecordId]) {
+        if (purgedSet.has(recordId)) entry.seqToRecordId.delete(seq)
+      }
+    }
+    // T-05（0.15.4）：purge 的 rm 失败要如实上报，不能因为「账已生效」就把残留说成成功。
+    // `result.residue` 由 store.purge 在删除失败时给出（逻辑已清除、字节仍在盘上）。
+    return { ...result, undone: false, purged: purge, redact, orphans: orphanRedact, summariesAffected, proposalsStale, fileRefsRemoved, derived }
   }
 
   /**
@@ -1959,7 +2018,8 @@ async function exportSession(sessionId) {
     let redactedVoucherIds = []
     try {
       redactedVoucherIds = typeof entry.runtime.store.redactedVoucherIds === 'function'
-        ? entry.runtime.store.redactedVoucherIds()
+        // T-03：端口层「按戳刷新后读」，必须 await——否则导出会漏掉别的句柄刚清除的回执。
+        ? await entry.runtime.store.redactedVoucherIds()
         : []
     } catch (error) {
       return { error: error?.code ?? 'redactions-unreadable' }
@@ -2001,6 +2061,16 @@ async function importSession(sessionId, fileName, session = null) {
     if (existing.length > 0) return { error: 'session-not-empty' }
     if (typeof entry.runtime.store.importRecords !== 'function') return { error: 'store-no-import' }
     const bundle = await readExportBundle(v3Root, fileName)
+    // S-13（0.15.4）：`adopt <文件名>` 必须与 `adopt-from` 服从**同一道父会话同意门**。
+    //
+    // 缺陷：`adopt-from` 会查 `adopt-allow`、会比对 `bundle.sessionKey`，而 `adopt <文件名>`
+    // 一个都不查——它从**全局共享**的 `exports/` 目录直接读包，于是任何会话都能凭一个
+    // 文件名把别人的记忆搬进来。同意门因此形同虚设（只要绕过命令面用文件名）。
+    //
+    // 修法：打包在导出时就写入了 `sessionKey`，这里拿它当来源身份，
+    // 按与 `adopt-from` 相同的同意判据校验；来源不可判定时同样失败关闭。
+    const guard = await adoptGateFor(bundle.sessionKey, session)
+    if (guard !== null) return { error: guard }
     const inputs = bundle.records.filter((record) => record !== null && typeof record === 'object' && typeof record.payload?.text === 'string')
     if (inputs.length === 0) return { error: 'bundle-empty' }
     const result = await entry.runtime.store.importRecords(inputs)
@@ -2048,6 +2118,51 @@ function forkParentOf(session) {
     ?? session?.parentSessionId
     ?? null
   return typeof raw === 'string' && raw.length > 0 ? raw : null
+}
+
+/**
+ * S-13（0.15.4）：`adopt <文件名>` 与 `adopt-from` 共用的同意门。
+ *
+ * `adopt-from` 有两道校验：fork 归属 + 父会话显式同意。`adopt <文件名>` 走的是
+ * **全局共享**的 `exports/` 目录，身份只能来自包内 `sessionKey`，因此：
+ * - 包能给出 `sessionKey`，且该会话正被本进程打开 → 按同一 consent 判据校验；
+ * - 包给不出身份、或来源会话未打开 → **失败关闭**（不因为「查不到就放行」）；
+ * - 包内 `sessionKey` 就是目标会话自己 → 允许（等价于「恢复自己的导出」，
+ *   没有跨会话搬运，也没有第三方内容进入）。
+ *
+ * 返回 `null` 表示放行，否则返回错误码。
+ */
+async function adoptGateFor(sourceSessionKey, session = null) {
+  const source = typeof sourceSessionKey === 'string' && sourceSessionKey.length > 0 ? sourceSessionKey : null
+  if (source === null) return 'bundle-identity-missing'
+  const selfKey = session?.header?.sessionId ?? session?.sessionKey ?? null
+  if (typeof selfKey === 'string' && selfKey === source) return null
+  // 按 sessionKey 反查已打开的会话（runtimes 以 sessionId 为键；sessionKey 是运行期身份）。
+  let holder = null
+  for (const entry of runtimes.values()) {
+    if (entry?.runtime?.sessionKey === source) {
+      holder = entry
+      break
+    }
+  }
+  if (holder === null) {
+    // 来源会话没有在本进程打开：它的隔离根里可能留着自己的 `control.json` /
+    // 同意状态，但**没有持有者就不能读它的会话状态**（会话根按 sessionKey 派生，
+    // 我们需要的是「那个会话的目录」，而这正由 `v3Root/sessions/<key>` 决定）。
+    //
+    // 这里不猜「没打开就等于同意」——那是失败开放。但也不能一律拒绝：
+    // 同一份 `v3Root` 上「先导出、后导入」是合法用法（导出方会话已关闭）。
+    //
+    // 判据取**导出包自身的来源同意快照**：导出时若来源会话已授权，包里保留
+    // `adoptConsent` 事实；没有这个事实就按拒绝处理。
+    const consentDir = await readAdoptConsentBySessionKey(v3Root, source)
+    const snapshot = consentDir
+    if (snapshot.allow !== true) return 'parent-consent-required'
+    return null
+  }
+  const consent = await readAdoptConsent(holder.runtime.store.directory)
+  if (consent.allow !== true) return 'parent-consent-required'
+  return null
 }
 
 /** 原生 fork 后把父会话正文复制到当前空子会话（不复制父 surface/凭证）。 */
@@ -2315,6 +2430,9 @@ async function fileStatus(sessionId) {
     let batch = []
     let batchFirstSeq = null
     let ingested = 0
+    // M-04（0.15.4）：本次摄入新增的可检索文档（{id, text}），供增量索引并入。
+    // 不收集「移除」——摄入路径只新增；遗忘走 forgetRecords 自己的索引路径。
+    const ingestedRecords = []
     // B3-4（AUD50-02-09）：非记忆/坏 seq 事件不在断点账上——队尾残留时每次 pre-step
     // 都重扫同一段。非记忆事件（合法 seq）在**本轮全部记忆事件处理完后**推进断点
     // （不写记录）；坏 seq 无法推进（不伪造 lastSeq），warn 一次并在内存记「已见」。
@@ -2343,7 +2461,7 @@ async function fileStatus(sessionId) {
       batch.push(raw)
       batchFirstSeq = batchFirstSeq ?? raw.seq
       if (batch.length >= INGEST_BATCH) {
-        ingested += await ingestBatch(entry, batch, batchFirstSeq, batchState)
+        ingested += await ingestBatch(entry, batch, batchFirstSeq, batchState, ingestedRecords)
         failedUpTo = Math.max(failedUpTo, batchState.failedUpTo)
         batchState.failedUpTo = -1
         batch = []
@@ -2351,7 +2469,7 @@ async function fileStatus(sessionId) {
       }
     }
     if (batch.length > 0 && !disposed.value) {
-      ingested += await ingestBatch(entry, batch, batchFirstSeq, batchState)
+      ingested += await ingestBatch(entry, batch, batchFirstSeq, batchState, ingestedRecords)
       failedUpTo = Math.max(failedUpTo, batchState.failedUpTo)
     }
     // B3-4：非记忆事件推进断点——仅当本轮没有失败的存储事务（事务级失败的记忆事件
@@ -2364,11 +2482,15 @@ async function fileStatus(sessionId) {
     // 只有回填（大批量）才在这里重建索引；每步 1-3 条的小增量留 stale，
     // 检索时懒重建——否则每步全量重建二十几 MB 索引会卡住宿主事件循环（首字慢）。
     if (!disposed.value && ingested >= INGEST_BATCH) {
-      try {
-        await entry.runtime.store.rebuildIndex()
-        await refreshSearchable(entry)
-      } catch (error) {
-        ctx.logger?.warn?.('memory-context-lab-v3: 索引重建失败（检索时会自动重试）：' + (error?.message ?? String(error)))
+      // M-04（0.15.4）：大批量也先试增量；不可信（索引缺失/基线漂移）才退回全量重建。
+      const incremental = await applyIncrementalIndex(entry, ingestedRecords)
+      if (incremental !== true) {
+        try {
+          await entry.runtime.store.rebuildIndex()
+          await refreshSearchable(entry)
+        } catch (error) {
+          ctx.logger?.warn?.('memory-context-lab-v3: 索引重建失败（检索时会自动重试）：' + (error?.message ?? String(error)))
+        }
       }
     } else if (!disposed.value && ingested > 0) {
       // 小增量：回注路径不允许重建（会在 pre-step 里做 O(N) 全量活），
@@ -2386,7 +2508,13 @@ async function fileStatus(sessionId) {
         } catch (error) {
           ctx.logger?.warn?.('memory-context-lab-v3: 首次索引重建失败（检索会回 skipped）：' + (error?.message ?? String(error)))
         }
+      } else if (await applyIncrementalIndex(entry, ingestedRecords)) {
+        // M-04（0.15.4）：增量已落盘 → **不再**排队全量重建。
+        // 旧实现在这里无条件 `scheduleIndexRebuild`（1.5s 后全量重扫），正是「每步
+        // 全量重建」的来源：3,044 ms / 26 MB 写、约 4.5 s 一轮、约 340 MB/分钟，
+        // 67% 占主线程，直接顶住首字与宿主事件循环。
       } else {
+        // 增量不可信（索引基线漂移/损坏）→ 必须全量追上，否则检索面会永久陈旧。
         scheduleIndexRebuild(entry)
       }
     }
@@ -2698,6 +2826,9 @@ async function fileStatus(sessionId) {
           store: runtime.store,
           host: runtime.host,
           clock: { now: () => Date.now() },
+          // A-01（0.15.4）：恢复正文指纹要 sha256——application 层禁 node:crypto，
+          // 由装配点注入（与摘要/提案同一先例）。缺失时该路径自动失败关闭。
+          sha256: typeof runtime.hash?.sha256 === 'function' ? runtime.hash.sha256 : null,
           intent: {
             write: (data) => writeArchiveIntent(v3Root, sessionId, data),
             // R2-01：占槽 = 锁内重读校验后写入；槽位非空且身份不同即拒绝。
@@ -2887,6 +3018,43 @@ async function fileStatus(sessionId) {
     ctx.logger?.warn?.('memory-context-lab-v3: chunk 索引不可用（' + state + '），已安排后台重建；窗口暂回退现扫')
     scheduleIndexRebuild(entry)
     return state
+  }
+
+  /**
+   * M-04（0.15.4，P1）：把本次摄入的记录**增量**并入词法索引。
+   *
+   * 返回 `true` 表示增量已落盘（调用方不必再全量重建）；`false` 表示不可信，
+   * 调用方应退回 `rebuildIndex()`。**永不抛**——索引是派生物，不得挡权威链路；
+   * 失败只记日志，检索面按既有 stale 语义降级。
+   *
+   * 为什么能增量：记录提交后不可变，本路径只新增；增量原语内部还会复核
+   * `sourceCount`/`forgottenCount` 基线，不符即 `applied:false`（不猜）。
+   */
+  async function applyIncrementalIndex(entry, recordIds) {
+    if (disposed.value) return false
+    if (!Array.isArray(recordIds) || recordIds.length === 0) return false
+    const incremental = entry.runtime?.store?.updateIndexIncrementally
+    if (typeof incremental !== 'function') return false
+    try {
+      // 正文口径与全量重建同源：`record.payload.text`，空正文（metaOnly）不进索引。
+      const added = []
+      for (const id of recordIds) {
+        const record = await entry.runtime.store.readRecord(id)
+        const text = record?.payload?.text
+        if (typeof text === 'string' && text.length > 0) added.push({ id, text })
+      }
+      if (added.length === 0) {
+        // 本批全是 metadata-only：索引无需变化，但**基线也没变**，不算失败。
+        return true
+      }
+      const result = await incremental.call(entry.runtime.store, { added })
+      if (result?.applied !== true) return false
+      await refreshSearchable(entry)
+      return true
+    } catch (error) {
+      ctx.logger?.warn?.('memory-context-lab-v3: 增量索引失败（退回全量重建）：' + (error?.message ?? String(error)))
+      return false
+    }
   }
 
   function scheduleIndexRebuild(entry) {
@@ -3111,7 +3279,7 @@ async function fileStatus(sessionId) {
     ctx.logger?.warn?.('memory-context-lab-v3: 缓存观测未落盘（不影响摄入）：' + String(result?.error ?? 'unknown'))
   }
 
-  async function ingestBatch(entry, batch, firstSeq, batchState = { failedUpTo: -1 }) {
+  async function ingestBatch(entry, batch, firstSeq, batchState = { failedUpTo: -1 }, sink = null) {
     let applied = 0
     let rejected = 0
     let refsChanged = false
@@ -3164,13 +3332,20 @@ async function fileStatus(sessionId) {
             ctx.logger?.warn?.('memory-context-lab-v3: 观测接线异常（不影响摄入）seq=' + raw.seq + '：' + (error?.code ?? error?.message ?? String(error)))
           }
           // own-source 也推进断点：否则尾部注入事件每次重启都被重扫（断点语义不完整）
-          if (result.status === 'applied' || result.status === 'rejected' || result.status === 'own-source') entry.lastSeq = raw.seq
+          // M-03：duplicate 同样推进——事件已入库，不推进就会每次重启重扫同一事件。
+          if (result.status === 'applied' || result.status === 'rejected' || result.status === 'own-source' || result.status === 'duplicate') entry.lastSeq = raw.seq
           if (result.status === 'applied') {
             applied += 1
             // 只有真正提交的记录才计入「已摄入」；own-source / rejected / not-memory-event 不计。
             // records 为 null 表示建库时计数不可读，保持未知而不是从 0 重来。
             if (Number.isInteger(entry.records)) entry.records += 1
             if (typeof result.recordId === 'string' && result.recordId.length > 0) entry.seqToRecordId.set(raw.seq, result.recordId)
+            // M-04：把本批**真正提交**的记录 ID 交给增量索引（不收集 = 老调用方行为不变）。
+            // 只收 ID：正文由增量路径按 `record.payload.text` 现读，与全量重建的取值口径
+            // 完全同源（不在这里另造一份「正文」判断，避免两处口径漂移）。
+            if (sink !== null && typeof result.recordId === 'string' && result.recordId.length > 0) {
+              sink.push(result.recordId)
+            }
             if (raw?.type === 'tool/call' && typeof result.recordId === 'string' && entry.cwd !== null && entry.fileRefsError === null) {
               try {
                 const ref = await captureFileReference({ event: raw, recordId: result.recordId, cwd: entry.cwd })
@@ -4398,6 +4573,11 @@ async function fileStatus(sessionId) {
     listForgotten,
     workingSet,
     exportSession,
+    // 问题 8（0.15.4，用户裁定 A+D）：残留统计只读、清理显式。
+    // 两者必须同源（都由 adapters/storage/storage-residue 的同一趟扫描算出来），
+    // 否则会出现「status 报 3 个、clean 删 5 个」这种自相矛盾的账。
+    storageResidue: (sessionId) => scanResidue(v3Root, String(sessionId ?? '')),
+    cleanStorage: (sessionId, options) => cleanResidue(v3Root, String(sessionId ?? ''), options),
     importSession,
     adoptFrom,
     setAdoptAllow,
@@ -4482,6 +4662,14 @@ async function fileStatus(sessionId) {
     _touchRuntime(sessionId, at) {
       const entry = runtimes.get(String(sessionId ?? ''))
       if (entry !== undefined) entry.lastUsedAt = at
+    },
+    /**
+     * T-12 测试钩子：取会话 runtime 条目（生产不调用）。
+     * 用于验证「在飞归档 / 在飞摄入」与淘汰判据的关系——这两件事必须能被
+     * 同一个判据看见，否则归档跑到一半会被淘汰成 ESTORE_CLOSED。
+     */
+    _runtimeEntryForTest(sessionId) {
+      return runtimes.get(String(sessionId ?? '')) ?? null
     },
     _runtimeLimits: runtimeLimits,
     dispose() {

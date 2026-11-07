@@ -291,7 +291,7 @@ test('崩溃补账：commitPrepared 的 summaryRef/proposalId 随 intent 保留�
     assert.equal(voucher.summaryId, summaryRef.summaryId)
     assert.equal(voucher.proposalId, proposalId, '提案身份必须随凭证落账，入口才能标 committed')
     assert.equal(voucher.txn, 3)
-    assert.equal(archive.history().rows[0].summaryId, summaryRef.summaryId, 'history 必须读得到摘要引用')
+    assert.equal((await archive.history()).rows[0].summaryId, summaryRef.summaryId, 'history 必须读得到摘要引用')
     assert.equal(await readArchiveIntent(root, 's-ref'), null)
   } finally {
     runtime.close()

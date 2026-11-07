@@ -2,9 +2,9 @@
 
 按 **DSH 会话** 启用的上下文管理插件（**v3 单引擎**）：把会话事件摄入本会话的隔离影子库，每一步按当前用户输入检索历史、把命中要点回注到本步上下文；composer chip 弹层只放**本对话控制**，底层参数在插件设置页。
 
-> **当前源码版本 0.15.3（发布镜像）**；唯一命令 `/memory-lab`，变更见[变更记录](./CHANGELOG.md)。
+> **当前源码版本 0.15.4（发布镜像）**；唯一命令 `/memory-lab`，变更见[变更记录](./CHANGELOG.md)。
 >
-> **0.15.3 修复 DSH 0.2.2 升级后的命令通道兼容问题**；它建立在 0.15.2 的 v3 单引擎、历史检索回注、按步/按轮归档、回执摘要与随包 dsh-ops 组件之上。详见[Release 说明](https://github.com/DreamRift/dsh-memory-context-lab/releases/latest)与 [CHANGELOG](./CHANGELOG.md)。
+> **0.15.4 修复全面排查确证的 63 项缺陷（含 8 个 P1）**；它建立在 0.15.2 的 v3 单引擎、历史检索回注、按步/按轮归档、回执摘要与随包 dsh-ops 组件之上。详见[Release 说明](https://github.com/DreamRift/dsh-memory-context-lab/releases/latest)与 [CHANGELOG](./CHANGELOG.md)。
 
 ## 它做什么、不做什么
 

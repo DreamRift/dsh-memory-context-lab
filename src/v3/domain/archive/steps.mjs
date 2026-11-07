@@ -276,18 +276,25 @@ function traceBatch({ eligible, budget, hardCap, toolIndex, pinnedSeqs, hasRecor
         continue
       }
     }
-    if (turn === null) turn = unit.turn
-    else if (unit.turn !== turn) {
-      stop = { reason: 'turn-boundary', seq: unit.startSeq }
-      if (firstBoundary === null) firstBoundary = 'turn-boundary'
-      break
-    }
     if (unit.hasHuman) {
       // 真实 DSH 的 user/message 在 step 1 内：前导锚点只跳过，不阻断后续步骤；
       // 一旦窗口里已经有候选，锚点就是不可跨越的硬边界。
       if (windowUnits.length === 0 && runs.length === 0 && current === null) { index += 1; continue }
       stop = { reason: 'turn-anchor', seq: unit.startSeq }
       if (firstBoundary === null) firstBoundary = 'turn-anchor'
+      break
+    }
+    // 2026-11-06 事故修复（归档在 seq 877 后永久停摆）：`turn` 的赋值**必须在
+    // 「跳过前导锚点」之后**。旧顺序先 `turn = unit.turn` 再判断 `hasHuman` 跳过，
+    // 被跳过的前导锚点于是把自己的 turn 锁成当前值；下一批候选属于下一个 turn，
+    // 立刻撞上 `unit.turn !== turn` → `turn-boundary` 中断 → 窗口为空 → 返回 null。
+    // 触发条件：早期 turn 被归档到只剩 1–2 个"漏网"的前导锚点（真机实测 turn 1
+    // 只剩 start=22 与 start=687 两个 hasHuman 单元），此后该会话**永远选不到候选**。
+    // 判据方向：`turn` 应由**第一个真正进入窗口的候选**决定，而不是被跳过的锚点。
+    if (turn === null) turn = unit.turn
+    else if (unit.turn !== turn) {
+      stop = { reason: 'turn-boundary', seq: unit.startSeq }
+      if (firstBoundary === null) firstBoundary = 'turn-boundary'
       break
     }
     // 队头判据用**活动面**首节点：step/start 不是面节点，段起点会跳过它。

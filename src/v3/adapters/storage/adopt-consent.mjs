@@ -24,6 +24,20 @@ export function adoptConsentPath(directory) {
   return path.join(directory, FILE)
 }
 
+/**
+ * S-13（0.15.4）：按 `sessionKey` 直接读「那个会话」的同意状态。
+ *
+ * 入口层（entry）不允许出现外部依赖（架构守卫：外部依赖只在 adapters 及以下），
+ * 所以会话根 → 会话目录的拼接放在这里。会话根形状与 `session-store` 一致：
+ * `<v3Root>/sessions/<sessionKey>`。
+ */
+export async function readAdoptConsentBySessionKey(v3Root, sessionKey) {
+  if (typeof v3Root !== 'string' || typeof sessionKey !== 'string' || sessionKey.length === 0) {
+    return { allow: false, exists: false, error: 'no-directory' }
+  }
+  return await readAdoptConsent(path.join(v3Root, 'sessions', sessionKey))
+}
+
 /** @returns {Promise<{allow:boolean, exists:boolean, error?:string, updatedAt?:number|null}>} */
 export async function readAdoptConsent(directory) {
   if (typeof directory !== 'string' || directory.length === 0) return { allow: false, exists: false, error: 'no-directory' }

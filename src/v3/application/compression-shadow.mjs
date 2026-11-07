@@ -36,6 +36,20 @@ function cloneJsonBounded(value, budget, depth = 0, ancestors = new WeakSet()) {
 
 export function shadowReport({ enabled = false } = {}) {
   if (!enabled) return null
+  // A-09（0.15.4）：这里以前**没有 return**——`shadowReport({enabled:true})`
+  // 恒返回 undefined，诊断面就打印 `shadowReport=undefined`，看着像「功能没接线」。
+  // 报告本身是只读描述：说清楚这一层**没有参与压缩决策**、证据从哪来。
+  return report('ok', null, 'shadow-only', {
+    shadowOnly: true,
+    participatesInDecision: false,
+    notes: [
+      '压缩影子只做观测：不改变注入内容、不改写会话、不产生派生物。',
+      '决策面（是否归档、净收益、保护闭包）见 archive/steps 与 application/archive。',
+    ],
+    limits: { ...SHADOW_LIMITS },
+    safety: Object.fromEntries(SAFETY_KEYS.map((key) => [key, null])),
+    safetyEvidence: Object.fromEntries(SAFETY_KEYS.map((key) => [key, { source: 'not-evaluated', anchor: null }])),
+  })
 }
 
 function report(status, decision, reason, detail = {}) {

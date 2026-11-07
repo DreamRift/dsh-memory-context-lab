@@ -104,14 +104,14 @@ test('P2-05 标记写失败可收敛：再 redact 一次补上标记，history �
     assert.equal(first.changed, true, '表面替换成功：' + JSON.stringify(first))
     assert.equal(first.marked, false, '标记失败必须如实上报：' + JSON.stringify(first))
     assert.equal(first.markError, 'EACCES')
-    assert.equal(serviceOf(port, session).history().rows[0].redacted, false, '账本没写成功 → history 仍是未清除')
+    assert.equal((await serviceOf(port, session).history()).rows[0].redacted, false, '账本没写成功 → history 仍是未清除')
 
     // 第二次：表面已是清除常量、账本仍缺行 → 必须补标记（旧实现提前返回，永远补不上）
     port.markVoucherRedacted = original
     const second = await serviceOf(port, session).redactVoucher(0)
     assert.equal(second.marked, true, '补标记必须成功：' + JSON.stringify(second))
     assert.equal(second.repaired, true, '必须标记为「补标记」而不是假装重新替换：' + JSON.stringify(second))
-    assert.equal(serviceOf(port, session).history().rows[0].redacted, true, '补标记后 history 必须是已清除')
+    assert.equal((await serviceOf(port, session).history()).rows[0].redacted, true, '补标记后 history 必须是已清除')
   } finally {
     port.markVoucherRedacted = original
     port.close?.()

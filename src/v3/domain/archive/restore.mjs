@@ -15,6 +15,29 @@ import { V3ContractViolation } from '../../contracts/errors.mjs'
 export const ROW_OUTCOMES = Object.freeze(['restored', 'skipped', 'forgotten'])
 
 /**
+ * 把一条 `restoreVoucher` 结果折算成会计结局（A-08，0.15.4）。
+ *
+ * 为什么单独抽出来：`receipt-changed` 一个原因码原先**同时**代表三件事——
+ *   ① 上次已恢复（面上早是原文）；
+ *   ② 面上被别的东西改过（真冲突）；
+ *   ③ 段已出面/被回收（没得恢复）。
+ * 旧实现全记 skipped，于是 `restore all` 跑第二次把**所有已恢复**都报成「跳过」，
+ * 用户以为恢复失败。
+ *
+ * 判据只在调用方拿得到证据时才升级（`alreadyRestored === true`）；拿不到就仍是
+ * skipped —— 「不知道」不得被折算成「成功了」（失败关闭）。
+ *
+ * @param {{ restored?: boolean, alreadyRestored?: boolean, reason?: string }} result
+ * @returns {{ outcome: 'restored'|'skipped'|'forgotten', reason?: string }}
+ */
+export function outcomeOfRestore(result) {
+  if (result?.restored === true) return { outcome: 'restored' }
+  if (result?.alreadyRestored === true) return { outcome: 'restored' }
+  if (result?.reason === 'record-forgotten') return { outcome: 'forgotten', reason: result.reason }
+  return { outcome: 'skipped', reason: result?.reason }
+}
+
+/**
  * 单行恢复资格：行内重建的回执正文必须与表面正文逐字节相等才可恢复。
  *
  * @param {{ receiptText: string, surfaceText: string }} row

@@ -201,6 +201,9 @@ window.__ModuleLoader__.load({
       panelSettings: '回注设置',
       panelNoSettings: '设置服务未就绪，暂时只能查看状态；可到插件设置页修改。',
       panelHint: '改动即时生效。完整观测：/memory-lab status。',
+      // C-03（0.15.4）：写命令会落到「选中的那个会话」，不是本对话。以前面板不说这件事，
+      // 于是可以对一个已停用的会话发 now/compact/export/fork 而毫无提示。
+      panelWriteConfirm: '这条命令会写入会话「{target}」，不是当前对话。继续？',
       // 数字都要带单位、说清是什么（用户反馈：旧文案「已摄入 144」「尝试 4 次」看不懂）。
       statusReady: '已存历史 {ingested} 条 · 可检索 {searchable} 条 · 本会话回注 {injected} 次',
       statusReadyNoSearchable: '已存历史 {ingested} 条 · 可检索 未知 · 本会话回注 {injected} 次',
@@ -329,6 +332,7 @@ statusStateError: '状态文件异常：{code}（值已按默认回落）',
       panelSettings: 'Recall settings',
       panelNoSettings: 'The settings service is not ready; status only for now. Edit in the plugin settings page.',
       panelHint: 'Changes apply live. Full detail: /memory-lab status.',
+      panelWriteConfirm: 'This command writes to session "{target}", not this chat. Continue?',
       statusReady: '{ingested} history items stored · {searchable} searchable · {injected} recalls this session',
       statusReadyNoSearchable: '{ingested} history items stored · searchable unknown · {injected} recalls this session',
       statusSearchableOnly: '{searchable} searchable · {injected} recalls this session',
@@ -712,28 +716,45 @@ statusStateError: 'State file error: {code} (defaults in effect)',
       }
     }
 
+    // C-05（0.15.4，P3）：内部码不得原样显示给用户。
+    //
+    // 旧实现把 `no-session` / `unknown-command` / `no-remote` / `no-result`
+    // 直接塞进 `text`，再由 `t('commandFailed', { message })` 拼成
+    // 「命令失败：no-remote」——字典里根本没有这几个键，用户看到的是一句英文内部码。
+    // 修法：`code` 字段保留原码（诊断/测试仍可断言），`text` 给中文人话。
+    // 这两件事必须同时成立：只改文案会让测试失去稳定的断言锚点。
+    const INTERNAL_CODE_TEXT = {
+      'no-session': '没有可用的会话（请先打开一个对话）',
+      'unknown-command': '命令为空，没有可执行的内容',
+      'no-remote': '命令通道不可用（插件未挂载或宿主未就绪）',
+      'no-result': '命令已发送但没有返回结果',
+    }
+    function internalFailure(code) {
+      return { ok: false, code, text: INTERNAL_CODE_TEXT[code] ?? '命令未执行' }
+    }
+
     async function runLine(ctx, sessionId, line) {
-      if (typeof sessionId !== 'string' || sessionId.length === 0) return { ok: false, text: 'no-session' }
-      if (typeof line !== 'string' || line.length === 0) return { ok: false, text: 'unknown-command' }
+      if (typeof sessionId !== 'string' || sessionId.length === 0) return internalFailure('no-session')
+      if (typeof line !== 'string' || line.length === 0) return internalFailure('unknown-command')
       const remote = remoteOf(ctx)
       const execute = remote?.commands?.execute
-      if (typeof execute !== 'function') return { ok: false, text: 'no-remote' }
+      if (typeof execute !== 'function') return internalFailure('no-remote')
       let result
       try {
         result = await execute(sessionId, line, [])
       } catch (error) {
-        return { ok: false, text: describeError(error) }
+        return { ok: false, code: 'transport', text: describeError(error) }
       }
-      if (result === null || result === undefined) return { ok: false, text: 'no-result' }
+      if (result === null || result === undefined) return internalFailure('no-result')
       if (typeof result === 'string') return { ok: true, text: result }
       if (result.ok === false) {
         const error = result.error
         const message = typeof error?.message === 'string' && error.message.length > 0 ? error.message : ''
         const code = typeof error?.code === 'string' && error.code.length > 0 ? error.code : ''
-        return { ok: false, text: message.length > 0 ? message : (code || 'transport') }
+        return { ok: false, code: code || 'transport', text: message.length > 0 ? message : (code || 'transport') }
       }
       const value = result.ok === true && 'value' in result ? result.value : result
-      if (value === null || value === undefined) return { ok: false, text: 'no-result' }
+      if (value === null || value === undefined) return internalFailure('no-result')
       if (typeof value === 'string') return { ok: true, text: value }
       // 真实 remote.commands.execute 返回 CommandExecution { commandId, result: { kind, text } }；
       // 旧代码只读 value.text，text 落在 value.result.text，于是所有按钮都显示“已更新”。
@@ -747,7 +768,13 @@ statusStateError: 'State file error: {code} (defaults in effect)',
     /** 投影里的会话控制（缺字段一律按默认全开，绝不因坏形状崩）。 */
     function controlOfStatus(status) {
       const overrides = Object.fromEntries(SESSION_OVERRIDE_FIELDS.map((field) => [field.key, null]))
-      const out = { enabled: true, recall: true, overrides, error: null }
+      // 问题 2 / 问题 7（0.15.4）：客户端回落必须与**宿主**同源，否则 chip 会撒谎。
+      //
+      // 宿主侧新会话（无 control.json）以 `defaultEnabled: false` 构造，
+      // 而这里旧写 `enabled: true` —— 于是新会话 chip 亮「已启用」，点进去却发现
+      // 什么都没回注。按用户裁定把回落对齐宿主：enabled=false（本对话未启用）、
+      // recall=true（一旦启用，回注默认开）。
+      const out = { enabled: false, recall: true, overrides, error: null }
       const raw = status !== null && typeof status === 'object' ? status.control : undefined
       if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out
       for (const key of ['enabled', 'recall']) {
@@ -1114,10 +1141,15 @@ statusStateError: 'State file error: {code} (defaults in effect)',
       // 本对话模式（P1）：旧会话迁移成 recall-only 后，这里给出切回 full-history 的入口。
       // 切换先弹确认（归档会改变模型可见表面，可用 /memory-lab restore all 还原），
       // 写入仍走 /memory-lab mode …，不直写 state。
+      //
+      // C-02（0.15.4，P2）：回落必须与**宿主**同源。宿主新会话的 `modeForNewSession`
+      // 是 `full-history`，而旧写回落到 `'recall-only'`——投影缺失时选择器把「按轮归档」
+      // 显示成「仅回注」，而且用户在这个窗口里点一下就会把**错的值写成真的**。
+      // 按用户裁定（问题 7：对齐宿主、不改宿主）改成 `full-history`。
       const projectedMode = status !== null && typeof status === 'object'
         && (status.mode === 'full-history' || status.mode === 'cooling' || status.mode === 'recall-only')
         ? status.mode
-        : 'recall-only'
+        : 'full-history'
       const mode = modeLocal ?? projectedMode
       const modeOptions = [
         ['full-history', 'modeFullHistory'],
@@ -1355,6 +1387,15 @@ statusStateError: 'State file error: {code} (defaults in effect)',
       const remoteAvailable = remoteOf(hostCtx) !== null
       const workspace = uiWorkspaceOf(hostCtx)
       const canRun = typeof selected === 'string' && selected.length > 0 && remoteAvailable && !busy
+      // C-03（0.15.4，P2）：面板能对**任意会话**发写命令，但以前既不说「这条命令会落到
+      // 哪个会话」，也不显示那个会话的控制状态——于是可以对一个已停用的会话执行
+      // now/compact/export/fork，用户以为自己在本对话里操作。
+      //
+      // 这里拿不到「当前会话 id」（面板是侧栏常驻面，props 没有 sessionId），所以不能
+      // 靠「和当前会话比对」来警告。改为**显式化目标**：所有写命令都先弹一步确认，
+      // 把目标会话的名字写进提示里，用户必须看见它才继续。读命令（status/history）不拦。
+      const [pendingWrite, setPendingWrite] = React.useState(null)
+      const labelOf = (sid) => String(byId[sid]?.title ?? byId[sid]?.name ?? sid ?? '')
       const run = async (line) => {
         if (!canRun) return
         setBusy(true)
@@ -1366,7 +1407,13 @@ statusStateError: 'State file error: {code} (defaults in effect)',
           setOutcome({ ok: false, text: describeError(error) })
         } finally {
           setBusy(false)
+          setPendingWrite(null)
         }
+      }
+      /** 写命令先确认目标；读命令直接跑。 */
+      const write = (line) => {
+        if (!canRun) return
+        setPendingWrite({ line, target: labelOf(selected) })
       }
       const fork = async () => {
         if (!canRun || workspace === null) return
@@ -1379,6 +1426,7 @@ statusStateError: 'State file error: {code} (defaults in effect)',
           setOutcome({ ok: false, text: describeError(error) })
         } finally {
           setBusy(false)
+          setPendingWrite(null)
         }
       }
       const button = (label, line) => React.createElement('button', {
@@ -1386,6 +1434,15 @@ statusStateError: 'State file error: {code} (defaults in effect)',
         className: 'mcl-panel-btn',
         disabled: !canRun,
         onClick: () => { void run(line) },
+      }, label)
+      /** 写命令按钮：先确认目标会话（C-03）。 */
+      const writeButton = (label, line, key) => React.createElement('button', {
+        type: 'button',
+        className: 'mcl-panel-btn',
+        key,
+        disabled: !canRun,
+        'data-mcl-write': key,
+        onClick: () => write(line),
       }, label)
       const options = ids.map((id) => React.createElement('option', { key: id, value: id },
         (byId[id]?.title ?? byId[id]?.name ?? id)))
@@ -1403,17 +1460,43 @@ statusStateError: 'State file error: {code} (defaults in effect)',
           }, options),
         React.createElement('div', { className: 'mcl-panel-row', key: 'actions' }, [
           button(t('panelStatus'), '/memory-lab status'),
-          button(t('panelArchiveNow'), '/memory-lab now'),
-          button(t('panelCompact'), '/memory-lab compact'),
+          writeButton(t('panelArchiveNow'), '/memory-lab now', 'now'),
+          writeButton(t('panelCompact'), '/memory-lab compact', 'compact'),
           button(t('panelHistory'), '/memory-lab history'),
-          button(t('panelExport'), '/memory-lab export'),
+          writeButton(t('panelExport'), '/memory-lab export', 'export'),
           workspace === null ? null : React.createElement('button', {
             type: 'button',
             className: 'mcl-panel-btn',
             key: 'fork',
             disabled: !canRun,
-            onClick: () => { void fork() },
+            onClick: () => setPendingWrite({ line: null, fork: true, target: labelOf(selected) }),
           }, t('forkAction')),
+        ]),
+        pendingWrite === null ? null : React.createElement('div', {
+          className: 'mcl-mode-confirm',
+          key: 'write.confirm',
+          'data-mcl-field': 'panel.write.confirm',
+        }, [
+          // 文案由自己拼（不依赖宿主 t() 是否支持插值），目标会话名必须显式印出。
+          React.createElement('div', { className: 'mcl-hint', key: 'warn' },
+            t('panelWriteConfirm').replace('{target}', String(pendingWrite.target ?? ''))),
+          React.createElement('div', { className: 'mcl-actions', key: 'actions' }, [
+            React.createElement('button', {
+              type: 'button',
+              className: 'mcl-btn',
+              key: 'confirm',
+              disabled: busy,
+              'data-mcl-write-confirm': true,
+              onClick: () => { void (pendingWrite.fork === true ? fork() : run(pendingWrite.line)) },
+            }, t('modeConfirm')),
+            React.createElement('button', {
+              type: 'button',
+              className: 'mcl-btn',
+              key: 'cancel',
+              'data-mcl-write-cancel': true,
+              onClick: () => setPendingWrite(null),
+            }, t('modeCancel')),
+          ]),
         ]),
         remoteAvailable ? null : React.createElement('div', { className: 'mcl-hint', key: 'remote' }, t('remoteUnavailable')),
         outcome === null ? null : React.createElement('div', {

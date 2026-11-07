@@ -67,7 +67,7 @@ const voucherOf = (id) => ({ voucherId: 'v-' + id, kind: 'span', recordIds: ['v3
 
 test('P2-07 读面：记录已 purge 时即便没有 redactions 标记也不得显示可导出', async () => {
   const store = storeOf({ purged: ['v3r-aaaa'], redacted: [], vouchers: [voucherOf('aaaa')] })
-  const history = serviceOf(store).history()
+  const history = await serviceOf(store).history()
   assert.equal(history.rows.length, 1)
   assert.equal(history.rows[0].purged, true, '必须标出「按 purge 事实兜底」：' + JSON.stringify(history.rows[0]))
   assert.equal(history.rows[0].redacted, true, '正文已物理删除 → 观察面不得再显示可恢复/可导出：' + JSON.stringify(history.rows[0]))
@@ -82,7 +82,7 @@ test('P2-07 恢复面：已 purge 的凭证直接拒绝，不去碰宿主面', a
 
 test('P2-07 不误杀：未 purge 的凭证仍按 redactions 标记显示', async () => {
   const store = storeOf({ purged: ['v3r-other'], redacted: [], vouchers: [voucherOf('cccc')] })
-  const row = serviceOf(store).history().rows[0]
+  const row = (await serviceOf(store).history()).rows[0]
   assert.equal(row.purged, false)
   assert.equal(row.redacted, false, '未 purge 且无标记 → 未清除')
   const restored = await serviceOf(store).restoreVoucher(0)

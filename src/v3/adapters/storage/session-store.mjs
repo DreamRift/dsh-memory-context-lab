@@ -19,7 +19,7 @@
  *   - transactions.jsonl 解析失败（含尾部半行）→ 存储判 damaged：读允许、写拒绝，
  *     文件字节不动（disposition-integrity 保留判据：读路径不得改写日志）。
  */
-import { mkdir, open, readdir, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readdir, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 
@@ -201,11 +201,23 @@ export async function repairSessionJournals(dir, { dryRun = false, now = () => D
   }
   const before = await inspectAll()
   const tails = before.filter((row) => row.state === 'tail-half-line')
+  // T-10（0.15.4）：中段损坏的**隐私账本**必须有出口，且出口必须是显式的。
+  //
+  // 缺陷：`purged.jsonl` 中段坏一行 → 打开期判 damaged → 写面全拒（读允许），
+  // 而 `repair` 只会修「尾部半行」，对中段损坏明确拒绝（安全红线，不能自动截断）——
+  // 于是整库**永久只读**，没有任何命令能把它救回来。用户只能手动删文件。
+  //
+  // 红线不变：**绝不自动截断/丢弃任何一行**（丢掉 purge 行 = 已清除的正文复活）。
+  // 新增的是「人工裁决」出口：`rebuildPurged` 明确要求调用方给出损坏文件名，
+  // 它只做一件事——把**读不出来的账本行**与**盘上真实存在的记录**对比，
+  // 把「账本里读不到、但记录文件已经不在」的 ID 视为已清除（补写 purge 行），
+  // 并原样备份坏账本（不删字节）。做不到一致就失败关闭，宁可继续只读。
+  const damaged = before.filter((row) => row.state === 'damaged')
   if (dryRun) {
-    return { dryRun: true, files: before, repaired: [], changed: false }
+    return { dryRun: true, files: before, repaired: [], changed: false, damaged }
   }
   if (tails.length === 0) {
-    return { dryRun: false, files: before, repaired: [], changed: false }
+    return { dryRun: false, files: before, repaired: [], changed: false, damaged }
   }
   // 跨进程锁内重读后再截断：别的进程可能刚补完那条 append。
   return withCrossProcessWriteLock(dir, async (ownership) => {
@@ -232,6 +244,122 @@ export async function repairSessionJournals(dir, { dryRun = false, now = () => D
     }
     const after = await inspectAll()
     return { dryRun: false, files: after, repaired, changed: repaired.length > 0 }
+  })
+}
+
+/**
+ * T-10（0.15.4）：`purged.jsonl` 中段损坏时的**显式**人工出口。
+ *
+ * 为什么不能自动修：purge 行是「这条正文已被物理清除」的唯一凭证。丢掉一行 →
+ * 已清除的内容在下一次索引重建时可能被重新当成可读记录（隐私回退）。
+ * 因此安全红线不变：**永不自动截断、永不丢弃任何一行**。
+ *
+ * 这个出口只在用户明确要求时运行，且判据是「盘上的事实」而不是「账本说的」：
+ * - 读不出来的那些行 → 备份原账本（不删字节）；
+ * - 用 `transactions.jsonl` 里已提交的 ID 集合 减去 `records/` 实存文件集合，
+ *   差集就是「提交过、但文件已经不在」的 ID ——它们只可能是被 purge 掉的；
+ * - 把这些 ID 补写成新的 purge 行，写进**新账本**（旧账本备份保留），
+ *   使读面恢复「已清除」这一事实。
+ *
+ * 任何一步读不到/不一致 → 失败关闭（返回 error），保持只读，交人工处理。
+ */
+export async function rebuildPurgedLedger(dir, { dryRun = false, now = () => Date.now() } = {}) {
+  const purgedPath = path.join(dir, PURGED_LOG)
+  const txnPath = path.join(dir, TXN_LOG)
+  const recordsDir = path.join(dir, RECORDS_DIR)
+
+  const readLines = async (file) => {
+    let text
+    try {
+      text = await readFile(file, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { ok: true, lines: [], raw: '' }
+      return { ok: false, reason: error?.code ?? String(error) }
+    }
+    const lines = []
+    for (const raw of text.split('\n')) {
+      if (raw.trim().length === 0) continue
+      try {
+        lines.push(JSON.parse(raw))
+      } catch {
+        // 坏行：读不出来就跳过**用于推断**，但原文会随旧账本一起备份保留。
+      }
+    }
+    return { ok: true, lines, raw: text }
+  }
+
+  const purgedNow = await readLines(purgedPath)
+  if (!purgedNow.ok) return { error: 'purged-unreadable', reason: purgedNow.reason }
+  const txnNow = await readLines(txnPath)
+  if (!txnNow.ok) return { error: 'txn-unreadable', reason: txnNow.reason }
+
+  // 读不出来的行数（诊断用）：坏行 = 非空但 JSON 不可解析。
+  const totalNonEmpty = purgedNow.raw.split('\n').filter((line) => line.trim().length > 0).length
+  const badLines = totalNonEmpty - purgedNow.lines.length
+
+  const committed = new Set()
+  for (const line of txnNow.lines) {
+    // commit 行的形状是 `{action:'commit', txn, recordIds:[...]}`（单条记录时代还可能是 id）。
+    // 只认一种写法会让「已提交」集合恒为空，补记就永远算不出来——那正是本出口失效的方式。
+    if (Array.isArray(line?.recordIds)) {
+      for (const id of line.recordIds) if (typeof id === 'string') committed.add(id)
+    } else if (typeof line?.id === 'string') {
+      committed.add(line.id)
+    }
+  }
+  let onDisk
+  try {
+    onDisk = new Set((await readdir(recordsDir)).filter((name) => name.endsWith('.json')).map((name) => name.slice(0, -5)))
+  } catch (error) {
+    if (error?.code === 'ENOENT') onDisk = new Set()
+    else return { error: 'records-unreadable', reason: error?.code ?? String(error) }
+  }
+
+  const alreadyPurged = new Set()
+  for (const line of purgedNow.lines) {
+    if (typeof line?.id === 'string' && line.action === 'purge') alreadyPurged.add(line.id)
+  }
+
+  // 「提交过、文件不在、账本里也没记 purge」= 需要补记的候选。
+  const missing = [...committed].filter((id) => !onDisk.has(id) && !alreadyPurged.has(id)).sort()
+
+  if (dryRun) {
+    return { dryRun: true, badLines, alreadyPurged: alreadyPurged.size, wouldRecord: missing, changed: false }
+  }
+  if (missing.length === 0) {
+    return { dryRun: false, badLines, alreadyPurged: alreadyPurged.size, recorded: [], changed: false }
+  }
+
+  return await withCrossProcessWriteLock(dir, async (ownership) => {
+    ownership.assertOwned()
+    // 旧账本原样备份（**不删字节**）：人工裁决必须可回溯。
+    const backupPath = purgedPath + '.bak-' + now()
+    try {
+      await copyFile(purgedPath, backupPath)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    // 重写账本：先保留所有原行（逐字节语义等价），再追加补记行。
+    // 注意：**不丢原行**——即使其中有坏行，坏行文本也原样留在 .bak 里，
+    // 新账本只承载「可解析的原行 + 补记行」，坏行本身不再参与解析（否则永远打不开）。
+    const kept = purgedNow.lines
+      .filter((line) => typeof line?.id === 'string' && line.action === 'purge')
+      .map((line) => ({ action: 'purge', id: line.id, at: line.at ?? null }))
+    const appended = missing.map((id) => ({ action: 'purge', id, at: null, rebuild: true }))
+    const all = [...kept, ...appended]
+    const text = all.map((row) => JSON.stringify(row)).join('\n') + '\n'
+    await writeFileAtomic(purgedPath, text)
+    await appendLine(path.join(dir, REPAIR_LOG), {
+      schemaVersion: 1,
+      at: now(),
+      file: PURGED_LOG,
+      action: 'rebuild-purged',
+      badLines,
+      reRecorded: appended.length,
+      backup: path.basename(backupPath),
+      reason: 'purged.jsonl 中段损坏（人工裁决：按「已提交但文件不在」补记 purge 行）',
+    })
+    return { dryRun: false, badLines, alreadyPurged: kept.length, recorded: appended.map((row) => row.id), backup: backupPath, changed: appended.length > 0 }
   })
 }
 
@@ -423,6 +551,11 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
   // P1-08：redactions.jsonl 的 `seq` 字段（清除回执时落下的新节点 seq）。
   // 老账本（升级前的库）没有这个字段 → 这里查不到，`redactionSeqOf` 返回 null。
   const redactedVoucherSeqs = new Map()
+  // A-01（0.15.4）：restore 落下的恢复节点 seq。与上面的 redacted 映射**分账**：
+  // redacted 回答「这张凭证被清除了吗」，restored 回答「它现在落在哪个节点上」。
+  const restoredVoucherSeqs = new Map()
+  // A-01 失败关闭判据：恢复正文的指纹（sha256）。正文被宿主改写即指纹不符 → 不覆盖。
+  const restoredVoucherHashes = new Map()
   for (const line of redactionsParsed.lines) {
     if (typeof line.voucherId !== 'string') continue
     if (line.action === 'redact') {
@@ -430,6 +563,12 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       else redactedVoucherSeqs.delete(line.voucherId)
     } else if (line.action === 'unredact') {
       redactedVoucherSeqs.delete(line.voucherId)
+    } else if (line.action === 'restored') {
+      // restore 落面产生的新节点；后续 redact 靠它定位（不再依赖已消失的回执正文）。
+      if (Number.isInteger(line.seq) && line.seq > 0) restoredVoucherSeqs.set(line.voucherId, line.seq)
+      else restoredVoucherSeqs.delete(line.voucherId)
+      if (typeof line.textHash === 'string' && line.textHash.length > 0) restoredVoucherHashes.set(line.voucherId, line.textHash)
+      else restoredVoucherHashes.delete(line.voucherId)
     }
   }
   const purgedParsed = opened.purgedParsed
@@ -479,6 +618,49 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
   let purgedReason = purgedParsed.reason ?? null
   // 文件戳：别的句柄/进程追加 forget 行后，本句柄必须能察觉（见 refreshForgotten）。
   let forgottenStamp = await fileStampOf(forgottenPath)
+  // T-03（0.15.4，P1）：redactions.jsonl 的**跨句柄可见性**。
+  //
+  // 缺陷：`redactedVouchers` 是打开期解析的内存集合，只有本句柄自己调
+  // `markVoucherRedacted` 时才会更新；别的句柄/进程清除一张回执后，本句柄仍然认为
+  // 它「未清除」→ 导出把已声明清除的回执正文原样带出（计划 §7.4 的泄露）。
+  // forgotten/purged 早已按文件戳刷新，唯独 redactions 漏了——这里补齐同一口径。
+  let redactionsStamp = await fileStampOf(path.join(dir, REDACTIONS_LOG))
+
+  /**
+   * T-03：按文件戳刷新清除账本（成本 = 未变化时一次 stat）。
+   *
+   * **语义**：必须在所有读 `redactedVouchers` / `redactedVoucherSeqs` /
+   * `restoredVoucherSeqs` 的入口前调用，否则第二个句柄会看到过期视图。
+   * 损坏时**不刷新**（保持 `redactionsParsed.damaged` 的失败关闭状态），由
+   * `redactionSeqOf` 等按既有口径抛 ESTORE_DAMAGED。
+   */
+  async function refreshRedactions() {
+    const stampNow = await fileStampOf(path.join(dir, REDACTIONS_LOG))
+    if (stampNow === redactionsStamp) return
+    redactionsStamp = stampNow
+    let parsed
+    try {
+      parsed = await parseTxnLog(path.join(dir, REDACTIONS_LOG), REDACTIONS_LOG)
+    } catch { return } // 读不到（瞬态）→ 保留旧视图，下一次调用再试
+    if (parsed.damaged) return // 坏账本不覆盖内存视图：读路径继续失败关闭
+    redactedVouchers.clear()
+    redactedVoucherSeqs.clear()
+    restoredVoucherSeqs.clear()
+    restoredVoucherHashes.clear()
+    for (const line of parsed.lines) {
+      if (typeof line.voucherId !== 'string') continue
+      if (line.action === 'redact') {
+        redactedVouchers.add(line.voucherId)
+        if (Number.isInteger(line.seq) && line.seq > 0) redactedVoucherSeqs.set(line.voucherId, line.seq)
+      } else if (line.action === 'unredact') {
+        redactedVouchers.delete(line.voucherId)
+        redactedVoucherSeqs.delete(line.voucherId)
+      } else if (line.action === 'restored') {
+        if (Number.isInteger(line.seq) && line.seq > 0) restoredVoucherSeqs.set(line.voucherId, line.seq)
+        if (typeof line.textHash === 'string' && line.textHash.length > 0) restoredVoucherHashes.set(line.voucherId, line.textHash)
+      }
+    }
+  }
   const health = () => ({
     healthy: !damaged && !vouchersDamaged && !forgottenDamaged && !purgedDamaged,
     damagedReason: damaged
@@ -524,6 +706,15 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
         if (typeof line.id === 'string' && line.action === 'purge') purgedIds.add(line.id)
       }
       for (const id of purgedIds) committedIds.delete(id)
+      // T-04（0.15.4）：刷新时**必须同步更新 damaged 判据**。
+      //
+      // 旧实现只重算 `purgedIds`，不更新 `purgedDamaged`/`purgedReason`——那两个值仍是
+      // **打开期快照**。后果：运行期账本被外部写坏（中段损坏、尾行半行）时，
+      // 本句柄照常追加、照常报 healthy，而「写成功但读不出来」的记录从此不可见。
+      // 五本账本里只有 forgotten 做了这件事，其余四本都没有，这里补齐其中最容易
+      // 在运行期被外部改写的 purged。
+      purgedDamaged = purgedParsedNow.damaged
+      purgedReason = purgedParsedNow.reason ?? null
       purgedStamp = purgedNow
     }
     const stamp = await fileStampOf(forgottenPath)
@@ -631,6 +822,18 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
         await writeFileAtomic(path.join(dir, RECORDS_DIR, record.id + '.json'), JSON.stringify(record) + '\n')
       }
       // 步骤 3：commit 行（提交点——此行落盘前的一切都是可隔离残留）
+      //
+      // T-01（0.15.4，P1）**追加门**：提交前必须确认 transactions.jsonl 的**尾部**
+      // 仍是完好行。理由：`damaged` 是打开期快照，在飞期间账本被别处撕坏（磁盘满、
+      // 断电、另一进程半写）时它不会更新。旧实现直接 appendLine，commit 行落在坏行
+      // 之后 → 重开整库只读，而 `repair` 只修尾部半行、认为「无需修复」，于是：
+      // **提交看起来成功、重开后整库不可写**。
+      // 与 checkpoint 的两处追加共用同一实现（inspectAppendTail），失败即拒绝本笔，
+      // 保留可恢复残留（payload 已落，重试可用新事务补账），绝不假成功。
+      const txnTail = await inspectAppendTail(path.join(dir, TXN_LOG), TXN_LOG)
+      if (txnTail.appendable !== true) {
+        throw v3Error('ESTORE_DAMAGED', TXN_LOG + ' 尾部不可追加（' + (txnTail.reason ?? '未给出原因') + '）：拒绝提交事务 txn=' + txn + '，已落盘的 payload 保留为可恢复残留，请先 repair')
+      }
       const commitLine = { action: 'commit', txn, recordIds: ids }
       if (commitAt !== null) commitLine.at = commitAt
       await appendLine(logPath, commitLine, { sync: true })
@@ -878,6 +1081,65 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
     },
 
     /**
+     * A-05（0.15.4）：把含指定记录的孤儿回执正文清除掉。
+     *
+     * 旧缺陷：`orphan-receipts.jsonl` 保存的是**明文回执正文**，却完全不在遗忘/清除
+     * 级联里——用户 forget/purge 之后，这段明文永久留在盘上，而且因为没有对应凭证，
+     * `restore` 恒 `receipt-changed`：既不可恢复，也不可清除。
+     *
+     * 语义与 `redactVoucher` 对齐：正文替换成同一个常量标记，记 `redacted: true`
+     * 与清除时间；`recordIds` 保留（它是「这段回执属于哪些记录」的审计事实，
+     * 不含正文）。**不可 undo**——正文已不在账本里，undo 只能给出谎言，所以
+     * `restoreOrphan` 见到 `redacted` 一律失败关闭。
+     *
+     * @param {string[]} recordIds
+     * @returns {Promise<{changed: number, ids: string[], failed: Array<{id: string, reason: string}>}>}
+     */
+    async redactOrphansFor(recordIds) {
+      assertWritable()
+      const wanted = new Set(Array.isArray(recordIds) ? recordIds : [])
+      const result = { changed: 0, ids: [], failed: [] }
+      if (wanted.size === 0) return result
+      if (orphansParsed.damaged) {
+        throw v3Error('ESTORE_DAMAGED', ORPHAN_LOG + ' 损坏（' + (orphansParsed.reason ?? '未给出原因') + '）：无法清除孤儿回执')
+      }
+      const lines = []
+      let changed = 0
+      for (const row of orphanRows) {
+        if (row.redacted === true || !(Array.isArray(row.recordIds) ? row.recordIds : []).some((id) => wanted.has(id))) {
+          lines.push(row)
+          continue
+        }
+        // A-05：**整本重写**，不是追加一行标记。
+        //
+        // 这是本条缺陷的要害：orphan-receipts.jsonl 是明文账本，追加一条
+        // `{redacted:true}` 只是让读面忽略旧行，**明文仍在磁盘上**——隐私承诺
+        // （「正文已清除」）就成了假的。所以这里把命中行原地换成不含正文的审计行。
+        // 代价是失去这一行的 append-only 属性；换算的是「已声明删除就必须真的删掉」，
+        // 与 purge 删 records/ 同一口径。
+        row.redacted = true
+        row.redactedAt = new Date().toISOString()
+        row.prevReceiptSeq = Number.isInteger(row.receiptSeq) ? row.receiptSeq : null
+        row.chars = typeof row.receiptText === 'string' ? row.receiptText.length : 0
+        row.receiptText = ''
+        lines.push(row)
+        result.changed += 1
+        result.ids.push(row.id)
+      }
+      if (result.changed === 0) return result
+      try {
+        await writeFileAtomic(path.join(dir, ORPHAN_LOG), lines.map((line) => JSON.stringify(line)).join('\n') + '\n')
+      } catch (error) {
+        result.failed.push({ id: '*', reason: error?.code ?? error?.message ?? String(error) })
+        // 写盘失败 → 内存视图不能停留在「已清除」的假象上。
+        result.changed = 0
+        result.ids = []
+        throw error
+      }
+      return result
+    },
+
+    /**
      * 只读来源元数据（不返回 payload）：摄入断点反推用。
      * 刻意**不受遗忘隐藏**——遗忘是可见性，不是「从未摄入」；按可读集反推会让断点回退，
      * 重放时把已遗忘正文重新落成新记录（隐私回退）。损坏同样失败关闭。
@@ -991,11 +1253,31 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       // ESTORE_DAMAGED，repair 也修不了（整库永久只能读）。落账先行后，最坏情况只是
       // 「账已清、文件还在」，打开期把删除补完（见 open 对账的 purged 收尾），永远可恢复。
       await appendLine(path.join(dir, PURGED_LOG), { action: 'purge', id, at: null }, { sync: true })
-      await rm(path.join(dir, RECORDS_DIR, id + '.json'), { force: true })
+      // T-05（0.15.4）：`rm` 失败**不得**让 purge 看起来没发生。
+      //
+      // 缺陷：账本行已落、`purgedIds` 语义已生效（读面 EFORGOTTEN、undo 被拒），
+      // 但旧实现让 `rm` 的异常直接抛出，调用方看到「报错」→ 以为没清成功 →
+      // 重试（每次都同样失败）或改用 forget（此时已被拒）。用户对「到底删了没」无从得知。
+      //
+      // 现在：删除失败**不再抛出**，而是如实返回 `residue`，由命令面告诉用户
+      // 「已承诺清除、逻辑上已不可读，但字节仍在盘上，重启打开时自动补删」。
+      // 打开期补删（见 open 对账的 purged 收尾）保证它最终会被物理删掉。
       purgedIds.add(id)
       committedIds.delete(id)
       purgedStamp = await fileStampOf(path.join(dir, PURGED_LOG))
-      return { purged: true, alreadyPurged: false }
+      let residue = null
+      try {
+        await rm(path.join(dir, RECORDS_DIR, id + '.json'), { force: true })
+      } catch (error) {
+        residue = {
+          id,
+          code: error?.code ?? 'rm-failed',
+          note: '账本已清除、读面已不可读，但记录字节仍在盘上；下次打开会自动补删',
+        }
+      }
+      return residue === null
+        ? { purged: true, alreadyPurged: false }
+        : { purged: true, alreadyPurged: false, residue }
     },
 
     /** 已物理清除的 ID（命令面判 undo 可用性、诊断面报数）。 */
@@ -1030,6 +1312,17 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
     },
 
     /** 隐私面已清除的回执 ID 集合（D-C，history 同步读取）。损坏 → 失败关闭。 */
+    /**
+     * T-03：**先按戳刷新、再读**的清除视图。
+     *
+     * 跨句柄语义要求调用前必须刷新；同步的 `redactedVoucherIds()` 无法 await，
+     * 所以给读面提供这个异步出口，由端口层统一使用。
+     */
+    async redactedVoucherIdsFresh() {
+      await refreshRedactions()
+      return this.redactedVoucherIds()
+    },
+
     redactedVoucherIds() {
       if (redactionsParsed.damaged) {
         throw v3Error('ESTORE_DAMAGED', 'redactions.jsonl 损坏（' + (redactionsParsed.reason ?? '未给出原因') + '）：无法判定哪些回执已清除')
@@ -1074,6 +1367,69 @@ export async function openV3SessionStore(root, sessionKey, options = {}) {
       }
       const seq = redactedVoucherSeqs.get(voucherId)
       return Number.isInteger(seq) && seq > 0 ? seq : null
+    },
+
+    /**
+     * A-01（0.15.4）：记录「restore 落下的恢复节点当前在哪个 seq」。
+     *
+     * ## 为什么需要
+     *
+     * `restore` 把回执节点**原地替换**成原文，宿主会分配一个新 seq，旧 seq 作废。
+     * 而 `redact`（清除回执正文）过去是**按正文逐字节定位**的——restore 之后面上
+     * 已经没有那段回执正文了，于是 `firstEligibleSeq(receiptText)` 恒返回 null，
+     * `redactVoucher` 永远拿到 `receipt-changed`。结果：**一旦 restore 过，
+     * 那张凭证就再也 redact 不掉、purge 时也无法从面上清除**（P1 级隐私缺口）。
+     *
+     * 修法与 `redactions.jsonl` 的 `seq` 字段同源（同一先例）：把「凭证 → 当前节点 seq」
+     * 这条**派生映射**持久化，定位改走它，正文比对只作二次复核。
+     *
+     * ## 语义边界
+     *
+     * - 这条映射是**派生物**，可被宿主压缩/改写作废；所以读回时仍要复核表面正文，
+     *   不一致就失败关闭（宁可 redact 不成立，也不覆盖错节点）；
+     * - `action:'unredact'` 时清空（回执正文已恢复，映射不再有意义）；
+     * - 老账本没有这条记录 → 返回 null，调用方沿用既有的失败关闭路径，行为不变。
+     */
+    async markVoucherRestoredSeq(voucherId, seq, textHash = null) {
+      assertWritable()
+      if (typeof voucherId !== 'string' || voucherId.length === 0) {
+        throw new V3ContractViolation('v3 store: voucherId 必须是非空字符串')
+      }
+      const seqOk = Number.isInteger(seq) && seq > 0
+      if (!seqOk) return { changed: false }
+      const hashOk = typeof textHash === 'string' && textHash.length > 0
+      if (restoredVoucherSeqs.get(voucherId) === seq && restoredVoucherHashes.get(voucherId) === (hashOk ? textHash : null)) {
+        return { changed: false }
+      }
+      // restoredSeq 与 action 分开记：这一行不改变「是否已清除」的状态，
+      // 只补一条定位辅助信息（所以用独立 action，不污染 redactedVouchers 的判定）。
+      // textHash 是**恢复正文的指纹**——A-01 的失败关闭判据（正文被宿主改写就不许覆盖）。
+      await appendLine(redactionsPath, { action: 'restored', voucherId, at: null, seq, ...(hashOk ? { textHash } : {}) }, { sync: true })
+      restoredVoucherSeqs.set(voucherId, seq)
+      if (hashOk) restoredVoucherHashes.set(voucherId, textHash)
+      else restoredVoucherHashes.delete(voucherId)
+      return { changed: true, seq }
+    },
+
+    /**
+     * 读回 restore 落下的节点 seq（A-01）。没有记录 → null（行为与 0.15.3 一致）。
+     * 账本损坏 → ESTORE_DAMAGED（与 `redactionSeqOf` 同口径，不静默当「没有」）。
+     */
+    restoredSeqOf(voucherId) {
+      if (redactionsParsed.damaged) {
+        throw v3Error('ESTORE_DAMAGED', 'redactions.jsonl 损坏（' + (redactionsParsed.reason ?? '未给出原因') + '）：无法定位已恢复的节点')
+      }
+      const seq = restoredVoucherSeqs.get(voucherId)
+      return Number.isInteger(seq) && seq > 0 ? seq : null
+    },
+
+    /** 读回 restore 落下的**恢复正文指纹**（A-01 失败关闭判据）；没有 → null。 */
+    restoredTextHashOf(voucherId) {
+      if (redactionsParsed.damaged) {
+        throw v3Error('ESTORE_DAMAGED', 'redactions.jsonl 损坏（' + (redactionsParsed.reason ?? '未给出原因') + '）：无法复核已恢复的节点')
+      }
+      const hash = restoredVoucherHashes.get(voucherId)
+      return typeof hash === 'string' && hash.length > 0 ? hash : null
     },
 
     /** 列已遗忘 ID；账本损坏 → ESTORE_DAMAGED（与 listVouchers 同口径，不静默当空）。 */

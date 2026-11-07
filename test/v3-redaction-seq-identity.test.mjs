@@ -34,7 +34,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -137,6 +137,55 @@ test('P1-08 老账本（无 seq）：redactionSeqOf 返回 null；补记 seq 后
     assert.equal(store.redactionSeqOf('v-3'), null, '还原后不得再报旧 seq')
   } finally {
     store.close()
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+test('A-03 只剩一张已清除、但面上仍有两个常量节点：必须失败关闭（不许取第一个）', async () => {
+  // 这是「唯一性」判据真正承重的场景：
+  //   已清除凭证**只有一张**（老账本那条 unique 前提成立），
+  //   但面上存在**两块**常量节点（另一块来自更早一次清除留下的残留）。
+  // 旧实现在这里取 firstEligibleSeq 的「第一个」，赌错就把别处正文写进本凭证槽位。
+  const root = await mkdtemp(path.join(tmpdir(), 'mcl-a03-two-constants-'))
+  const ctx = fakeCtx()
+  const engine = attachV3Engine(ctx, { v3Root: root })
+  try {
+    const session = createFakeSession()
+    const { first, second } = await twoVouchers(engine, ctx, session)
+    assert.equal((await engine.forgetRecords('session-fake', first.recordIds)).redact.changed, 1)
+    assert.equal((await engine.forgetRecords('session-fake', second.recordIds)).redact.changed, 1)
+
+    // 把 second 的清除**撤销**（它不再是「已清除」），但在活动面上再手工种一块常量节点，
+    // 使「已清除凭证数 = 1」而「常量节点数 = 2」同时成立。
+    const undone = await engine.forgetRecords('session-fake', second.recordIds, { undo: true })
+    assert.equal(undone.unredact.changed, 1, '先让 second 真的还原：' + JSON.stringify(undone.unredact))
+    session.pushAssistant('[记忆上下文] 该回执涉及已遗忘记录，摘要已清除；原文不可恢复。')
+    await ctx.callPreStep(session)
+    await engine._waitForIdle()
+
+    // 抹掉 first 的 redaction seq → 走老账本分支。
+    const ledger = path.join(root, 'sessions', 'session-fake', 'redactions.jsonl')
+    const rows = (await readFile(ledger, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    await writeFile(ledger, rows.map((row) => {
+      const { seq: _seq, ...rest } = row
+      return JSON.stringify(rest)
+    }).join('\n') + '\n', 'utf8')
+
+    engine.dispose()
+    const ctx2 = fakeCtx()
+    const engine2 = attachV3Engine(ctx2, { v3Root: root })
+    try {
+      await ctx2.callPreStep(session)
+      await engine2._waitForIdle()
+      const undo = await engine2.forgetRecords('session-fake', first.recordIds, { undo: true })
+      assert.equal(undo.unredact.changed, 0, '两个常量节点时必须失败关闭：' + JSON.stringify(undo.unredact))
+      assert.deepEqual(undo.unredact.failed.map((row) => row.reason), ['redaction-seq-ambiguous'],
+        '必须报「歧义」，而不是猜一个：' + JSON.stringify(undo.unredact))
+    } finally {
+      await engine2._waitForIdle().catch(() => {})
+      engine2.dispose()
+    }
+  } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {})
   }
 })

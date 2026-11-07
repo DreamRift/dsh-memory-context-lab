@@ -100,7 +100,16 @@ test('G6b-S3 装配面零引用：候选默认关闭，接线属集成分批', a
     const source = await readFile(path.join(SRC, rel), 'utf8')
     assert.ok(source.length > 1000, rel + ' 内容异常，零引用断言会失去判别力')
     scanned.push(rel)
-    assert.equal(/domain\/visibility|contracts\/visibility|dedupeVisible/.test(source), false, rel + ' 不得接上可见片段去重（候选默认关闭）')
+    // 2026-11-06（0.15.4）：判据只看**代码**，剥掉注释后再匹配。
+    //
+    // 本断言要拦的是「把候选接上装配面」（import、传参、调用），不是「提到这个名字」。
+    // 旧写法对全文做字面匹配，导致装配面里连一句「此处不要加 dedupeVisible」的
+    // 警告注释都会把守卫打红——那等于禁止记录这项决定，与 G6b 保留但登记的口径相悖。
+    // 剥注释不放宽判据：真正的接线必然出现在代码行上（S4 的量具自检正是植入代码引用）。
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+    assert.equal(/domain\/visibility|contracts\/visibility|dedupeVisible/.test(code), false, rel + ' 不得接上可见片段去重（候选默认关闭）')
   }
   assert.deepEqual(scanned, ASSEMBLY_FILES)
 })

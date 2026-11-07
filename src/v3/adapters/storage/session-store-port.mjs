@@ -11,9 +11,9 @@
 import { assertPort } from '../../ports/index.mjs'
 import { v3Error, V3ContractViolation } from '../../contracts/index.mjs'
 import { restoreEligibilityOf } from '../../domain/archive/restore.mjs'
-import { openV3SessionStore, repairSessionJournals } from './session-store.mjs'
+import { openV3SessionStore, rebuildPurgedLedger, repairSessionJournals } from './session-store.mjs'
 import { withCrossProcessWriteLock } from './write-lock.mjs'
-import { buildLexicalIndex, isIndexStale, readLexicalIndex, writeLexicalIndex } from './lexical-index.mjs'
+import { buildLexicalIndex, isIndexStale, readLexicalIndex, updateLexicalIndexIncremental, writeLexicalIndex } from './lexical-index.mjs'
 import { buildChunkIndex, writeChunkIndex } from './chunk-index.mjs'
 
 /**
@@ -92,6 +92,26 @@ export async function createSessionStorePort(root, sessionKey) {
     return { index, chunkIndex }
   }
 
+  /**
+   * M-04（0.15.4，P1）：**增量**并入索引，避免每步全量重建。
+   *
+   * 记录提交后不可变，所以「旧索引 + 新增 doc − 移除 doc」与全量重扫等价。
+   * 旧索引不可信（缺失/损坏/基线与实际不符）时**不猜**：返回 `applied:false`，
+   * 由调用方退回 `rebuildIndex()`。宁可多扫一次，也不让索引悄悄偏离真源。
+   *
+   * @param {{added?: Array<{id,text}>, removed?: string[]}} plan
+   */
+  async function updateIndexIncrementally(plan = {}) {
+    return withCrossProcessWriteLock(dir, async (ownership) => {
+      await store.syncFromLog()
+      ownership.assertOwned()
+      const result = await updateLexicalIndexIncremental(store, plan)
+      if (result.applied !== true) return { applied: false, reason: result.reason ?? 'not-applied' }
+      await writeLexicalIndex(store, result.index)
+      return { applied: true, index: result.index }
+    })
+  }
+
   /** 锁内全量重建（调用方必须已持锁）。 */
   async function rebuildIndex() {
     return (await buildIndex({ write: true })).index
@@ -137,7 +157,6 @@ export async function createSessionStorePort(root, sessionKey) {
   // 来源事件 → 记录 ID 缓存：进程内惰性构建，任何写操作后失效（H-01：断点必须能从库反推）。
   // P7 首次呈现复用这张表定位「这次 tool/result 已经有哪条记录」，不新建记录类型/第二套冷库。
   let sourceEventMap = null
-  let sourceEventFailure = null
 
   /**
    * 来源事件 ID → 记录 ID。
@@ -148,7 +167,15 @@ export async function createSessionStorePort(root, sessionKey) {
    * 含已遗忘记录：遗忘是「不可见」，不是「从未摄入」；读正文时仍会 EFORGOTTEN。
    */
   async function sourceEventMapOf() {
-    if (sourceEventFailure !== null) throw sourceEventFailure
+    // T-08（0.15.4）：失败**不再永久粘住**。
+    //
+    // 旧实现把首次失败的 error 存进 `sourceEventFailure`，此后每次都直接抛它：
+    // 磁盘修好后（补回记录、修复权限）进程内也永远恢复不了——只能重启 DSH，
+    // 而用户看到的是「怎么修都没用」。
+    //
+    // 现在：失败只在**本次调用**抛出（fail-closed 不变，绝不返回半张表），
+    // 但不把错误记成终态；下一次调用重新尝试构建。仍然失败就仍然抛，
+    // 修好了就自然恢复，不需要重启。
     if (sourceEventMap !== null) return sourceEventMap
     const out = new Map()
     for (const id of await store.listRecordIds()) {
@@ -156,8 +183,8 @@ export async function createSessionStorePort(root, sessionKey) {
       try {
         provenance = await store.readProvenance(id)
       } catch (error) {
-        // 读不到 ≠ 没有（fail-closed）：派生物不得掩盖损坏，否则断点会静默回退到 -1
-        sourceEventFailure = error
+        // 读不到 ≠ 没有（fail-closed）：派生物不得掩盖损坏，否则断点会静默回退到 -1。
+        // 只让这一次失败，不写终态（T-08）。
         throw error
       }
       const sourceEventId = provenance?.sourceEventId
@@ -430,18 +457,46 @@ export async function createSessionStorePort(root, sessionKey) {
 
     async health() {
       const base = store.health()
-      const index = await readLexicalIndex(store)
+      // T-07（0.15.4）：派生索引损坏**不得**把整个库判成坏库。
+      //
+      // 缺陷：旧实现让 `readLexicalIndex` 的 ESTORE_CORRUPT 直接冒出 health()。
+      // 后果是观察面把「索引这个可删可建的缓存坏了」显示成「库坏了」，
+      // 而 `/memory-lab on` 路径里任何 health 调用都会因此整体失败——
+      // 用户被一个**删掉就能重建**的派生文件挡在门外，还以为是数据损坏。
+      //
+      // 现在：索引读失败只影响索引面（indexedCount/indexStale/indexDamaged），
+      // 账本面的 healthy 保持不动；命令面据 indexDamaged 提示「可重建」。
+      let index = null
+      let indexError = null
+      try {
+        index = await readLexicalIndex(store)
+      } catch (error) {
+        indexError = error?.code ?? error?.message ?? String(error)
+      }
+      if (indexError !== null) {
+        return { ...base, indexedCount: 0, indexStale: true, indexDamaged: true, indexError }
+      }
       // 新鲜度只有一把尺子（isIndexStale）：health 与检索入口不得各算一遍（H-03）
-      return { ...base, indexedCount: index?.indexedCount ?? 0, indexStale: await isIndexStale(store, index) }
+      return { ...base, indexedCount: index?.indexedCount ?? 0, indexStale: await isIndexStale(store, index), indexDamaged: false, indexError: null }
     },
 
     async rebuildIndex() {
       return rebuildIndexSafely()
     },
 
+    /** M-04（0.15.4）：增量并入索引；不可信时返回 applied:false，调用方退回全量重建。 */
+    async updateIndexIncrementally(plan) {
+      return updateIndexIncrementally(plan)
+    },
+
     /** 日志尾部半行修复（/memory-lab repair）：dryRun 只报告，不写任何字节。 */
     async repairJournals(options = {}) {
       return repairSessionJournals(dir, options)
+    },
+
+    /** T-10（0.15.4）：purged.jsonl 中段损坏时的显式人工出口（默认 dryRun）。 */
+    async rebuildPurged(options = {}) {
+      return rebuildPurgedLedger(dir, options)
     },
 
     /** 关闭底层句柄（composition.dispose 用；端口方法面之外，测试替身可缺席）。 */
@@ -453,8 +508,16 @@ export async function createSessionStorePort(root, sessionKey) {
       return store.listVouchers()
     },
 
-    /** D-C：隐私面清除标记（history 用；旧测试替身可缺席）。 */
-    redactedVoucherIds() {
+    /**
+     * D-C：隐私面清除标记（history 用；旧测试替身可缺席）。
+     *
+     * T-03（0.15.4，P1）：**必须按戳刷新后读**。旧实现直接返回本句柄打开期的内存集合，
+     * 于是别的句柄/进程清除一张回执后，本句柄仍认为它未清除 → 导出把已声明清除的
+     * 回执正文原样带出（计划 §7.4「forget 级联无自有出口泄露」）。
+     * 刷新未变化时只有一次 stat；有变化才重解析。
+     */
+    async redactedVoucherIds() {
+      if (typeof store.redactedVoucherIdsFresh === 'function') return store.redactedVoucherIdsFresh()
       return typeof store.redactedVoucherIds === 'function' ? store.redactedVoucherIds() : []
     },
 
@@ -472,6 +535,30 @@ export async function createSessionStorePort(root, sessionKey) {
     /** P1-08：已清除回执的节点 seq（老账本/测试替身缺席时返回 null）。 */
     redactionSeqOf(voucherId) {
       return typeof store.redactionSeqOf === 'function' ? store.redactionSeqOf(voucherId) : null
+    },
+
+    /**
+     * A-01（0.15.4）：记录 restore 落下的恢复节点 seq。
+     *
+     * 与 `markVoucherRedacted` 同纪律——所有写原语一个锁；端口缺席时降级为
+     * `{changed:false}`（应用层据此走旧路径，不会崩）。
+     */
+    async markVoucherRestoredSeq(voucherId, seq, textHash = null) {
+      if (typeof store.markVoucherRestoredSeq !== 'function') return { changed: false }
+      return withCrossProcessWriteLock(dir, (ownership) => {
+        ownership.assertOwned()
+        return store.markVoucherRestoredSeq(voucherId, seq, textHash)
+      })
+    },
+
+    /** A-01：读回恢复节点 seq（老账本/测试替身缺席时返回 null）。 */
+    restoredSeqOf(voucherId) {
+      return typeof store.restoredSeqOf === 'function' ? store.restoredSeqOf(voucherId) : null
+    },
+
+    /** A-01：读回恢复正文指纹（失败关闭判据；缺席返回 null）。 */
+    restoredTextHashOf(voucherId) {
+      return typeof store.restoredTextHashOf === 'function' ? store.restoredTextHashOf(voucherId) : null
     },
 
     /** P1-07：孤儿回执（补凭证放弃后的恢复线索）。写进同一把会话写锁。 */

@@ -57,6 +57,11 @@ test('export → adopt：空会话导入后正文可回读，且拒绝非空会�
     const fileName = path.basename(exported.file)
 
     const sessionB = createFakeSession({ id: 'session-b' })
+    // S-13（0.15.4）：`adopt <文件名>` 不再无条件可用——跨会话导入必须由**来源会话**
+    // 显式授权（与 adopt-from 同一道门）。这条测试原本假设「拿到文件名就能导入」，
+    // 那正是 S-13 的缺陷本身；现在先授权，再验导入能力。
+    const granted = await engineA.setAdoptAllow('session-a', true)
+    assert.equal(granted.allow, true, JSON.stringify(granted))
     const imported = await engineB.importSession('session-b', fileName, sessionB)
     assert.equal(imported.error, undefined, JSON.stringify(imported))
     assert.equal(imported.imported, 3)

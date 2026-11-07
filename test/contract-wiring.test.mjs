@@ -187,6 +187,21 @@ test('P0-5②：剥注释后不存在单点存活的未定义标识符（jobCap 
     }
     while (i < n) {
       const ch = text[i]
+      // 数字字面量整体吃掉：否则 `0xff01` 会被切成 `0` + 标识符 `xff01`，
+      // `0o600` 变成 `o600`，在孤儿检测里冒充「未声明引用」（真实误报）。
+      if (ch >= '0' && ch <= '9') {
+        let j = i + 1
+        // 十六进制 / 八进制 / 二进制前缀允许字母
+        if ((ch === '0') && /[xXoObB]/.test(text[i + 1] ?? '')) {
+          j = i + 2
+          while (j < n && /[0-9a-fA-F_]/.test(text[j])) j++
+        } else {
+          while (j < n && /[0-9a-zA-Z_.]/.test(text[j])) j++
+        }
+        out += text.slice(i, j).replace(/[^\n]/g, ' ')
+        i = j
+        continue
+      }
       if (ch === '/' && text[i + 1] === '*') {
         const end = text.indexOf('*/', i + 2)
         out += text.slice(i, end < 0 ? n : end + 2).replace(/[^\n]/g, ' ')

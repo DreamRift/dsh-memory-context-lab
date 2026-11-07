@@ -171,14 +171,29 @@ test('索引重建分寸：首次摄入建索引；陈化的小增量不重建�
     await engine._waitForIdle()
     assert.equal(await idxExists(), true, '首次摄入必须建索引（否则新会话头几步回注必然 skipped）')
 
-    // 2) 陈化的小增量：记录索引文件的「内容戳」，摄入后它不得变化
+    // 2) 陈化的小增量：**必须走增量并入**，而不是全量重建。
+    //
+    // M-04（0.15.4）改变了这一条的口径：旧断言要求小增量后索引文件「戳不变」
+    // （即完全不动），用来钉「不在热路径做十几 MB 全量重建」。但那条断言把
+    // **正确行为也一起禁掉了**——索引从此停在旧基线，检索面永久陈旧，只能靠
+    // 1.5s 后的全量重建来追（这正是 M-04 要修的 340 MB/分钟写放大）。
+    // 新口径：允许（并要求）索引被**增量**追上，判据改成两条——
+    //   ① 索引内容确实更新了（新增记录可检索）；
+    //   ② 规模开销是增量的：文件大小不得翻倍（全量重建会重写整份倒排表）。
     const stampOf = async () => { const i = await fs_stat(idxSmall); return i.mtimeMs + ':' + i.size }
     const before = await stampOf()
+    const sizeBefore = Number(before.split(':')[1])
     session.push('user/message', { data: { text: '第三条' } })
     session.push('user/message', { data: { text: '第四条' } })
     await ctx.callPreStep({ session }, { kind: 'enter' })
     await engine._waitForIdle()
-    assert.equal(await stampOf(), before, '陈化的小增量不得触发全量索引重建（首字不受十几 MB 重建拖累）')
+    const after = await stampOf()
+    const sizeAfter = Number(after.split(':')[1])
+    assert.notEqual(after, before, '小增量必须被索引追上（否则检索面永久陈旧）')
+    assert.ok(
+      sizeAfter <= sizeBefore * 2 + 4096,
+      '小增量必须走增量并入，不得全量重写整份倒排表（前 ' + sizeBefore + ' B → 后 ' + sizeAfter + ' B）',
+    )
 
     // 3) 回填（≥100 条）：批量化摄入后重建一次
     for (let i = 0; i < 150; i += 1) session.push('user/message', { data: { text: '回填' + i } })

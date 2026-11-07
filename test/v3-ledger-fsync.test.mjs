@@ -87,7 +87,13 @@ test('B3-5 静态守卫：提交点走 fsync，可重建缓存不走（性能面
   // （对账识别合法缺失）。两者都是「不可回家的隐私事实」，必须 fsync。
   // P1-07：孤儿回执账本是「放弃补凭证后的恢复线索」——丢了就永久丢原文，必须 fsync；
   // 它与 vouchers 分账，因此是一个**独立**提交点。
-  assert.equal(syncCalls.length, 8, 'commit + vouchers + forget + revoke + redaction + purge(forget) + purge(purged) + orphan 共 8 个提交点')
+  // A-01（0.15.4）：新增第 9 个提交点——`action:'restored'`（restore 落下的恢复节点
+  // seq + 正文指纹）。它与 redaction 共用 redactions.jsonl，但**语义独立**：丢了它，
+  // restore 之后那张凭证就再也 redact 不掉（这正是 A-01 的隐私缺口），所以必须 fsync。
+  // 0.15.4：孤儿回执清除（A-05）走的是 `writeFileAtomic`（整本重写 + handle.sync()），
+  // 所以提交点数**仍是 9** —— 它落盘同样可靠，只是不走 appendLine 的 fsync 路径。
+  // 这条断言盯的是「payload/事务类提交点不得退回裸 writeFile」，不是「只能有 9 处写盘」。
+  assert.equal(syncCalls.length, 9, 'commit + vouchers + forget + revoke + redaction + purge(forget) + purge(purged) + orphan + restored 共 9 个 appendLine 提交点（孤儿回执清除走 writeFileAtomic，自带 fsync）')
   assert.ok(syncCalls.every((l) => /logPath, commitLine|vouchersPath, voucher|forgottenPath|redactionsPath|PURGED_LOG|ORPHAN_LOG/.test(l)), 'fsync 只落在提交点')
   const plainAppends = lines.filter((l) => /appendLine\(path\.join/.test(l) && !l.includes('{ sync: true }'))
   assert.ok(plainAppends.every((l) => /REPAIR_LOG|CHECKPOINT_LOG/.test(l)), 'repair 审计/检查点缓存保持非 fsync 路径')

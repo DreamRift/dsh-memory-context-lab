@@ -88,6 +88,129 @@ export function searchLexical(index, query, { limit = 10 } = {}) {
   return rankResults([...scores].map(([id, score]) => ({ id, score }))).slice(0, limit)
 }
 
+/**
+ * M-04（0.15.4，P1）**增量索引**：把新增/移除的记录并入已有索引，不做全量重扫。
+ *
+ * ## 缺陷
+ *
+ * 旧实现只有 `rebuildLexicalIndex`（读**全部**记录 → 重建 → 写整份索引）。每步摄入
+ * 1–3 条记录也会触发一次：实测 3,044 ms / 26 MB 写、稳定循环约 4.5 s 一次、
+ * 约 340 MB/分钟写入、67% 占主线程。计划 §5.4 明文要求「pre-step 只读已就绪索引…
+ * 不做全库重建」、§9.3 要求「索引后台换代…不在 pre-step 全量重建」。
+ *
+ * ## 为什么可以增量（正确性前提）
+ *
+ * 记录**提交后不可变**（`submitTransaction` 冲突即拒、无原地改写），本会话内一旦
+ * 提交就只有两种情况改变可检索集合：**新增**可检索记录、**遗忘**已有记录。
+ * 因此「旧索引 + 新增 doc + 移除 doc」与「全量重扫」在语义上等价——前提是
+ * `sourceCount` / `forgottenCount` 两个基线要跟着更新（否则新鲜度判据会说谎）。
+ *
+ * ## 边界（失败即退回全量）
+ *
+ * 增量要求旧索引**可信**：索引缺失、损坏、或基线与实际不符（期间有别的写者）时
+ * 一律返回 `{ applied: false }`，由调用方退回 `rebuildLexicalIndex`。宁可多扫一次，
+ * 也不让索引悄悄偏离真源。
+ *
+ * @param {object} store 存储端口（需 directory / listRecordIds / readRecord）
+ * @param {{added?: Array<{id,text}>, removed?: string[], textOfRecord?: Function}} plan
+ * @returns {Promise<{applied: boolean, index?: object, reason?: string}>}
+ */
+export async function updateLexicalIndexIncremental(store, plan = {}) {
+  const added = Array.isArray(plan.added) ? plan.added : []
+  const removed = Array.isArray(plan.removed) ? plan.removed : []
+  if (added.length === 0 && removed.length === 0) return { applied: false, reason: 'no-change' }
+
+  let index
+  try {
+    index = await readLexicalIndex(store)
+  } catch (error) {
+    return { applied: false, reason: 'index-unreadable' }
+  }
+  if (index === null || typeof index !== 'object' || typeof index.terms !== 'object') {
+    return { applied: false, reason: 'index-absent' }
+  }
+  // 基线复核：旧索引必须对应**新增之前**的库。
+  //
+  // 时序是「记录先提交，索引后追」——调用本原语时新增记录已经在库里了。因此旧索引
+  // 的 sourceCount 应当等于「当前库记录数 − 本次新增数」（移除方向则相反）。
+  // 写成「等于当前库」是错的：那样永远不符，增量永远退回全量（等于没修）。
+  const ids = await store.listRecordIds()
+  const expectedBaseline = ids.length - added.length + removed.length
+  if (!Number.isInteger(index.sourceCount) || index.sourceCount !== expectedBaseline) {
+    return { applied: false, reason: 'baseline-drift' }
+  }
+  // 新增记录必须真的在库里（防止调用方传错 ID 造出幽灵文档）。
+  const idSet = new Set(ids)
+  for (const entry of added) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string') {
+      return { applied: false, reason: 'bad-entry' }
+    }
+    if (!idSet.has(entry.id) && !removed.includes(entry.id)) {
+      return { applied: false, reason: 'unknown-record' }
+    }
+  }
+  const forgottenCount = typeof store.listForgotten === 'function' ? store.listForgotten().length : 0
+  if ((Number.isInteger(index.forgottenCount) ? index.forgottenCount : 0) !== forgottenCount) {
+    return { applied: false, reason: 'forgotten-drift' }
+  }
+
+  // 无原型对象：与 buildLexicalIndex 同一条编码纪律（H-13 原型污染）。
+  const terms = Object.create(null)
+  for (const term of Object.keys(index.terms)) {
+    const row = index.terms[term]
+    const copy = Object.create(null)
+    for (const id of Object.keys(row ?? {})) copy[id] = row[id]
+    terms[term] = copy
+  }
+  const docLengths = Object.create(null)
+  for (const id of Object.keys(index.docLengths ?? {})) docLengths[id] = index.docLengths[id]
+
+  /** 从倒排表里彻底摘掉一篇文档（不能只把 tf 清零，否则该词元会留下空行）。 */
+  const dropDoc = (id) => {
+    for (const term of Object.keys(terms)) {
+      if (terms[term][id] !== undefined) {
+        delete terms[term][id]
+        if (Object.keys(terms[term]).length === 0) delete terms[term]
+      }
+    }
+    delete docLengths[id]
+  }
+
+  for (const id of removed) dropDoc(id)
+  for (const entry of added) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string' || typeof entry.text !== 'string') {
+      return { applied: false, reason: 'bad-entry' }
+    }
+    dropDoc(entry.id) // 幂等：同 ID 重复并入不产生双份 tf
+    const tokens = tokenizeQuery(entry.text)
+    docLengths[entry.id] = tokens.length
+    for (const term of tokens) {
+      if (terms[term] === undefined) terms[term] = Object.create(null)
+      terms[term][entry.id] = (terms[term][entry.id] ?? 0) + 1
+    }
+  }
+
+  const docIds = Object.keys(docLengths)
+  let totalTokens = 0
+  for (const id of docIds) totalTokens += docLengths[id]
+  return {
+    applied: true,
+    index: {
+      terms,
+      docLengths,
+      avgDocLength: docIds.length === 0 ? 0 : totalTokens / docIds.length,
+      indexedCount: docIds.length,
+      // 增量后基线必须跟着走：否则下一次新鲜度判定会一直判 stale（永久全量重建）。
+      // 直接取**当前库真实记录数**，而不是 `旧值 + 增 − 删` 的算术：后者在调用方
+      // 多传/漏传一条 ID 时会算出与真实库不符的基线，反而制造永久 stale。
+      sourceCount: ids.length,
+      forgottenCount: added.length > 0 || removed.length > 0
+        ? (typeof store.listForgotten === 'function' ? store.listForgotten().length : forgottenCount)
+        : forgottenCount,
+    },
+  }
+}
+
 /** 持久化索引（派生物缓存）。 */
 export async function writeLexicalIndex(store, index) {
   await writeFileAtomic(path.join(store.directory, INDEX_FILE), JSON.stringify(index) + '\n')
@@ -172,9 +295,17 @@ export async function isIndexStale(store, index) {
   if (index === null) return true
   const ids = await store.listRecordIds()
   const baseline = Number.isInteger(index.sourceCount) ? index.sourceCount : index.indexedCount
+  // T-09（0.15.4）：新鲜度判定必须**总是**读遗忘集，不能因为前面的基线相等就跳过。
+  //
+  // 缺陷：旧实现在 `baseline !== ids.length` 时提前 `return true`，也就跳过了下面的
+  // `listForgotten()`。于是「health 会不会抛错」取决于**索引是否刚好新鲜**——
+  // 库坏了而索引恰好匹配时静默返回 stale=true，库好的时候反而因为读遗忘账本抛错。
+  // 同一个健康面，抛不抛由无关变量决定，调用方根本无法据以判断。
+  //
+  // 现在：先把遗忘集读出来（读失败就如实抛，判据一致），再按两个条件判 stale。
+  const forgottenCount = typeof store.listForgotten === 'function' ? store.listForgotten().length : 0
   if (baseline !== ids.length) return true
   // 已遗忘集规模变了 → 索引里可能还留着已遗忘正文，必须重建
-  const forgottenCount = typeof store.listForgotten === 'function' ? store.listForgotten().length : 0
   const indexForgotten = Number.isInteger(index.forgottenCount) ? index.forgottenCount : 0
   return forgottenCount !== indexForgotten
 }

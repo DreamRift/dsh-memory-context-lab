@@ -142,7 +142,7 @@ test('I6-2 actual status output is byte-identical under all default-off values',
     commands: { register(definition) { commands.push(definition); return () => {} } },
     get() { return undefined },
   }
-  const expected = '本会话尚未摄入：先发出任意一条消息触发一次步骤，影子库会在后台建库。\n· 本对话：已停用；回注开；覆盖 无（跟随全局设置页）\n· 模式：按轮归档（full-history）；计划先行 关；停用恢复 开\n· 生效回注设置：已关闭；条数 10；装包阈 0.5；首部 160 字符；查询上限 512 字符；全历史默认 开；轮次判定 DSH 轮次（默认）；计划先行默认 关；按步闸门 20%；按步批量 10 步；停用恢复 开\n· 固定工具：等待 tools 服务就绪（已订阅注入；就绪后注册一次）\n· 回注：尝试 0 次；注入 0；跳过 0；失败 0；上次成功：从未'
+  const expected = '本会话尚未摄入：先发出任意一条消息触发一次步骤，影子库会在后台建库。\n· 本对话：已停用；回注开；覆盖 无（用内置缺省：本对话默认关闭；设置页开关不影响未开启的新会话，要启用请 /memory-lab on）\n· 模式：按轮归档（full-history）；计划先行 关；停用恢复 开\n· 生效回注设置：已关闭；条数 10；装包阈 0.5；首部 160 字符；查询上限 512 字符；全历史默认 开；轮次判定 DSH 轮次（默认）；计划先行默认 关；按步闸门 20%；按步批量 10 步；停用恢复 开\n· 固定工具：等待 tools 服务就绪（已订阅注入；就绪后注册一次）\n· 回注：尝试 0 次；注入 0；跳过 0；失败 0；上次成功：从未'
   try {
     await apply(ctx, { enabled: false })
     const session = createFakeSession({ id: 'i6-status-fixture' })

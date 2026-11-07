@@ -128,7 +128,7 @@ test('B3-7 markVoucherRedacted 同锁：等待且正常标记', async () => {
       await port.appendVoucher({ recordIds: [], targetEventId: 'evt-m', receiptText: '回执', txn: 1 })
       const marked = await port.markVoucherRedacted('v-1', true)
       assert.equal(marked.changed, true)
-      assert.deepEqual(port.redactedVoucherIds(), ['v-1'])
+      assert.deepEqual(await port.redactedVoucherIds(), ['v-1'])
       const again = await port.markVoucherRedacted('v-1', true)
       assert.equal(again.changed, false, '幂等不重复追加')
     } finally {

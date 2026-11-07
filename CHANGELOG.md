@@ -1,33 +1,106 @@
+## 0.15.4（2026-11-06，全面排查 63 项缺陷修复；正式版）
+
+按 [0.15.3 全面排查报告]（63 项：P1×8 / P2×34 / P3×21）
+与[缺陷修复方案]逐条落地。本版**无新增配置项、无数据迁移**。
+
+### 归档停摆（P0，真机复现）
+
+- **根因**：`domain/archive/steps.mjs` 在阶段 1 选窗口时，`hasHuman` 检查写在了 `turn` 赋值**之前**。
+  第一步的 `turn` 恒为 `null`，于是首个含真人消息的单元（往往是**已被归档过的历史残留**）被当成
+  回合锚点，扫描从一开始就无法继续 → 归档静默停摆，而 `status` 仍显示闸门已开。
+- **修法**：把 `turn` 赋值提到检查之前（6 行顺序调整）。
+- **守卫**：`v3-step-leading-anchor-turn.test.mjs`。真机验证：重启后凭证由 8 张增至 12 张，最后一张到 seq 4167。
+
+### 隐私与清除
+
+- **M-01 脱敏吞正文（P1）**：`redact.mjs` 的 `KEY_VALUE_RE` 普通分支值写成 `[^\r\n]{4,}`（吃到行尾），
+  一行里 `password: x; 后续正文` 的**后续全部被吃掉**。改为两步法（问题 1-C）：先切 token，
+  再按键名判值边界；接受「纯字母短密码」的已知残留。实测曾有 23 条记录被截断（9010→759 字符）。
+  守卫 `v3-redact-swallow-m01.test.mjs`。
+- **问题 3-B 承诺降级**：`forget purge` 后 `records/` 真删，但 `vouchers.jsonl` 里的回执正文仍在。
+  文案据实改为「可见面已清除，审计账本保留痕」，不再暗示「彻底删除」。守卫 `v3-forget-promise-q3.test.mjs`。
+- **A-01 恢复节点永久阻断清除（P1）**：restore 出来的节点没有账本身份，`redact`/`purge` 按 seq 定位不到它，
+  于是一旦恢复过就一直清不掉。按问题 5-A 让恢复节点**可再归档**，从而获得账本身份。
+  守卫 `v3-restore-then-redact-a01.test.mjs`。
+- **T-03 跨句柄清除账本不刷新**：`redactedVoucherIds()` 改为按戳刷新后读，导出等读路径 `await` 它。
+  守卫 `v3-redactions-cross-handle-t03.test.mjs`。
+- **A-05 孤儿回执永不清除（P2）**：`orphan-receipts.jsonl` 存的是**明文回执正文**，却完全不在遗忘级联里。
+  forget/purge 之后这段明文永久留盘；又因为没有对应凭证，`restore` 恒 `receipt-changed`——既不可恢复、
+  也不可清除。新增 `redactOrphansFor`：命中行**整本重写**（不是追加标记位——追加只会让读面忽略旧行，
+  明文仍在盘上），正文置空、保留 `recordIds` 作审计；`restoreOrphan` 见到 `redacted` 明确报
+  `orphan-redacted`。守卫 `v3-a05-orphan-cascade.test.mjs`（含「磁盘上不得残留明文」断言）。
+- **A-03 老账本 undo 猜错槽位（P1）**：无 seq 的老账本走「面上第一个常量节点」兜底，赌错就把别处正文
+  写进本凭证槽位（位置与内容互换）。收紧为**常量节点必须唯一**，否则失败关闭（`redaction-seq-ambiguous`）。
+  守卫 `v3-redaction-seq-identity.test.mjs` 新增用例。
+
+### 性能
+
+- **M-04 每步全量重建索引（P1）**：小增量分支原走 `scheduleIndexRebuild`（1500 ms 节流后**全库重建**），
+  实测单次 3,044 ms / 26 MB，稳态约 4.5 s 一轮、写入约 340 MB/min、主线程占用 67%。
+  改为**增量索引**（`lexical-index.mjs` 新增增量原语），小增量只并入新增记录。
+  守卫 `v3-index-incremental-m04.test.mjs`。
+
+### 语义正确性
+
+- **M-03 记录重复**：提交前按**事件 ID** 去重，命中即拒绝落库（问题 6-C）。
+  ⚠️ **不做正文 hash 去重**——实测 2,127 条（418 组）是「正文相同但事件不同」的两次真实操作，
+  合并它们等于篡改历史。守卫 `v3-ingest-dedupe-m03.test.mjs`（含一条反向用例：不同事件的相同正文必须都落库）。
+- **问题 2 / 问题 7 缺省对齐（M-02、C-01、C-02）**：客户端不再自带一份与宿主相反的缺省值。
+  `controlOfStatus` 回落 `enabled:false, recall:true`；模式回落改为 `full-history`（宿主
+  `modeForNewSession` 同值）。**宿主侧行为不变**：新会话默认关闭、自动回注默认开，二者原本就是正确行为，
+  只修 `controlLine` 文案。守卫 `v3-client-defaults-c02-c05.test.mjs`、`v3-defaults-alignment-q2q7.test.mjs`。
+- **C-05 内部码直出**：`no-session` / `unknown-command` / `no-remote` / `no-result` 不再作为用户可见文案
+  显示（改为中文人话），但 `code` 字段保留（诊断与测试锚点）。
+- **C-03 面板静默写别的会话（P2）**：侧栏面板能对**任意选中会话**执行 `now`/`compact`/`export`/`fork`，
+  却既不说明命令落到哪个会话，也不显示该会话的控制状态——可以对一个已停用的会话发写命令而毫无提示。
+  面板拿不到「当前会话 id」（侧栏常驻面 props 无 `sessionId`），因此不能靠比对来警告；改为**显式化目标**：
+  所有写命令先弹一步确认，把目标会话名写进提示，用户必须看见才继续。读命令（status/history）不拦。
+
+### Windows 与持久化
+
+- **T-02 心跳与 rename 争用（P1）**：写锁心跳原用 `writeFileAtomic`（含 rename），在 Windows 上与
+  读取句柄争用触发 `EPERM`。按问题 4-B+A：心跳与 rename **解耦**，并只对 `EPERM` 做**有界重试**
+  且记日志；不做无差别重试，也不走原生 `ReplaceFile` 路径。守卫 `v3-heartbeat-decoupled-t02.test.mjs`。
+- **T-01 提交追加门**：账本追加门改为尾部窗口读，避免整本解析。守卫 `v3-commit-append-gate-t01.test.mjs`。
+
+### 生命周期（问题 8-A+D）
+
+- **新增 `/memory-lab storage [status|clean [--yes]]`**：`quarantine/`（崩溃残留，只进不出）与
+  `exports/`（本地导出包，无 TTL）此前**既无出口可清、也无处看大小**。现在：
+  `status` 报告实际残留（文件数与体积，读不到就说读不到，不猜 0）；`clean` 先预览，
+  加 `--yes` 才真删；**只删这两处，绝不动 `records/`、账本与索引**；不跟随符号链接。
+  **不做 TTL 自动删**——自动删正文与「可恢复」的承诺相冲。
+  统计与清理**同源**（同一趟扫描），避免「status 报 3 个、clean 删 5 个」。
+  `/memory-lab status` 增加「残留」行。守卫 `v3-storage-residue.test.mjs`（7 例）。
+
+### G6b「可见片段去重」：保留，登记为候选（未接线）
+
+`src/v3/domain/visibility/` 全套保留，但 `composition.mjs` 的唯一 `createRecall(...)` 调用点
+**不传** `visibility` / `dedupeVisible`；仓库没有 `snapshotOf` 生产方、也没有对应设置项，
+整链在真实会话中**不可达**（A-06 / A-07 / A-11）。按用户裁定保留代码、登记待议。
+新增 `v3-g6b-unwired.test.mjs` 钉住「不得悄悄接线」；既有 `v3-g6b-source-guard` 的
+零引用判据改为**剥注释后**匹配（旧写法会把「此处不要加 dedupeVisible」的警告注释误判成接线）。
+
+### 验证
+
+- `plugin` 与 `release` 各 `node scripts/test-all.mjs` **261/261 套件通过**（exit 0，win32-x64）。
+- 本版新增守卫 **14 个**；每项均做「临时回退 → 红 → 恢复 → 绿」变异自证。
+- `release/src`、`release/test` 与 `plugin` 对应树**零差异**；两处 `package.json` 同为 0.15.4。
+
+### 未做
+
+- **未打 tag、未建 Release**（待单独授权）；推送 GitHub 见发布记录。
+- **未安装到 desktop profile**（需用户确认重启时机）。
+
 ## 0.15.3（2026-11-06，DSH 0.2.2 命令通道兼容修复）
 
-### 根因
+- **根因**：DSH 0.2.2 的动态客户端门面只放行白名单生命周期方法与当前插件声明的服务，不再转发 `ctx.inject`。旧实现把 `remote.commands` 放进可选子插件注入，父插件的 `fiber.inject` 没有它，读取 `ctx.remote.commands` 被动态门面拒绝，弹层只能显示「命令通道不可用」。
+- **修法**：浏览器半正式声明 `['slots', 'locale', 'remote', 'remote.commands']`；`uiWorkspace` 与 `configForms` 仍按非核心可选接入处理。宿主探针的 `turn/start` 字段检查同步 0.2.2 实际形状。
+- **守卫与验证**：plugin 与 release 各 `node scripts/test-all.mjs` **239/239 套件通过**（exit 0，win32-x64）；release 相关客户端回归 57/57；`probe:host` 对 DSH `0.2.2-rc.1` 11/11 PASS。
+- **产物**：`dist/dsh-memory-context-lab-0.15.3.tgz`（同时复制到 `release/dist/`），10,248 条目；精确字节数与 sha256 见 `release/RELEASE.md`，包内文档不写自身摘要。
+- **验收边界**：未安装到 desktop profile、未重启 DSH，真实浏览器点击验收待做。
 
-升级到 DSH Desktop `0.2.2-rc.1` 后，记忆上下文的 composer 弹层显示「命令通道不可用」，导致本对话启用、回注、计划先行等开关无法写入。OPS 组件本身可启用，宿主 `ops_*` 工具也正常执行；问题只出在浏览器客户端的命令服务声明。
-
-新版宿主的 `dynamicCordisContext` 只放行白名单生命周期方法与**当前插件**声明的服务，且不再转发 `ctx.inject(...)`。旧实现把 `remote.commands` 放进可选 `ctx.inject`，该子插件声明不会进入父插件的 `fiber.inject`，因此动态门面读取 `ctx.remote.commands` 时被拒绝，弹层只能降级为禁用状态。
-
-### 修法
-
-- 浏览器半正式声明 `['slots', 'locale', 'remote', 'remote.commands']`，与官方 `dsh-client-ui-commands` 一致；命令通道缺失时保持 waiting，而不是渲染一个所有控制都禁用的假可用面板。
-- `uiWorkspace` 保留为可选接入，仅影响 fork 附加入口；设置页 `configForms` 仍按既有可选逻辑处理。
-- 宿主契约探针更新 `turn/start` 字段检查：0.2.2 的事件形状是 `session.append('turn/start', { turn })`，不再依赖旧正则里的 `event.data.turn`。
-
-### 守卫与验证
-
-- 新增/改写 `v3-client-optional-injects.test.mjs`：钉住命令服务正式声明、缺服务不装配、正常服务下 chip/面板/字典装配。
-- plugin 源码树 `node scripts/test-all.mjs`：**239/239 套件通过**（exit 0，win32-x64）。
-- release 镜像相关客户端测试与宿主探针：**57/57 通过**，`probe:host` 对 DSH `0.2.2-rc.1` 11/11 PASS。
-- `npm pack`：`dsh-memory-context-lab-0.15.3.tgz`，10,248 文件；vendor dsh-ops 与 Bash 载荷仍在包内。精确字节数与 sha256 见 `RELEASE.md`。
-
-### 验收边界
-
-未安装到 desktop profile、未重启 DSH，真实浏览器点击验收待做。恢复使用时安装新 tgz 并重启，再在对话中点击记忆上下文开关确认 `/memory-lab on` 可执行。
-
-## 0.15.2（2026-11-05）
-
-> 本版是相对上一个正式版本 **v0.13.1** 的发布版本。0.14.0-beta.1 … beta.51、0.15.0、0.15.1 全部是开发期过渡号，
-> 下面「本版内容」只讲 0.15.2 自己改了什么；**跨版本的大项变化**（v3 单引擎、历史检索回注、双归档模式、
-> 回执摘要、捆绑 dsh-ops 等）写在同一 tag 的 GitHub Release 说明里，不在这里重复。
+## 0.15.2（2026-11-05，按步归档死锁修复；未推送）
 
 0.15.1 的源码线收口后，真机走查发现**按步归档在真实会话里一次都压不动**：把模式切到「按步归档」后，`/memory-lab status` 的「下一次归档」恒为「活动面不连续（not-dense）」。本轮只修这一处根因，**不改产品方向、不改默认值、无新增配置项、无数据迁移**。
 
@@ -316,7 +389,7 @@
 
 ## 0.14.0-beta.51（2026-10-30，测试版）
 
-相比 0.14.0-beta.50（本版一次收完审计 beta.50 后续（docs/dev-0.14.0/审计-0.14.0-beta.50-后续-20261029.md）的全部 40 项确认缺陷：2 P1 + 10 P2 + 28 P3，按 B1/B2/B3 批执行；不改产品边界）：
+相比 0.14.0-beta.50（本版一次收完[审计 beta.50 后续]的全部 40 项确认缺陷：2 P1 + 10 P2 + 28 P3，按 B1/B2/B3 批执行；不改产品边界）：
 
 ### 修复（B1 批，两个 P1）
 
@@ -553,7 +626,7 @@
 - **实现要点**：`step/start`、`step/end` 是日志事件、不是活动面节点，span 只能由步骤内的**活动面节点**拼成——否则宿主 `range replace` 的密集覆盖判据必然失败（本版真实踩到并钉了守卫）。
 - **e2e**：cooling 用 6 步夹具实测「保留最近 2 步、一次压 3 步」，闸门与凭证照常；`/memory-lab status` 的「下一次归档」预览在 cooling 下走同一个步骤选择器，不骗人。
 - **守卫**：新增 `v3-step-cooling`（6 条）。全量 **92 套全绿、0 跳过**。
-- **文档**：实时降温判定设计-beta.40（docs/dev-0.14.0/实时降温判定设计-beta.40.md）（灵枢 role 分层/时间衰减/可回读/主动遗忘四条对照，及为何不引入概率模型）。
+- **文档**：[实时降温判定设计-beta.40]（灵枢 role 分层/时间衰减/可回读/主动遗忘四条对照，及为何不引入概率模型）。
 
 ## 0.14.0-beta.39（2026-10-28，测试版；回注包不再锁死归档 + 下一次归档预览）
 

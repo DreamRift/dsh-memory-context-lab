@@ -36,6 +36,8 @@ import { labRootFor } from './storage.mjs'
 import { PLUGIN_SOURCE_KIND, RECALL_SOURCE_FORM } from './v3/contracts/sources.mjs'
 import { READBACK_MAX_CHARS } from './v3/contracts/readback.mjs'
 import { wrapInjectedPayload } from './v3/domain/security/untrusted.mjs'
+// 问题 8（0.15.4）：残留体积的人话格式（与 storage-residue 的清理判据同源）。
+import { formatBytes } from './v3/adapters/storage/storage-residue.mjs'
 import { userInputTextOf } from './v3/domain/session/user-input.mjs'
 import { SESSION_OVERRIDE_BOUNDS, SESSION_OVERRIDE_KEYS, mergeSessionSettings } from './v3/domain/session/session-control.mjs'
 import { parseStrictInteger } from './v3/domain/session/number-input.mjs'
@@ -117,7 +119,14 @@ export const inject = ['commands']
  *   不是裸值——直接 `config.limit` 拿到的是对象，传下去会被当成非法参数。
  */
 export const Config = Schema.object({
-  enabled: Schema.boolean().default(true).description('新会话默认回注开关；本对话可在 composer 面板单独关闭').volatile(),
+  // 问题 2（用户裁定，0.15.4）：旧描述「新会话默认回注开关」是**过度承诺**。
+  //
+  // 真实语义（`mergeSessionSettings` + `controlOf()` 硬编码 `defaultEnabled:false`）：
+  // 它只对**已经用 /memory-lab on 开过的会话**追加生效——关掉它会把那些会话的回注一并关掉；
+  // 但它**不会**让新会话默认回注（新会话没有 control.json，一律以 false 构造）。
+  // 用户 2026-10-28 的裁定是「插件本身默认在新对话是关闭的、自动回注默认开启」，
+  // 两者都在既有实现里成立，缺的只是把这层关系说清楚。行为不动，只改描述。
+  enabled: Schema.boolean().default(true).description('回注总闸：关闭后，所有已启用本插件的会话都停止自动回注（不影响新会话是否启用——那仍是本对话自己 /memory-lab on）').volatile(),
   limit: Schema.number().default(10).min(1).max(20).step(1).description('新会话默认单次回注条数；本对话可在 composer 面板覆盖').volatile(),
   packMinScore: Schema.number().default(0.5).min(0).max(50).step(0.1).description('装包阈值：低于此分的命中不进回注包（0 表示不过滤）').volatile(),
   previewChars: Schema.number().default(160).min(40).max(4000).step(10).description('每条命中在回注包里的首部字符数').volatile(),
@@ -468,6 +477,7 @@ const USAGE = [
   '　　　/memory-lab compact —— 归档并带确定性摘要',
   '　　　/memory-lab dry-run —— 预览归档候选（不写）',
   '　　　/memory-lab history —— 列出恢复凭证',
+  '　　　/memory-lab storage [status|clean [--yes]] —— 查看/清理插件替你保管的残留（quarantine 崩溃残留、exports 本地导出包）；不动记录与账本',
   '　　　/memory-lab repair [status|apply] —— 日志尾部半行修复（status 只报告）',
   '　　　/memory-lab working-set —— 当前回合的工作集',
   '　　　/memory-lab export|adopt <文件名>|adopt-from <父ID>|adopt-allow on|off —— 导出/导入/父记忆复制授权',
@@ -932,7 +942,7 @@ export async function apply(ctx, config) {
       definitionId: COMMAND_DEFINITION_ID,
       name: COMMAND_NAME,
       description: '记忆上下文：本对话开关 / 摄入与回注 / 检索与回读',
-      input: { hint: 'status | on|off | inject on|off | set limit <1–20> | unset limit | set gate <0–95> | unset gate | reset | mode <full-history|cooling|recall-only> | planfirst on|off|approve | now | compact | dry-run | history | repair [status|apply] | working-set | export|adopt <文件名>|adopt-from <父ID>|adopt-allow on|off | file-status | verify <ID|all> | restore [序号|all] | pin|unpin <ID> | pins | forget preview|apply|purge|undo|status <ID…> | t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] | config show | recall <词> | read <ID> | help' },
+      input: { hint: 'status | on|off | inject on|off | set limit <1–20> | unset limit | set gate <0–95> | unset gate | reset | mode <full-history|cooling|recall-only> | planfirst on|off|approve | now | compact | dry-run | history | repair [status|apply] | storage [status|clean [--yes]] | working-set | export|adopt <文件名>|adopt-from <父ID>|adopt-allow on|off | file-status | verify <ID|all> | restore [序号|all] | pin|unpin <ID> | pins | forget preview|apply|purge|undo|status <ID…> | t2 [backfill [1–2000]|backfill cancel|backfill status|cleanup] | config show | recall <词> | read <ID> | help' },
       handler: async (invocation) => {
         const words = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean)
         const sub = (words[0] ?? 'help').toLowerCase()
@@ -943,6 +953,49 @@ export async function apply(ctx, config) {
         }
         try {
           if (sub === 'status') return ok(await statusText(sessionId, invocation?.agent?.session ?? null))
+          // 问题 8（0.15.4，用户裁定 A+D）：残留清理出口。
+          //
+          // `status` 报告有多少；这里让用户能清。只删 quarantine 与 exports，
+          // **绝不碰** records/ 账本/ 索引。默认要 `--yes` 才真删（dry-run 先给数字），
+          // 避免一条命令手滑删掉用户还在用的导出包。
+          if (sub === 'storage') {
+            const storageWords = words.slice(1).map((word) => word.toLowerCase())
+            const action = storageWords[0] ?? 'status'
+            const dryRun = !storageWords.includes('--yes')
+            if (action !== 'clean' && action !== 'status') {
+              return ok('用法：/memory-lab storage [status | clean [--yes]]\n'
+                + '　status = 只报残留大小（等同 /memory-lab status 的「残留」行）\n'
+                + '　clean  = 预览将删除的文件；加 --yes 才真删\n'
+                + '　只清 quarantine（崩溃残留）与 exports（本地导出包），不动记录与账本。')
+            }
+            try {
+              if (action === 'status') {
+                const residue = await engine.storageResidue(sessionId)
+                const describe = (name, entry) => entry === undefined || entry.files === 0
+                  ? '　' + name + '：无'
+                  : '　' + name + '：' + entry.files + ' 个 / ' + formatBytes(entry.bytes)
+                return ok([
+                  '存储残留（' + (residue.totalBytes > 0 ? formatBytes(residue.totalBytes) : '无') + '）：',
+                  describe('quarantine', residue.byKind?.quarantine),
+                  describe('exports', residue.byKind?.exports),
+                ].join('\n'))
+              }
+              const result = await engine.cleanStorage(sessionId, { dryRun })
+              if (dryRun) {
+                return ok(result.removed === 0
+                  ? '没有可清理的残留（quarantine 与 exports 都是空的）。'
+                  : '将清理 ' + result.removed + ' 个文件 / ' + formatBytes(result.bytes)
+                    + '（quarantine + exports）。确认无误后执行：\n/memory-lab storage clean --yes')
+              }
+              const failedLine = result.failed.length > 0
+                ? '\n· ' + result.failed.length + ' 个未删除（' + result.failed[0].code + ' 等），可稍后重试'
+                : ''
+              return ok('已清理 ' + result.removed + ' 个文件 / ' + formatBytes(result.bytes) + '。'
+                + '\n· 记录、账本与索引未受影响。' + failedLine)
+            } catch (error) {
+              return ok('残留处理失败：' + (error?.code ?? 'EINTERNAL') + ' ' + (error?.message ?? ''))
+            }
+          }
           if (sub === 't2') {
             const t2Words = words.slice(1).map((word) => word.toLowerCase())
             const action = t2Words[0] ?? ''
@@ -1146,7 +1199,27 @@ export async function apply(ctx, config) {
           }
           if (sub === 'repair') {
             const mode = (words[1] ?? 'status').toLowerCase()
-            if (mode !== 'status' && mode !== 'apply') return fail('用法：/memory-lab repair [status|apply]（status 只报告，apply 锁内截断尾部半行）')
+            // T-10（0.15.4）：purged 中段损坏的**显式**人工出口。
+            // 通用 repair 的红线是「只动尾部、绝不丢行」——那条不变；
+            // 这是一条单独的、必须指名调用的人工裁决路径。
+            if (mode === 'rebuild-purged') {
+              const apply = words.includes('--apply')
+              const report = await engine.repairStore(sessionId, { dryRun: !apply, rebuildPurged: true })
+              if (report.error === 'not-ready') return fail('本会话尚未建库/打开：先发出任意一条消息，再执行 repair。')
+              if (report.error !== undefined) return fail('重建不可用：' + report.error)
+              if (apply !== true) {
+                return ok('purged 账本重建（预览，未改字节）：'
+                  + '\n· 不可解析的行：' + (report.badLines ?? 0)
+                  + '\n· 账本已记 purge：' + (report.alreadyPurged ?? 0)
+                  + '\n· 需要补记（已提交但记录文件不在）：' + (report.wouldRecord?.length ?? 0)
+                  + ((report.wouldRecord?.length ?? 0) > 0 ? '\n   ' + report.wouldRecord.slice(0, 10).join('、') + ((report.wouldRecord?.length ?? 0) > 10 ? ' …' : '') : '')
+                  + '\n执行 /memory-lab repair rebuild-purged --apply 落盘（旧账本会原样备份，不删字节）。')
+              }
+              return ok('purged 账本已重建：补记 ' + (report.recorded?.length ?? 0) + ' 条；旧账本备份在 '
+                + (report.backup ? String(report.backup).split(/[\\/]/).pop() : '(未写)')
+                + (report.changed === false ? '（无需补记，未改字节）' : ''))
+            }
+            if (mode !== 'status' && mode !== 'apply') return fail('用法：/memory-lab repair [status|apply|rebuild-purged [--apply]]（status 只报告，apply 锁内截断尾部半行，rebuild-purged 是 purged 中段损坏的显式人工出口）')
             const result = await engine.repairStore(sessionId, { dryRun: mode !== 'apply' })
             if (result.error === 'not-ready') return fail('本会话尚未建库/打开：先发出任意一条消息，再执行 repair。')
             if (result.error !== undefined) return fail('修复不可用：' + result.error)
@@ -1187,6 +1260,16 @@ export async function apply(ctx, config) {
             if (file === undefined) return fail('用法：/memory-lab adopt <exports 文件名>')
             const result = await engine.importSession(sessionId, file, invocation?.agent?.session)
             if (result.error === 'session-not-empty') return fail('目标会话已有记录；适用于新空会话（fork 后）')
+            // S-13：adopt <文件名> 与 adopt-from 走同一道同意门（见 v3-entry 的 adoptGateFor）。
+            if (result.error === 'bundle-identity-missing') {
+              return fail('导出包缺少来源会话标识，无法校验复制授权（失败关闭）')
+            }
+            if (result.error === 'bundle-source-not-open') {
+              return fail('导出包的来源会话未在本进程打开，无法校验复制授权：先打开该会话，或改用 adopt-from <父会话ID>')
+            }
+            if (result.error === 'parent-consent-required') {
+              return fail('来源会话未授权被复制（默认拒绝）：先在来源会话执行 /memory-lab adopt-allow on')
+            }
             if (result.error !== undefined) return fail('导入不可用：' + result.error)
             return ok('已导入 ' + result.imported + ' 条正文（来源会话 ' + result.sessionKey + '）' + summaryImportNote(result.summaries))
           }
@@ -1246,7 +1329,10 @@ export async function apply(ctx, config) {
             if (raw === '' || raw === 'all') {
               const result = await engine.restoreHistory(sessionId)
               if (result.error !== undefined) return fail('恢复不可用：' + (result.error?.code ?? result.error))
-              return ok('恢复：' + result.restored + '/' + result.total + '；跳过 ' + result.skipped
+              // A-08：已恢复并用 alreadyRestored 单列，不再让「上次就恢复过」看着像跳过。
+              const againRestored = Number.isInteger(result.alreadyRestored) && result.alreadyRestored > 0
+                ? '（其中 ' + result.alreadyRestored + ' 段上次已恢复）' : ''
+              return ok('恢复：' + result.restored + '/' + result.total + againRestored + '；跳过 ' + result.skipped
                 + (result.forgotten > 0 ? '；已遗忘 ' + result.forgotten : ''))
             }
             const index = parseStrictInteger(raw)
@@ -1308,10 +1394,20 @@ export async function apply(ctx, config) {
               : '\n隐私面：' + face.changed + '/' + face.attempted + ' 段回执已' + (op === 'undo' ? '还原' : '清除')
                 + (face.failed.length > 0 ? '；' + face.failed.length + ' 段失败（#' + face.failed.map((row) => row.index + ':' + row.reason).join('、') + '）' : '')
             // H4：三种遗忘语义必须说清楚，不能一句「已遗忘」让人以为正文已删。
+            // 问题 3-B（用户裁定，0.15.4）：文案必须如实区分「正文不可见」与「账本留痕」。
+            //
+            // 旧文案说「冷库正文与派生物已删除」——records/ 确实删了，但 vouchers.jsonl 里
+            // 回执文本（约 400 字）与摘要（约 220 字）**仍然保留**：它们是审计账本的不可变
+            // 组成部分（计划 §9.1「不改写历史 voucher」）。真机核对 12/12 张凭证都留有
+            // receiptText/summaryText。所以「已删除」是过度承诺，用户据此以为字面全清。
+            //
+            // 新文案按 B 改承诺：说清「可见面已清除、检索不到、不可 undo」，
+            // 同时明说审计账本里仍留有回执与摘要的痕（这是有意的，不是遗漏）。
             const head = op === 'undo'
               ? '已撤销遗忘 '
               : (op === 'purge'
-                ? '已物理清除 ' + (result.purgedCount ?? ids.length) + ' 条（冷库正文与派生物已删除，不可撤销）'
+                ? '已物理清除 ' + (result.purgedCount ?? ids.length) + ' 条：冷库正文已从 records/ 删净，检索与回执不再可读，不可 undo。'
+                  + '审计账本（vouchers.jsonl）里仍留有该批的回执与摘要文字（各约数百字）——这是账本不可改写的设计，不会出现在检索或回注里。'
                 : '已遗忘 ' + ids.length + ' 条（可见面/检索/回执/导出已清除；冷库正文保留以支持 undo，需要不可恢复请用 forget purge）')
             const derivedLine = op === 'purge' && result.derived !== null && result.derived !== undefined
               ? '\n派生物：摘要清除 ' + (result.derived.summaries?.removed ?? '未知') + ' 条；repair-log 清理 ' + (result.derived.repairLog?.changed ?? '未知') + ' 行'
@@ -1394,7 +1490,14 @@ export async function apply(ctx, config) {
     ]
     parts.push(keys.length > 0
       ? '覆盖 ' + keys.map((key) => key + '=' + overrides[key]).join('、')
-      : '覆盖 无（跟随全局设置页）')
+      // 问题 2（用户裁定，0.15.4）：旧文案「跟随全局设置页」是误导。
+      //
+      // 实际生效链路是：新会话没有 control.json 时，宿主以 `defaultEnabled: false`
+      // 构造 —— 设置页那个开关**只对已开过本对话的会话**追加生效，不会让新会话默认回注。
+      // 于是「跟随全局设置页」让人以为翻设置页就能改变本对话，翻完却发现毫无变化。
+      // 按用户裁定 A 口径（行为不变、只改承诺）如实写清三件事：
+      // 1) 本对话现在用的是内置缺省；2) 设置页只影响「已启用的会话」；3) 要开就敲命令。
+      : '覆盖 无（用内置缺省：本对话默认关闭；设置页开关不影响未开启的新会话，要启用请 /memory-lab on）')
     if (control !== null && control !== undefined && control.error) parts.push('控制文件异常 ' + control.error)
     return parts.join('；')
   }
@@ -1512,6 +1615,30 @@ export async function apply(ctx, config) {
     const diagnosticsEnabled = settingsNow().offlineDiagnostics === true
     if (diagnosticsEnabled) {
       lines.push(...offlineDiagnosticsLines(engine.diagnosticsOf?.(sessionId), diagnosticsEnabled))
+    }
+    // 问题 8（0.15.4，用户裁定 A+D）：如实报告插件替你保管的残留。
+    //
+    // 旧实现对 quarantine（只进不出）与 exports（无 TTL）**一个字都不说**，
+    // 用户既不知道有多少，也没有出口可清。这里只报告，不自动删——
+    // 自动删正文与「可恢复」的承诺相冲。清理走 `/memory-lab storage clean`。
+    try {
+      const residue = await engine.storageResidue?.(sessionId)
+      if (residue !== null && residue !== undefined) {
+        const fmt = (entry) => (entry === undefined || entry.files === 0
+          ? '无'
+          : entry.files + ' 个 / ' + formatBytes(entry.bytes))
+        lines.push('· 残留：quarantine ' + fmt(residue.byKind?.quarantine)
+          + '；exports ' + fmt(residue.byKind?.exports)
+          + (residue.totalBytes > 0
+            ? '（合计 ' + formatBytes(residue.totalBytes) + '；/memory-lab storage clean 可清理）'
+            : ''))
+        for (const failure of residue.errors ?? []) {
+          lines.push('　· ' + failure.kind + ' 统计失败：' + failure.code + '（无法确认大小）')
+        }
+      }
+    } catch (error) {
+      // 统计失败不得让 status 整条失败：如实说「读不到」，不猜成 0。
+      lines.push('· 残留：读不到（' + (error?.code ?? 'EINTERNAL') + '）')
     }
     return lines.join('\n')
   }

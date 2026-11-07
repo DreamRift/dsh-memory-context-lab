@@ -16,7 +16,7 @@ import { RESTORE_SOURCE_FORM, V3ContractViolation } from '../contracts/index.mjs
 import { normalizeSchedulePolicyConfig } from '../contracts/archive-schedule-policy.mjs'
 import { evaluateSchedulePolicy, nextSchedulePolicyState } from '../domain/archive/schedule-policy.mjs'
 import { renderArchiveReceipt } from '../domain/archive/receipt.mjs'
-import { restoreEligibilityOf, settleRestore } from '../domain/archive/restore.mjs'
+import { restoreEligibilityOf, settleRestore, outcomeOfRestore } from '../domain/archive/restore.mjs'
 import { selectArchiveSpan } from '../domain/archive/candidates.mjs'
 import { STEP_BATCH_DEFAULT, selectStepSpan } from '../domain/archive/steps.mjs'
 import { summarizeRecords } from '../domain/compress/summary.mjs'
@@ -95,7 +95,7 @@ function schedulePolicyViewOf(decision, scheduled, safeCandidates) {
   return { ...decision, scheduled, safeCandidates }
 }
 
-export function createArchiveService({ store, host, clock, intent = null, random = null, abandon = null } = {}) {
+export function createArchiveService({ store, host, clock, intent = null, random = null, abandon = null, sha256 = null } = {}) {
   if (store === null || typeof store !== 'object') throw new V3ContractViolation('v3 archive: 需要 store')
   if (host === null || typeof host !== 'object') throw new V3ContractViolation('v3 archive: 需要 host')
   // R2-01（2026-10-30）：intentId 由 random 端口生成——application 层禁 import node:*，
@@ -104,6 +104,9 @@ export function createArchiveService({ store, host, clock, intent = null, random
     throw new V3ContractViolation('v3 archive: 需要 random.uuid 端口（R2-01 intentId 生成，composition 注入）')
   }
   const journal = intent !== null && typeof intent === 'object' ? intent : null
+  // A-01（0.15.4）：restore 落下的恢复正文指纹。application 层禁 import node:*，
+  // sha256 由 composition 注入（缺失时该路径自动失败关闭，退回正文扫描）。
+  const hashOf = typeof sha256 === 'function' ? sha256 : null
   // P1-07：补凭证失败的**有界**放弃阈值。默认 5 次 / 6 小时——磁盘满这类瞬时故障通常
   // 在几分钟内被用户处理掉；中段损坏（永久性）不该让归档无限期停摆，也不该让该段
   // 永久无法恢复。两条任一命中即放弃（放弃前先把孤儿回执落盘）。
@@ -796,8 +799,41 @@ async function replaceVoucherReceipt(index, expected, next) {
       return { changed: false, reason: 'host-no-surface-text' }
     }
     // 单节点 replace 会生成新 seq；凭证里的 targetEventId 只在首次落面时有效。
-    // 以「表面正文逐字节相等」定位当前节点，避免用过期 seq 覆盖错节点。
-    const targetSeq = await firstEligibleSeq(await host.surfaceNodes(), expected, (seq) => host.surfaceTextAt(seq))
+    //
+    // A-01（0.15.4）：定位顺序改为「先账本 seq、再正文扫描」。
+    //
+    // 为什么必须这样：`restore` 把回执节点**原地替换**成原文后，面上再也没有那段回执
+    // 正文了，正文扫描必然返回 null → `receipt-changed` → 这张凭证永远 redact 不掉。
+    // 账本里由 restore 落下的 `restored` 行给了确定 seq，先按它定位并**复核正文**
+    // （节点可能已被宿主压缩/改写，那就不许覆盖）。账本没有记录（老库/从未 restore）
+    // 时才退回正文扫描，行为与 0.15.3 完全一致。
+    const nodes = await host.surfaceNodes()
+    let targetSeq = null
+    if (typeof store.restoredSeqOf === 'function') {
+      let recorded = null
+      try { recorded = store.restoredSeqOf(voucher.voucherId) } catch { recorded = null }
+      if (Number.isInteger(recorded) && nodes.includes(recorded)) {
+        // 复核：这个 seq 现在装的是不是**restore 当初落下的那段正文**？
+        //
+        // restore 之后节点里是恢复出来的原文，不是回执正文，所以不能拿 expected 比。
+        // 也不能只判「不是回执/不是清除标记」——那样宿主压缩改写过的任何正文都会被
+        // 当成可覆盖，违背失败关闭。判据用**记下来的恢复正文指纹**：落面时把
+        // sha256 写进账本，这里逐字节复核；指纹缺（老库）或不符一律不走这条路径。
+        let fingerprintOk = false
+        if (hashOf !== null && typeof store.restoredTextHashOf === 'function') {
+          let recordedHash = null
+          try { recordedHash = store.restoredTextHashOf(voucher.voucherId) } catch { recordedHash = null }
+          if (typeof recordedHash === 'string' && recordedHash.length > 0) {
+            const currentText = await host.surfaceTextAt(recorded)
+            fingerprintOk = hashOf(currentText) === recordedHash
+          }
+        }
+        if (fingerprintOk) targetSeq = recorded
+      }
+    }
+    if (targetSeq === null) {
+      targetSeq = await firstEligibleSeq(nodes, expected, (seq) => host.surfaceTextAt(seq))
+    }
     if (targetSeq === null) return { changed: false, reason: 'receipt-changed' }
     try {
       const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: next })
@@ -855,11 +891,23 @@ async function replaceVoucherReceipt(index, expected, next) {
       // 老账本没有 seq：只有「当前恰好只有这一张已清除回执」时映射才无歧义；
       // 多于一张就失败关闭——宁可 undo 不成立，也不把别人的正文写到错位置。
       let redacted = null
-      try { redacted = store.redactedVoucherIds() } catch { redacted = null }
+      // T-03：端口层已改为「按戳刷新后读」，必须 await（否则拿到 Promise，判据失真）。
+      try { redacted = await store.redactedVoucherIds() } catch { redacted = null }
       if (redacted === null || redacted.length !== 1 || redacted[0] !== voucher.voucherId) {
         return { changed: false, reason: 'redaction-seq-missing' }
       }
-      targetSeq = await firstEligibleSeq(await host.surfaceNodes(), REDACTED_RECEIPT, (seq) => host.surfaceTextAt(seq))
+      // A-03（0.15.4）：即便「当前只有这一张已清除」，面上仍可能有**多个**常量节点
+      // （别的凭证被清除后又恢复、或并发写入留下的残留）。取「第一个」等于赌它是本凭证的，
+      // 赌错就把别处的正文写进这个槽位（位置与内容互换）。所以要求**唯一**，不唯一就失败关闭。
+      const nodes0 = await host.surfaceNodes()
+      const constantSeqs = []
+      for (const seq of nodes0) {
+        if ((await host.surfaceTextAt(seq)) === REDACTED_RECEIPT) constantSeqs.push(seq)
+      }
+      if (constantSeqs.length !== 1) {
+        return { changed: false, reason: constantSeqs.length === 0 ? 'receipt-changed' : 'redaction-seq-ambiguous' }
+      }
+      targetSeq = constantSeqs[0]
       if (targetSeq === null) return { changed: false, reason: 'receipt-changed' }
     } else {
       // seq 定位后仍要复核表面正文：节点可能已被宿主压缩/改写（那就不能覆盖）。
@@ -909,7 +957,25 @@ async function replaceVoucherReceipt(index, expected, next) {
       return { restored: false, reason: 'purge-ledger-unreadable' }
     }
     const targetSeq = await firstEligibleSeq(await host.surfaceNodes(), voucher.receiptText, (seq) => host.surfaceTextAt(seq))
-    if (targetSeq === null) return { restored: false, reason: 'receipt-changed' }
+    if (targetSeq === null) {
+      // A-08（0.15.4）：`receipt-changed` 一个码掩盖了**三类完全不同的事实**：
+      //   ① 这一张已经恢复过（面上早就是原文了）——不是失败，是「已完成」；
+      //   ② 面上被别的东西改过（真冲突）；
+      //   ③ 段早已出面/被回收（确实没得恢复）。
+      // 旧实现一律记 skipped，于是 `restore all` 跑第二次会把所有「已恢复」报成跳过，
+      // 用户看到「N 段跳过」以为出了问题。这里用账本里记下的恢复节点 seq 判定 ①。
+      let alreadyRestored = null
+      try {
+        alreadyRestored = typeof store.restoredSeqOf === 'function' ? store.restoredSeqOf(voucher.voucherId) : null
+      } catch { alreadyRestored = null }
+      if (Number.isInteger(alreadyRestored) && alreadyRestored > 0) {
+        const nodesNow = await host.surfaceNodes()
+        if (nodesNow.includes(alreadyRestored)) {
+          return { restored: false, alreadyRestored: true, reason: 'already-restored', restoredSeq: alreadyRestored }
+        }
+      }
+      return { restored: false, reason: 'receipt-changed' }
+    }
     const loaded = await recordsOf(voucher.recordIds)
     if (!loaded.ok) {
       // D-B：已遗忘与「读失败」必须分开记账（旧实现只表现为 record-read-failed）。
@@ -927,7 +993,24 @@ async function replaceVoucherReceipt(index, expected, next) {
     })
     try {
       const confirmation = await host.surfaceOp({ op: 'replace', targetEventId: targetSeq, text: next, sourceForm: RESTORE_SOURCE_FORM })
-      return { restored: true, seq: confirmation?.seq, chars: text.length, voucherIndex: index }
+      const newSeq = Number.isInteger(confirmation?.seq) ? confirmation.seq : null
+      // A-01（0.15.4）：把恢复节点的 seq 落进账本。
+      //
+      // 这是「restore 之后就无法 redact」的根因修复：restore 会把回执节点原地替换成原文，
+      // 宿主分配新 seq、旧 seq 作废，面上再也没有那段回执正文——过去 redact 靠正文扫描
+      // 定位，于是恒拿到 receipt-changed，那张凭证就**永久清洗不掉**了。
+      // 现在把「凭证 → 当前节点 seq」持久化，redact/unredact 优先按 seq 定位。
+      // 写失败不影响本次 restore（正文已经落面），只让清洗退回旧路径——如实记进返回值。
+      let seqRecorded = false
+      if (newSeq !== null && typeof store.markVoucherRestoredSeq === 'function') {
+        try {
+          // 同时记下**恢复正文的指纹**：后续 redact 靠它确认「这个 seq 装的确实是我
+          // 当初恢复的那段正文」，而非宿主改写后的别的内容（失败关闭判据）。
+          const marked = await store.markVoucherRestoredSeq(voucher.voucherId, newSeq, hashOf === null ? null : hashOf(next))
+          seqRecorded = marked?.changed === true || marked?.seq === newSeq
+        } catch { seqRecorded = false }
+      }
+      return { restored: true, seq: newSeq, chars: text.length, voucherIndex: index, seqRecorded }
     } catch (error) {
       return { restored: false, reason: 'surface-rejected', error }
     }
@@ -941,6 +1024,9 @@ async function replaceVoucherReceipt(index, expected, next) {
     if (typeof host.surfaceNodes !== 'function' || typeof host.surfaceTextAt !== 'function') {
       return { restored: false, reason: 'host-no-surface-text' }
     }
+    // A-05（0.15.4）：孤儿回执被遗忘级联清除过 → 正文已不在账本里，永远不可恢复。
+    // 必须**明确**说清，不能落到 `receipt-changed`（那会让用户以为「也许还有救」）。
+    if (orphan?.redacted === true) return { restored: false, reason: 'orphan-redacted' }
     const targetSeq = await firstEligibleSeq(await host.surfaceNodes(), orphan.receiptText, (seq) => host.surfaceTextAt(seq))
     if (targetSeq === null) return { restored: false, reason: 'receipt-changed' }
     const loaded = await recordsOf(Array.isArray(orphan.recordIds) ? orphan.recordIds : [])
@@ -974,12 +1060,10 @@ async function replaceVoucherReceipt(index, expected, next) {
       const result = await restoreVoucher(index)
       rows.push({ index, ...result })
     }
-    // D-B：会计走 N-11 三桶——restored + skipped + forgotten === total，
-    // 已遗忘记录不再混进「跳过」，让 status/命令面能说清「为什么没恢复」。
-    const settled = settleRestore(rows.map((row) => ({
-      outcome: row.restored === true ? 'restored' : (row.reason === 'record-forgotten' ? 'forgotten' : 'skipped'),
-      reason: row.restored === true ? undefined : row.reason,
-    })))
+    // A-08（0.15.4）：三桶之外单列 alreadyRestored——「上次已经恢复过」是**完成**，
+    // 不是跳过。把它算进 skipped 会让第二次 `restore all` 看起来「全部失败」。
+    // 折算规则收在 `outcomeOfRestore`（纯函数，可单独钉住）。
+    const settled = settleRestore(rows.map(outcomeOfRestore))
     // P1-07：孤儿回执是「放弃补凭证」留下的恢复线索——不恢复它，放弃就等于永久丢原文。
     const orphanRows = []
     let orphans = []
@@ -995,6 +1079,9 @@ async function replaceVoucherReceipt(index, expected, next) {
     return {
       total: settled.total,
       restored: settled.restored,
+      // A-08：三桶里 alreadyRestored 已并入 restored（它们确实处于「已恢复」状态），
+      // 这里单列出来，让命令面能说「其中 N 段上次就恢复过」而不是含糊地算成跳过。
+      alreadyRestored: rows.filter((row) => row.alreadyRestored === true).length,
       skipped: settled.skipped,
       forgotten: settled.forgotten,
       balanced: settled.balanced,
@@ -1006,12 +1093,13 @@ async function replaceVoucherReceipt(index, expected, next) {
     }
   }
 
-  function history() {
+  async function history() {
     let vouchers
     try { vouchers = store.listVouchers() } catch (error) { return { error } }
     let redactedIds = new Set()
     try {
-      redactedIds = new Set(typeof store.redactedVoucherIds === 'function' ? store.redactedVoucherIds() : [])
+      // T-03：端口层「按戳刷新后读」，必须 await。
+      redactedIds = new Set(typeof store.redactedVoucherIds === 'function' ? await store.redactedVoucherIds() : [])
     } catch {
       // 标记账本损坏不阻断历史列表：只把 redacted 标为 null（未知），不伪造「未清除」。
       redactedIds = null

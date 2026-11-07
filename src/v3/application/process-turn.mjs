@@ -54,7 +54,7 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
    * @param {object} input { items: Array<{ event, text, meta }> }（event 必须是**已归一化**事件）
    * @returns {Promise<Array<object>>} 与入参同序的结果（rejected / applied / failed）
    */
-  async function processTurnMany({ items } = {}) {
+  async function processTurnMany({ items, seenEventIds = null } = {}) {
     if (!Array.isArray(items)) {
       throw new V3ContractViolation('v3 processTurn: items 必须是数组')
     }
@@ -75,6 +75,28 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
         continue
       }
       const normalized = validation.event
+
+      // M-03（0.15.4，P2）**事件级幂等**：同一 sourceEventId 不得落库两次。
+      //
+      // 判据是宿主的**事件 ID**，不是正文。这是有意的：正文相同的两个事件可能是
+      // 两次真实发生过的相同操作（例如两条一模一样的工具结果 `[cwd: …]`），按正文
+      // 去重会把真实历史合并成一条——那是**篡改历史**，不是省空间。
+      // 实测本库 3,214 条记录里 sourceEventId 重复 0 组、正文重复 28 组 122 条，
+      // 后者全是短操作摘要的不同事件，正说明「按正文去重」会误伤。
+      //
+      // 幂等命中时不新建记录、不推进回合，如实返回已有记录（调用方可继续用 ID）。
+      if (seenEventIds !== null && typeof normalized.id === 'string' && seenEventIds.has(normalized.id)) {
+        metrics?.counter?.('v3.processTurn.duplicateEvent', 1)
+        prepared.push({
+          rejected: false,
+          duplicate: true,
+          record: null,
+          existingRecordId: seenEventIds.get(normalized.id),
+          now: clock.now(),
+          turn: turnState.turn,
+        })
+        continue
+      }
 
       // ② 裁决：回合推进（只有真实人类输入开新回合）+ 不可变 decision
       turnState = nextTurnState(turnState, normalized, ownSourceKinds)
@@ -114,7 +136,10 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
     }
 
     // ③ 持久化：一批一笔事务（全有或全无）
-    const records = prepared.filter((entry) => entry.rejected === false).map((entry) => entry.record)
+    // M-03：duplicate 条目没有 record（不落库），必须一起排除，否则 transaction 会收到 null。
+    const records = prepared
+      .filter((entry) => entry.rejected === false && entry.duplicate !== true)
+      .map((entry) => entry.record)
     let txn = null
     let failure = null
     if (records.length > 0) {
@@ -131,6 +156,18 @@ export function createProcessTurn({ store, clock, random, metrics, ownSourceKind
     return prepared.map((entry) => {
       if (entry.rejected === true) {
         return { status: 'rejected', errors: entry.errors, turn: entry.turn }
+      }
+      // M-03：幂等命中 → 已有记录，不是新提交，也不算失败。
+      // 语义上等同 `own-source`：本事件对库没有新增效果，但**断点要推进**（否则
+      // 每次重启都会重扫同一事件）。调用方按 `status==='duplicate'` 单独处理。
+      if (entry.duplicate === true) {
+        metrics?.counter?.('v3.processTurn.duplicate', 1)
+        return {
+          status: 'duplicate',
+          turn: entry.turn,
+          recordId: entry.existingRecordId,
+          record: null,
+        }
       }
       const appliedEffects = failure === null ? 1 : 0
       const outcomeRaw = {

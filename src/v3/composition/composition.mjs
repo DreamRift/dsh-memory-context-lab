@@ -112,6 +112,13 @@ export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsS
   })
   const processTurn = createProcessTurn({ store: port, clock, random, metrics, ownSourceKinds: ownKinds })
   const lifecycle = createSessionLifecycle({ store: port, clock, random, metrics })
+  // G6b（可见片段去重）**未接线**——这是 2026-11-06 用户确认的现状，不是遗漏。
+  //
+  // `createRecall` 支持 `visibility` + `dedupeVisible` 两个入参，但本处**故意不传**：
+  // 仓库里没有 `snapshotOf` 的生产方，也没有 `dedupeVisible` 设置项，整链在真实会话
+  // 中不可达（A-06/A-07/A-11）。用户裁定保留代码、登记为候选，等有数据集再决定是否开发。
+  //
+  // 因此下面这行**不要**加 dedupeVisible —— `test/v3-g6b-unwired.test.mjs` 会钉住这一点。
   const recall = createRecall({ provider, metrics, sessionKey: key })
   const executor = createSurfaceExecutor({ host, clock, metrics })
   const diagnostics = createDiagnostics({
@@ -155,7 +162,22 @@ export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsS
       normalized.push({ index, event: normalizedEvent.event, text: item.text, meta: item.meta })
     }
     if (normalized.length === 0) return results
-    const outcomes = await processTurn.many({ items: normalized })
+    // M-03（0.15.4，P2）**事件级幂等**：同一 sourceEventId 不得落库两次。
+    // 判据只用宿主事件 ID（不按正文——正文相同可能是两次真实发生的相同操作）。
+    // 读不到来源表时不阻止摄入（失败开放于「不误拦」方向）：幂等是省重复，不是安全门。
+    let seenEventIds = null
+    try {
+      if (typeof store.sourceEventIds === 'function' && typeof store.recordIdOfSourceEvent === 'function') {
+        seenEventIds = new Map()
+        for (const eventId of await store.sourceEventIds()) {
+          const recordId = await store.recordIdOfSourceEvent(eventId)
+          if (typeof recordId === 'string') seenEventIds.set(eventId, recordId)
+        }
+      }
+    } catch {
+      seenEventIds = null // 来源表不可读：不做幂等（不因此拒绝摄入）
+    }
+    const outcomes = await processTurn.many({ items: normalized, seenEventIds })
     for (let i = 0; i < outcomes.length; i += 1) {
       results[normalized[i].index] = outcomes[i]
     }
@@ -164,7 +186,8 @@ export async function createV3Runtime({ v3Root, dshSession, sessionKey, metricsS
     // 走同一条路径（否则「直接调 runtime」会绕过镜像）。
     if (typeof provider.mirrorRecord === 'function') {
       for (const outcome of outcomes) {
-        if (outcome.status !== 'applied' || outcome.record === undefined) continue
+        // M-03：duplicate 没有新记录（record 为 null），镜像无事可做——已有记录早已镜像。
+        if (outcome.status !== 'applied' || outcome.record === undefined || outcome.record === null) continue
         try {
           provider.mirrorRecord(outcome.record)
         } catch {

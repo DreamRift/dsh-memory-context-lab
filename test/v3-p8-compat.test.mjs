@@ -139,7 +139,7 @@ test('P8 旧 voucher：history/restore 兼容，新归档只追加（旧行字�
         random: { uuid: () => '00000000-0000-0000-0000-000000000001' },
       })
 
-      const history = archive.history()
+      const history = await archive.history()
       assert.equal(history.total, 1)
       assert.equal(history.rows[0].restoreChars, null, '旧凭证没有 restoreChars → null（不猜 0）')
       assert.equal(history.rows[0].summary, false)
@@ -171,7 +171,7 @@ test('P8 旧 voucher：history/restore 兼容，新归档只追加（旧行字�
       const onDisk = (await readFile(path.join(dir, 'vouchers.jsonl'), 'utf8')).split('\n')
       assert.equal(onDisk[0] + '\n', oldLine, '旧凭证行逐字节不变（不重写历史）')
       assert.equal(onDisk.length, 3, '只追加一行（末尾空行除外）')
-      assert.equal(archive.history().total, 2, '旧下标 0 不变，新凭证按顺序追加')
+      assert.equal((await archive.history()).total, 2, '旧下标 0 不变，新凭证按顺序追加')
     } finally {
       second.store.close()
     }

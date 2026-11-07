@@ -29,7 +29,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, readdir, rm, copyFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, copyFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -141,6 +141,16 @@ test('B2-10 导入 roundtrip：ID 保留、文本可读、目标根字节干净'
     await copyFile(exported.file, path.join(rootB, 'exports', fileName))
 
     const sessionB = createFakeSession({ id: 'session-import' })
+    // S-13（0.15.4）：跨会话导入必须由**来源会话**显式授权（与 adopt-from 同一道门）。
+    // 这条测试原本假设「拿到文件名就能导入」，那正是 S-13 的缺陷本身；
+    // 它同时是跨 root 导入（A 的导出 → B 的根），授权事实要落在 B 能读到的来源会话目录里。
+    // 授权事实要落在 B 能读到的**来源会话目录**里；来源身份取自导出包内的 sessionKey。
+    const bundleForConsent = JSON.parse(await readFile(path.join(rootB, 'exports', fileName), 'utf8'))
+    const sourceKey = bundleForConsent.sessionKey
+    assert.equal(typeof sourceKey, 'string', '导出包必须带来源 sessionKey（S-13 的判据）')
+    await mkdir(path.join(rootB, 'sessions', sourceKey), { recursive: true })
+    await writeFile(path.join(rootB, 'sessions', sourceKey, 'adopt-consent.json'),
+      JSON.stringify({ schemaVersion: 1, allow: true, sessionKey: sourceKey, updatedAt: Date.now() }), 'utf8')
     const imported = await engineB.importSession('session-import', fileName, sessionB)
     assert.equal(imported.error, undefined, JSON.stringify(imported))
 

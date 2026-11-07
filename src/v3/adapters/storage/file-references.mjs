@@ -11,6 +11,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 
 import { writeFileAtomic } from './session-store.mjs'
+import { withCrossProcessWriteLock } from './write-lock.mjs'
 
 export const FILE_REFERENCES_SCHEMA_VERSION = 1
 export const FILE_REFERENCE_MAX_BYTES = 1024 * 1024
@@ -57,7 +58,7 @@ function workspaceIdOf(root) {
   return 'ws-' + createHash('sha256').update(path.resolve(root)).digest('hex').slice(0, 16)
 }
 
-export async function writeFileReferences(directory, refs) {
+export async function writeFileReferences(directory, refs, { merge = true } = {}) {
   if (!Array.isArray(refs)) throw new Error('v3 file-references: refs 必须是数组')
   await mkdir(directory, { recursive: true })
   const sanitized = refs.map((ref) => {
@@ -65,9 +66,46 @@ export async function writeFileReferences(directory, refs) {
     const { workspaceRoot: _workspaceRoot, ...rest } = ref
     return rest
   })
-  const body = JSON.stringify({ schemaVersion: FILE_REFERENCES_SCHEMA_VERSION, refs: sanitized }, null, 2) + '\n'
-  await writeFileAtomic(fileReferencesPath(directory), body)
-  return refs.length
+  // T-11（0.15.4）：写入必须与其他写者串行，且**锁内重读后合并**。
+  //
+  // 缺陷：旧实现直接 `writeFileAtomic(整本覆盖)`。调用方写的是**自己内存里**的
+  // `entry.fileRefs` 快照，两个句柄/进程各持一份 → 后写的整本覆盖先写的，
+  // 先写的那些文件引用凭空消失（核证面「这文件没读过」→ 误判 unverifiable）。
+  // 这与事务日志有跨进程写锁保护形成对照：同一目录里的账本却裸写。
+  //
+  // 现在：进会话写锁 → 锁内重读磁盘现值 → 按 `path` 合并（本次的引用覆盖同路径旧值）
+  // → 再原子落盘。`merge:false` 保留「整本替换」能力（导入/显式重置用），
+  // 但它同样在锁内执行，不会与并发追加互相覆盖。
+  const write = async (ownership) => {
+    let base = []
+    if (merge === true) {
+      try {
+        const current = await readFileReferences(directory)
+        base = current.refs
+      } catch (error) {
+        // 账本损坏时不能静默当成空表去覆盖——那会把「坏」变成「丢」。
+        // 交给调用方：它自己的 catch 会记 warn，且不会写入。
+        throw error
+      }
+    }
+    const byPath = new Map()
+    for (const ref of base) {
+      if (ref !== null && typeof ref === 'object' && typeof ref.path === 'string') byPath.set(ref.path, ref)
+    }
+    for (const ref of sanitized) {
+      if (ref !== null && typeof ref === 'object' && typeof ref.path === 'string') byPath.set(ref.path, ref)
+      else base.push(ref)
+    }
+    const merged = [...byPath.values(), ...base.filter((ref) => !(ref !== null && typeof ref === 'object' && typeof ref.path === 'string'))]
+    const body = JSON.stringify({ schemaVersion: FILE_REFERENCES_SCHEMA_VERSION, refs: merged }, null, 2) + '\n'
+    ownership?.assertOwned?.()
+    await writeFileAtomic(fileReferencesPath(directory), body)
+    return merged.length
+  }
+  if (typeof withCrossProcessWriteLock === 'function') {
+    return await withCrossProcessWriteLock(directory, write)
+  }
+  return await write(null)
 }
 
 function parseArguments(raw) {
